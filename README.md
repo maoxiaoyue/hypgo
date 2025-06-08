@@ -1,2 +1,31 @@
 # HypGo
 A new Go programming framework that supports HTTP/3 and HTTP/2
+
+# HypGo GitHub 設定指南
+
+## 1. Repository 基本設定
+
+### Repository 名稱
+```
+hypgo
+```
+
+### Description
+```
+HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent ORM integration, message queues, and advanced JSON validation.
+```
+
+## Features
+- ⚡ **HTTP/2 & HTTP/3 support** - Supports the latest network protocols
+- 🗄️ **Ent ORM integration** - Powerful Entity Framework
+- 📨 **Message Queuing** - Supports RabbitMQ and Kafka
+- 🔍 **Advanced JSON Processing** - Including field validation and type checking
+- 📝 **Log Rotation** - Built-in log management function
+- ⚙️ **Viper Settings** - Use YAML configuration files
+- 🏗️ **MVC Architecture** - Layered design of Controllers, Models, and Services
+
+### Install
+
+```bash
+go get github.com/yourusername/hypgo
+```
