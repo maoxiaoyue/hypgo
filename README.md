@@ -2,9 +2,10 @@
 A new Go programming framework that supports HTTP/3 and HTTP/2
 
 ### Description
-```
+
 HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent ORM integration, message queues, and advanced JSON validation.
-```
+
+### Story 
 
 ## Features
 - ⚡ **HTTP/2 & HTTP/3 support** - Supports the latest network protocols
