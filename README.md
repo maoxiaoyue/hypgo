@@ -23,3 +23,10 @@ HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent 
 ```bash
 go get github.com/yourusername/hypgo
 ```
+
+## Why HTTP/2.0 And HTTP/3.0?
+The only reason is very fast. Especially, when using a smaller flow
+
+### References
+HTTP vs. HTTP/2 vs. HTTP/3: What’s the Difference?
+https://www.pubnub.com/blog/http-vs-http-2-vs-http-3-whats-the-difference/
