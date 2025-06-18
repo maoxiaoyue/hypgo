@@ -19,7 +19,7 @@ HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent 
 ### Install
 
 ```bash
-go get github.com/yourusername/hypgo
+go get github.com/maoxiaoyue/hypgo
 ```
 
 ## Why HTTP/2.0 And HTTP/3.0?
