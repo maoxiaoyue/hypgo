@@ -16,6 +16,8 @@ HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent 
 - ⚙️ **Viper Settings** - Use YAML configuration files
 - 🏗️ **MVC Architecture** - Layered design of Controllers, Models, and Services
 
+### Require
+Go Version 1.23 or above
 ### Install
 
 ```bash
