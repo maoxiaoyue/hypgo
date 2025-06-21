@@ -1,11 +1,6 @@
 # HypGo
 A new Go programming framework that supports HTTP/3 and HTTP/2
 
-# HypGo GitHub 設定指南
-
-## 1. Repository 基本設定
-
-### Repository 名稱
 ```
 hypgo
 ```
