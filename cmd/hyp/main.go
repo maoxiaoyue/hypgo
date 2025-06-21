@@ -1,4 +1,4 @@
-package hyp
+package main
 
 import (
 	"fmt"
@@ -15,6 +15,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(newCmd)
+	rootCmd.AddCommand(apiCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(generateCmd)
 }
