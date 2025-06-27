@@ -1,14 +1,20 @@
 # HypGo
 A new Go programming framework that supports HTTP/3 and HTTP/2
 
-```
-hypgo
-```
+
 
 ### Description
 ```
-HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent ORM integration, message queues, and advanced JSON validation.
+HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent ORM integration, message queues, and advanced JSON validation etc.
+And I want to add a functional plugins .... for example, kafka and make docker image auotmatic. This will be complete by the "hyp" command and the config parameter in the yaml
 ```
+=======
+### Description
+
+HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent ORM integration, message queues, and advanced JSON validation. HTTP/3.0 is nearly 10 times faster than HTTP/1.1. In my case, it's useful and important. So, I try design this framework.
+
+### Story 
+
 
 ## Features
 - ⚡ **HTTP/2 & HTTP/3 support** - Supports the latest network protocols
@@ -19,8 +25,20 @@ HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent 
 - ⚙️ **Viper Settings** - Use YAML configuration files
 - 🏗️ **MVC Architecture** - Layered design of Controllers, Models, and Services
 
+### Require
+Go Version 1.23 or above
 ### Install
 
 ```bash
-go get github.com/yourusername/hypgo
+go get github.com/maoxiaoyue/hypgo
 ```
+
+## Why HTTP/2.0 And HTTP/3.0?
+The only reason is very fast. Especially, when using a smaller flow
+
+### References
+HTTP vs. HTTP/2 vs. HTTP/3: What’s the Difference?
+
+https://www.pubnub.com/blog/http-vs-http-2-vs-http-3-whats-the-difference/
+
+### Roadmap: V1.0 and V2.0 Plans
