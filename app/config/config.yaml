@@ -1,0 +1,45 @@
+# hypgo Framework Configuration
+
+server:
+  protocol: http2  # 可選: http1, http2, http3
+  addr: :8080
+  read_timeout: 30
+  write_timeout: 30
+  idle_timeout: 120
+  keep_alive: 30
+  max_handlers: 1000
+  max_concurrent_streams: 100
+  max_read_frame_size: 1048576
+  tls:
+    enabled: false
+    cert_file: "certs/server.crt"
+    key_file: "certs/server.key"
+
+database:
+  driver: mysql  # 可選: mysql, postgres, tidb, redis, cassandra
+  dsn: "root:password@tcp(localhost:3306)/hypgo?charset=utf8mb4&parseTime=True&loc=Local"
+  max_idle_conns: 10
+  max_open_conns: 100
+  redis:
+    addr: "localhost:6379"
+    password: ""
+    db: 0
+  cassandra:
+    hosts:
+      - "localhost:9042"
+    keyspace: "hypgo"
+
+logger:
+  level: debug  # 可選: debug, info, notice, warning, emergency
+  output: logs/app.log  # stdout 或檔案路徑
+  colors: true
+  rotation:
+    max_size: 100MB    # 10MB, 100MB, 1GB
+    max_age: 7d        # 1h, 1d, 1w
+    max_backups: 10
+    compress: true
+
+rabbitmq:
+  url: "amqp://guest:guest@localhost:5672/"
+  exchange: "hypgo"
+  queue: "default"
