@@ -11,7 +11,7 @@ import (
 
 var newCmd = &cobra.Command{
 	Use:   "new [project-name]",
-	Short: "Create a new HypGo full-stack project",
+	Short: "Create a new hypgo full-stack project",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runNew,
 }
@@ -95,7 +95,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 }
 
 func createConfigFile(projectName string) error {
-	configContent := `# HypGo Configuration File
+	configContent := `# hypgo Configuration File
 
 server:
   protocol: http2  # http1, http2, http3
@@ -200,7 +200,7 @@ func main() {
 
     // 啟動服務器
     go func() {
-        log.Info("Starting HypGo server...")
+        log.Info("Starting hypgo server...")
         if err := srv.Start(); err != nil {
             log.Emergency("Server error: %v", err)
             os.Exit(1)
@@ -295,7 +295,7 @@ func HomeHandler(w http.ResponseWriter, r *http.Request) {
         Title    string
         Protocol string
     }{
-        Title:    "Welcome to HypGo",
+        Title:    "Welcome to hypgo",
         Protocol: r.Proto,
     }
 
@@ -314,7 +314,7 @@ func InfoHandler(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(Response{
         Success: true,
-        Message: "HypGo Framework",
+        Message: "hypgo Framework",
         Data: map[string]interface{}{
             "version":  "1.0.0",
             "protocol": r.Proto,
@@ -346,7 +346,7 @@ func createWelcomeTemplate(projectName string) error {
 <body>
     <div class="container">
         <div class="hero">
-            <h1 class="title">Welcome to HypGo</h1>
+            <h1 class="title">Welcome to hypgo</h1>
             <p class="subtitle">A Modern Go Web Framework with HTTP/3 Support</p>
             <div class="protocol-badge">{{.Protocol}}</div>
         </div>
@@ -382,7 +382,7 @@ func createWelcomeTemplate(projectName string) error {
         <div id="output" class="output"></div>
 
         <div class="footer">
-            <p>HypGo Framework &copy; 2024 | <a href="https://github.com/yourusername/hypgo">GitHub</a></p>
+            <p>hypgo Framework &copy; 2024 | <a href="https://github.com/yourusername/hypgo">GitHub</a></p>
         </div>
     </div>
 

@@ -12,7 +12,7 @@ import (
 
 var apiCmd = &cobra.Command{
 	Use:   "api [project-name]",
-	Short: "Create a new HypGo API-only project",
+	Short: "Create a new hypgo API-only project",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runAPI,
 }
@@ -83,7 +83,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 }
 
 func createAPIConfigFile(projectName string) error {
-	configContent := `# HypGo API Configuration
+	configContent := `# hypgo API Configuration
 
 server:
   protocol: http2  # http1, http2, http3

@@ -21,7 +21,7 @@ func init() {
 
 var runCmd = &cobra.Command{
 	Use:   "run",
-	Short: "Run the HypGo application",
+	Short: "Run the hypgo application",
 	RunE:  runRun,
 }
 

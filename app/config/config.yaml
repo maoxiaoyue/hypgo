@@ -1,4 +1,4 @@
-# HypGo Framework Configuration
+# hypgo Framework Configuration
 
 server:
   protocol: http2  # 可選: http1, http2, http3

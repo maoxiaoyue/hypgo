@@ -9,8 +9,8 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "hyp",
-	Short: "HypGo framework CLI tool",
-	Long:  `HypGo is a modern Go web framework with HTTP/3 support`,
+	Short: "hypgo framework CLI tool",
+	Long:  `hypgo is a modern Go web framework with HTTP/3 support`,
 }
 
 func init() {
