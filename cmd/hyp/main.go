@@ -18,6 +18,11 @@ func init() {
 	rootCmd.AddCommand(apiCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(generateCmd)
+	rootCmd.AddCommand(installCmd)
+	rootCmd.AddCommand(restartCmd)
+	rootCmd.AddCommand(dockerCmd)
+	rootCmd.AddCommand(healthCmd)
+	rootCmd.AddCommand(versionCmd)
 }
 
 func main() {
