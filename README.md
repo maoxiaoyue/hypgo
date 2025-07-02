@@ -6,6 +6,9 @@ A modern Go web framework with HTTP/3, HTTP/2 support and plugin architecture.
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.1.0-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
 
+[English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md)
+
+
 ## Description
 
 HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Ent ORM integration, message queues, and advanced JSON validation. HTTP/3.0 is nearly 10 times faster than HTTP/1.1. In my case, it's useful and important. So, I try design this framework.
