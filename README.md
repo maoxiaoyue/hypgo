@@ -406,13 +406,6 @@ make build
 
 HypGo is released under the [MIT License](LICENSE).
 
-## Support
-
-- 📧 Email: support@hypgo.dev
-- 💬 Discord: [Join our community](https://discord.gg/hypgo)
-- 📖 Documentation: [docs.hypgo.dev](https://docs.hypgo.dev)
-- 🐛 Issues: [GitHub Issues](https://github.com/maoxiaoyue/hypgo/issues)
-
 ## Acknowledgments
 
 HypGo is built on the shoulders of giants:
