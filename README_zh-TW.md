@@ -405,13 +405,6 @@ make build
 
 HypGo 採用 [MIT 授權](LICENSE) 發布。
 
-## 支援
-
-- 📧 電子郵件：support@hypgo.dev
-- 💬 Discord：[加入我們的社群](https://discord.gg/hypgo)
-- 📖 文件：[docs.hypgo.dev](https://docs.hypgo.dev)
-- 🐛 問題：[GitHub Issues](https://github.com/maoxiaoyue/hypgo/issues)
-
 ## 致謝
 
 HypGo 站在巨人的肩膀上：
