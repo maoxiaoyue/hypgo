@@ -420,4 +420,4 @@ HypGo is built on the shoulders of giants:
 
 ---
 
-Made with ❤️ by the HypGo Team
+Made with ❤️ by the Maoxiaoyu From Taiwan
