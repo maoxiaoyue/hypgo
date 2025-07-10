@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -157,6 +158,25 @@ func validateProperty(name string, value interface{}, prop Property) error {
 			return fmt.Errorf("field %s length must not exceed %d", name, *prop.MaxLength)
 		}
 
+		if prop.Pattern != "" {
+			if match, _ := regexp.MatchString(prop.Pattern, str); !match {
+				return fmt.Errorf("field %s does not match pattern %s", name, prop.Pattern)
+			}
+		}
+
+		if len(prop.Enum) > 0 {
+			found := false
+			for _, v := range prop.Enum {
+				if v == str {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("field %s must be one of %v", name, prop.Enum)
+			}
+		}
+
 	case "number":
 		num, ok := value.(float64)
 		if !ok {
@@ -206,4 +226,57 @@ func Marshal(v interface{}) ([]byte, error) {
 
 func MarshalCompact(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
+}
+
+// 自定義驗證規則
+func (v *Validator) RegisterValidation(tag string, fn validator.Func) error {
+	return v.validator.RegisterValidation(tag, fn)
+}
+
+// 驗證錯誤處理
+type ValidationError struct {
+	Field   string
+	Tag     string
+	Value   interface{}
+	Message string
+}
+
+func (v *Validator) FormatErrors(err error) []ValidationError {
+	var errors []ValidationError
+
+	if err == nil {
+		return errors
+	}
+
+	validationErrors, ok := err.(validator.ValidationErrors)
+	if !ok {
+		return errors
+	}
+
+	for _, e := range validationErrors {
+		error := ValidationError{
+			Field:   e.Field(),
+			Tag:     e.Tag(),
+			Value:   e.Value(),
+			Message: v.formatErrorMessage(e),
+		}
+		errors = append(errors, error)
+	}
+
+	return errors
+}
+
+func (v *Validator) formatErrorMessage(e validator.FieldError) string {
+	switch e.Tag() {
+	case "required":
+		return fmt.Sprintf("%s is required", e.Field())
+	case "email":
+		return fmt.Sprintf("%s must be a valid email address", e.Field())
+	case "min":
+		return fmt.Sprintf("%s must be at least %s", e.Field(), e.Param())
+	case "max":
+		return fmt.Sprintf("%s must not exceed %s", e.Field(), e.Param())
+	default:
+		return fmt.Sprintf("%s failed %s validation", e.Field(), e.Tag())
+	}
 }

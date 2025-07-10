@@ -1,8 +1,6 @@
 package middleware
 
 import (
-	//"crypto/rand"
-	//"encoding/base64"
 	"net/http"
 )
 

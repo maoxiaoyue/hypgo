@@ -11,7 +11,7 @@ import (
 
 var newCmd = &cobra.Command{
 	Use:   "new [project-name]",
-	Short: "Create a new hypgo full-stack project",
+	Short: "Create a new HypGo full-stack project",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runNew,
 }
@@ -95,7 +95,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 }
 
 func createConfigFile(projectName string) error {
-	configContent := `# hypgo Configuration File
+	configContent := `# HypGo Configuration File
 
 server:
   protocol: http2  # http1, http2, http3
@@ -107,13 +107,14 @@ server:
   max_handlers: 1000
   max_concurrent_streams: 100
   max_read_frame_size: 1048576
+  enable_graceful_restart: true  # 啟用熱重啟
   tls:
     enabled: false
     cert_file: ""
     key_file: ""
 
 database:
-  driver: mysql  # mysql, postgres, tidb, redis, cassandra
+  driver: mysql  # mysql, postgres, tidb, redis
   dsn: "user:password@tcp(localhost:3306)/database?charset=utf8mb4&parseTime=True&loc=Local"
   max_idle_conns: 10
   max_open_conns: 100
@@ -121,10 +122,6 @@ database:
     addr: "localhost:6379"
     password: ""
     db: 0
-  cassandra:
-    hosts:
-      - "localhost:9042"
-    keyspace: "hypgo"
 
 logger:
   level: debug  # debug, info, notice, warning, emergency
@@ -136,10 +133,9 @@ logger:
     max_backups: 10
     compress: true
 
-rabbitmq:
-  url: "amqp://guest:guest@localhost:5672/"
-  exchange: "hypgo"
-  queue: "default"
+# 插件配置將存放在獨立的文件中
+# 使用 'hyp addp <plugin-name>' 來添加插件
+# 支援的插件：rabbitmq, kafka, cassandra, scylladb, mongodb, elasticsearch
 `
 
 	filename := filepath.Join(projectName, "config", "config.yaml")
@@ -200,7 +196,7 @@ func main() {
 
     // 啟動服務器
     go func() {
-        log.Info("Starting hypgo server...")
+        log.Info("Starting HypGo server...")
         if err := srv.Start(); err != nil {
             log.Emergency("Server error: %v", err)
             os.Exit(1)
@@ -295,7 +291,7 @@ func HomeHandler(w http.ResponseWriter, r *http.Request) {
         Title    string
         Protocol string
     }{
-        Title:    "Welcome to hypgo",
+        Title:    "Welcome to HypGo",
         Protocol: r.Proto,
     }
 
@@ -314,7 +310,7 @@ func InfoHandler(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(Response{
         Success: true,
-        Message: "hypgo Framework",
+        Message: "HypGo Framework",
         Data: map[string]interface{}{
             "version":  "1.0.0",
             "protocol": r.Proto,
@@ -346,7 +342,7 @@ func createWelcomeTemplate(projectName string) error {
 <body>
     <div class="container">
         <div class="hero">
-            <h1 class="title">Welcome to hypgo</h1>
+            <h1 class="title">Welcome to HypGo</h1>
             <p class="subtitle">A Modern Go Web Framework with HTTP/3 Support</p>
             <div class="protocol-badge">{{.Protocol}}</div>
         </div>
@@ -382,7 +378,7 @@ func createWelcomeTemplate(projectName string) error {
         <div id="output" class="output"></div>
 
         <div class="footer">
-            <p>hypgo Framework &copy; 2024 | <a href="https://github.com/yourusername/hypgo">GitHub</a></p>
+            <p>HypGo Framework &copy; 2024 | <a href="https://github.com/yourusername/hypgo">GitHub</a></p>
         </div>
     </div>
 
