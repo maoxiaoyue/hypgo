@@ -1,4 +1,4 @@
-module github.com/maoxiaoyue/HypGo
+module github.com/maoxiaoyue/hypgo
 
 go 1.23.0
 
@@ -13,7 +13,6 @@ require (
 	github.com/gocql/gocql v1.7.0
 	github.com/gorilla/mux v1.8.1
 	github.com/lib/pq v1.10.9
-	github.com/maoxiaoyue/hypgo v0.0.0-20250628121836-6406e099b83e
 	github.com/quic-go/quic-go v0.52.0
 	github.com/redis/go-redis/v9 v9.10.0
 	github.com/spf13/cobra v1.8.0
