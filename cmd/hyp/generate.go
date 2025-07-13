@@ -41,8 +41,8 @@ import (
     "net/http"
 
     "github.com/gorilla/mux"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type {{.Name}}Controller struct {
@@ -189,8 +189,8 @@ import (
     "context"
     "fmt"
 
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type {{.Name}}Service struct {

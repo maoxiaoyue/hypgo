@@ -154,10 +154,10 @@ import (
     "syscall"
     "time"
 
-    "github.com/yourusername/hypgo/pkg/config"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
-    "github.com/yourusername/hypgo/pkg/server"
+    "github.com/maoxiaoyue/hypgo/pkg/config"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/server"
     "{{.ProjectName}}/app/controllers"
 )
 
@@ -247,9 +247,9 @@ import (
     "encoding/json"
 
     "github.com/gorilla/mux"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
-    "github.com/yourusername/hypgo/pkg/websocket"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/websocket"
 )
 
 type Response struct {
@@ -378,7 +378,7 @@ func createWelcomeTemplate(projectName string) error {
         <div id="output" class="output"></div>
 
         <div class="footer">
-            <p>HypGo Framework &copy; 2024 | <a href="https://github.com/yourusername/hypgo">GitHub</a></p>
+            <p>HypGo Framework &copy; 2024 | <a href="https://github.com/maoxiaoyue/hypgo">GitHub</a></p>
         </div>
     </div>
 
@@ -616,7 +616,7 @@ func createGoMod(projectName string) error {
 
 go 1.21
 
-require github.com/yourusername/hypgo v1.0.0
+require github.com/maoxiaoyue/hypgo v1.0.0
 `, projectName)
 
 	filename := filepath.Join(projectName, "go.mod")

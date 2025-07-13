@@ -81,8 +81,8 @@ import (
     "time"
 
     "github.com/streadway/amqp"
-    "github.com/yourusername/hypgo/pkg/config"
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/config"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type Service struct {
@@ -235,7 +235,7 @@ import (
 
     "github.com/segmentio/kafka-go"
     "github.com/segmentio/kafka-go/sasl/plain"
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type Service struct {
@@ -363,7 +363,7 @@ import (
     "time"
 
     "github.com/gocql/gocql"
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type Service struct {
@@ -499,7 +499,7 @@ import (
     "time"
 
     "github.com/gocql/gocql"
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type Service struct {
