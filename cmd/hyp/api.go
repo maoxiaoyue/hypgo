@@ -163,10 +163,10 @@ import (
     "syscall"
     "time"
 
-    "github.com/yourusername/hypgo/pkg/config"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
-    "github.com/yourusername/hypgo/pkg/server"
+    "github.com/maoxiaoyue/hypgo/pkg/config"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/server"
     "{{.ProjectName}}/app/controllers"
     "{{.ProjectName}}/app/middleware"
 )
@@ -251,9 +251,9 @@ import (
     "time"
 
     "github.com/gorilla/mux"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
-    "github.com/yourusername/hypgo/pkg/websocket"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/websocket"
 )
 
 type APIResponse struct {
@@ -443,7 +443,7 @@ import (
     "sync"
     "strings"
 
-    "github.com/yourusername/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 // Logger 中間件
