@@ -14,7 +14,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
-	"github.com/quic-go/quic-go"
+	//"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -71,28 +71,19 @@ func (s *Server) startHTTP3() error {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{s.loadCertificate()},
-		NextProtos:   []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29"},
+		NextProtos:   []string{"h3"},
 		MinVersion:   tls.VersionTLS13,
-	}
-
-	quicConfig := &quic.Config{
-		MaxIdleTimeout:                 time.Duration(s.config.Server.IdleTimeout) * time.Second,
-		MaxIncomingStreams:             1000,
-		MaxIncomingUniStreams:          1000,
-		KeepAlivePeriod:                time.Duration(s.config.Server.KeepAlive) * time.Second,
-		EnableDatagrams:                true,
-		Allow0RTT:                      true,
-		InitialStreamReceiveWindow:     10 * 1024 * 1024,  // 10 MB
-		MaxStreamReceiveWindow:         100 * 1024 * 1024, // 100 MB
-		InitialConnectionReceiveWindow: 10 * 1024 * 1024,  // 10 MB
-		MaxConnectionReceiveWindow:     100 * 1024 * 1024, // 100 MB
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+		},
 	}
 
 	s.h3Server = &http3.Server{
-		Handler:    s.router,
-		Addr:       s.config.Server.Addr,
-		TLSConfig:  tlsConfig,
-		QuicConfig: quicConfig,
+		Handler:   s.router,
+		Addr:      s.config.Server.Addr,
+		TLSConfig: tlsConfig,
 	}
 
 	// Add Alt-Svc header for HTTP/3 discovery
@@ -320,7 +311,8 @@ func (s *Server) forkNewProcess() error {
 	return nil
 }
 
-// ListenAndServeWithGracefulShutdown starts server with graceful shutdown support
+//ListenAndServeWithGracefulShutdown starts server with graceful shutdown support
+/*
 func (s *Server) ListenAndServeWithGracefulShutdown() error {
 	// Start server in goroutine
 	errChan := make(chan error, 1)
@@ -352,7 +344,7 @@ func (s *Server) ListenAndServeWithGracefulShutdown() error {
 	}
 
 	return nil
-}
+}*/
 
 // Health returns server health status
 func (s *Server) Health() error {
