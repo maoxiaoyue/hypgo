@@ -39,7 +39,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// 創建配置文件
-	if err := createConfigFile(projectName); err != nil {
+	if err := createNewConfigFile(projectName); err != nil {
 		return err
 	}
 
@@ -94,7 +94,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func createConfigFile(projectName string) error {
+func createNewConfigFile(projectName string) error {
 	configContent := `# HypGo Configuration File
 
 server:
