@@ -3,7 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"text/template"
 
 	"github.com/spf13/cobra"
@@ -612,13 +617,74 @@ body {
 }
 
 func createGoMod(projectName string) error {
+	latestTag, err := getLatestGitTag("github.com/maoxiaoyue/hypgo")
+	if err != nil {
+		// 如果無法獲取標籤，使用佔位版本
+		latestTag = "v0.0.0"
+		fmt.Fprintf(os.Stderr, "Warning: Failed to get latest tag, using %s: %v\n", latestTag, err)
+	}
+
 	content := fmt.Sprintf(`module %s
 
 go 1.21
 
-require github.com/maoxiaoyue/hypgo v0.1-alpha
-`, projectName)
+require github.com/maoxiaoyue/hypgo %s
+`, projectName, latestTag)
 
 	filename := filepath.Join(projectName, "go.mod")
 	return os.WriteFile(filename, []byte(content), 0644)
+}
+
+// getLatestGitTag 獲取指定儲存庫的最新標籤
+func getLatestGitTag(repo string) (string, error) {
+	cmd := exec.Command("git", "ls-remote", "--tags", fmt.Sprintf("git@%s.git", repo))
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run git ls-remote: %w", err)
+	}
+
+	// 解析 git ls-remote 輸出，提取標籤
+	tags := []string{}
+	tagRegex := regexp.MustCompile(`refs/tags/(.+)$`)
+	for _, line := range strings.Split(string(output), "\n") {
+		if matches := tagRegex.FindStringSubmatch(line); len(matches) > 1 {
+			tag := strings.TrimSuffix(matches[1], "^{}") // 移除 ^{} 後綴
+			if isValidSemver(tag) {
+				tags = append(tags, tag)
+			}
+		}
+	}
+
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no valid semantic version tags found")
+	}
+
+	// 按語義版本排序，選擇最新版本
+	sort.Slice(tags, func(i, j int) bool {
+		return compareSemver(tags[i], tags[j]) > 0
+	})
+
+	return tags[0], nil
+}
+
+// isValidSemver 簡單檢查是否為語義版本（vX.Y.Z）
+func isValidSemver(tag string) bool {
+	semverRegex := regexp.MustCompile(`^v\d+\.\d+\.\d+(-.*)?$`)
+	return semverRegex.MatchString(tag)
+}
+
+// compareSemver 比較兩個語義版本
+func compareSemver(v1, v2 string) int {
+	// 簡單實現：移除 "v" 前綴並比較
+	v1Parts := strings.Split(strings.TrimPrefix(v1, "v"), ".")
+	v2Parts := strings.Split(strings.TrimPrefix(v2, "v"), ".")
+
+	for i := 0; i < len(v1Parts) && i < len(v2Parts); i++ {
+		v1Num, _ := strconv.Atoi(strings.Split(v1Parts[i], "-")[0])
+		v2Num, _ := strconv.Atoi(strings.Split(v2Parts[i], "-")[0])
+		if v1Num != v2Num {
+			return v1Num - v2Num
+		}
+	}
+	return len(v1Parts) - len(v2Parts)
 }
