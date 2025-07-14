@@ -112,15 +112,15 @@ hyp run
 
 ```bash
 # 添加訊息佇列支援
-hyp addp rabbitmq
-hyp addp kafka
+hyp install rabbitmq
+hyp install kafka
 
 # 添加資料庫支援
-hyp addp mongodb
-hyp addp cassandra
+hyp install mongodb
+hyp install cassandra
 
 # 添加搜尋功能
-hyp addp elasticsearch
+hyp install elasticsearch
 ```
 
 ### 3. 建構 Docker 映像
@@ -173,7 +173,7 @@ HypGo 使用模組化插件系統，允許您在不修改核心框架的情況�
 
 ```bash
 # 添加插件
-hyp addp <插件名稱>
+hyp install <插件名稱>
 
 # 可用插件：
 - rabbitmq      # 訊息佇列
@@ -239,7 +239,7 @@ hyp generate service <名稱>     # 生成服務
 
 ### 插件管理
 ```bash
-hyp addp <插件>    # 添加插件
+hyp install <插件>    # 添加插件
 ```
 
 ### 部署
@@ -326,7 +326,7 @@ func main() {
 ### 使用插件
 
 ```go
-// 執行後：hyp addp kafka
+// 執行後：hyp install kafka
 import "myapp/app/plugins/kafka"
 
 kafkaService, _ := kafka.New(config.GetPluginConfig("kafka"), logger)

@@ -113,15 +113,15 @@ hyp run
 
 ```bash
 # Add message queue support
-hyp addp rabbitmq
-hyp addp kafka
+hyp install rabbitmq
+hyp install kafka
 
 # Add database support
-hyp addp mongodb
-hyp addp cassandra
+hyp install mongodb
+hyp install cassandra
 
 # Add search capability
-hyp addp elasticsearch
+hyp install elasticsearch
 ```
 
 ### 3. Build Docker Image
@@ -174,7 +174,7 @@ HypGo uses a modular plugin system that allows you to add functionality without 
 
 ```bash
 # Add a plugin
-hyp addp <plugin-name>
+hyp install <plugin-name>
 
 # Available plugins:
 - rabbitmq    # Message queue
@@ -240,7 +240,7 @@ hyp generate service <name>     # Generate service
 
 ### Plugin Management
 ```bash
-hyp addp <plugin>  # Add plugin
+hyp install <plugin>  # Add plugin
 ```
 
 ### Deployment
@@ -327,7 +327,7 @@ func main() {
 ### Using Plugins
 
 ```go
-// After running: hyp addp kafka
+// After running: hyp install kafka
 import "myapp/app/plugins/kafka"
 
 kafkaService, _ := kafka.New(config.GetPluginConfig("kafka"), logger)
