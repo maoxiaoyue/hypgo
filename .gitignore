@@ -12,7 +12,7 @@ dist/
 *.out
 
 # Go workspace
-go.work
+#go.work
 
 # Dependency directories
 vendor/
@@ -37,5 +37,5 @@ hypgo.pid
 *.tmp.*
 
 # Build artifacts
-hypgo-app
+#hypgo-app
 Dockerfile.tmp.*

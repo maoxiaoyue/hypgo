@@ -3,7 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"text/template"
 
 	"github.com/spf13/cobra"
@@ -11,7 +16,7 @@ import (
 
 var newCmd = &cobra.Command{
 	Use:   "new [project-name]",
-	Short: "Create a new hypgo full-stack project",
+	Short: "Create a new HypGo full-stack project",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runNew,
 }
@@ -39,7 +44,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// 創建配置文件
-	if err := createConfigFile(projectName); err != nil {
+	if err := createNewConfigFile(projectName); err != nil {
 		return err
 	}
 
@@ -94,8 +99,8 @@ func runNew(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func createConfigFile(projectName string) error {
-	configContent := `# hypgo Configuration File
+func createNewConfigFile(projectName string) error {
+	configContent := `# HypGo Configuration File
 
 server:
   protocol: http2  # http1, http2, http3
@@ -107,13 +112,14 @@ server:
   max_handlers: 1000
   max_concurrent_streams: 100
   max_read_frame_size: 1048576
+  enable_graceful_restart: true  # 啟用熱重啟
   tls:
     enabled: false
     cert_file: ""
     key_file: ""
 
 database:
-  driver: mysql  # mysql, postgres, tidb, redis, cassandra
+  driver: mysql  # mysql, postgres, tidb, redis
   dsn: "user:password@tcp(localhost:3306)/database?charset=utf8mb4&parseTime=True&loc=Local"
   max_idle_conns: 10
   max_open_conns: 100
@@ -121,10 +127,6 @@ database:
     addr: "localhost:6379"
     password: ""
     db: 0
-  cassandra:
-    hosts:
-      - "localhost:9042"
-    keyspace: "hypgo"
 
 logger:
   level: debug  # debug, info, notice, warning, emergency
@@ -136,10 +138,9 @@ logger:
     max_backups: 10
     compress: true
 
-rabbitmq:
-  url: "amqp://guest:guest@localhost:5672/"
-  exchange: "hypgo"
-  queue: "default"
+# 插件配置將存放在獨立的文件中
+# 使用 'hyp addp <plugin-name>' 來添加插件
+# 支援的插件：rabbitmq, kafka, cassandra, scylladb, mongodb, elasticsearch
 `
 
 	filename := filepath.Join(projectName, "config", "config.yaml")
@@ -158,10 +159,10 @@ import (
     "syscall"
     "time"
 
-    "github.com/yourusername/hypgo/pkg/config"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
-    "github.com/yourusername/hypgo/pkg/server"
+    "github.com/maoxiaoyue/hypgo/pkg/config"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/server"
     "{{.ProjectName}}/app/controllers"
 )
 
@@ -200,7 +201,7 @@ func main() {
 
     // 啟動服務器
     go func() {
-        log.Info("Starting hypgo server...")
+        log.Info("Starting HypGo server...")
         if err := srv.Start(); err != nil {
             log.Emergency("Server error: %v", err)
             os.Exit(1)
@@ -251,9 +252,9 @@ import (
     "encoding/json"
 
     "github.com/gorilla/mux"
-    "github.com/yourusername/hypgo/pkg/database"
-    "github.com/yourusername/hypgo/pkg/logger"
-    "github.com/yourusername/hypgo/pkg/websocket"
+    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/websocket"
 )
 
 type Response struct {
@@ -295,7 +296,7 @@ func HomeHandler(w http.ResponseWriter, r *http.Request) {
         Title    string
         Protocol string
     }{
-        Title:    "Welcome to hypgo",
+        Title:    "Welcome to HypGo",
         Protocol: r.Proto,
     }
 
@@ -314,7 +315,7 @@ func InfoHandler(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(Response{
         Success: true,
-        Message: "hypgo Framework",
+        Message: "HypGo Framework",
         Data: map[string]interface{}{
             "version":  "1.0.0",
             "protocol": r.Proto,
@@ -346,7 +347,7 @@ func createWelcomeTemplate(projectName string) error {
 <body>
     <div class="container">
         <div class="hero">
-            <h1 class="title">Welcome to hypgo</h1>
+            <h1 class="title">Welcome to HypGo</h1>
             <p class="subtitle">A Modern Go Web Framework with HTTP/3 Support</p>
             <div class="protocol-badge">{{.Protocol}}</div>
         </div>
@@ -382,7 +383,7 @@ func createWelcomeTemplate(projectName string) error {
         <div id="output" class="output"></div>
 
         <div class="footer">
-            <p>hypgo Framework &copy; 2024 | <a href="https://github.com/yourusername/hypgo">GitHub</a></p>
+            <p>HypGo Framework &copy; 2024 | <a href="https://github.com/maoxiaoyue/hypgo">GitHub</a></p>
         </div>
     </div>
 
@@ -616,13 +617,74 @@ body {
 }
 
 func createGoMod(projectName string) error {
+	latestTag, err := getLatestGitTag("github.com/maoxiaoyue/hypgo")
+	if err != nil {
+		// 如果無法獲取標籤，使用佔位版本
+		latestTag = "v0.0.0"
+		fmt.Fprintf(os.Stderr, "Warning: Failed to get latest tag, using %s: %v\n", latestTag, err)
+	}
+
 	content := fmt.Sprintf(`module %s
 
 go 1.21
 
-require github.com/yourusername/hypgo v1.0.0
-`, projectName)
+require github.com/maoxiaoyue/hypgo %s
+`, projectName, latestTag)
 
 	filename := filepath.Join(projectName, "go.mod")
 	return os.WriteFile(filename, []byte(content), 0644)
+}
+
+// getLatestGitTag 獲取指定儲存庫的最新標籤
+func getLatestGitTag(repo string) (string, error) {
+	cmd := exec.Command("git", "ls-remote", "--tags", fmt.Sprintf("git@%s.git", repo))
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run git ls-remote: %w", err)
+	}
+
+	// 解析 git ls-remote 輸出，提取標籤
+	tags := []string{}
+	tagRegex := regexp.MustCompile(`refs/tags/(.+)$`)
+	for _, line := range strings.Split(string(output), "\n") {
+		if matches := tagRegex.FindStringSubmatch(line); len(matches) > 1 {
+			tag := strings.TrimSuffix(matches[1], "^{}") // 移除 ^{} 後綴
+			if isValidSemver(tag) {
+				tags = append(tags, tag)
+			}
+		}
+	}
+
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no valid semantic version tags found")
+	}
+
+	// 按語義版本排序，選擇最新版本
+	sort.Slice(tags, func(i, j int) bool {
+		return compareSemver(tags[i], tags[j]) > 0
+	})
+
+	return tags[0], nil
+}
+
+// isValidSemver 簡單檢查是否為語義版本（vX.Y.Z）
+func isValidSemver(tag string) bool {
+	semverRegex := regexp.MustCompile(`^v\d+\.\d+\.\d+(-.*)?$`)
+	return semverRegex.MatchString(tag)
+}
+
+// compareSemver 比較兩個語義版本
+func compareSemver(v1, v2 string) int {
+	// 簡單實現：移除 "v" 前綴並比較
+	v1Parts := strings.Split(strings.TrimPrefix(v1, "v"), ".")
+	v2Parts := strings.Split(strings.TrimPrefix(v2, "v"), ".")
+
+	for i := 0; i < len(v1Parts) && i < len(v2Parts); i++ {
+		v1Num, _ := strconv.Atoi(strings.Split(v1Parts[i], "-")[0])
+		v2Num, _ := strconv.Atoi(strings.Split(v2Parts[i], "-")[0])
+		if v1Num != v2Num {
+			return v1Num - v2Num
+		}
+	}
+	return len(v1Parts) - len(v2Parts)
 }
