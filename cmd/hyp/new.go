@@ -616,7 +616,7 @@ func createGoMod(projectName string) error {
 
 go 1.21
 
-require github.com/maoxiaoyue/hypgo v1.0.0
+require github.com/maoxiaoyue/hypgo v0.1-alpha
 `, projectName)
 
 	filename := filepath.Join(projectName, "go.mod")
