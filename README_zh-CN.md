@@ -380,39 +380,8 @@ HTTP/1.1 vs HTTP/2 vs HTTP/3（1000 个并发请求）
 └─────────────┴──────────┴────────────┴─────────────┘
 ```
 
-## 贡献
-
-欢迎贡献！请查看我们的[贡献指南](CONTRIBUTING.md)了解详情。
-
-### 开发设置
-
-```bash
-# 克隆仓库
-git clone https://github.com/maoxiaoyue/hypgo
-cd hypgo
-
-# 安装依赖
-go mod download
-
-# 运行测试
-make test
-
-# 构建
-make build
-```
-
 ## 许可证
 
 HypGo 采用 [MIT 许可证](LICENSE) 发布。
-
-## 致谢
-
-HypGo 站在巨人的肩膀上：
-- [quic-go](https://github.com/quic-go/quic-go) 提供 HTTP/3 支持
-- [Ent](https://entgo.io/) 提供 ORM
-- [Viper](https://github.com/spf13/viper) 提供配置管理
-- [Cobra](https://github.com/spf13/cobra) 提供 CLI
-
----
 
 由 卯小月 用❤️制作

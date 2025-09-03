@@ -380,40 +380,9 @@ HTTP/1.1 vs HTTP/2 vs HTTP/3 (1000 concurrent requests)
 │ HTTP/3      │ 152,456  │ 6.6ms      │ 183.2 MB/s  │
 └─────────────┴──────────┴────────────┴─────────────┘
 ```
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone https://github.com/maoxiaoyue/hypgo
-cd hypgo
-
-# Install dependencies
-go mod download
-
-# Run tests
-make test
-
-# Build
-make build
-```
-
 ## License
 
 HypGo is released under the [MIT License](LICENSE).
 
-## Acknowledgments
-
-HypGo is built on the shoulders of giants:
-- [quic-go](https://github.com/quic-go/quic-go) for HTTP/3 support
-- [Ent](https://entgo.io/) for ORM
-- [Viper](https://github.com/spf13/viper) for configuration
-- [Cobra](https://github.com/spf13/cobra) for CLI
-
----
 
 Made with ❤️ by Maoxiaoyu From Taiwan
