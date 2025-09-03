@@ -143,7 +143,7 @@ api:
     expiration: 24h
 
 # 插件配置將存放在獨立的文件中
-# 使用 'hyp addp <plugin-name>' 來添加插件
+# 使用 'hyp install <plugin-name>' 來添加插件
 # 支援的插件：rabbitmq, kafka, cassandra, scylladb, mongodb, elasticsearch
 `
 

@@ -113,15 +113,15 @@ hyp run
 
 ```bash
 # Add message queue support
-hyp addp rabbitmq
-hyp addp kafka
+hyp install rabbitmq
+hyp install kafka
 
 # Add database support
-hyp addp mongodb
-hyp addp cassandra
+hyp install mongodb
+hyp install cassandra
 
 # Add search capability
-hyp addp elasticsearch
+hyp install elasticsearch
 ```
 
 ### 3. Build Docker Image
@@ -174,7 +174,7 @@ HypGo uses a modular plugin system that allows you to add functionality without 
 
 ```bash
 # Add a plugin
-hyp addp <plugin-name>
+hyp install <plugin-name>
 
 # Available plugins:
 - rabbitmq    # Message queue
@@ -240,7 +240,7 @@ hyp generate service <name>     # Generate service
 
 ### Plugin Management
 ```bash
-hyp addp <plugin>  # Add plugin
+hyp install <plugin>  # Add plugin
 ```
 
 ### Deployment
@@ -327,7 +327,7 @@ func main() {
 ### Using Plugins
 
 ```go
-// After running: hyp addp kafka
+// After running: hyp install kafka
 import "myapp/app/plugins/kafka"
 
 kafkaService, _ := kafka.New(config.GetPluginConfig("kafka"), logger)
@@ -380,40 +380,9 @@ HTTP/1.1 vs HTTP/2 vs HTTP/3 (1000 concurrent requests)
 │ HTTP/3      │ 152,456  │ 6.6ms      │ 183.2 MB/s  │
 └─────────────┴──────────┴────────────┴─────────────┘
 ```
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone https://github.com/maoxiaoyue/hypgo
-cd hypgo
-
-# Install dependencies
-go mod download
-
-# Run tests
-make test
-
-# Build
-make build
-```
-
 ## License
 
 HypGo is released under the [MIT License](LICENSE).
 
-## Acknowledgments
-
-HypGo is built on the shoulders of giants:
-- [quic-go](https://github.com/quic-go/quic-go) for HTTP/3 support
-- [Ent](https://entgo.io/) for ORM
-- [Viper](https://github.com/spf13/viper) for configuration
-- [Cobra](https://github.com/spf13/cobra) for CLI
-
----
 
 Made with ❤️ by Maoxiaoyu From Taiwan

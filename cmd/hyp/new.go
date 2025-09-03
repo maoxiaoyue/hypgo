@@ -139,7 +139,7 @@ logger:
     compress: true
 
 # 插件配置將存放在獨立的文件中
-# 使用 'hyp addp <plugin-name>' 來添加插件
+# 使用 'hyp install <plugin-name>' 來添加插件
 # 支援的插件：rabbitmq, kafka, cassandra, scylladb, mongodb, elasticsearch
 `
 
@@ -643,7 +643,7 @@ func getLatestGitTag(repo string) (string, error) {
 		return "", fmt.Errorf("failed to run git ls-remote: %w", err)
 	}
 
-	// 解析 git ls-remote 輸出，提取標籤
+	// 解析 git ls-remote 字串，提取標籤
 	tags := []string{}
 	tagRegex := regexp.MustCompile(`refs/tags/(.+)$`)
 	for _, line := range strings.Split(string(output), "\n") {

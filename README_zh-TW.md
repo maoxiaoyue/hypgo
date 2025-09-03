@@ -112,15 +112,15 @@ hyp run
 
 ```bash
 # 添加訊息佇列支援
-hyp addp rabbitmq
-hyp addp kafka
+hyp install rabbitmq
+hyp install kafka
 
 # 添加資料庫支援
-hyp addp mongodb
-hyp addp cassandra
+hyp install mongodb
+hyp install cassandra
 
 # 添加搜尋功能
-hyp addp elasticsearch
+hyp install elasticsearch
 ```
 
 ### 3. 建構 Docker 映像
@@ -173,7 +173,7 @@ HypGo 使用模組化插件系統，允許您在不修改核心框架的情況�
 
 ```bash
 # 添加插件
-hyp addp <插件名稱>
+hyp install <插件名稱>
 
 # 可用插件：
 - rabbitmq      # 訊息佇列
@@ -239,7 +239,7 @@ hyp generate service <名稱>     # 生成服務
 
 ### 插件管理
 ```bash
-hyp addp <插件>    # 添加插件
+hyp install <插件>    # 添加插件
 ```
 
 ### 部署
@@ -326,7 +326,7 @@ func main() {
 ### 使用插件
 
 ```go
-// 執行後：hyp addp kafka
+// 執行後：hyp install kafka
 import "myapp/app/plugins/kafka"
 
 kafkaService, _ := kafka.New(config.GetPluginConfig("kafka"), logger)
@@ -380,38 +380,9 @@ HTTP/1.1 vs HTTP/2 vs HTTP/3（1000 個並發請求）
 └─────────────┴──────────┴────────────┴─────────────┘
 ```
 
-## 貢獻
-
-歡迎貢獻！請查看我們的[貢獻指南](CONTRIBUTING.md)了解詳情。
-
-### 開發設置
-
-```bash
-# 複製儲存庫
-git clone https://github.com/maoxiaoyue/hypgo
-cd hypgo
-
-# 安裝依賴
-go mod download
-
-# 執行測試
-make test
-
-# 建構
-make build
-```
-
 ## 授權
 
 HypGo 採用 [MIT 授權](LICENSE) 發布。
-
-## 致謝
-
-HypGo 站在巨人的肩膀上：
-- [quic-go](https://github.com/quic-go/quic-go) 提供 HTTP/3 支援
-- [Ent](https://entgo.io/) 提供 ORM
-- [Viper](https://github.com/spf13/viper) 提供配置管理
-- [Cobra](https://github.com/spf13/cobra) 提供 CLI
 
 ---
 
