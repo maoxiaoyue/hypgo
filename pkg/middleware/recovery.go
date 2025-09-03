@@ -1,9 +1,11 @@
+// Package middleware 提供 HTTP/3 優化的中間件系統
 package middleware
 
 import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"strings"
 	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -150,9 +152,16 @@ func executeWithRecovery(c *hypcontext.Context) (err error) {
 
 	c.Next()
 
-	// 檢查是否有錯誤
-	if c.Errors != nil && len(c.Errors) > 0 {
-		return fmt.Errorf("request error occurred")
+	// 檢查是否有錯誤（從 context 中獲取）
+	if errValue, exists := c.Get("error"); exists {
+		switch e := errValue.(type) {
+		case error:
+			return e
+		case string:
+			return fmt.Errorf("%s", e)
+		default:
+			return fmt.Errorf("error occurred: %v", e)
+		}
 	}
 
 	// 檢查狀態碼
@@ -295,15 +304,26 @@ type ErrorHandlerConfig struct {
 	LogErrors         bool
 	SendDetailedError bool
 	ErrorHandler      func(c *hypcontext.Context, err error)
-	ErrorMap          map[error]int // 錯誤到狀態碼的映射
+	ErrorTypeMap      map[string]int // 錯誤類型到狀態碼的映射
 }
 
 // ErrorHandler 創建錯誤處理中間件
 func ErrorHandler(config ErrorHandlerConfig) hypcontext.HandlerFunc {
 	return func(c *hypcontext.Context) {
 		defer func() {
-			if len(c.Errors) > 0 {
-				err := c.Errors[0]
+			// 檢查是否有錯誤（需要從 context 中獲取）
+			if errValue, exists := c.Get("error"); exists {
+				var err error
+
+				// 嘗試轉換為 error 類型
+				switch e := errValue.(type) {
+				case error:
+					err = e
+				case string:
+					err = fmt.Errorf("%s", e)
+				default:
+					err = fmt.Errorf("unknown error: %v", e)
+				}
 
 				// 記錄錯誤
 				if config.LogErrors {
@@ -321,9 +341,14 @@ func ErrorHandler(config ErrorHandlerConfig) hypcontext.HandlerFunc {
 
 				// 根據錯誤類型設置狀態碼
 				statusCode := http.StatusInternalServerError
-				if config.ErrorMap != nil {
-					if code, ok := config.ErrorMap[err]; ok {
-						statusCode = code
+				if config.ErrorTypeMap != nil {
+					// 根據錯誤訊息匹配狀態碼
+					errMsg := err.Error()
+					for errType, code := range config.ErrorTypeMap {
+						if strings.Contains(errMsg, errType) {
+							statusCode = code
+							break
+						}
 					}
 				}
 
@@ -337,9 +362,44 @@ func ErrorHandler(config ErrorHandlerConfig) hypcontext.HandlerFunc {
 					})
 				} else {
 					c.JSON(statusCode, map[string]string{
-						"error": "Internal Server Error",
+						"error": http.StatusText(statusCode),
 					})
 				}
+			}
+		}()
+
+		c.Next()
+
+		// 處理請求後檢查響應狀態
+		if c.Response.Status() >= 400 {
+			// 如果有錯誤狀態碼但沒有錯誤訊息，創建一個
+			if _, exists := c.Get("error"); !exists {
+				c.Set("error", fmt.Errorf("request failed with status %d", c.Response.Status()))
+			}
+		}
+	}
+}
+
+// SimpleErrorHandler 簡單的錯誤處理中間件
+func SimpleErrorHandler() hypcontext.HandlerFunc {
+	return func(c *hypcontext.Context) {
+		defer func() {
+			if r := recover(); r != nil {
+				var err error
+				switch x := r.(type) {
+				case string:
+					err = fmt.Errorf("%s", x)
+				case error:
+					err = x
+				default:
+					err = fmt.Errorf("unknown panic: %v", r)
+				}
+
+				// 記錄錯誤並返回 500
+				fmt.Printf("[Error] Panic recovered: %v\n", err)
+				c.JSON(http.StatusInternalServerError, map[string]string{
+					"error": "Internal Server Error",
+				})
 			}
 		}()
 
