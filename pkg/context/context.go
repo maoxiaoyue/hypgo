@@ -2,7 +2,7 @@
 package context
 
 import (
-	//"context"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -124,7 +124,7 @@ type RequestMetrics struct {
 func New(w http.ResponseWriter, r *http.Request) *Context {
 	c := &Context{
 		Request:   r,
-		Response:  &responseWriter{ResponseWriter: w},
+		Response:  newResponseWriter(w),
 		Params:    make(Params, 0, 8),
 		handlers:  make([]HandlerFunc, 0, 8),
 		index:     -1,
@@ -276,7 +276,10 @@ func (c *Context) PostForm(key string) string {
 // GetPostForm 獲取表單資料，返回是否存在
 func (c *Context) GetPostForm(key string) (string, bool) {
 	if c.formCache == nil {
-		c.Request.ParseForm()
+		err := c.Request.ParseForm()
+		if err != nil {
+			return "", false
+		}
 		c.formCache = c.Request.PostForm
 	}
 	values := c.formCache[key]
@@ -296,6 +299,11 @@ func (c *Context) BindJSON(obj interface{}) error {
 // ShouldBindJSON 嘗試綁定 JSON（不會中止請求）
 func (c *Context) ShouldBindJSON(obj interface{}) error {
 	return c.bindWith(obj, bindingJSON{})
+}
+
+// bindWith 內部綁定方法
+func (c *Context) bindWith(obj interface{}, b binding) error {
+	return b.Bind(c.Request, obj)
 }
 
 // JSON 回應 JSON 資料
@@ -635,12 +643,26 @@ func (c *Context) Value(key interface{}) interface{} {
 // responseWriter 實現 ResponseWriter 介面
 type responseWriter struct {
 	http.ResponseWriter
-	status  int
-	size    int
-	written bool
+	status   int
+	size     int
+	written  bool
+	streamID uint64
+	mu       sync.Mutex
 }
 
+// newResponseWriter 創建新的 responseWriter
+func newResponseWriter(w http.ResponseWriter) ResponseWriter {
+	return &responseWriter{
+		ResponseWriter: w,
+		status:         http.StatusOK,
+	}
+}
+
+// WriteHeader 寫入狀態碼
 func (w *responseWriter) WriteHeader(code int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if !w.written {
 		w.status = code
 		w.ResponseWriter.WriteHeader(code)
@@ -648,6 +670,7 @@ func (w *responseWriter) WriteHeader(code int) {
 	}
 }
 
+// Write 寫入資料
 func (w *responseWriter) Write(data []byte) (int, error) {
 	if !w.written {
 		w.WriteHeader(http.StatusOK)
@@ -657,20 +680,69 @@ func (w *responseWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
+// WriteString 寫入字串
 func (w *responseWriter) WriteString(s string) (int, error) {
 	return w.Write([]byte(s))
 }
 
+// Status 返回狀態碼
 func (w *responseWriter) Status() int {
 	return w.status
 }
 
+// Size 返回已寫入的大小
 func (w *responseWriter) Size() int {
 	return w.size
 }
 
+// Written 返回是否已寫入
 func (w *responseWriter) Written() bool {
 	return w.written
+}
+
+// Hijack 實現 http.Hijacker 介面
+func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("the ResponseWriter doesn't support hijacking")
+}
+
+// Flush 實現 http.Flusher 介面
+func (w *responseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Push 實現 http.Pusher 介面 (HTTP/2 和 HTTP/3)
+func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
+	if pusher, ok := w.ResponseWriter.(http.Pusher); ok {
+		return pusher.Push(target, opts)
+	}
+	return fmt.Errorf("server push not supported")
+}
+
+// WriteHeader3 HTTP/3 特定的寫入頭部方法
+func (w *responseWriter) WriteHeader3(statusCode int, headers http.Header) {
+	// 設置額外的 HTTP/3 特定頭部
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+	w.WriteHeader(statusCode)
+}
+
+// PushPromise HTTP/3 推送承諾
+func (w *responseWriter) PushPromise(target string, opts *http.PushOptions) error {
+	// 實現 HTTP/3 特定的推送承諾邏輯
+	return w.Push(target, opts)
+}
+
+// StreamID 返回流 ID
+func (w *responseWriter) StreamID() uint64 {
+	return w.streamID
 }
 
 // errorMsg 錯誤訊息
@@ -688,10 +760,19 @@ const (
 	ErrorTypePublic  ErrorType = 1 << 62
 )
 
+// binding 介面定義
+type binding interface {
+	Bind(*http.Request, interface{}) error
+}
+
 // bindingJSON JSON 綁定實現
 type bindingJSON struct{}
 
-func (bindingJSON) bindWith(c *Context, obj interface{}) error {
-	decoder := json.NewDecoder(c.Request.Body)
+// Bind 實現 binding 介面
+func (bindingJSON) Bind(req *http.Request, obj interface{}) error {
+	if req == nil || req.Body == nil {
+		return fmt.Errorf("invalid request")
+	}
+	decoder := json.NewDecoder(req.Body)
 	return decoder.Decode(obj)
 }
