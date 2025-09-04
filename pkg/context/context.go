@@ -1,4 +1,3 @@
-// Package context 提供 HTTP/3 QUIC 優化的請求上下文處理
 package context
 
 import (
@@ -120,8 +119,14 @@ type RequestMetrics struct {
 
 // ===== 核心方法 =====
 
-// New 創建新的 Context
+// New 創建新的 Context（使用物件池）
 func New(w http.ResponseWriter, r *http.Request) *Context {
+	// 優先使用物件池
+	if contextPool != nil {
+		return AcquireContext(w, r)
+	}
+
+	// 備用：傳統方式創建
 	c := &Context{
 		Request:   r,
 		Response:  newResponseWriter(w),
@@ -142,6 +147,13 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 	}
 
 	return c
+}
+
+// Release 釋放 Context 回物件池
+func (c *Context) Release() {
+	if contextPool != nil {
+		ReleaseContext(c)
+	}
 }
 
 // Next 執行下一個中間件
@@ -276,10 +288,7 @@ func (c *Context) PostForm(key string) string {
 // GetPostForm 獲取表單資料，返回是否存在
 func (c *Context) GetPostForm(key string) (string, bool) {
 	if c.formCache == nil {
-		err := c.Request.ParseForm()
-		if err != nil {
-			return "", false
-		}
+		c.Request.ParseForm()
 		c.formCache = c.Request.PostForm
 	}
 	values := c.formCache[key]
