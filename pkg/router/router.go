@@ -2,12 +2,11 @@
 package router
 
 import (
-	//"fmt"
 	"net/http"
 	"path"
 	"regexp"
-	//"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/maoxiaoyue/hypgo/pkg/context"
 )
@@ -148,10 +147,7 @@ func New() *Router {
 
 	// 初始化 context 池
 	router.contextPool.New = func() interface{} {
-		return &context.Context{
-			Params: make(context.Params, 0, router.maxParams),
-			Keys:   make(map[string]interface{}),
-		}
+		return context.New(nil, nil)
 	}
 
 	return router
@@ -159,21 +155,15 @@ func New() *Router {
 
 // ServeHTTP 實現 http.Handler 介面
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// 從池中獲取 context
-	c := r.contextPool.Get().(*context.Context)
-	c.Reset(w, req)
-
-	// 設置全域中間件
-	c.SetHandlers(r.middleware)
+	// 從池中獲取或創建 context
+	c := context.New(w, req)
+	defer c.Release() // 使用 context 包的 Release 方法
 
 	// 路由匹配
 	r.handleRequest(c)
 
 	// 記錄指標
 	r.recordMetrics(c)
-
-	// 歸還 context 到池
-	r.contextPool.Put(c)
 }
 
 // handleRequest 處理請求路由
@@ -186,31 +176,168 @@ func (r *Router) handleRequest(c *context.Context) {
 	if cached, ok := r.routeCache.Load(cacheKey); ok {
 		if route, ok := cached.(*cachedRoute); ok {
 			c.Params = route.params
-			c.SetHandlers(append(r.middleware, route.handlers...))
-			c.Next()
+			// 設置處理器
+			handlers := append(r.middleware, route.handlers...)
+			for _, handler := range handlers {
+				handler(c)
+				if c.Response.Written() {
+					return
+				}
+			}
 			return
 		}
 	}
 
 	// 查找路由樹
 	if root := r.trees[httpMethod]; root != nil {
-		if handlers, params, _ := root.getValue(path, c.Params); handlers != nil {
-			c.Params = params
-			c.SetHandlers(append(r.middleware, handlers...))
-			c.Next()
+		if value := root.getValue(path, c, false); value.handlers != nil {
+			c.Params = value.params
+			// 執行中間件和處理器
+			handlers := append(r.middleware, value.handlers...)
+			for _, handler := range handlers {
+				handler(c)
+				if c.Response.Written() {
+					return
+				}
+			}
 
 			// 快取熱門路由
-			r.cacheRoute(cacheKey, handlers, params)
+			r.cacheRoute(cacheKey, value.handlers, value.params)
 			return
 		}
 	}
 
 	// 處理 404
 	if r.notFoundHandler != nil {
-		c.SetHandlers([]context.HandlerFunc{r.notFoundHandler})
-		c.Next()
+		r.notFoundHandler(c)
 	} else {
 		c.String(http.StatusNotFound, "404 Not Found")
+	}
+}
+
+// nodeValue 節點值
+type nodeValue struct {
+	handlers []context.HandlerFunc
+	params   context.Params
+	tsr      bool
+	fullPath string
+}
+
+// getValue 返回節點值
+func (n *node) getValue(path string, c *context.Context, unescape bool) (value nodeValue) {
+	value.params = c.Params
+walk: // 外層循環
+	for {
+		prefix := n.path
+		if len(path) > len(prefix) {
+			if path[:len(prefix)] == prefix {
+				path = path[len(prefix):]
+
+				// 如果這個節點沒有通配符，則繼續遍歷子節點
+				if !n.wildChild {
+					idxc := path[0]
+					for i, c := range []byte(n.indices) {
+						if c == idxc {
+							n = n.children[i]
+							continue walk
+						}
+					}
+
+					// 沒有找到匹配
+					value.tsr = (path == "/" && n.handlers != nil)
+					return
+				}
+
+				// 處理通配符
+				n = n.children[0]
+				switch n.nType {
+				case param:
+					// 找到參數結束位置
+					end := 0
+					for end < len(path) && path[end] != '/' {
+						end++
+					}
+
+					// 保存參數值
+					if cap(value.params) < int(n.priority) {
+						value.params = make(context.Params, 0, n.priority)
+					}
+					i := len(value.params)
+					value.params = value.params[:i+1]
+					value.params[i].Key = n.path[1:]
+					value.params[i].Value = path[:end]
+
+					// 繼續處理剩餘路徑
+					if end < len(path) {
+						if len(n.children) > 0 {
+							path = path[end:]
+							n = n.children[0]
+							continue walk
+						}
+
+						// 沒有更多子節點
+						value.tsr = (len(n.handlers) == 0 && path[end:] == "/")
+						return
+					}
+
+					if value.handlers = n.handlers; value.handlers != nil {
+						value.fullPath = n.fullPath
+						return
+					}
+					if len(n.children) == 1 {
+						// 檢查是否應該重定向
+						n = n.children[0]
+						value.tsr = (n.path == "/" && n.handlers != nil) || (n.path == "" && n.indices == "/")
+					}
+					return
+
+				case catchAll:
+					// 保存通配符值
+					if cap(value.params) < int(n.priority) {
+						value.params = make(context.Params, 0, n.priority)
+					}
+					i := len(value.params)
+					value.params = value.params[:i+1]
+					value.params[i].Key = n.path[2:]
+					value.params[i].Value = path
+
+					value.handlers = n.handlers
+					value.fullPath = n.fullPath
+					return
+
+				default:
+					panic("invalid node type")
+				}
+			}
+		} else if path == prefix {
+			// 找到了完全匹配
+			if value.handlers = n.handlers; value.handlers != nil {
+				value.fullPath = n.fullPath
+				return
+			}
+
+			// 檢查是否需要尾部斜槓重定向
+			if path == "/" && n.wildChild && n.nType != root {
+				value.tsr = true
+				return
+			}
+
+			// 檢查子節點中的尾部斜槓
+			for i, index := range []byte(n.indices) {
+				if index == '/' {
+					n = n.children[i]
+					value.tsr = (n.path == "/" && n.handlers != nil) ||
+						(n.nType == catchAll && n.children[0].handlers != nil)
+					return
+				}
+			}
+
+			return
+		}
+
+		// 沒有找到
+		value.tsr = (path == "/" && n.handlers != nil)
+		return
 	}
 }
 
@@ -377,10 +504,12 @@ func (group *RouterGroup) SetStreamPriority(path string, priority uint8) {
 // EnableServerPush 為特定路由啟用 Server Push
 func (group *RouterGroup) EnableServerPush(path string, resources []string) {
 	handler := func(c *context.Context) {
-		// 如果是 HTTP/2 或 HTTP/3，推送資源
-		if c.Protocol >= context.HTTP2 {
-			for _, resource := range resources {
-				c.Push(resource, nil)
+		// 檢查協議版本
+		if protoValue, exists := c.Get("protocol"); exists {
+			if proto, ok := protoValue.(string); ok && (proto == "HTTP/2" || proto == "HTTP/3") {
+				for _, resource := range resources {
+					c.Push(resource, nil)
+				}
 			}
 		}
 		c.Next()
@@ -501,7 +630,7 @@ func (n *node) addRoute(path string, handlers []context.HandlerFunc) {
 		}
 
 		// 檢查現有子節點
-		for i, c := range n.indices {
+		for i, c := range []byte(n.indices) {
 			if c == idxc {
 				i = n.incrementChildPrio(i)
 				n = n.children[i]
@@ -516,7 +645,7 @@ func (n *node) addRoute(path string, handlers []context.HandlerFunc) {
 			child := &node{
 				fullPath: fullPath,
 			}
-			n.children = append(n.children, child)
+			n.addChild(child)
 			n.incrementChildPrio(len(n.indices) - 1)
 			n = child
 		}
@@ -531,6 +660,32 @@ func (n *node) addRoute(path string, handlers []context.HandlerFunc) {
 	}
 	n.handlers = handlers
 	n.fullPath = fullPath
+}
+
+// incrementChildPrio 增加子節點優先級
+func (n *node) incrementChildPrio(pos int) int {
+	cs := n.children
+	cs[pos].priority++
+	prio := cs[pos].priority
+
+	// 調整位置（優先級排序）
+	newPos := pos
+	for ; newPos > 0 && cs[newPos-1].priority < prio; newPos-- {
+		// 交換節點位置
+		cs[newPos-1], cs[newPos] = cs[newPos], cs[newPos-1]
+	}
+
+	// 更新索引
+	if newPos != pos {
+		n.indices = n.indices[:newPos] + n.indices[pos:pos+1] + n.indices[newPos:pos] + n.indices[pos+1:]
+	}
+
+	return newPos
+}
+
+// addChild 添加子節點
+func (n *node) addChild(child *node) {
+	n.children = append(n.children, child)
 }
 
 // insertChild 插入子節點
@@ -706,14 +861,19 @@ func (r *Router) cacheRoute(key string, handlers []context.HandlerFunc, params c
 
 // recordMetrics 記錄指標
 func (r *Router) recordMetrics(c *context.Context) {
-	r.metrics.TotalRequests++
+	atomic.AddUint64(&r.metrics.TotalRequests, 1)
 
-	switch c.Protocol {
-	case context.HTTP3:
-		r.metrics.HTTP3Requests++
-	case context.HTTP2:
-		r.metrics.HTTP2Requests++
-	default:
-		r.metrics.HTTP1Requests++
+	// 從 context 中獲取協議資訊
+	if protoValue, exists := c.Get("protocol"); exists {
+		if proto, ok := protoValue.(string); ok {
+			switch proto {
+			case "HTTP/3":
+				atomic.AddUint64(&r.metrics.HTTP3Requests, 1)
+			case "HTTP/2":
+				atomic.AddUint64(&r.metrics.HTTP2Requests, 1)
+			default:
+				atomic.AddUint64(&r.metrics.HTTP1Requests, 1)
+			}
+		}
 	}
 }
