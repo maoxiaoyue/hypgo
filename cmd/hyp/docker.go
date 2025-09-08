@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,7 +164,7 @@ func detectContainerRuntime() string {
 
 func detectGoVersion() string {
 	// 從 go.mod 讀取版本
-	data, err := ioutil.ReadFile("go.mod")
+	data, err := os.ReadFile("go.mod")
 	if err == nil {
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
@@ -236,7 +235,7 @@ func getAppPort() (string, error) {
 
 func getProjectName() string {
 	// 從 go.mod 獲取模塊名
-	data, err := ioutil.ReadFile("go.mod")
+	data, err := os.ReadFile("go.mod")
 	if err != nil {
 		return "hypgo-app"
 	}
@@ -419,7 +418,7 @@ CMD ["./{{.AppName}}"]
 	}
 
 	// 寫入臨時 Dockerfile
-	tmpfile, err := ioutil.TempFile(".", "Dockerfile.tmp.")
+	tmpfile, err := os.CreateTemp(".", "Dockerfile.tmp.")
 	if err != nil {
 		return "", err
 	}
@@ -618,7 +617,7 @@ networks:
 	response = strings.TrimSpace(strings.ToLower(response))
 
 	if response == "y" || response == "yes" {
-		if err := ioutil.WriteFile("docker-compose.yml", []byte(composeContent), 0644); err != nil {
+		if err := os.WriteFile("docker-compose.yml", []byte(composeContent), 0644); err != nil {
 			fmt.Printf("❌ Failed to save docker-compose.yml: %v\n", err)
 		} else {
 			fmt.Println("✅ docker-compose.yml saved successfully")
@@ -712,5 +711,5 @@ temp/
 		return err
 	}
 
-	return ioutil.WriteFile(".dockerignore", buf.Bytes(), 0644)
+	return os.WriteFile(".dockerignore", buf.Bytes(), 0644)
 }
