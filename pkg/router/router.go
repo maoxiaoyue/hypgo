@@ -28,7 +28,7 @@ type OptimizedRouter struct {
 	methodNotAllowed hypcontext.HandlerFunc
 }
 
-/*
+/* //更完整的功能
 type HybridRouter struct {
 	core *OptimizedRouter
 
