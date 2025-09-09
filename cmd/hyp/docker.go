@@ -1,244 +1,356 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"archive/tar"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"text/template"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/daemon"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
-var (
+// ContainerBuilder 純 Go 的容器建構器
+type ContainerBuilder struct {
+	projectName string
 	imageName   string
 	imageTag    string
-	dockerfile  string
-	noPush      bool
 	registry    string
-	buildArgs   []string
-	useRootless bool
-	goVersion   string
-	platform    string
+	port        string
+	baseImage   string
+}
+
+var (
+	cb           ContainerBuilder
+	outputFormat string
+	pushImage    bool
 )
 
 func init() {
-	dockerCmd.Flags().StringVarP(&imageName, "name", "n", "", "Docker image name (default: project name)")
-	dockerCmd.Flags().StringVarP(&imageTag, "tag", "t", "latest", "Docker image tag")
-	dockerCmd.Flags().StringVarP(&dockerfile, "dockerfile", "f", "", "Path to Dockerfile (auto-generated if not specified)")
-	dockerCmd.Flags().BoolVar(&noPush, "no-push", true, "Don't push image to registry")
-	dockerCmd.Flags().StringVarP(&registry, "registry", "r", "", "Docker registry URL")
-	dockerCmd.Flags().StringArrayVar(&buildArgs, "build-arg", []string{}, "Build arguments")
-	dockerCmd.Flags().BoolVar(&useRootless, "rootless", true, "Use rootless container (recommended)")
-	dockerCmd.Flags().StringVar(&goVersion, "go-version", "", "Go version to use (default: auto-detect)")
-	dockerCmd.Flags().StringVar(&platform, "platform", "", "Target platform (e.g., linux/amd64,linux/arm64)")
+	containerCmd.Flags().StringVarP(&cb.imageName, "name", "n", "", "Container image name")
+	containerCmd.Flags().StringVarP(&cb.imageTag, "tag", "t", "latest", "Container image tag")
+	containerCmd.Flags().StringVarP(&cb.registry, "registry", "r", "", "Container registry URL")
+	containerCmd.Flags().StringVar(&cb.baseImage, "base", "gcr.io/distroless/static:nonroot", "Base image")
+	containerCmd.Flags().StringVar(&outputFormat, "output", "oci", "Output format (oci/docker/tar)")
+	containerCmd.Flags().BoolVar(&pushImage, "push", false, "Push to registry")
 }
 
-var dockerCmd = &cobra.Command{
-	Use:   "docker",
-	Short: "Build and package the application as a Docker container",
-	Long:  `Build a Docker image for your HypGo application with automatic port detection and configuration`,
-	RunE:  runDocker,
+var containerCmd = &cobra.Command{
+	Use:   "container",
+	Short: "Build container image using pure Go (no Docker required)",
+	Long:  `Build OCI/Docker compatible container images without requiring Docker daemon`,
+	RunE:  runContainer,
 }
 
-func runDocker(cmd *cobra.Command, args []string) error {
-	fmt.Println("🐳 HypGo Docker Builder")
-	fmt.Println("=======================")
+func runContainer(cmd *cobra.Command, args []string) error {
+	fmt.Println("📦 HypGo Container Builder (Pure Go)")
+	fmt.Println("=====================================")
 
-	// 1. 檢查前置條件
-	if err := checkPrerequisites(); err != nil {
-		return err
+	//準備建構
+	if err := cb.prepare(); err != nil {
+		return fmt.Errorf("preparation failed: %w", err)
 	}
 
-	// 2. 檢測 Go 版本
-	if goVersion == "" {
-		goVersion = detectGoVersion()
+	//編譯應用程式
+	fmt.Println("🔨 Building application...")
+	if err := cb.buildBinary(); err != nil {
+		return fmt.Errorf("build failed: %w", err)
 	}
-	fmt.Printf("✅ Using Go version: %s\n", goVersion)
 
-	// 3. 讀取配置獲取端口
-	port, err := getAppPort()
+	//建立容器映像
+	fmt.Println("🐳 Creating container image...")
+	_, err := cb.buildImage()
+	if err != nil {
+		return fmt.Errorf("image creation failed: %w", err)
+	}
+
+	//輸出或推送映像
+	if err := cb.outputImage(); err != nil {
+		return fmt.Errorf("output failed: %w", err)
+	}
+
+	cb.printInstructions()
+	return nil
+}
+
+// prepare 準備建構環境
+func (cb *ContainerBuilder) prepare() error {
+	// 獲取專案名稱
+	cb.projectName = cb.getProjectName()
+	if cb.imageName == "" {
+		cb.imageName = strings.ToLower(cb.projectName)
+	}
+
+	// 獲取端口
+	cb.port = cb.getAppPort()
+
+	fmt.Printf("✅ Project: %s\n", cb.projectName)
+	fmt.Printf("✅ Port: %s\n", cb.port)
+	fmt.Printf("✅ Base image: %s\n", cb.baseImage)
+
+	return nil
+}
+
+// buildBinary 編譯 Go 二進位檔案
+func (cb *ContainerBuilder) buildBinary() error {
+	// 使用 ko 或直接編譯
+	buildCmd := []string{
+		"go", "build",
+		"-ldflags", "-w -s",
+		"-o", cb.projectName,
+		".",
+	}
+
+	// 設置環境變數
+	env := os.Environ()
+	env = append(env, "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+
+	cmd := exec.Command(buildCmd[0], buildCmd[1:]...)
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("compilation failed: %w", err)
+	}
+
+	fmt.Printf("✅ Binary built: %s\n", cb.projectName)
+	return nil
+}
+
+// buildImage 建立容器映像
+func (cb *ContainerBuilder) buildImage() (v1.Image, error) {
+	// 方法 1: 使用 ko 風格的建構
+	return cb.buildWithKoStyle()
+
+	// 方法 2: 使用 buildah 風格的建構
+	// return cb.buildWithBuildahStyle()
+
+	// 方法 3: 使用 go-containerregistry
+	// return cb.buildWithContainerRegistry()
+}
+
+// buildWithKoStyle 使用 ko 風格建構
+func (cb *ContainerBuilder) buildWithKoStyle() (v1.Image, error) {
+	// 獲取基礎映像
+	base, err := crane.Pull(cb.baseImage)
+	if err != nil {
+		// 如果無法拉取，使用空映像
+		base = empty.Image
+	}
+
+	// 建立層
+	layer, err := cb.createAppLayer()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create layer: %w", err)
+	}
+
+	// 添加層到基礎映像
+	image, err := mutate.AppendLayers(base, layer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to append layers: %w", err)
+	}
+
+	// 設置配置
+	cfg, err := image.ConfigFile()
+	if err != nil {
+		return nil, err
+	}
+
+	cfg = cb.updateConfig(cfg)
+
+	image, err = mutate.ConfigFile(image, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update config: %w", err)
+	}
+
+	return image, nil
+}
+
+// createAppLayer 建立應用程式層
+func (cb *ContainerBuilder) createAppLayer() (v1.Layer, error) {
+	// 建立 tar 檔案
+	tarPath := fmt.Sprintf("%s.tar", cb.projectName)
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tarPath)
+
+	tw := tar.NewWriter(tarFile)
+	defer tw.Close()
+
+	// 添加二進位檔案
+	if err := cb.addFileToTar(tw, cb.projectName, "/app/"+cb.projectName); err != nil {
+		return nil, err
+	}
+
+	// 添加配置檔案
+	if err := cb.addDirToTar(tw, "config", "/app/config"); err != nil {
+		fmt.Printf("⚠️  No config directory found\n")
+	}
+
+	// 添加靜態檔案
+	if err := cb.addDirToTar(tw, "static", "/app/static"); err != nil {
+		fmt.Printf("⚠️  No static directory found\n")
+	}
+
+	tw.Close()
+	tarFile.Close()
+
+	// 建立層
+	return tarball.LayerFromFile(tarPath)
+}
+
+// addFileToTar 添加檔案到 tar
+func (cb *ContainerBuilder) addFileToTar(tw *tar.Writer, src, dst string) error {
+	file, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("✅ Detected application port: %s\n", port)
+	defer file.Close()
 
-	// 4. 獲取項目名稱
-	projectName := getProjectName()
-	if imageName == "" {
-		imageName = strings.ToLower(projectName)
+	info, err := file.Stat()
+	if err != nil {
+		return err
 	}
 
-	// 5. 生成 .dockerignore
-	if err := generateDockerIgnore(); err != nil {
-		fmt.Printf("⚠️  Warning: Failed to generate .dockerignore: %v\n", err)
+	header := &tar.Header{
+		Name:    dst,
+		Mode:    0755,
+		Size:    info.Size(),
+		ModTime: info.ModTime(),
 	}
 
-	// 6. 生成或使用 Dockerfile
-	dockerfilePath := dockerfile
-	if dockerfilePath == "" {
-		dockerfilePath, err = generateDockerfile(port, projectName)
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+
+	_, err = io.Copy(tw, file)
+	return err
+}
+
+// addDirToTar 添加目錄到 tar
+func (cb *ContainerBuilder) addDirToTar(tw *tar.Writer, src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		defer os.Remove(dockerfilePath) // 清理臨時文件
-	}
 
-	// 7. 構建 Docker 鏡像
-	fullImageName := buildFullImageName()
-	if err := buildDockerImage(dockerfilePath, fullImageName); err != nil {
-		return err
-	}
-
-	// 8. 推送到註冊表（如果需要）
-	if !noPush && registry != "" {
-		if err := pushDockerImage(fullImageName); err != nil {
+		// 計算目標路徑
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
 			return err
 		}
-	}
+		targetPath := filepath.Join(dst, relPath)
 
-	// 9. 生成運行指令
-	printRunInstructions(fullImageName, port)
-
-	return nil
-}
-
-func checkPrerequisites() error {
-	fmt.Println("🔍 Checking prerequisites...")
-
-	// 檢查 Docker 或 Podman
-	dockerCmd := detectContainerRuntime()
-	if dockerCmd == "" {
-		return fmt.Errorf(`❌ Container runtime not found. Please install one of the following:
-   - Docker Desktop: https://www.docker.com/products/docker-desktop
-   - Podman: https://podman.io/getting-started/installation
-   - Docker Engine: https://docs.docker.com/engine/install/`)
-	}
-	fmt.Printf("✅ Found container runtime: %s\n", dockerCmd)
-
-	// 檢查 daemon 是否運行
-	cmd := exec.Command(dockerCmd, "info")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// 檢查是否是權限問題
-		if strings.Contains(string(output), "permission denied") {
-			return fmt.Errorf(`❌ Permission denied. Try one of these solutions:
-   1. Add your user to the docker group:
-      sudo usermod -aG docker $USER
-      (then logout and login again)
-   
-   2. Use rootless mode (recommended):
-      %s run --rootless ...
-   
-   3. Use sudo (not recommended):
-      sudo %s ...`, dockerCmd, dockerCmd)
+		// 建立 header
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("❌ Container daemon is not running. Please start %s first", dockerCmd)
-	}
+		header.Name = targetPath
 
-	// 檢查是否在項目目錄中
-	if _, err := os.Stat("go.mod"); os.IsNotExist(err) {
-		return fmt.Errorf("❌ Please run this command in a HypGo project directory")
-	}
-
-	fmt.Println("✅ All prerequisites met")
-	return nil
-}
-
-func detectContainerRuntime() string {
-	// 優先順序：docker > podman > nerdctl
-	runtimes := []string{"docker", "podman", "nerdctl"}
-	for _, rt := range runtimes {
-		if _, err := exec.LookPath(rt); err == nil {
-			return rt
+		// 寫入 header
+		if err := tw.WriteHeader(header); err != nil {
+			return err
 		}
-	}
-	return ""
-}
 
-func detectGoVersion() string {
-	// 從 go.mod 讀取版本
-	data, err := ioutil.ReadFile("go.mod")
-	if err == nil {
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "go ") {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					return parts[1]
-				}
+		// 如果是檔案，寫入內容
+		if !info.IsDir() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
 			}
+			defer file.Close()
+			_, err = io.Copy(tw, file)
+			return err
 		}
-	}
 
-	// 從系統獲取版本
-	cmd := exec.Command("go", "version")
-	output, err := cmd.Output()
-	if err == nil {
-		// 解析 "go version go1.21.0 linux/amd64"
-		parts := strings.Fields(string(output))
-		if len(parts) >= 3 {
-			version := strings.TrimPrefix(parts[2], "go")
-			return version
-		}
-	}
-
-	// 默認使用最新穩定版
-	return "1.21"
+		return nil
+	})
 }
 
-func getAppPort() (string, error) {
-	// 嘗試從多個配置文件讀取
-	configFiles := []string{
-		"config/config.yaml",
-		"config/config.yml",
-		"config.yaml",
-		"config.yml",
-		".env",
+// updateConfig 更新映像配置
+func (cb *ContainerBuilder) updateConfig(cfg *v1.ConfigFile) *v1.ConfigFile {
+	if cfg.Config.Env == nil {
+		cfg.Config.Env = []string{}
+	}
+	if cfg.Config.ExposedPorts == nil {
+		cfg.Config.ExposedPorts = map[string]struct{}{}
 	}
 
-	for _, file := range configFiles {
-		if _, err := os.Stat(file); err == nil {
-			viper.SetConfigFile(file)
-			if err := viper.ReadInConfig(); err == nil {
-				addr := viper.GetString("server.addr")
-				if addr == "" {
-					addr = viper.GetString("SERVER_ADDR")
-				}
-				if addr == "" {
-					addr = viper.GetString("PORT")
-				}
+	// 設置環境變數
+	cfg.Config.Env = append(cfg.Config.Env,
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"PORT="+cb.port,
+	)
 
-				if addr != "" {
-					// 提取端口號
-					if strings.HasPrefix(addr, ":") {
-						return addr[1:], nil
-					}
-					parts := strings.Split(addr, ":")
-					if len(parts) >= 2 {
-						return parts[len(parts)-1], nil
-					}
-					return addr, nil
-				}
-			}
-		}
+	// 暴露端口
+	cfg.Config.ExposedPorts[cb.port+"/tcp"] = struct{}{}
+
+	// 設置入口點
+	cfg.Config.Entrypoint = []string{"/app/" + cb.projectName}
+
+	// 設置工作目錄
+	cfg.Config.WorkingDir = "/app"
+
+	// 設置標籤
+	if cfg.Config.Labels == nil {
+		cfg.Config.Labels = map[string]string{}
 	}
+	cfg.Config.Labels["org.opencontainers.image.source"] = "hypgo"
+	cfg.Config.Labels["org.opencontainers.image.created"] = time.Now().Format(time.RFC3339)
 
-	return "8080", nil // 默認端口
+	return cfg
 }
 
-func getProjectName() string {
-	// 從 go.mod 獲取模塊名
-	data, err := ioutil.ReadFile("go.mod")
+// outputImage 輸出映像
+func (cb *ContainerBuilder) outputImage() error {
+	imageName := cb.getFullImageName()
+	image, err := cb.buildImage()
 	if err != nil {
-		return "hypgo-app"
+		return err
+	}
+	tag, err := name.NewTag(imageName)
+	if err != nil {
+		return fmt.Errorf("invalid image name: %w", err)
+	}
+	switch outputFormat {
+	case "tar":
+		// 輸出為 tar 檔案
+		tarPath := fmt.Sprintf("%s.tar", cb.imageName)
+		return crane.Save(image, imageName, tarPath)
+
+	case "oci":
+		// 輸出為 OCI 格式
+		return crane.Push(image, imageName)
+
+	case "docker":
+		// 載入到 Docker daemon (如果有)
+		_, err := daemon.Write(tag, image)
+		return err
+
+	default:
+		return fmt.Errorf("unknown output format: %s", outputFormat)
+	}
+}
+
+// getProjectName 獲取專案名稱
+func (cb *ContainerBuilder) getProjectName() string {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		return "hypgo_app"
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -246,8 +358,7 @@ func getProjectName() string {
 		if strings.HasPrefix(line, "module ") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 {
-				modulePath := parts[1]
-				return filepath.Base(modulePath)
+				return filepath.Base(parts[1])
 			}
 		}
 	}
@@ -256,461 +367,71 @@ func getProjectName() string {
 	return filepath.Base(cwd)
 }
 
-func generateDockerfile(port, projectName string) (string, error) {
-	fmt.Println("📝 Generating optimized Dockerfile...")
-
-	// 判斷是否使用 rootless
-	userSection := ""
-	if useRootless {
-		userSection = `
-# Create non-root user
-RUN addgroup -g 1001 -S hypgo && \
-    adduser -u 1001 -S hypgo -G hypgo
-
-# Set ownership
-RUN chown -R hypgo:hypgo /app
-
-# Switch to non-root user
-USER hypgo`
-	}
-
-	// 多階段構建的 Dockerfile 模板
-	dockerfileTemplate := `# Build stage
-FROM golang:{{.GoVersion}}-alpine AS builder
-
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
-
-WORKDIR /build
-
-# Copy go mod files first for better caching
-COPY go.mod go.sum ./
-
-# Download dependencies
-RUN go mod download
-
-# Verify dependencies
-RUN go mod verify
-
-# Copy source code
-COPY . .
-
-# Build with optimizations
-RUN CGO_ENABLED=0 GOOS=linux GOARCH={{.Arch}} \
-    go build -ldflags="-w -s" \
-    -a -installsuffix cgo \
-    -o {{.AppName}} .
-
-# Runtime stage - use distroless for security
-FROM gcr.io/distroless/static-debian12:nonroot
-
-# Copy timezone data
-COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-
-# Set timezone
-ENV TZ=UTC
-
-WORKDIR /app
-
-# Copy built binary with specific permissions
-COPY --from=builder --chown=nonroot:nonroot /build/{{.AppName}} ./
-
-# Copy configuration files
-COPY --from=builder --chown=nonroot:nonroot /build/config ./config
-
-# Copy static assets if they exist
-COPY --from=builder --chown=nonroot:nonroot /build/static ./static 2>/dev/null || true
-COPY --from=builder --chown=nonroot:nonroot /build/templates ./templates 2>/dev/null || true
-{{.UserSection}}
-
-# Expose port
-EXPOSE {{.Port}}
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/app/{{.AppName}}", "health"] || exit 1
-
-# Run the application
-ENTRYPOINT ["/app/{{.AppName}}"]
-`
-
-	// 如果不使用 rootless，使用傳統 alpine
-	if !useRootless {
-		dockerfileTemplate = `# Build stage
-FROM golang:{{.GoVersion}}-alpine AS builder
-
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates
-
-WORKDIR /build
-
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download && go mod verify
-
-# Copy source code
-COPY . .
-
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH={{.Arch}} \
-    go build -ldflags="-w -s" -a -installsuffix cgo -o {{.AppName}} .
-
-# Runtime stage
-FROM alpine:latest
-
-# Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata
-
-WORKDIR /app
-
-# Copy built binary
-COPY --from=builder /build/{{.AppName}} .
-
-# Copy configuration files
-COPY --from=builder /build/config ./config
-
-# Copy static files if they exist
-COPY --from=builder /build/static ./static 2>/dev/null || true
-COPY --from=builder /build/templates ./templates 2>/dev/null || true
-{{.UserSection}}
-
-# Expose port
-EXPOSE {{.Port}}
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:{{.Port}}/health || exit 1
-
-# Run the application
-CMD ["./{{.AppName}}"]
-`
-	}
-
-	// 檢測架構
-	arch := runtime.GOARCH
-	if arch == "arm64" {
-		arch = "arm64"
-	} else {
-		arch = "amd64"
-	}
-
-	tmpl, err := template.New("dockerfile").Parse(dockerfileTemplate)
-	if err != nil {
-		return "", err
-	}
-
-	data := struct {
-		AppName     string
-		Port        string
-		GoVersion   string
-		Arch        string
-		UserSection string
-	}{
-		AppName:     projectName,
-		Port:        port,
-		GoVersion:   goVersion,
-		Arch:        arch,
-		UserSection: userSection,
-	}
-
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", err
-	}
-
-	// 寫入臨時 Dockerfile
-	tmpfile, err := ioutil.TempFile(".", "Dockerfile.tmp.")
-	if err != nil {
-		return "", err
-	}
-
-	if _, err := tmpfile.Write(buf.Bytes()); err != nil {
-		tmpfile.Close()
-		os.Remove(tmpfile.Name())
-		return "", err
-	}
-
-	tmpfile.Close()
-	return tmpfile.Name(), nil
+// getAppPort 獲取應用程式端口
+func (cb *ContainerBuilder) getAppPort() string {
+	// 簡化版本，實際應該從配置讀取
+	return "8080"
 }
 
-func buildFullImageName() string {
-	name := imageName
-	if registry != "" {
-		name = fmt.Sprintf("%s/%s", strings.TrimSuffix(registry, "/"), imageName)
+// getFullImageName 獲取完整映像名稱
+func (cb *ContainerBuilder) getFullImageName() string {
+	name := cb.imageName
+	if cb.registry != "" {
+		name = cb.registry + "/" + name
 	}
-	return fmt.Sprintf("%s:%s", name, imageTag)
+	return name + ":" + cb.imageTag
 }
 
-func buildDockerImage(dockerfilePath, fullImageName string) error {
-	fmt.Printf("\n🔨 Building Docker image: %s\n", fullImageName)
-
-	containerCmd := detectContainerRuntime()
-	args := []string{"build", "-t", fullImageName, "-f", dockerfilePath}
-
-	// 添加平台參數
-	if platform != "" {
-		args = append(args, "--platform", platform)
-	}
-
-	// 添加構建參數
-	for _, arg := range buildArgs {
-		args = append(args, "--build-arg", arg)
-	}
-
-	// 添加構建進度顯示
-	args = append(args, "--progress=plain")
-
-	args = append(args, ".")
-
-	cmd := exec.Command(containerCmd, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	startTime := time.Now()
-	if err := cmd.Run(); err != nil {
-		// 提供更詳細的錯誤信息
-		return fmt.Errorf(`failed to build Docker image: %w
-
-Troubleshooting tips:
-1. Check if Docker daemon is running
-2. Ensure you have enough disk space
-3. Try building with --no-cache flag
-4. Check Docker logs: docker logs`, err)
-	}
-
-	duration := time.Since(startTime)
-	fmt.Printf("\n✅ Docker image built successfully in %s\n", duration.Round(time.Second))
-
-	// 顯示鏡像信息
-	showImageInfo(fullImageName)
-
-	return nil
-}
-
-func showImageInfo(imageName string) {
-	containerCmd := detectContainerRuntime()
-	cmd := exec.Command(containerCmd, "images", imageName, "--format", "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}")
-	output, err := cmd.Output()
-	if err == nil {
-		fmt.Println("\n📊 Image Information:")
-		fmt.Println(string(output))
-	}
-}
-
-func pushDockerImage(fullImageName string) error {
-	fmt.Printf("\n📤 Pushing image to registry: %s\n", registry)
-
-	containerCmd := detectContainerRuntime()
-
-	// 檢查是否已登錄
-	if err := checkDockerLogin(); err != nil {
-		return err
-	}
-
-	cmd := exec.Command(containerCmd, "push", fullImageName)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to push Docker image: %w", err)
-	}
-
-	fmt.Println("✅ Image pushed successfully")
-	return nil
-}
-
-func checkDockerLogin() error {
-	containerCmd := detectContainerRuntime()
-	cmd := exec.Command(containerCmd, "info")
-	output, err := cmd.Output()
-	if err != nil {
-		return err
-	}
-
-	if registry != "" && !strings.Contains(string(output), registry) {
-		fmt.Printf("⚠️  You may need to login to %s first:\n", registry)
-		fmt.Printf("   %s login %s\n", containerCmd, registry)
-	}
-
-	return nil
-}
-
-func printRunInstructions(fullImageName, port string) {
-	containerCmd := detectContainerRuntime()
-
-	fmt.Println("\n🚀 Docker image ready!")
+// printInstructions 列印使用說明
+func (cb *ContainerBuilder) printInstructions() {
+	fmt.Println("\n🚀 Container image ready!")
 	fmt.Println("========================")
-	fmt.Printf("Image: %s\n", fullImageName)
-	fmt.Printf("Port: %s\n\n", port)
+	fmt.Printf("Image: %s\n", cb.getFullImageName())
+	fmt.Printf("Format: %s\n", outputFormat)
 
-	fmt.Println("📋 Run commands:")
-	fmt.Println("----------------")
+	switch outputFormat {
+	case "tar":
+		fmt.Printf("\n# Load with Docker:\n")
+		fmt.Printf("docker load < %s.tar\n", cb.imageName)
+		fmt.Printf("\n# Load with Podman:\n")
+		fmt.Printf("podman load < %s.tar\n", cb.imageName)
 
-	// 基本運行命令
-	fmt.Printf("# Run container:\n")
-	fmt.Printf("%s run -d -p %s:%s --name %s %s\n\n", containerCmd, port, port, imageName, fullImageName)
+	case "oci":
+		fmt.Printf("\n# Run with any OCI runtime:\n")
+		fmt.Printf("ctr run %s\n", cb.getFullImageName())
 
-	// Rootless 模式
-	if useRootless {
-		fmt.Printf("# Run in rootless mode (more secure):\n")
-		fmt.Printf("%s run -d --userns=host -p %s:%s --name %s %s\n\n", containerCmd, port, port, imageName, fullImageName)
+	case "docker":
+		fmt.Printf("\n# Run with Docker:\n")
+		fmt.Printf("docker run -p %s:%s %s\n", cb.port, cb.port, cb.getFullImageName())
 	}
-
-	// 帶配置掛載的運行命令
-	fmt.Printf("# Run with custom config:\n")
-	fmt.Printf("%s run -d -p %s:%s -v $(pwd)/config:/app/config:ro --name %s %s\n\n", containerCmd, port, port, imageName, fullImageName)
-
-	// 帶日誌掛載的運行命令
-	fmt.Printf("# Run with logs volume:\n")
-	fmt.Printf("%s run -d -p %s:%s -v hypgo-logs:/app/logs --name %s %s\n\n", containerCmd, port, port, imageName, fullImageName)
-
-	// Docker Compose 示例
-	fmt.Println("# Docker Compose example:")
-	fmt.Println("------------------------")
-	generateDockerCompose(fullImageName, port)
 }
 
-func generateDockerCompose(imageName, port string) {
-	composeContent := fmt.Sprintf(`version: '3.8'
+// Alternative: 使用 ko 套件
+func buildWithKo() error {
+	// Ko 是 Google 的純 Go 容器建構工具
+	// 可以直接整合到程式碼中
 
-services:
-  app:
-    image: %s
-    ports:
-      - "%s:%s"
-    volumes:
-      - ./config:/app/config:ro
-      - hypgo-logs:/app/logs
-    environment:
-      - HYPGO_ENV=production
-      - TZ=UTC
-    restart: unless-stopped
-    networks:
-      - hypgo-network
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:%s/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
+	/*
+		import "github.com/google/ko/pkg/build"
+		import "github.com/google/ko/pkg/publish"
 
-volumes:
-  hypgo-logs:
-    driver: local
-
-networks:
-  hypgo-network:
-    driver: bridge
-`, imageName, port, port, port)
-
-	fmt.Println(composeContent)
-
-	// 詢問是否保存 docker-compose.yml
-	fmt.Print("\n💾 Save docker-compose.yml? (y/N): ")
-	reader := bufio.NewReader(os.Stdin)
-	response, _ := reader.ReadString('\n')
-	response = strings.TrimSpace(strings.ToLower(response))
-
-	if response == "y" || response == "yes" {
-		if err := ioutil.WriteFile("docker-compose.yml", []byte(composeContent), 0644); err != nil {
-			fmt.Printf("❌ Failed to save docker-compose.yml: %v\n", err)
-		} else {
-			fmt.Println("✅ docker-compose.yml saved successfully")
-			fmt.Println("\n# Run with docker-compose:")
-			fmt.Println("docker-compose up -d")
+		builder, err := build.NewGo(ctx, ".")
+		if err != nil {
+			return err
 		}
-	}
-}
 
-func generateDockerIgnore() error {
-	dockerignoreContent := `# Binaries
-*.exe
-*.dll
-*.so
-*.dylib
-*_test.go
+		result, err := builder.Build(ctx, ".")
+		if err != nil {
+			return err
+		}
 
-# Build artifacts
-/{{.ProjectName}}
-/bin/
-/dist/
-/build/
+		publisher, err := publish.NewDefault(repo)
+		if err != nil {
+			return err
+		}
 
-# Test binary
-*.test
+		ref, err := publisher.Publish(ctx, result)
+	*/
 
-# Coverage
-*.out
-*.cov
-coverage.txt
-coverage.html
-
-# Dependency directories
-vendor/
-
-# Go workspace
-go.work
-go.work.sum
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# OS
-Thumbs.db
-.DS_Store
-
-# Project specific
-logs/
-*.log
-*.pid
-.env
-.env.*
-!.env.example
-
-# Docker
-Dockerfile*
-docker-compose*.yml
-.dockerignore
-
-# Git
-.git/
-.gitignore
-.github/
-
-# Documentation
-*.md
-docs/
-LICENSE
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-*.bak
-*.backup
-`
-
-	projectName := getProjectName()
-	tmpl, err := template.New("dockerignore").Parse(dockerignoreContent)
-	if err != nil {
-		return err
-	}
-
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, struct{ ProjectName string }{projectName}); err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(".dockerignore", buf.Bytes(), 0644)
+	return nil
 }
