@@ -1,12 +1,7 @@
 package context
 
+// Package context 提供 HypGo 框架的核心上下文功能
 import (
-	"bufio"
-	"encoding/json"
-	"fmt"
-	"io"
-	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -21,19 +16,23 @@ type Context struct {
 	// 請求和回應
 	Request  *http.Request
 	Response ResponseWriter
+	Writer   ResponseWriter // Gin 兼容別名
 
 	// HTTP/3 QUIC 特定支援
 	quicConn   *QuicConnection
 	streamInfo *StreamInfo
 
 	// 路由參數
-	Params     Params
-	queryCache url.Values
-	formCache  url.Values
+	Params      Params
+	queryCache  url.Values
+	formCache   url.Values
+	rawData     []byte
+	routerGroup *RouterGroup
 
 	// 中間件和處理器
 	handlers []HandlerFunc
 	index    int8
+	fullPath string
 
 	// 資料存儲
 	mu   sync.RWMutex
@@ -48,16 +47,13 @@ type Context struct {
 	// 效能監控
 	startTime time.Time
 	metrics   *RequestMetrics
+
+	// 內容協商
+	Accepted []string
+
+	// SameSite cookie 設置
+	sameSite http.SameSite
 }
-
-// Protocol 定義支援的協議類型
-type Protocol int
-
-const (
-	HTTP1 Protocol = iota
-	HTTP2
-	HTTP3
-)
 
 // QuicConnection 封裝 QUIC 連接資訊
 type QuicConnection struct {
@@ -78,34 +74,28 @@ type StreamInfo struct {
 	Exclusive    bool
 }
 
-// ResponseWriter 擴展標準 ResponseWriter 支援 HTTP/3
-type ResponseWriter interface {
-	http.ResponseWriter
-	http.Hijacker
-	http.Flusher
-	http.Pusher
-
-	// HTTP/3 特定方法
-	WriteHeader3(statusCode int, headers http.Header)
-	PushPromise(target string, opts *http.PushOptions) error
-	StreamID() uint64
-
-	// 狀態方法
-	Status() int
-	Size() int
-	Written() bool
-	WriteString(string) (int, error)
-}
-
 // HandlerFunc 定義處理函數類型
 type HandlerFunc func(*Context)
 
-// Params 路由參數
-type Params []Param
+// HandlersChain 定義處理器鏈
+type HandlersChain []HandlerFunc
 
-type Param struct {
-	Key   string
-	Value string
+// RouterGroup 路由組（簡化版）
+type RouterGroup struct {
+	Handlers HandlersChain
+	basePath string
+	root     bool
+	engine   *Engine
+}
+
+// Engine 引擎（簡化版）
+type Engine struct {
+	HTMLRender HTMLRender
+}
+
+// HTMLRender HTML 渲染器介面
+type HTMLRender interface {
+	Instance(string, interface{}) Render
 }
 
 // RequestMetrics 請求指標
@@ -126,7 +116,6 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 		return AcquireContext(w, r)
 	}
 
-	// 備用：傳統方式創建
 	c := &Context{
 		Request:   r,
 		Response:  newResponseWriter(w),
@@ -136,7 +125,11 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 		Keys:      make(map[string]interface{}),
 		startTime: time.Now(),
 		metrics:   &RequestMetrics{},
+		sameSite:  http.SameSiteDefaultMode,
 	}
+
+	// Writer 是 Response 的別名（Gin 兼容）
+	c.Writer = c.Response
 
 	// 檢測並設置協議
 	c.detectProtocol()
@@ -149,12 +142,74 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 	return c
 }
 
+// Reset 重置 Context 到初始狀態（用於物件池）
+func (c *Context) Reset(w http.ResponseWriter, r *http.Request) {
+	c.Request = r
+	if w != nil {
+		c.Response = newResponseWriter(w)
+		c.Writer = c.Response
+	} else {
+		c.Response = nil
+		c.Writer = nil
+	}
+	c.Params = c.Params[:0]
+	c.handlers = nil
+	c.index = -1
+	c.Keys = nil
+	c.Errors = c.Errors[:0]
+	c.Accepted = nil
+	c.queryCache = nil
+	c.formCache = nil
+	c.rawData = nil
+	c.fullPath = ""
+	c.startTime = time.Now()
+	c.metrics = &RequestMetrics{}
+	if r != nil {
+		c.detectProtocol()
+		if c.protocol == HTTP3 {
+			c.initQuicConnection()
+		}
+	}
+}
+
+// Copy 返回當前 Context 的副本（用於 goroutine）
+func (c *Context) Copy() *Context {
+	cp := &Context{
+		Request:  c.Request.Clone(c.Request.Context()),
+		Response: nil,
+		Writer:   nil,
+		Params:   make(Params, len(c.Params)),
+		handlers: nil,
+		index:    c.index,
+		fullPath: c.fullPath,
+		protocol: c.protocol,
+	}
+
+	copy(cp.Params, c.Params)
+
+	// 深拷貝 Keys
+	cp.Keys = make(map[string]interface{}, len(c.Keys))
+	c.mu.RLock()
+	for k, v := range c.Keys {
+		cp.Keys[k] = v
+	}
+	c.mu.RUnlock()
+
+	// 拷貝錯誤
+	cp.Errors = make(errorMsgs, len(c.Errors))
+	copy(cp.Errors, c.Errors)
+
+	return cp
+}
+
 // Release 釋放 Context 回物件池
 func (c *Context) Release() {
 	if contextPool != nil {
 		ReleaseContext(c)
 	}
 }
+
+// ===== 中間件執行 =====
 
 // Next 執行下一個中間件
 func (c *Context) Next() {
@@ -165,18 +220,122 @@ func (c *Context) Next() {
 	}
 }
 
+// IsAborted 檢查是否已中止
+func (c *Context) IsAborted() bool {
+	return c.index >= abortIndex
+}
+
 // Abort 中止請求處理
 func (c *Context) Abort() {
-	c.index = int8(len(c.handlers))
+	c.index = abortIndex
 }
 
 // AbortWithStatus 中止並設置狀態碼
 func (c *Context) AbortWithStatus(code int) {
 	c.Status(code)
+	c.Writer.WriteHeaderNow()
 	c.Abort()
 }
 
-// ===== HTTP/3 QUIC 優化方法 =====
+// AbortWithStatusJSON 中止並返回 JSON 錯誤
+func (c *Context) AbortWithStatusJSON(code int, jsonObj interface{}) {
+	c.Abort()
+	c.JSON(code, jsonObj)
+}
+
+// AbortWithError 中止並返回錯誤
+func (c *Context) AbortWithError(code int, err error) *Error {
+	c.AbortWithStatus(code)
+	return c.Error(err)
+}
+
+// HandlerName 返回當前處理器的名稱
+func (c *Context) HandlerName() string {
+	return nameOfFunction(c.handlers[c.index])
+}
+
+// HandlerNames 返回所有處理器的名稱
+func (c *Context) HandlerNames() []string {
+	names := make([]string, 0, len(c.handlers))
+	for _, handler := range c.handlers {
+		names = append(names, nameOfFunction(handler))
+	}
+	return names
+}
+
+// ===== 路徑和路由 =====
+
+// FullPath 返回匹配的路由完整路徑
+func (c *Context) FullPath() string {
+	return c.fullPath
+}
+
+// SetFullPath 設置完整路徑
+func (c *Context) SetFullPath(fullPath string) {
+	c.fullPath = fullPath
+}
+
+// BasePath 獲取基礎路徑
+func (c *Context) BasePath() string {
+	if c.routerGroup != nil {
+		return c.routerGroup.basePath
+	}
+	return ""
+}
+
+// GetRouterGroup 獲取路由組
+func (c *Context) GetRouterGroup() *RouterGroup {
+	return c.routerGroup
+}
+
+// SetRouterGroup 設置路由組
+func (c *Context) SetRouterGroup(group *RouterGroup) {
+	c.routerGroup = group
+}
+
+// ===== Context 介面實現 =====
+
+// Deadline 返回請求的截止時間
+func (c *Context) Deadline() (deadline time.Time, ok bool) {
+	if c.Request == nil || c.Request.Context() == nil {
+		return
+	}
+	return c.Request.Context().Deadline()
+}
+
+// Done 返回一個通道，當請求被取消時關閉
+func (c *Context) Done() <-chan struct{} {
+	if c.Request == nil || c.Request.Context() == nil {
+		return nil
+	}
+	return c.Request.Context().Done()
+}
+
+// Err 返回請求的錯誤（如果有）
+func (c *Context) Err() error {
+	if c.Request == nil || c.Request.Context() == nil {
+		return nil
+	}
+	return c.Request.Context().Err()
+}
+
+// Value 實現 context.Context 介面
+func (c *Context) Value(key interface{}) interface{} {
+	if key == 0 {
+		return c.Request
+	}
+	if keyAsString, ok := key.(string); ok {
+		if val, exists := c.Get(keyAsString); exists {
+			return val
+		}
+	}
+	if c.Request == nil || c.Request.Context() == nil {
+		return nil
+	}
+	return c.Request.Context().Value(key)
+}
+
+// ===== 協議檢測 =====
 
 // detectProtocol 檢測當前使用的協議
 func (c *Context) detectProtocol() {
@@ -189,401 +348,16 @@ func (c *Context) detectProtocol() {
 	}
 }
 
-// initQuicConnection 初始化 QUIC 連接資訊
-func (c *Context) initQuicConnection() {
-	// 從請求中提取 QUIC 連接資訊
-	if conn, ok := c.Request.Context().Value("quic_conn").(*QuicConnection); ok {
-		c.quicConn = conn
+// Protocol 返回協議字符串
+func (c *Context) Protocol() string {
+	switch c.protocol {
+	case HTTP3:
+		return "HTTP/3"
+	case HTTP2:
+		return "HTTP/2"
+	default:
+		return "HTTP/1.1"
 	}
-
-	// 初始化流資訊
-	c.streamInfo = &StreamInfo{
-		StreamID: c.extractStreamID(),
-		Priority: c.extractPriority(),
-	}
-}
-
-// extractStreamID 提取流 ID
-func (c *Context) extractStreamID() uint64 {
-	// 實現從請求中提取流 ID 的邏輯
-	return 0
-}
-
-// extractPriority 提取優先級
-func (c *Context) extractPriority() uint8 {
-	// 實現優先級提取邏輯
-	return 0
-}
-
-// SetStreamPriority 設置流優先級（HTTP/3 特性）
-func (c *Context) SetStreamPriority(priority uint8) error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("stream priority only available in HTTP/3")
-	}
-	c.streamInfo.Priority = priority
-	// 實際設置 QUIC 流優先級
-	return nil
-}
-
-// GetRTT 獲取往返時間（對 HTTP/3 優化）
-func (c *Context) GetRTT() time.Duration {
-	if c.quicConn != nil {
-		return c.quicConn.rtt
-	}
-	return 0
-}
-
-// GetCongestionWindow 獲取擁塞窗口大小
-func (c *Context) GetCongestionWindow() uint32 {
-	if c.quicConn != nil {
-		return c.quicConn.congWin
-	}
-	return 0
-}
-
-// ===== 請求資料獲取方法 =====
-
-// Param 獲取路由參數
-func (c *Context) Param(key string) string {
-	for _, p := range c.Params {
-		if p.Key == key {
-			return p.Value
-		}
-	}
-	return ""
-}
-
-// Query 獲取查詢參數
-func (c *Context) Query(key string) string {
-	value, _ := c.GetQuery(key)
-	return value
-}
-
-// GetQuery 獲取查詢參數，返回是否存在
-func (c *Context) GetQuery(key string) (string, bool) {
-	if c.queryCache == nil {
-		c.queryCache = c.Request.URL.Query()
-	}
-	values := c.queryCache[key]
-	if len(values) == 0 {
-		return "", false
-	}
-	return values[0], true
-}
-
-// QueryArray 獲取查詢參數陣列
-func (c *Context) QueryArray(key string) []string {
-	if c.queryCache == nil {
-		c.queryCache = c.Request.URL.Query()
-	}
-	return c.queryCache[key]
-}
-
-// PostForm 獲取表單資料
-func (c *Context) PostForm(key string) string {
-	value, _ := c.GetPostForm(key)
-	return value
-}
-
-// GetPostForm 獲取表單資料，返回是否存在
-func (c *Context) GetPostForm(key string) (string, bool) {
-	if c.formCache == nil {
-		c.Request.ParseForm()
-		c.formCache = c.Request.PostForm
-	}
-	values := c.formCache[key]
-	if len(values) == 0 {
-		return "", false
-	}
-	return values[0], true
-}
-
-// ===== JSON 處理方法 =====
-
-// BindJSON 綁定 JSON 資料到結構體
-func (c *Context) BindJSON(obj interface{}) error {
-	return c.bindWith(obj, bindingJSON{})
-}
-
-// ShouldBindJSON 嘗試綁定 JSON（不會中止請求）
-func (c *Context) ShouldBindJSON(obj interface{}) error {
-	return c.bindWith(obj, bindingJSON{})
-}
-
-// bindWith 內部綁定方法
-func (c *Context) bindWith(obj interface{}, b binding) error {
-	return b.Bind(c.Request, obj)
-}
-
-// JSON 回應 JSON 資料
-func (c *Context) JSON(code int, obj interface{}) {
-	c.Header("Content-Type", "application/json; charset=utf-8")
-	c.Status(code)
-
-	encoder := json.NewEncoder(c.Response)
-	if err := encoder.Encode(obj); err != nil {
-		c.Error(err)
-	}
-}
-
-// IndentedJSON 回應格式化的 JSON
-func (c *Context) IndentedJSON(code int, obj interface{}) {
-	c.Header("Content-Type", "application/json; charset=utf-8")
-	c.Status(code)
-
-	data, err := json.MarshalIndent(obj, "", "  ")
-	if err != nil {
-		c.Error(err)
-		return
-	}
-	c.Response.Write(data)
-}
-
-// ===== 回應方法 =====
-
-// String 回應字串
-func (c *Context) String(code int, format string, values ...interface{}) {
-	c.Header("Content-Type", "text/plain; charset=utf-8")
-	c.Status(code)
-
-	if len(values) > 0 {
-		fmt.Fprintf(c.Response, format, values...)
-	} else {
-		io.WriteString(c.Response, format)
-	}
-}
-
-// HTML 回應 HTML
-func (c *Context) HTML(code int, html string) {
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Status(code)
-	io.WriteString(c.Response, html)
-}
-
-// File 回應檔案
-func (c *Context) File(filepath string) {
-	http.ServeFile(c.Response, c.Request, filepath)
-}
-
-// Stream 串流回應（支援 HTTP/3 優化）
-func (c *Context) Stream(step func(w io.Writer) bool) bool {
-	w := c.Response
-	for {
-		if !step(w) {
-			return false
-		}
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
-		// HTTP/3 優化：調整流控制
-		if c.protocol == HTTP3 && c.quicConn != nil {
-			// 根據 RTT 和擁塞窗口調整發送速率
-			c.adaptiveStreamControl()
-		}
-	}
-}
-
-// adaptiveStreamControl HTTP/3 自適應流控制
-func (c *Context) adaptiveStreamControl() {
-	// 根據網路狀況動態調整
-	if c.quicConn.rtt > 100*time.Millisecond {
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// ===== Header 操作 =====
-
-// Header 設置回應頭
-func (c *Context) Header(key, value string) {
-	if c.Response.Written() {
-		return
-	}
-	c.Response.Header().Set(key, value)
-}
-
-// GetHeader 獲取請求頭
-func (c *Context) GetHeader(key string) string {
-	return c.Request.Header.Get(key)
-}
-
-// Status 設置狀態碼
-func (c *Context) Status(code int) {
-	c.Response.WriteHeader(code)
-}
-
-// ===== Cookie 操作 =====
-
-// SetCookie 設置 Cookie
-func (c *Context) SetCookie(name, value string, maxAge int, path, domain string, secure, httpOnly bool) {
-	cookie := &http.Cookie{
-		Name:     name,
-		Value:    value,
-		MaxAge:   maxAge,
-		Path:     path,
-		Domain:   domain,
-		Secure:   secure,
-		HttpOnly: httpOnly,
-		SameSite: http.SameSiteStrictMode,
-	}
-	http.SetCookie(c.Response, cookie)
-}
-
-// Cookie 獲取 Cookie
-func (c *Context) Cookie(name string) (string, error) {
-	cookie, err := c.Request.Cookie(name)
-	if err != nil {
-		return "", err
-	}
-	return cookie.Value, nil
-}
-
-// ===== 上下文資料存儲 =====
-
-// Set 存儲資料到上下文
-func (c *Context) Set(key string, value interface{}) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.Keys[key] = value
-}
-
-// Get 從上下文獲取資料
-func (c *Context) Get(key string) (interface{}, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	value, exists := c.Keys[key]
-	return value, exists
-}
-
-// MustGet 必須獲取資料，不存在則 panic
-func (c *Context) MustGet(key string) interface{} {
-	value, exists := c.Get(key)
-	if !exists {
-		panic(fmt.Sprintf("Key %s does not exist", key))
-	}
-	return value
-}
-
-// GetString 獲取字串值
-func (c *Context) GetString(key string) string {
-	if val, exists := c.Get(key); exists {
-		if s, ok := val.(string); ok {
-			return s
-		}
-	}
-	return ""
-}
-
-// GetInt 獲取整數值
-func (c *Context) GetInt(key string) int {
-	if val, exists := c.Get(key); exists {
-		if i, ok := val.(int); ok {
-			return i
-		}
-	}
-	return 0
-}
-
-// GetBool 獲取布林值
-func (c *Context) GetBool(key string) bool {
-	if val, exists := c.Get(key); exists {
-		if b, ok := val.(bool); ok {
-			return b
-		}
-	}
-	return false
-}
-
-// GetDuration 獲取時間間隔
-func (c *Context) GetDuration(key string) time.Duration {
-	if val, exists := c.Get(key); exists {
-		if d, ok := val.(time.Duration); ok {
-			return d
-		}
-	}
-	return 0
-}
-
-// ===== 錯誤處理 =====
-
-// Error 添加錯誤
-func (c *Context) Error(err error) {
-	c.Errors = append(c.Errors, &errorMsg{
-		Err:  err,
-		Type: ErrorTypePrivate,
-	})
-}
-
-// AbortWithError 中止並返回錯誤
-func (c *Context) AbortWithError(code int, err error) {
-	c.Status(code)
-	c.Error(err)
-	c.Abort()
-}
-
-// ===== 檔案上傳 =====
-
-// FormFile 獲取上傳的檔案
-func (c *Context) FormFile(name string) (*multipart.FileHeader, error) {
-	if c.Request.MultipartForm == nil {
-		if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
-			return nil, err
-		}
-	}
-	file, header, err := c.Request.FormFile(name)
-	if err != nil {
-		return nil, err
-	}
-	file.Close()
-	return header, nil
-}
-
-// MultipartForm 獲取多部分表單
-func (c *Context) MultipartForm() (*multipart.Form, error) {
-	err := c.Request.ParseMultipartForm(32 << 20)
-	return c.Request.MultipartForm, err
-}
-
-// SaveUploadedFile 保存上傳的檔案
-func (c *Context) SaveUploadedFile(file *multipart.FileHeader, dst string) error {
-	src, err := file.Open()
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	// 創建目標檔案
-	// 實現檔案保存邏輯
-	return nil
-}
-
-// ===== 客戶端資訊 =====
-
-// ClientIP 獲取客戶端 IP
-func (c *Context) ClientIP() string {
-	// 檢查 X-Forwarded-For
-	if ip := c.GetHeader("X-Forwarded-For"); ip != "" {
-		return ip
-	}
-	// 檢查 X-Real-IP
-	if ip := c.GetHeader("X-Real-IP"); ip != "" {
-		return ip
-	}
-	// 從連接獲取
-	if ip, _, err := net.SplitHostPort(c.Request.RemoteAddr); err == nil {
-		return ip
-	}
-	return ""
-}
-
-// ContentType 獲取內容類型
-func (c *Context) ContentType() string {
-	return c.GetHeader("Content-Type")
-}
-
-// IsWebsocket 檢查是否為 WebSocket 請求
-func (c *Context) IsWebsocket() bool {
-	return c.GetHeader("Upgrade") == "websocket"
 }
 
 // ===== 效能監控 =====
@@ -602,186 +376,4 @@ func (c *Context) RecordBytesIn(bytes int64) {
 // RecordBytesOut 記錄輸出位元組
 func (c *Context) RecordBytesOut(bytes int64) {
 	c.metrics.BytesOut += bytes
-}
-
-// ===== HTTP/3 Server Push =====
-
-// Push 使用 HTTP/3 Server Push
-func (c *Context) Push(target string, opts *http.PushOptions) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("server push only available in HTTP/2 and HTTP/3")
-	}
-
-	pusher, ok := c.Response.(http.Pusher)
-	if !ok {
-		return fmt.Errorf("server push not supported")
-	}
-
-	return pusher.Push(target, opts)
-}
-
-// ===== Deadline 和 Timeout =====
-
-// Deadline 返回請求的截止時間
-func (c *Context) Deadline() (time.Time, bool) {
-	return c.Request.Context().Deadline()
-}
-
-// Done 返回一個通道，當請求被取消時關閉
-func (c *Context) Done() <-chan struct{} {
-	return c.Request.Context().Done()
-}
-
-// Err 返回請求的錯誤（如果有）
-func (c *Context) Err() error {
-	return c.Request.Context().Err()
-}
-
-// Value 實現 context.Context 介面
-func (c *Context) Value(key interface{}) interface{} {
-	if keyAsString, ok := key.(string); ok {
-		if val, exists := c.Get(keyAsString); exists {
-			return val
-		}
-	}
-	return c.Request.Context().Value(key)
-}
-
-// ===== 輔助結構 =====
-
-// responseWriter 實現 ResponseWriter 介面
-type responseWriter struct {
-	http.ResponseWriter
-	status   int
-	size     int
-	written  bool
-	streamID uint64
-	mu       sync.Mutex
-}
-
-// newResponseWriter 創建新的 responseWriter
-func newResponseWriter(w http.ResponseWriter) ResponseWriter {
-	return &responseWriter{
-		ResponseWriter: w,
-		status:         http.StatusOK,
-	}
-}
-
-// WriteHeader 寫入狀態碼
-func (w *responseWriter) WriteHeader(code int) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if !w.written {
-		w.status = code
-		w.ResponseWriter.WriteHeader(code)
-		w.written = true
-	}
-}
-
-// Write 寫入資料
-func (w *responseWriter) Write(data []byte) (int, error) {
-	if !w.written {
-		w.WriteHeader(http.StatusOK)
-	}
-	n, err := w.ResponseWriter.Write(data)
-	w.size += n
-	return n, err
-}
-
-// WriteString 寫入字串
-func (w *responseWriter) WriteString(s string) (int, error) {
-	return w.Write([]byte(s))
-}
-
-// Status 返回狀態碼
-func (w *responseWriter) Status() int {
-	return w.status
-}
-
-// Size 返回已寫入的大小
-func (w *responseWriter) Size() int {
-	return w.size
-}
-
-// Written 返回是否已寫入
-func (w *responseWriter) Written() bool {
-	return w.written
-}
-
-// Hijack 實現 http.Hijacker 介面
-func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return hijacker.Hijack()
-	}
-	return nil, nil, fmt.Errorf("the ResponseWriter doesn't support hijacking")
-}
-
-// Flush 實現 http.Flusher 介面
-func (w *responseWriter) Flush() {
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
-// Push 實現 http.Pusher 介面 (HTTP/2 和 HTTP/3)
-func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
-	if pusher, ok := w.ResponseWriter.(http.Pusher); ok {
-		return pusher.Push(target, opts)
-	}
-	return fmt.Errorf("server push not supported")
-}
-
-// WriteHeader3 HTTP/3 特定的寫入頭部方法
-func (w *responseWriter) WriteHeader3(statusCode int, headers http.Header) {
-	// 設置額外的 HTTP/3 特定頭部
-	for k, v := range headers {
-		for _, val := range v {
-			w.Header().Add(k, val)
-		}
-	}
-	w.WriteHeader(statusCode)
-}
-
-// PushPromise HTTP/3 推送承諾
-func (w *responseWriter) PushPromise(target string, opts *http.PushOptions) error {
-	// 實現 HTTP/3 特定的推送承諾邏輯
-	return w.Push(target, opts)
-}
-
-// StreamID 返回流 ID
-func (w *responseWriter) StreamID() uint64 {
-	return w.streamID
-}
-
-// errorMsg 錯誤訊息
-type errorMsg struct {
-	Err  error
-	Type ErrorType
-}
-
-type errorMsgs []*errorMsg
-
-type ErrorType uint64
-
-const (
-	ErrorTypePrivate ErrorType = 1 << 63
-	ErrorTypePublic  ErrorType = 1 << 62
-)
-
-// binding 介面定義
-type binding interface {
-	Bind(*http.Request, interface{}) error
-}
-
-// bindingJSON JSON 綁定實現
-type bindingJSON struct{}
-
-// Bind 實現 binding 介面
-func (bindingJSON) Bind(req *http.Request, obj interface{}) error {
-	if req == nil || req.Body == nil {
-		return fmt.Errorf("invalid request")
-	}
-	decoder := json.NewDecoder(req.Body)
-	return decoder.Decode(obj)
 }
