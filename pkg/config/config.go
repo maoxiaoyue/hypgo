@@ -3,152 +3,171 @@ package config
 import (
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
+// Config 主配置結構
 type Config struct {
-	Server   ServerConfig           `mapstructure:"server"`
-	Database DatabaseConfig         `mapstructure:"database"`
-	Logger   LoggerConfig           `mapstructure:"logger"`
-	Plugins  map[string]interface{} `mapstructure:"plugins"`
+	Server    ServerConfig    `yaml:"server" json:"server"`
+	Cassandra CassandraConfig `yaml:"cassandra" json:"cassandra"`
+	Logger    LoggerConfig    `yaml:"logger" json:"logger"`
+	Database  DatabaseConfig  `yaml:"database" json:"database"`
 }
 
+// ServerConfig 伺服器配置
 type ServerConfig struct {
-	Protocol              string    `mapstructure:"protocol"` // http1, http2, http3
-	Addr                  string    `mapstructure:"addr"`
-	ReadTimeout           int       `mapstructure:"read_timeout"`
-	WriteTimeout          int       `mapstructure:"write_timeout"`
-	IdleTimeout           int       `mapstructure:"idle_timeout"`
-	KeepAlive             int       `mapstructure:"keep_alive"`
-	MaxHandlers           int       `mapstructure:"max_handlers"`
-	MaxConcurrentStreams  uint32    `mapstructure:"max_concurrent_streams"`
-	MaxReadFrameSize      uint32    `mapstructure:"max_read_frame_size"`
-	TLS                   TLSConfig `mapstructure:"tls"`
-	EnableGracefulRestart bool      `mapstructure:"enable_graceful_restart"`
+	Host         string `yaml:"host" json:"host"`
+	Port         int    `yaml:"port" json:"port"`
+	Mode         string `yaml:"mode" json:"mode"` // http2, http3
+	ReadTimeout  int    `yaml:"read_timeout" json:"read_timeout"`
+	WriteTimeout int    `yaml:"write_timeout" json:"write_timeout"`
 }
 
-type TLSConfig struct {
-	Enabled  bool   `mapstructure:"enabled"`
-	CertFile string `mapstructure:"cert_file"`
-	KeyFile  string `mapstructure:"key_file"`
-}
-
-type DatabaseConfig struct {
-	Driver       string          `mapstructure:"driver"` // mysql, postgres, tidb, redis, cassandra
-	DSN          string          `mapstructure:"dsn"`
-	MaxIdleConns int             `mapstructure:"max_idle_conns"`
-	MaxOpenConns int             `mapstructure:"max_open_conns"`
-	Redis        RedisConfig     `mapstructure:"redis"`
-	Cassandra    CassandraConfig `mapstructure:"cassandra"`
-}
-
-type RedisConfig struct {
-	Addr     string `mapstructure:"addr"`
-	Password string `mapstructure:"password"`
-	DB       int    `mapstructure:"db"`
-}
-
+// CassandraConfig Cassandra配置
 type CassandraConfig struct {
-	Hosts    []string `mapstructure:"hosts"`
-	Keyspace string   `mapstructure:"keyspace"`
+	Hosts            []string `yaml:"hosts" json:"hosts"`
+	Keyspace         string   `yaml:"keyspace" json:"keyspace"`
+	Username         string   `yaml:"username" json:"username"`
+	Password         string   `yaml:"password" json:"password"`
+	Consistency      string   `yaml:"consistency" json:"consistency"`
+	Compression      string   `yaml:"compression" json:"compression"`
+	ConnectTimeout   int      `yaml:"connect_timeout" json:"connect_timeout"`
+	Timeout          int      `yaml:"timeout" json:"timeout"`
+	NumConns         int      `yaml:"num_conns" json:"num_conns"`
+	MaxConns         int      `yaml:"max_conns" json:"max_conns"`
+	MaxRetries       int      `yaml:"max_retries" json:"max_retries"`
+	EnableLogging    string   `yaml:"enable_logging" json:"enable_logging"` // "true" or "false"
+	PageSize         int      `yaml:"page_size" json:"page_size"`
+	ShardAwarePort   int      `yaml:"shard_aware_port" json:"shard_aware_port"`
+	EnableShardAware bool     `yaml:"enable_shard_aware" json:"enable_shard_aware"`
 }
 
+// LoggerConfig 日誌配置
 type LoggerConfig struct {
-	Level    string         `mapstructure:"level"`
-	Output   string         `mapstructure:"output"`
-	Rotation RotationConfig `mapstructure:"rotation"`
-	Colors   bool           `mapstructure:"colors"`
+	Level      string `yaml:"level" json:"level"`
+	Output     string `yaml:"output" json:"output"`
+	Filename   string `yaml:"filename" json:"filename"`
+	MaxSize    int    `yaml:"max_size" json:"max_size"` // MB
+	MaxAge     int    `yaml:"max_age" json:"max_age"`   // days
+	MaxBackups int    `yaml:"max_backups" json:"max_backups"`
+	Colorize   bool   `yaml:"colorize" json:"colorize"`
 }
 
-type RotationConfig struct {
-	MaxSize    string `mapstructure:"max_size"` // 10MB, 100MB
-	MaxAge     string `mapstructure:"max_age"`  // 1h, 1d, 1w
-	MaxBackups int    `mapstructure:"max_backups"`
-	Compress   bool   `mapstructure:"compress"`
+// DatabaseConfig 資料庫配置
+type DatabaseConfig struct {
+	Type string `yaml:"type" json:"type"` // mysql, postgresql, cassandra, scylladb
 }
 
-func Load(configPath string) (*Config, error) {
-	viper.SetConfigFile(configPath)
+// LoadConfig 載入配置
+func LoadConfig(configPath string) (*Config, error) {
 	viper.SetConfigType("yaml")
 
-	viper.SetEnvPrefix("HYPGO")
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
-
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("failed to read config: %w", err)
+	// 讀取主配置文件
+	mainConfig, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
+	var config Config
+	if err := yaml.Unmarshal(mainConfig, &config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// 載入插件配置
-	cfg.Plugins = make(map[string]interface{})
-	if err := loadPluginConfigs(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to load plugin configs: %w", err)
+	// 載入其他配置文件
+	configDir := filepath.Dir(configPath)
+	files, err := filepath.Glob(filepath.Join(configDir, "*.yaml"))
+	if err != nil {
+		return nil, err
 	}
 
-	return &cfg, nil
-}
-
-func loadPluginConfigs(cfg *Config) error {
-	configDir := filepath.Dir(viper.ConfigFileUsed())
-
-	// 插件配置文件列表
-	pluginFiles := []string{
-		"rabbitmq.yaml",
-		"kafka.yaml",
-		"cassandra.yaml",
-		"scylladb.yaml",
-		"mongodb.yaml",
-		"elasticsearch.yaml",
-	}
-
-	for _, file := range pluginFiles {
-		pluginPath := filepath.Join(configDir, file)
-
-		// 檢查文件是否存在
-		if _, err := ioutil.ReadFile(pluginPath); err != nil {
-			continue // 跳過不存在的插件配置
+	for _, file := range files {
+		if file == configPath {
+			continue // 跳過主配置文件
 		}
 
-		// 讀取插件配置
-		pluginViper := viper.New()
-		pluginViper.SetConfigFile(pluginPath)
-
-		if err := pluginViper.ReadInConfig(); err != nil {
-			return fmt.Errorf("failed to read %s: %w", file, err)
+		content, err := ioutil.ReadFile(file)
+		if err != nil {
+			continue
 		}
 
-		// 獲取插件名稱（去掉 .yaml 後綴）
-		pluginName := strings.TrimSuffix(file, ".yaml")
-
-		// 將插件配置添加到主配置中
-		cfg.Plugins[pluginName] = pluginViper.AllSettings()
+		// 根據文件名決定配置類型
+		filename := filepath.Base(file)
+		switch filename {
+		case "cassandra.yaml":
+			var cassandraConfig CassandraConfig
+			if err := yaml.Unmarshal(content, &cassandraConfig); err == nil {
+				config.Cassandra = cassandraConfig
+			}
+		case "logger.yaml":
+			var loggerConfig LoggerConfig
+			if err := yaml.Unmarshal(content, &loggerConfig); err == nil {
+				config.Logger = loggerConfig
+			}
+		}
 	}
 
-	return nil
+	// 設定預設值
+	setDefaults(&config)
+
+	return &config, nil
 }
 
-// GetPluginConfig 獲取特定插件的配置
-func (c *Config) GetPluginConfig(pluginName string) (map[string]interface{}, bool) {
-	config, ok := c.Plugins[pluginName].(map[string]interface{})
-	return config, ok
+// setDefaults 設定預設值
+func setDefaults(config *Config) {
+	// Cassandra預設值
+	if config.Cassandra.Hosts == nil || len(config.Cassandra.Hosts) == 0 {
+		config.Cassandra.Hosts = []string{"127.0.0.1:9042"}
+	}
+	if config.Cassandra.Keyspace == "" {
+		config.Cassandra.Keyspace = "hypgo"
+	}
+	if config.Cassandra.Consistency == "" {
+		config.Cassandra.Consistency = "LOCAL_QUORUM"
+	}
+	if config.Cassandra.ConnectTimeout == 0 {
+		config.Cassandra.ConnectTimeout = 10
+	}
+	if config.Cassandra.Timeout == 0 {
+		config.Cassandra.Timeout = 10
+	}
+	if config.Cassandra.NumConns == 0 {
+		config.Cassandra.NumConns = 3
+	}
+	if config.Cassandra.MaxRetries == 0 {
+		config.Cassandra.MaxRetries = 3
+	}
+	if config.Cassandra.PageSize == 0 {
+		config.Cassandra.PageSize = 1000
+	}
+	if config.Cassandra.EnableLogging == "" {
+		config.Cassandra.EnableLogging = "true"
+	}
+
+	// Logger預設值
+	if config.Logger.Level == "" {
+		config.Logger.Level = "INFO"
+	}
+	if config.Logger.Output == "" {
+		config.Logger.Output = "stdout"
+	}
 }
 
-// SavePIDFile 保存進程 ID 文件（用於熱重啟）
-func SavePIDFile() error {
-	pid := os.Getpid()
-	return ioutil.WriteFile("hypgo.pid", []byte(fmt.Sprintf("%d", pid)), 0644)
-}
-
-// RemovePIDFile 刪除進程 ID 文件
-func RemovePIDFile() {
-	os.Remove("hypgo.pid")
+// DefaultCassandraConfig 預設Cassandra配置
+func DefaultCassandraConfig() *CassandraConfig {
+	return &CassandraConfig{
+		Hosts:          []string{"127.0.0.1:9042"},
+		Keyspace:       "hypgo",
+		Consistency:    "LOCAL_QUORUM",
+		Compression:    "snappy",
+		ConnectTimeout: 10,
+		Timeout:        10,
+		NumConns:       3,
+		MaxConns:       10,
+		MaxRetries:     3,
+		EnableLogging:  "true",
+		PageSize:       1000,
+	}
 }
