@@ -1,4 +1,4 @@
-package elasticsearch
+package elasticSearch
 
 import (
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
