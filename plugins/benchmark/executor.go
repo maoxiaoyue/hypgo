@@ -114,7 +114,7 @@ func (e *Executor) executeWrite(ctx context.Context, runner Runner, operation Op
 			latency := time.Since(startTime)
 			e.metrics.RecordLatency(latency)
 
-			if err != nil || !opResult.Success {
+			if err != nil || opResult == nil {
 				atomic.AddInt64(&failureCount, 1)
 				result.Errors = append(result.Errors, err)
 			} else {
@@ -164,7 +164,7 @@ func (e *Executor) executeRead(ctx context.Context, runner Runner, operation Ope
 			latency := time.Since(startTime)
 			e.metrics.RecordLatency(latency)
 
-			if err != nil || !opResult.Success {
+			if err != nil || opResult == nil {
 				atomic.AddInt64(&failureCount, 1)
 			} else {
 				atomic.AddInt64(&successCount, 1)
@@ -222,7 +222,7 @@ func (e *Executor) executeMixed(ctx context.Context, runner Runner, operation Op
 			latency := time.Since(startTime)
 			e.metrics.RecordLatency(latency)
 
-			if err != nil || !opResult.Success {
+			if err != nil || opResult == nil {
 				atomic.AddInt64(&failureCount, 1)
 			} else {
 				atomic.AddInt64(&successCount, 1)

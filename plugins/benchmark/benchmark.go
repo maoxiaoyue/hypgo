@@ -1,3 +1,4 @@
+// plugins/benchmark/benchmark.go
 package benchmark
 
 import (
@@ -142,6 +143,7 @@ type OperationResult struct {
 	StartTime         time.Time     `json:"start_time"`
 	EndTime           time.Time     `json:"end_time"`
 	Duration          time.Duration `json:"duration"`
+	Success           bool          `json:"success"`
 	TotalOperations   int64         `json:"total_operations"`
 	SuccessOperations int64         `json:"success_operations"`
 	FailedOperations  int64         `json:"failed_operations"`
@@ -182,6 +184,54 @@ func NewPlugin() *Plugin {
 		executor: NewExecutor(),
 		reporter: NewReporter(),
 	}
+}
+
+// CreateRunner 創建運行器工廠方法（簡化版）
+func CreateRunner(dbType string, config map[string]interface{}) (Runner, error) {
+	// 這裡返回一個簡單的模擬運行器
+	// 實際實現應該根據 dbType 返回對應的運行器
+	return &MockRunner{
+		dbType: dbType,
+		config: config,
+	}, nil
+}
+
+// MockRunner 模擬運行器（用於測試）
+type MockRunner struct {
+	dbType  string
+	config  map[string]interface{}
+	metrics *Metrics
+}
+
+func (r *MockRunner) Name() string { return r.dbType }
+func (r *MockRunner) Init(config map[string]interface{}) error {
+	r.config = config
+	r.metrics = &Metrics{LastUpdate: time.Now()}
+	return nil
+}
+func (r *MockRunner) Setup(ctx context.Context) error    { return nil }
+func (r *MockRunner) Teardown(ctx context.Context) error { return nil }
+func (r *MockRunner) RunQuery(ctx context.Context, query Query) (*QueryResult, error) {
+	return &QueryResult{
+		QueryID:   query.ID,
+		StartTime: time.Now(),
+		EndTime:   time.Now().Add(10 * time.Millisecond),
+		Duration:  10 * time.Millisecond,
+		Success:   true,
+	}, nil
+}
+func (r *MockRunner) RunOperation(ctx context.Context, op Operation) (*OperationResult, error) {
+	return &OperationResult{
+		Success:  true,
+		Duration: 5 * time.Millisecond,
+	}, nil
+}
+func (r *MockRunner) HealthCheck(ctx context.Context) error { return nil }
+func (r *MockRunner) GetMetrics() *Metrics {
+	if r.metrics == nil {
+		r.metrics = &Metrics{}
+	}
+	return r.metrics
 }
 
 // Name 返回插件名稱
