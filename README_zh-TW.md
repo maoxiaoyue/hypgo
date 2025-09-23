@@ -91,7 +91,7 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ## 快速開始
 
 ### 1. 建立新專案
-
+必須包含 $GOPATH/bin 於 $PATH 中
 #### 全棧專案（包含前端）
 ```bash
 hyp new myapp
@@ -115,12 +115,15 @@ hyp run
 hyp install rabbitmq
 hyp install kafka
 
-# 添加資料庫支援
-hyp install mongodb
+# Add database support
+hyp install scylladb
 hyp install cassandra
 
-# 添加搜尋功能
+# Add search capability
 hyp install elasticsearch
+
+#add benchmark
+hyp install benchmark
 ```
 
 ### 3. 建構 Docker 映像

@@ -93,6 +93,7 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ### 1. 创建新项目
 
 #### 全栈项目（包含前端）
+如果PATH包含go的執行文件
 ```bash
 hyp new myapp
 cd myapp
@@ -115,12 +116,15 @@ hyp run
 hyp install rabbitmq
 hyp install kafka
 
-# 添加数据库支持
-hyp install mongodb
+# Add database support
+hyp install scylladb
 hyp install cassandra
 
-# 添加搜索功能
+# Add search capability
 hyp install elasticsearch
+
+#add benchmark
+hyp install benchmark
 ```
 
 ### 3. 构建 Docker 镜像

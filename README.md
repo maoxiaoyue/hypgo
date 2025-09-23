@@ -102,6 +102,7 @@ hyp run
 ```
 
 #### API-only Project
+If the path has $GOPATH/bin
 ```bash
 hyp api myapi
 cd myapi
@@ -117,11 +118,14 @@ hyp install rabbitmq
 hyp install kafka
 
 # Add database support
-hyp install mongodb
+hyp install scylladb
 hyp install cassandra
 
 # Add search capability
 hyp install elasticsearch
+
+#add benchmark
+hyp install benchmark
 ```
 
 ### 3. Build Docker Image
