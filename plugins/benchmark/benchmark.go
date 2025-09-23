@@ -1,4 +1,3 @@
-// plugins/benchmark/benchmark.go
 package benchmark
 
 import (
