@@ -4,170 +4,240 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"strings"
 
-	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
 
-// Config 主配置結構
-type Config struct {
-	Server    ServerConfig    `yaml:"server" json:"server"`
-	Cassandra CassandraConfig `yaml:"cassandra" json:"cassandra"`
-	Logger    LoggerConfig    `yaml:"logger" json:"logger"`
-	Database  DatabaseConfig  `yaml:"database" json:"database"`
+// ConfigInterface 配置接口，使用者需要實現此接口
+type ConfigInterface interface {
+	Validate() error
+	GetServerConfig() ServerConfigInterface
+	GetDatabaseConfig() DatabaseConfigInterface
+	GetLoggerConfig() LoggerConfigInterface
 }
 
-// ServerConfig 伺服器配置
-type ServerConfig struct {
-	Host         string `yaml:"host" json:"host"`
-	Port         int    `yaml:"port" json:"port"`
-	Mode         string `yaml:"mode" json:"mode"` // http2, http3
-	ReadTimeout  int    `yaml:"read_timeout" json:"read_timeout"`
-	WriteTimeout int    `yaml:"write_timeout" json:"write_timeout"`
+// ServerConfigInterface 服務器配置接口
+type ServerConfigInterface interface {
+	GetAddr() string
+	GetProtocol() string
+	GetReadTimeout() int
+	GetWriteTimeout() int
+	GetMaxHeaderBytes() int
+	IsGracefulRestartEnabled() bool
 }
 
-// CassandraConfig Cassandra配置
-type CassandraConfig struct {
-	Hosts            []string `yaml:"hosts" json:"hosts"`
-	Keyspace         string   `yaml:"keyspace" json:"keyspace"`
-	Username         string   `yaml:"username" json:"username"`
-	Password         string   `yaml:"password" json:"password"`
-	Consistency      string   `yaml:"consistency" json:"consistency"`
-	Compression      string   `yaml:"compression" json:"compression"`
-	ConnectTimeout   int      `yaml:"connect_timeout" json:"connect_timeout"`
-	Timeout          int      `yaml:"timeout" json:"timeout"`
-	NumConns         int      `yaml:"num_conns" json:"num_conns"`
-	MaxConns         int      `yaml:"max_conns" json:"max_conns"`
-	MaxRetries       int      `yaml:"max_retries" json:"max_retries"`
-	EnableLogging    string   `yaml:"enable_logging" json:"enable_logging"` // "true" or "false"
-	PageSize         int      `yaml:"page_size" json:"page_size"`
-	ShardAwarePort   int      `yaml:"shard_aware_port" json:"shard_aware_port"`
-	EnableShardAware bool     `yaml:"enable_shard_aware" json:"enable_shard_aware"`
+// DatabaseConfigInterface 數據庫配置接口
+type DatabaseConfigInterface interface {
+	GetDriver() string
+	GetDSN() string
+	GetMaxIdleConns() int
+	GetMaxOpenConns() int
+	GetRedisConfig() RedisConfigInterface
 }
 
-// LoggerConfig 日誌配置
-type LoggerConfig struct {
-	Level      string `yaml:"level" json:"level"`
-	Output     string `yaml:"output" json:"output"`
-	Filename   string `yaml:"filename" json:"filename"`
-	MaxSize    int    `yaml:"max_size" json:"max_size"` // MB
-	MaxAge     int    `yaml:"max_age" json:"max_age"`   // days
-	MaxBackups int    `yaml:"max_backups" json:"max_backups"`
-	Colorize   bool   `yaml:"colorize" json:"colorize"`
+// RedisConfigInterface Redis配置接口
+type RedisConfigInterface interface {
+	GetAddr() string
+	GetPassword() string
+	GetDB() int
 }
 
-// DatabaseConfig 資料庫配置
-type DatabaseConfig struct {
-	Type string `yaml:"type" json:"type"` // mysql, postgresql, cassandra, scylladb
+// LoggerConfigInterface 日誌配置接口
+type LoggerConfigInterface interface {
+	GetLevel() string
+	GetOutput() string
+	GetFormat() string
+	GetFilename() string
+	GetMaxSize() int
+	GetMaxAge() int
+	GetMaxBackups() int
+	IsColorized() bool
 }
 
-// LoadConfig 載入配置
-func LoadConfig(configPath string) (*Config, error) {
-	viper.SetConfigType("yaml")
+// ConfigLoader 配置加載器
+type ConfigLoader struct {
+	configPath string
+	plugins    map[string]interface{}
+}
 
-	// 讀取主配置文件
-	mainConfig, err := ioutil.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+// NewConfigLoader 創建配置加載器
+func NewConfigLoader(configPath string) *ConfigLoader {
+	if configPath == "" {
+		configPath = "config"
 	}
-
-	var config Config
-	if err := yaml.Unmarshal(mainConfig, &config); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	return &ConfigLoader{
+		configPath: configPath,
+		plugins:    make(map[string]interface{}),
 	}
+}
 
-	// 載入其他配置文件
-	configDir := filepath.Dir(configPath)
-	files, err := filepath.Glob(filepath.Join(configDir, "*.yaml"))
-	if err != nil {
-		return nil, err
-	}
+// Load 加載配置文件到指定的結構體
+func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
+	var configData []byte
+	var err error
 
-	for _, file := range files {
-		if file == configPath {
-			continue // 跳過主配置文件
-		}
-
-		content, err := ioutil.ReadFile(file)
+	if configFile != "" {
+		// 讀取指定的配置文件
+		configData, err = ioutil.ReadFile(configFile)
 		if err != nil {
+			return fmt.Errorf("failed to read config file %s: %w", configFile, err)
+		}
+	} else {
+		// 讀取默認配置文件
+		defaultConfigFile := filepath.Join(cl.configPath, "config.yaml")
+		configData, err = ioutil.ReadFile(defaultConfigFile)
+		if err != nil {
+			return fmt.Errorf("failed to read default config file: %w", err)
+		}
+	}
+
+	// 解析配置到用戶提供的結構體
+	if err := yaml.Unmarshal(configData, config); err != nil {
+		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// 加載插件配置
+	if err := cl.loadPluginConfigs(); err != nil {
+		return fmt.Errorf("failed to load plugin configs: %w", err)
+	}
+
+	// 如果配置實現了 Validate 方法，則調用驗證
+	if validator, ok := config.(interface{ Validate() error }); ok {
+		if err := validator.Validate(); err != nil {
+			return fmt.Errorf("config validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// LoadWithInterface 加載配置並返回 ConfigInterface
+func (cl *ConfigLoader) LoadWithInterface(configFile string, config ConfigInterface) error {
+	if err := cl.Load(configFile, config); err != nil {
+		return err
+	}
+	return config.Validate()
+}
+
+// loadPluginConfigs 加載插件配置文件
+func (cl *ConfigLoader) loadPluginConfigs() error {
+	configFiles, err := filepath.Glob(filepath.Join(cl.configPath, "*.yaml"))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range configFiles {
+		filename := filepath.Base(file)
+		if filename == "config.yaml" {
 			continue
 		}
 
-		// 根據文件名決定配置類型
-		filename := filepath.Base(file)
-		switch filename {
-		case "cassandra.yaml":
-			var cassandraConfig CassandraConfig
-			if err := yaml.Unmarshal(content, &cassandraConfig); err == nil {
-				config.Cassandra = cassandraConfig
-			}
-		case "logger.yaml":
-			var loggerConfig LoggerConfig
-			if err := yaml.Unmarshal(content, &loggerConfig); err == nil {
-				config.Logger = loggerConfig
-			}
+		// 讀取插件配置文件
+		data, err := ioutil.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", file, err)
+		}
+
+		// 解析插件配置
+		var pluginConfig map[string]interface{}
+		if err := yaml.Unmarshal(data, &pluginConfig); err != nil {
+			return fmt.Errorf("failed to unmarshal %s: %w", file, err)
+		}
+
+		// 插件名稱為文件名（去掉.yaml後綴）
+		pluginName := strings.TrimSuffix(filename, ".yaml")
+		cl.plugins[pluginName] = pluginConfig
+	}
+
+	return nil
+}
+
+// GetPluginConfig 獲取插件配置
+func (cl *ConfigLoader) GetPluginConfig(pluginName string) map[string]interface{} {
+	if cfg, ok := cl.plugins[pluginName]; ok {
+		if configMap, ok := cfg.(map[string]interface{}); ok {
+			return configMap
 		}
 	}
-
-	// 設定預設值
-	setDefaults(&config)
-
-	return &config, nil
+	return nil
 }
 
-// setDefaults 設定預設值
-func setDefaults(config *Config) {
-	// Cassandra預設值
-	if config.Cassandra.Hosts == nil || len(config.Cassandra.Hosts) == 0 {
-		config.Cassandra.Hosts = []string{"127.0.0.1:9042"}
-	}
-	if config.Cassandra.Keyspace == "" {
-		config.Cassandra.Keyspace = "hypgo"
-	}
-	if config.Cassandra.Consistency == "" {
-		config.Cassandra.Consistency = "LOCAL_QUORUM"
-	}
-	if config.Cassandra.ConnectTimeout == 0 {
-		config.Cassandra.ConnectTimeout = 10
-	}
-	if config.Cassandra.Timeout == 0 {
-		config.Cassandra.Timeout = 10
-	}
-	if config.Cassandra.NumConns == 0 {
-		config.Cassandra.NumConns = 3
-	}
-	if config.Cassandra.MaxRetries == 0 {
-		config.Cassandra.MaxRetries = 3
-	}
-	if config.Cassandra.PageSize == 0 {
-		config.Cassandra.PageSize = 1000
-	}
-	if config.Cassandra.EnableLogging == "" {
-		config.Cassandra.EnableLogging = "true"
+// GetAllPluginConfigs 獲取所有插件配置
+func (cl *ConfigLoader) GetAllPluginConfigs() map[string]interface{} {
+	return cl.plugins
+}
+
+// LoadYAML 通用的 YAML 文件加載方法
+func LoadYAML(filename string, out interface{}) error {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read file %s: %w", filename, err)
 	}
 
-	// Logger預設值
-	if config.Logger.Level == "" {
-		config.Logger.Level = "INFO"
+	if err := yaml.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("failed to unmarshal yaml: %w", err)
 	}
-	if config.Logger.Output == "" {
-		config.Logger.Output = "stdout"
+
+	return nil
+}
+
+// SaveYAML 通用的 YAML 文件保存方法
+func SaveYAML(filename string, data interface{}) error {
+	output, err := yaml.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+
+	if err := ioutil.WriteFile(filename, output, 0644); err != nil {
+		return fmt.Errorf("failed to write file %s: %w", filename, err)
+	}
+
+	return nil
+}
+
+// WatchConfig 監視配置文件變化（用於熱重載）
+type ConfigWatcher struct {
+	configFile string
+	onChange   func() error
+}
+
+// NewConfigWatcher 創建配置監視器
+func NewConfigWatcher(configFile string, onChange func() error) *ConfigWatcher {
+	return &ConfigWatcher{
+		configFile: configFile,
+		onChange:   onChange,
 	}
 }
 
-// DefaultCassandraConfig 預設Cassandra配置
-func DefaultCassandraConfig() *CassandraConfig {
-	return &CassandraConfig{
-		Hosts:          []string{"127.0.0.1:9042"},
-		Keyspace:       "hypgo",
-		Consistency:    "LOCAL_QUORUM",
-		Compression:    "snappy",
-		ConnectTimeout: 10,
-		Timeout:        10,
-		NumConns:       3,
-		MaxConns:       10,
-		MaxRetries:     3,
-		EnableLogging:  "true",
-		PageSize:       1000,
+// 配置驗證輔助函數
+
+// ValidateProtocol 驗證協議
+func ValidateProtocol(protocol string) error {
+	switch protocol {
+	case "http1", "http2", "http3":
+		return nil
+	default:
+		return fmt.Errorf("invalid protocol: %s, must be http1, http2, or http3", protocol)
+	}
+}
+
+// ValidateLogLevel 驗證日誌級別
+func ValidateLogLevel(level string) error {
+	switch level {
+	case "debug", "info", "notice", "warning", "emergency":
+		return nil
+	default:
+		return fmt.Errorf("invalid log level: %s", level)
+	}
+}
+
+// ValidateDatabaseDriver 驗證數據庫驅動
+func ValidateDatabaseDriver(driver string) error {
+	switch driver {
+	case "mysql", "postgres", "tidb", "redis", "cassandra", "scylladb", "":
+		return nil
+	default:
+		return fmt.Errorf("unsupported database driver: %s", driver)
 	}
 }
