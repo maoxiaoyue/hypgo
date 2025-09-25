@@ -1,4 +1,3 @@
-// hypgo/pkg/database/ent.go
 package database
 
 import (

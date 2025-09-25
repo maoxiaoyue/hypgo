@@ -1,11 +1,12 @@
 package cassandra
 
 import (
-	"context"
+	stdcontext "context"
 	"fmt"
 	"time"
 
 	"github.com/gocql/gocql"
+	"github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/database"
 )
 
@@ -159,8 +160,11 @@ func (c *CassandraPlugin) Init(configMap map[string]interface{}) error {
 		switch config.Compression {
 		case "snappy":
 			cluster.Compressor = gocql.SnappyCompressor{}
-		case "lz4":
-			cluster.Compressor = gocql.LZ4Compressor{}
+			// LZ4 壓縮需要額外的導入，如需使用請確保已安裝：
+			// go get github.com/gocql/gocql/lz4
+			// 然後取消下面的註釋：
+			// case "lz4":
+			//	cluster.Compressor = gocql.LZ4Compressor{}
 		}
 	}
 
@@ -217,16 +221,42 @@ func (c *CassandraPlugin) Close() error {
 	return nil
 }
 
-// Ping 健康檢查
-func (c *CassandraPlugin) Ping(ctx context.Context) error {
+// Ping 健康檢查 (使用 HypGo context)
+func (c *CassandraPlugin) Ping(ctx *context.Context) error {
 	if c.session == nil {
 		return fmt.Errorf("no cassandra session")
 	}
 
 	query := c.session.Query("SELECT now() FROM system.local")
-	if ctx != nil {
-		query = query.WithContext(ctx)
+
+	// 如果有 HypGo context 且包含 Request，使用其 context
+	if ctx != nil && ctx.Request != nil {
+		stdCtx := ctx.Request.Context()
+		query = query.WithContext(stdCtx)
+	} else {
+		// 否則使用標準背景 context
+		stdCtx := stdcontext.Background()
+		query = query.WithContext(stdCtx)
 	}
+
+	if err := query.Exec(); err != nil {
+		return fmt.Errorf("cassandra ping failed: %w", err)
+	}
+
+	return nil
+}
+
+// PingWithStdContext 使用標準 context 進行健康檢查
+func (c *CassandraPlugin) PingWithStdContext(ctx stdcontext.Context) error {
+	if c.session == nil {
+		return fmt.Errorf("no cassandra session")
+	}
+
+	if ctx == nil {
+		ctx = stdcontext.Background()
+	}
+
+	query := c.session.Query("SELECT now() FROM system.local").WithContext(ctx)
 
 	if err := query.Exec(); err != nil {
 		return fmt.Errorf("cassandra ping failed: %w", err)
@@ -246,6 +276,23 @@ func (c *CassandraPlugin) Query(query string, values ...interface{}) *gocql.Quer
 		return nil
 	}
 	return c.session.Query(query, values...)
+}
+
+// QueryWithContext 使用 HypGo context 執行查詢
+func (c *CassandraPlugin) QueryWithContext(ctx *context.Context, query string, values ...interface{}) *gocql.Query {
+	if c.session == nil {
+		return nil
+	}
+
+	q := c.session.Query(query, values...)
+
+	// 如果有 HypGo context 且包含 Request，使用其 context
+	if ctx != nil && ctx.Request != nil {
+		stdCtx := ctx.Request.Context()
+		q = q.WithContext(stdCtx)
+	}
+
+	return q
 }
 
 // Batch 創建批處理
