@@ -3,152 +3,241 @@ package config
 import (
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	Server   ServerConfig           `mapstructure:"server"`
-	Database DatabaseConfig         `mapstructure:"database"`
-	Logger   LoggerConfig           `mapstructure:"logger"`
-	Plugins  map[string]interface{} `mapstructure:"plugins"`
+// ConfigInterface 配置接口，使用者需要實現此接口
+type ConfigInterface interface {
+	Validate() error
+	GetServerConfig() ServerConfigInterface
+	GetDatabaseConfig() DatabaseConfigInterface
+	GetLoggerConfig() LoggerConfigInterface
 }
 
-type ServerConfig struct {
-	Protocol              string    `mapstructure:"protocol"` // http1, http2, http3
-	Addr                  string    `mapstructure:"addr"`
-	ReadTimeout           int       `mapstructure:"read_timeout"`
-	WriteTimeout          int       `mapstructure:"write_timeout"`
-	IdleTimeout           int       `mapstructure:"idle_timeout"`
-	KeepAlive             int       `mapstructure:"keep_alive"`
-	MaxHandlers           int       `mapstructure:"max_handlers"`
-	MaxConcurrentStreams  uint32    `mapstructure:"max_concurrent_streams"`
-	MaxReadFrameSize      uint32    `mapstructure:"max_read_frame_size"`
-	TLS                   TLSConfig `mapstructure:"tls"`
-	EnableGracefulRestart bool      `mapstructure:"enable_graceful_restart"`
+// ServerConfigInterface 服務器配置接口
+type ServerConfigInterface interface {
+	GetAddr() string
+	GetProtocol() string
+	GetReadTimeout() int
+	GetWriteTimeout() int
+	GetMaxHeaderBytes() int
+	IsGracefulRestartEnabled() bool
 }
 
-type TLSConfig struct {
-	Enabled  bool   `mapstructure:"enabled"`
-	CertFile string `mapstructure:"cert_file"`
-	KeyFile  string `mapstructure:"key_file"`
+// DatabaseConfigInterface 數據庫配置接口
+type DatabaseConfigInterface interface {
+	GetDriver() string
+	GetDSN() string
+	GetMaxIdleConns() int
+	GetMaxOpenConns() int
+	GetRedisConfig() RedisConfigInterface
 }
 
-type DatabaseConfig struct {
-	Driver       string          `mapstructure:"driver"` // mysql, postgres, tidb, redis, cassandra
-	DSN          string          `mapstructure:"dsn"`
-	MaxIdleConns int             `mapstructure:"max_idle_conns"`
-	MaxOpenConns int             `mapstructure:"max_open_conns"`
-	Redis        RedisConfig     `mapstructure:"redis"`
-	Cassandra    CassandraConfig `mapstructure:"cassandra"`
+// RedisConfigInterface Redis配置接口
+type RedisConfigInterface interface {
+	GetAddr() string
+	GetPassword() string
+	GetDB() int
 }
 
-type RedisConfig struct {
-	Addr     string `mapstructure:"addr"`
-	Password string `mapstructure:"password"`
-	DB       int    `mapstructure:"db"`
+// LoggerConfigInterface 日誌配置接口
+type LoggerConfigInterface interface {
+	GetLevel() string
+	GetOutput() string
+	GetFormat() string
+	GetFilename() string
+	GetMaxSize() int
+	GetMaxAge() int
+	GetMaxBackups() int
+	IsColorized() bool
 }
 
-type CassandraConfig struct {
-	Hosts    []string `mapstructure:"hosts"`
-	Keyspace string   `mapstructure:"keyspace"`
+// ConfigLoader 配置加載器
+type ConfigLoader struct {
+	configPath string
+	plugins    map[string]interface{}
 }
 
-type LoggerConfig struct {
-	Level    string         `mapstructure:"level"`
-	Output   string         `mapstructure:"output"`
-	Rotation RotationConfig `mapstructure:"rotation"`
-	Colors   bool           `mapstructure:"colors"`
-}
-
-type RotationConfig struct {
-	MaxSize    string `mapstructure:"max_size"` // 10MB, 100MB
-	MaxAge     string `mapstructure:"max_age"`  // 1h, 1d, 1w
-	MaxBackups int    `mapstructure:"max_backups"`
-	Compress   bool   `mapstructure:"compress"`
-}
-
-func Load(configPath string) (*Config, error) {
-	viper.SetConfigFile(configPath)
-	viper.SetConfigType("yaml")
-
-	viper.SetEnvPrefix("HYPGO")
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
-
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("failed to read config: %w", err)
+// NewConfigLoader 創建配置加載器
+func NewConfigLoader(configPath string) *ConfigLoader {
+	if configPath == "" {
+		configPath = "config"
 	}
-
-	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	return &ConfigLoader{
+		configPath: configPath,
+		plugins:    make(map[string]interface{}),
 	}
-
-	// 載入插件配置
-	cfg.Plugins = make(map[string]interface{})
-	if err := loadPluginConfigs(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to load plugin configs: %w", err)
-	}
-
-	return &cfg, nil
 }
 
-func loadPluginConfigs(cfg *Config) error {
-	configDir := filepath.Dir(viper.ConfigFileUsed())
+// Load 加載配置文件到指定的結構體
+func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
+	var configData []byte
+	var err error
 
-	// 插件配置文件列表
-	pluginFiles := []string{
-		"rabbitmq.yaml",
-		"kafka.yaml",
-		"cassandra.yaml",
-		"scylladb.yaml",
-		"mongodb.yaml",
-		"elasticsearch.yaml",
-	}
-
-	for _, file := range pluginFiles {
-		pluginPath := filepath.Join(configDir, file)
-
-		// 檢查文件是否存在
-		if _, err := ioutil.ReadFile(pluginPath); err != nil {
-			continue // 跳過不存在的插件配置
+	if configFile != "" {
+		// 讀取指定的配置文件
+		configData, err = ioutil.ReadFile(configFile)
+		if err != nil {
+			return fmt.Errorf("failed to read config file %s: %w", configFile, err)
 		}
-
-		// 讀取插件配置
-		pluginViper := viper.New()
-		pluginViper.SetConfigFile(pluginPath)
-
-		if err := pluginViper.ReadInConfig(); err != nil {
-			return fmt.Errorf("failed to read %s: %w", file, err)
+	} else {
+		// 讀取默認配置文件
+		defaultConfigFile := filepath.Join(cl.configPath, "config.yaml")
+		configData, err = ioutil.ReadFile(defaultConfigFile)
+		if err != nil {
+			return fmt.Errorf("failed to read default config file: %w", err)
 		}
+	}
 
-		// 獲取插件名稱（去掉 .yaml 後綴）
-		pluginName := strings.TrimSuffix(file, ".yaml")
+	// 解析配置到用戶提供的結構體
+	if err := yaml.Unmarshal(configData, config); err != nil {
+		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
 
-		// 將插件配置添加到主配置中
-		cfg.Plugins[pluginName] = pluginViper.AllSettings()
+	// 加載插件配置
+	if err := cl.loadPluginConfigs(); err != nil {
+		return fmt.Errorf("failed to load plugin configs: %w", err)
+	}
+
+	// 如果配置實現了 Validate 方法，則調用驗證
+	if validator, ok := config.(interface{ Validate() error }); ok {
+		if err := validator.Validate(); err != nil {
+			return fmt.Errorf("config validation failed: %w", err)
+		}
 	}
 
 	return nil
 }
 
-// GetPluginConfig 獲取特定插件的配置
-func (c *Config) GetPluginConfig(pluginName string) (map[string]interface{}, bool) {
-	config, ok := c.Plugins[pluginName].(map[string]interface{})
-	return config, ok
+// LoadWithInterface 加載配置並返回 ConfigInterface
+func (cl *ConfigLoader) LoadWithInterface(configFile string, config ConfigInterface) error {
+	if err := cl.Load(configFile, config); err != nil {
+		return err
+	}
+	return config.Validate()
 }
 
-// SavePIDFile 保存進程 ID 文件（用於熱重啟）
-func SavePIDFile() error {
-	pid := os.Getpid()
-	return ioutil.WriteFile("hypgo.pid", []byte(fmt.Sprintf("%d", pid)), 0644)
+// loadPluginConfigs 加載插件配置文件
+func (cl *ConfigLoader) loadPluginConfigs() error {
+	configFiles, err := filepath.Glob(filepath.Join(cl.configPath, "*.yaml"))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range configFiles {
+		filename := filepath.Base(file)
+		if filename == "config.yaml" {
+			continue
+		}
+
+		// 讀取插件配置文件
+		data, err := ioutil.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", file, err)
+		}
+
+		// 解析插件配置
+		var pluginConfig map[string]interface{}
+		if err := yaml.Unmarshal(data, &pluginConfig); err != nil {
+			return fmt.Errorf("failed to unmarshal %s: %w", file, err)
+		}
+
+		// 插件名稱為文件名（去掉.yaml後綴）
+		pluginName := strings.TrimSuffix(filename, ".yaml")
+		cl.plugins[pluginName] = pluginConfig
+	}
+
+	return nil
 }
 
-// RemovePIDFile 刪除進程 ID 文件
-func RemovePIDFile() {
-	os.Remove("hypgo.pid")
+// GetPluginConfig 獲取插件配置
+func (cl *ConfigLoader) GetPluginConfig(pluginName string) map[string]interface{} {
+	if cfg, ok := cl.plugins[pluginName]; ok {
+		if configMap, ok := cfg.(map[string]interface{}); ok {
+			return configMap
+		}
+	}
+	return nil
+}
+
+// GetAllPluginConfigs 獲取所有插件配置
+func (cl *ConfigLoader) GetAllPluginConfigs() map[string]interface{} {
+	return cl.plugins
+}
+
+// LoadYAML 通用的 YAML 文件加載方法
+func LoadYAML(filename string, out interface{}) error {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read file %s: %w", filename, err)
+	}
+
+	if err := yaml.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("failed to unmarshal yaml: %w", err)
+	}
+
+	return nil
+}
+
+// SaveYAML 通用的 YAML 文件保存方法
+func SaveYAML(filename string, data interface{}) error {
+	output, err := yaml.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+
+	if err := ioutil.WriteFile(filename, output, 0644); err != nil {
+		return fmt.Errorf("failed to write file %s: %w", filename, err)
+	}
+
+	return nil
+}
+
+// WatchConfig 監視配置文件變化（用於熱重載）
+type ConfigWatcher struct {
+	configFile string
+	onChange   func() error
+}
+
+// NewConfigWatcher 創建配置監視器
+func NewConfigWatcher(configFile string, onChange func() error) *ConfigWatcher {
+	return &ConfigWatcher{
+		configFile: configFile,
+		onChange:   onChange,
+	}
+}
+
+// 配置驗證輔助函數
+
+// ValidateProtocol 驗證協議
+func ValidateProtocol(protocol string) error {
+	switch protocol {
+	case "http1", "http2", "http3":
+		return nil
+	default:
+		return fmt.Errorf("invalid protocol: %s, must be http1, http2, or http3", protocol)
+	}
+}
+
+// ValidateLogLevel 驗證日誌級別
+func ValidateLogLevel(level string) error {
+	switch level {
+	case "debug", "info", "notice", "warning", "emergency":
+		return nil
+	default:
+		return fmt.Errorf("invalid log level: %s", level)
+	}
+}
+
+// ValidateDatabaseDriver 驗證數據庫驅動
+func ValidateDatabaseDriver(driver string) error {
+	switch driver {
+	case "mysql", "postgres", "tidb", "redis", "cassandra", "scylladb", "":
+		return nil
+	default:
+		return fmt.Errorf("unsupported database driver: %s", driver)
+	}
 }
