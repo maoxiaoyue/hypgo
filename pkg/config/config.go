@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -15,6 +16,32 @@ type ConfigInterface interface {
 	GetServerConfig() ServerConfigInterface
 	GetDatabaseConfig() DatabaseConfigInterface
 	GetLoggerConfig() LoggerConfigInterface
+}
+
+type Config struct {
+	Server   ServerConfig   `mapstructure:"server"`
+	Database DatabaseConfig `mapstructure:"database"`
+	Logger   LoggerConfig   `mapstructure:"logger"`
+	Plugins  PluginsConfig  `mapstructure:"plugins"`
+}
+
+type ServerConfig struct {
+	Addr         string        `mapstructure:"addr"`
+	Protocol     string        `mapstructure:"protocol"` // "http2", "http3"
+	TLS          TLSConfig     `mapstructure:"tls"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+}
+
+type TLSConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	CertFile string `mapstructure:"cert_file"`
+	KeyFile  string `mapstructure:"key_file"`
+}
+
+type DatabaseConfig struct {
+	Driver string `mapstructure:"driver"` // mysql, postgresql, tidb, redis
+	DSN    string `mapstructure:"dsn"`
 }
 
 // ServerConfigInterface 服務器配置接口
@@ -34,6 +61,20 @@ type DatabaseConfigInterface interface {
 	GetMaxIdleConns() int
 	GetMaxOpenConns() int
 	GetRedisConfig() RedisConfigInterface
+}
+
+type LoggerConfig struct {
+	Level        string `mapstructure:"level"` // debug, info, notice, warning, emergency
+	Output       string `mapstructure:"output"`
+	MaxSize      int    `mapstructure:"max_size"`
+	MaxAge       int    `mapstructure:"max_age"`
+	Compress     bool   `mapstructure:"compress"`
+	ColorEnabled bool   `mapstructure:"color_enabled"`
+}
+
+type PluginsConfig struct {
+	Enabled []string               `mapstructure:"enabled"`
+	Configs map[string]interface{} `mapstructure:"configs"`
 }
 
 // RedisConfigInterface Redis配置接口
