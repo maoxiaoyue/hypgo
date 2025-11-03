@@ -8,8 +8,7 @@ import (
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
-// OptimizedRouter 高效能路由器
-type OptimizedRouter struct {
+type Router struct {
 	trees      map[string]*radixNode // 每個 HTTP 方法一棵樹
 	cache      *routeCache           // 路由快取
 	pool       *sync.Pool            // 參數池
@@ -26,6 +25,10 @@ type OptimizedRouter struct {
 	// 404/405 處理器
 	notFound         hypcontext.HandlerFunc
 	methodNotAllowed hypcontext.HandlerFunc
+}
+
+type HTTP3Config struct {
+	Enabled bool
 }
 
 /* //更完整的功能
@@ -61,19 +64,19 @@ const (
 // routeCache 路由快取（LRU）
 type routeCache struct {
 	mu       sync.RWMutex
-	cache    map[string]*cacheEntry
-	head     *cacheEntry
-	tail     *cacheEntry
+	items    map[string]*cacheItem
+	head     *cacheItem
+	tail     *cacheItem
 	capacity int
 	size     int
 }
 
-type cacheEntry struct {
+type cacheItem struct {
 	key      string
 	handlers []hypcontext.HandlerFunc
 	params   []Param
-	prev     *cacheEntry
-	next     *cacheEntry
+	prev     *cacheItem
+	next     *cacheItem
 }
 
 // Param 路由參數
@@ -82,44 +85,32 @@ type Param struct {
 	Value string
 }
 
-// NewOptimized 創建優化的路由器
-func NewOptimized(opts ...RouterOption) *OptimizedRouter {
-	r := &OptimizedRouter{
+// New 創建新的路由器
+func New() *Router {
+	return &Router{
 		trees:                  make(map[string]*radixNode),
-		maxParams:              16,
+		cache:                  newRouteCache(1000),
+		middleware:             make([]hypcontext.HandlerFunc, 0),
+		maxParams:              10,
 		enableCache:            true,
 		cacheSize:              1000,
-		caseSensitive:          true,
+		caseSensitive:          false,
 		strictSlash:            false,
-		handleMethodNotAllowed: false,
-	}
-
-	// 應用選項
-	for _, opt := range opts {
-		opt(r)
-	}
-
-	// 初始化快取
-	if r.enableCache {
-		r.cache = newRouteCache(r.cacheSize)
-	}
-
-	// 初始化參數池
-	r.pool = &sync.Pool{
-		New: func() interface{} {
-			return make([]Param, 0, r.maxParams)
+		handleMethodNotAllowed: true,
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return make(map[string]string)
+			},
 		},
 	}
-
-	return r
 }
 
 // RouterOption 路由器選項
-type RouterOption func(*OptimizedRouter)
+type RouterOption func(*Router)
 
 // WithCache 設置快取
 func WithCache(size int) RouterOption {
-	return func(r *OptimizedRouter) {
+	return func(r *Router) {
 		r.enableCache = true
 		r.cacheSize = size
 	}
@@ -127,7 +118,7 @@ func WithCache(size int) RouterOption {
 
 // WithMaxParams 設置最大參數數
 func WithMaxParams(n int) RouterOption {
-	return func(r *OptimizedRouter) {
+	return func(r *Router) {
 		r.maxParams = n
 	}
 }
@@ -135,7 +126,7 @@ func WithMaxParams(n int) RouterOption {
 // ===== 路由註冊 =====
 
 // Handle 註冊路由
-func (r *OptimizedRouter) Handle(method, path string, handlers ...hypcontext.HandlerFunc) {
+func (r *Router) Handle(method, path string, handlers ...hypcontext.HandlerFunc) {
 	if path == "" {
 		panic("path cannot be empty")
 	}
@@ -161,29 +152,35 @@ func (r *OptimizedRouter) Handle(method, path string, handlers ...hypcontext.Han
 }
 
 // GET 註冊 GET 路由
-func (r *OptimizedRouter) GET(path string, handlers ...hypcontext.HandlerFunc) {
+func (r *Router) GET(path string, handlers ...hypcontext.HandlerFunc) {
 	r.Handle(http.MethodGet, path, handlers...)
 }
 
 // POST 註冊 POST 路由
-func (r *OptimizedRouter) POST(path string, handlers ...hypcontext.HandlerFunc) {
+func (r *Router) POST(path string, handlers ...hypcontext.HandlerFunc) {
 	r.Handle(http.MethodPost, path, handlers...)
 }
 
 // PUT 註冊 PUT 路由
-func (r *OptimizedRouter) PUT(path string, handlers ...hypcontext.HandlerFunc) {
+func (r *Router) PUT(path string, handlers ...hypcontext.HandlerFunc) {
 	r.Handle(http.MethodPut, path, handlers...)
 }
 
 // DELETE 註冊 DELETE 路由
-func (r *OptimizedRouter) DELETE(path string, handlers ...hypcontext.HandlerFunc) {
+func (r *Router) DELETE(path string, handlers ...hypcontext.HandlerFunc) {
 	r.Handle(http.MethodDelete, path, handlers...)
 }
 
-// ===== 路由匹配（核心） =====
+// Static 服務靜態文件
+func (r *Router) Static(path string, dir string) {
+	fs := http.FileServer(http.Dir(dir))
+	r.GET(path+"/*filepath", func(c *hypcontext.Context) {
+		http.StripPrefix(path, fs).ServeHTTP(c.Writer, c.Request)
+	})
+}
 
 // ServeHTTP 實現 http.Handler
-func (r *OptimizedRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := hypcontext.New(w, req)
 	defer c.Release()
 
@@ -494,7 +491,7 @@ func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.Han
 // ===== 輔助函數 =====
 
 // executeHandlers 執行處理器鏈
-func (r *OptimizedRouter) executeHandlers(c *hypcontext.Context, handlers []hypcontext.HandlerFunc) {
+func (r *Router) executeHandlers(c *hypcontext.Context, handlers []hypcontext.HandlerFunc) {
 	// 執行全域中間件
 	for _, h := range r.middleware {
 		h(c)
@@ -513,12 +510,12 @@ func (r *OptimizedRouter) executeHandlers(c *hypcontext.Context, handlers []hypc
 }
 
 // getParams 從池中獲取參數切片
-func (r *OptimizedRouter) getParams() []Param {
+func (r *Router) getParams() []Param {
 	return r.pool.Get().([]Param)
 }
 
 // putParams 返回參數切片到池
-func (r *OptimizedRouter) putParams(params []Param) {
+func (r *Router) putParams(params []Param) {
 	if params != nil {
 		params = params[:0]
 		r.pool.Put(params)
@@ -526,7 +523,7 @@ func (r *OptimizedRouter) putParams(params []Param) {
 }
 
 // makeContextParams 轉換參數格式
-func (r *OptimizedRouter) makeContextParams(params []Param) hypcontext.Params {
+func (r *Router) makeContextParams(params []Param) hypcontext.Params {
 	if len(params) == 0 {
 		return nil
 	}
@@ -594,18 +591,17 @@ func countParams(path string) int {
 	return n
 }
 
-// ===== LRU 快取實現 =====
-
-func newRouteCache(capacity int) *routeCache {
+// newRouteCache 創建路由快取
+func newRouteCache(size int) *routeCache {
 	return &routeCache{
-		cache:    make(map[string]*cacheEntry),
-		capacity: capacity,
+		items: make(map[string]*cacheItem),
+		size:  size,
 	}
 }
 
-func (c *routeCache) get(key string) *cacheEntry {
+func (c *routeCache) get(key string) *cacheItem {
 	c.mu.RLock()
-	entry, exists := c.cache[key]
+	entry, exists := c.items[key]
 	c.mu.RUnlock()
 
 	if !exists {
@@ -624,7 +620,7 @@ func (c *routeCache) put(key string, handlers []hypcontext.HandlerFunc, params [
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if entry, exists := c.cache[key]; exists {
+	if entry, exists := c.items[key]; exists {
 		entry.handlers = handlers
 		entry.params = params
 		c.moveToHead(entry)
@@ -632,13 +628,13 @@ func (c *routeCache) put(key string, handlers []hypcontext.HandlerFunc, params [
 	}
 
 	// 新增項目
-	entry := &cacheEntry{
+	entry := &cacheItem{
 		key:      key,
 		handlers: handlers,
 		params:   params,
 	}
 
-	c.cache[key] = entry
+	c.items[key] = entry
 	c.addToHead(entry)
 	c.size++
 
@@ -648,12 +644,12 @@ func (c *routeCache) put(key string, handlers []hypcontext.HandlerFunc, params [
 	}
 }
 
-func (c *routeCache) moveToHead(entry *cacheEntry) {
+func (c *routeCache) moveToHead(entry *cacheItem) {
 	c.removeEntry(entry)
 	c.addToHead(entry)
 }
 
-func (c *routeCache) addToHead(entry *cacheEntry) {
+func (c *routeCache) addToHead(entry *cacheItem) {
 	entry.prev = nil
 	entry.next = c.head
 
@@ -667,7 +663,7 @@ func (c *routeCache) addToHead(entry *cacheEntry) {
 	}
 }
 
-func (c *routeCache) removeEntry(entry *cacheEntry) {
+func (c *routeCache) removeEntry(entry *cacheItem) {
 	if entry.prev != nil {
 		entry.prev.next = entry.next
 	} else {
@@ -686,7 +682,7 @@ func (c *routeCache) removeTail() {
 		return
 	}
 
-	delete(c.cache, c.tail.key)
+	delete(c.items, c.tail.key)
 	c.removeEntry(c.tail)
 	c.size--
 }
@@ -694,17 +690,17 @@ func (c *routeCache) removeTail() {
 // ===== 公開方法 =====
 
 // Use 添加全域中間件
-func (r *OptimizedRouter) Use(middleware ...hypcontext.HandlerFunc) {
+func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
 	r.middleware = append(r.middleware, middleware...)
 }
 
 // NotFound 設置 404 處理器
-func (r *OptimizedRouter) NotFound(handler hypcontext.HandlerFunc) {
+func (r *Router) NotFound(handler hypcontext.HandlerFunc) {
 	r.notFound = handler
 }
 
 // MethodNotAllowed 設置 405 處理器
-func (r *OptimizedRouter) MethodNotAllowed(handler hypcontext.HandlerFunc) {
+func (r *Router) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 	r.methodNotAllowed = handler
 	r.handleMethodNotAllowed = true
 }

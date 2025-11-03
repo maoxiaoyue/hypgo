@@ -71,18 +71,6 @@ func registerCommands() {
 		},
 	})
 
-	// 註冊 install 命令
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "install [plugin-name]",
-		Short: "Install a HypGo plugin",
-		Long:  `Install a HypGo plugin and add its configuration file to the config directory.`,
-		Args:  cobra.MinimumNArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 install.go 中的實際實作
-			// RunInstall(args[0])
-		},
-	})
-
 	// 註冊 list 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "list",

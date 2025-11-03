@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -81,12 +82,12 @@ func (s *Server) Use(middlewares ...hypcontext.HandlerFunc) {
 // Start 根據配置啟動伺服器
 func (s *Server) Start() error {
 	// 保存 PID 檔案
-	if err := config.SavePIDFile(); err != nil {
+	if err := s.savePIDFile(); err != nil {
 		s.logger.Warning("Failed to save PID file: %v", err)
 	}
 
 	// 設置優雅重啟處理
-	if s.config.Server.EnableGracefulRestart {
+	if s.isGracefulRestartEnabled() {
 		go s.handleGracefulRestart()
 	}
 
@@ -383,7 +384,7 @@ func (s *Server) handleGracefulRestart() {
 		}
 
 		// 移除 PID 檔案
-		config.RemovePIDFile()
+		s.removePIDFile()
 		os.Exit(0)
 	}
 }
@@ -479,4 +480,22 @@ func (s *Server) GetProtocol() string {
 // EnableHTTP3 啟用 HTTP/3
 func (s *Server) EnableHTTP3(config *router.HTTP3Config) {
 	s.router.EnableHTTP3(config)
+}
+
+// savePIDFile 保存 PID 檔案
+func (s *Server) savePIDFile() error {
+	pid := os.Getpid()
+	pidStr := strconv.Itoa(pid)
+	return os.WriteFile("hypgo.pid", []byte(pidStr), 0644)
+}
+
+// removePIDFile 移除 PID 檔案
+func (s *Server) removePIDFile() {
+	os.Remove("hypgo.pid")
+}
+
+// isGracefulRestartEnabled 檢查是否啟用優雅重啟
+func (s *Server) isGracefulRestartEnabled() bool {
+	// 預設啟用優雅重啟
+	return true
 }

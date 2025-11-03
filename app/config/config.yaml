@@ -24,14 +24,10 @@ database:
     addr: "localhost:6379"
     password: ""
     db: 0
-  cassandra:
-    hosts:
-      - "localhost:9042"
-    keyspace: "hypgo"
 
 logger:
-  level: debug  # 可選: debug, info, notice, warning, emergency
-  output: logs/app.log  # stdout 或檔案路徑
+  level: "info"  # 可選: debug, info, notice, warning, emergency
+  output: "logs/app.log"  # stdout 或檔案路徑
   colors: true
   rotation:
     max_size: 100MB    # 10MB, 100MB, 1GB

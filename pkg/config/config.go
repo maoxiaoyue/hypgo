@@ -2,9 +2,8 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -19,29 +18,37 @@ type ConfigInterface interface {
 }
 
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Logger   LoggerConfig   `mapstructure:"logger"`
-	Plugins  PluginsConfig  `mapstructure:"plugins"`
+	Server   ServerConfig   `mapstructure:"server" yaml:"server"`
+	Database DatabaseConfig `mapstructure:"database" yaml:"database"`
+	Logger   LoggerConfig   `mapstructure:"logger" yaml:"logger"`
 }
 
 type ServerConfig struct {
-	Addr         string        `mapstructure:"addr"`
-	Protocol     string        `mapstructure:"protocol"` // "http2", "http3"
-	TLS          TLSConfig     `mapstructure:"tls"`
-	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
-	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+	Addr         string        `mapstructure:"addr" yaml:"addr"`
+	Protocol     string        `mapstructure:"protocol" yaml:"protocol"` // "http1", "http2", "http3", "auto"
+	TLS          TLSConfig     `mapstructure:"tls" yaml:"tls"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
+
+	// HTTP/2 相關配置
+	MaxHandlers          int `mapstructure:"max_handlers" yaml:"max_handlers"`
+	MaxConcurrentStreams int `mapstructure:"max_concurrent_streams" yaml:"max_concurrent_streams"`
+	MaxReadFrameSize     int `mapstructure:"max_read_frame_size" yaml:"max_read_frame_size"`
+	IdleTimeout          int `mapstructure:"idle_timeout" yaml:"idle_timeout"` // 秒
+
+	// 優雅重啟
+	EnableGracefulRestart bool `mapstructure:"enable_graceful_restart" yaml:"enable_graceful_restart"`
 }
 
 type TLSConfig struct {
-	Enabled  bool   `mapstructure:"enabled"`
-	CertFile string `mapstructure:"cert_file"`
-	KeyFile  string `mapstructure:"key_file"`
+	Enabled  bool   `mapstructure:"enabled" yaml:"enabled"`
+	CertFile string `mapstructure:"cert_file" yaml:"cert_file"`
+	KeyFile  string `mapstructure:"key_file" yaml:"key_file"`
 }
 
 type DatabaseConfig struct {
-	Driver string `mapstructure:"driver"` // mysql, postgresql, tidb, redis
-	DSN    string `mapstructure:"dsn"`
+	Driver string `mapstructure:"driver" yaml:"driver"` // mysql, postgresql, tidb, redis
+	DSN    string `mapstructure:"dsn" yaml:"dsn"`
 }
 
 // ServerConfigInterface 服務器配置接口
@@ -64,17 +71,12 @@ type DatabaseConfigInterface interface {
 }
 
 type LoggerConfig struct {
-	Level        string `mapstructure:"level"` // debug, info, notice, warning, emergency
-	Output       string `mapstructure:"output"`
-	MaxSize      int    `mapstructure:"max_size"`
-	MaxAge       int    `mapstructure:"max_age"`
-	Compress     bool   `mapstructure:"compress"`
-	ColorEnabled bool   `mapstructure:"color_enabled"`
-}
-
-type PluginsConfig struct {
-	Enabled []string               `mapstructure:"enabled"`
-	Configs map[string]interface{} `mapstructure:"configs"`
+	Level        string `mapstructure:"level" yaml:"level"` // debug, info, notice, warning, emergency
+	Output       string `mapstructure:"output" yaml:"output"`
+	MaxSize      int    `mapstructure:"max_size" yaml:"max_size"`
+	MaxAge       int    `mapstructure:"max_age" yaml:"max_age"`
+	Compress     bool   `mapstructure:"compress" yaml:"compress"`
+	ColorEnabled bool   `mapstructure:"color_enabled" yaml:"color_enabled"`
 }
 
 // RedisConfigInterface Redis配置接口
@@ -99,7 +101,6 @@ type LoggerConfigInterface interface {
 // ConfigLoader 配置加載器
 type ConfigLoader struct {
 	configPath string
-	plugins    map[string]interface{}
 }
 
 // NewConfigLoader 創建配置加載器
@@ -109,7 +110,6 @@ func NewConfigLoader(configPath string) *ConfigLoader {
 	}
 	return &ConfigLoader{
 		configPath: configPath,
-		plugins:    make(map[string]interface{}),
 	}
 }
 
@@ -120,14 +120,14 @@ func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
 
 	if configFile != "" {
 		// 讀取指定的配置文件
-		configData, err = ioutil.ReadFile(configFile)
+		configData, err = os.ReadFile(configFile)
 		if err != nil {
 			return fmt.Errorf("failed to read config file %s: %w", configFile, err)
 		}
 	} else {
 		// 讀取默認配置文件
 		defaultConfigFile := filepath.Join(cl.configPath, "config.yaml")
-		configData, err = ioutil.ReadFile(defaultConfigFile)
+		configData, err = os.ReadFile(defaultConfigFile)
 		if err != nil {
 			return fmt.Errorf("failed to read default config file: %w", err)
 		}
@@ -138,9 +138,9 @@ func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// 加載插件配置
-	if err := cl.loadPluginConfigs(); err != nil {
-		return fmt.Errorf("failed to load plugin configs: %w", err)
+	// 應用預設值
+	if cfg, ok := config.(*Config); ok {
+		cfg.ApplyDefaults()
 	}
 
 	// 如果配置實現了 Validate 方法，則調用驗證
@@ -153,6 +153,100 @@ func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
 	return nil
 }
 
+// ApplyDefaults 應用預設值
+func (c *Config) ApplyDefaults() {
+	// Server 預設值
+	if c.Server.Addr == "" {
+		c.Server.Addr = ":8080"
+	}
+	if c.Server.Protocol == "" {
+		c.Server.Protocol = "http2"
+	}
+	if c.Server.ReadTimeout == 0 {
+		c.Server.ReadTimeout = 30 * time.Second
+	}
+	if c.Server.WriteTimeout == 0 {
+		c.Server.WriteTimeout = 30 * time.Second
+	}
+
+	// HTTP/2 預設值
+	if c.Server.MaxHandlers == 0 {
+		c.Server.MaxHandlers = 1000
+	}
+	if c.Server.MaxConcurrentStreams == 0 {
+		c.Server.MaxConcurrentStreams = 250
+	}
+	if c.Server.MaxReadFrameSize == 0 {
+		c.Server.MaxReadFrameSize = 1048576 // 1MB
+	}
+	if c.Server.IdleTimeout == 0 {
+		c.Server.IdleTimeout = 120 // 120秒
+	}
+
+	// Logger 預設值
+	if c.Logger.Level == "" {
+		c.Logger.Level = "info"
+	}
+	if c.Logger.Output == "" {
+		c.Logger.Output = "stdout"
+	}
+	if c.Logger.MaxSize == 0 {
+		c.Logger.MaxSize = 100 // 100MB
+	}
+	if c.Logger.MaxAge == 0 {
+		c.Logger.MaxAge = 7 // 7天
+	}
+}
+
+// Validate 驗證配置
+func (c *Config) Validate() error {
+	// 驗證協議
+	if err := ValidateProtocol(c.Server.Protocol); err != nil {
+		return err
+	}
+
+	// 驗證日誌級別
+	if err := ValidateLogLevel(c.Logger.Level); err != nil {
+		return err
+	}
+
+	// 驗證數據庫驅動
+	if c.Database.Driver != "" {
+		if err := ValidateDatabaseDriver(c.Database.Driver); err != nil {
+			return err
+		}
+	}
+
+	// 驗證 TLS 配置
+	if c.Server.TLS.Enabled {
+		if c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "" {
+			return fmt.Errorf("TLS enabled but cert_file or key_file is empty")
+		}
+	}
+
+	// HTTP/3 必須啟用 TLS
+	if c.Server.Protocol == "http3" && !c.Server.TLS.Enabled {
+		return fmt.Errorf("HTTP/3 requires TLS to be enabled")
+	}
+
+	return nil
+}
+
+// GetServerConfig 實現 ConfigInterface
+func (c *Config) GetServerConfig() ServerConfigInterface {
+	return &c.Server
+}
+
+// GetDatabaseConfig 實現 ConfigInterface
+func (c *Config) GetDatabaseConfig() DatabaseConfigInterface {
+	return &c.Database
+}
+
+// GetLoggerConfig 實現 ConfigInterface
+func (c *Config) GetLoggerConfig() LoggerConfigInterface {
+	return &c.Logger
+}
+
 // LoadWithInterface 加載配置並返回 ConfigInterface
 func (cl *ConfigLoader) LoadWithInterface(configFile string, config ConfigInterface) error {
 	if err := cl.Load(configFile, config); err != nil {
@@ -161,57 +255,9 @@ func (cl *ConfigLoader) LoadWithInterface(configFile string, config ConfigInterf
 	return config.Validate()
 }
 
-// loadPluginConfigs 加載插件配置文件
-func (cl *ConfigLoader) loadPluginConfigs() error {
-	configFiles, err := filepath.Glob(filepath.Join(cl.configPath, "*.yaml"))
-	if err != nil {
-		return err
-	}
-
-	for _, file := range configFiles {
-		filename := filepath.Base(file)
-		if filename == "config.yaml" {
-			continue
-		}
-
-		// 讀取插件配置文件
-		data, err := ioutil.ReadFile(file)
-		if err != nil {
-			return fmt.Errorf("failed to read %s: %w", file, err)
-		}
-
-		// 解析插件配置
-		var pluginConfig map[string]interface{}
-		if err := yaml.Unmarshal(data, &pluginConfig); err != nil {
-			return fmt.Errorf("failed to unmarshal %s: %w", file, err)
-		}
-
-		// 插件名稱為文件名（去掉.yaml後綴）
-		pluginName := strings.TrimSuffix(filename, ".yaml")
-		cl.plugins[pluginName] = pluginConfig
-	}
-
-	return nil
-}
-
-// GetPluginConfig 獲取插件配置
-func (cl *ConfigLoader) GetPluginConfig(pluginName string) map[string]interface{} {
-	if cfg, ok := cl.plugins[pluginName]; ok {
-		if configMap, ok := cfg.(map[string]interface{}); ok {
-			return configMap
-		}
-	}
-	return nil
-}
-
-// GetAllPluginConfigs 獲取所有插件配置
-func (cl *ConfigLoader) GetAllPluginConfigs() map[string]interface{} {
-	return cl.plugins
-}
-
 // LoadYAML 通用的 YAML 文件加載方法
 func LoadYAML(filename string, out interface{}) error {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("failed to read file %s: %w", filename, err)
 	}
@@ -230,14 +276,14 @@ func SaveYAML(filename string, data interface{}) error {
 		return fmt.Errorf("failed to marshal yaml: %w", err)
 	}
 
-	if err := ioutil.WriteFile(filename, output, 0644); err != nil {
+	if err := os.WriteFile(filename, output, 0644); err != nil {
 		return fmt.Errorf("failed to write file %s: %w", filename, err)
 	}
 
 	return nil
 }
 
-// WatchConfig 監視配置文件變化（用於熱重載）
+// ConfigWatcher 監視配置文件變化（用於熱重載）
 type ConfigWatcher struct {
 	configFile string
 	onChange   func() error
@@ -256,10 +302,10 @@ func NewConfigWatcher(configFile string, onChange func() error) *ConfigWatcher {
 // ValidateProtocol 驗證協議
 func ValidateProtocol(protocol string) error {
 	switch protocol {
-	case "http1", "http2", "http3":
+	case "http1", "http2", "http3", "auto":
 		return nil
 	default:
-		return fmt.Errorf("invalid protocol: %s, must be http1, http2, or http3", protocol)
+		return fmt.Errorf("invalid protocol: %s, must be http1, http2, http3, or auto", protocol)
 	}
 }
 
