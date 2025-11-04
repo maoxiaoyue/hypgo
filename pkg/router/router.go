@@ -21,24 +21,21 @@ type Router struct {
 	caseSensitive          bool
 	strictSlash            bool
 	handleMethodNotAllowed bool
-
+	// HTTP/3 配置
+	http3Config *HTTP3Config
 	// 404/405 處理器
 	notFound         hypcontext.HandlerFunc
 	methodNotAllowed hypcontext.HandlerFunc
 }
 
 type HTTP3Config struct {
-	Enabled bool
+	Enabled            bool  // 是否啟用 HTTP/3
+	MaxHeaderBytes     int   // 最大標頭大小
+	EnableDatagrams    bool  // 是否啟用數據報
+	EnableWebtransport bool  // 是否啟用 WebTransport
+	MaxBidiStreams     int64 // 最大雙向流數量
+	MaxUniStreams      int64 // 最大單向流數量
 }
-
-/* //更完整的功能
-type HybridRouter struct {
-	core *OptimizedRouter
-
-	websocket WebSocketSupport
-	static    StaticFileSupport
-	http3     HTTP3Config
-}*/
 
 // radixNode Radix Tree 節點
 type radixNode struct {
@@ -97,6 +94,7 @@ func New() *Router {
 		caseSensitive:          false,
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
+		http3Config:            nil, // 預設不啟用
 		pool: &sync.Pool{
 			New: func() interface{} {
 				return make(map[string]string)
@@ -171,6 +169,21 @@ func (r *Router) DELETE(path string, handlers ...hypcontext.HandlerFunc) {
 	r.Handle(http.MethodDelete, path, handlers...)
 }
 
+// PATCH 註冊 PATCH 路由
+func (r *Router) PATCH(path string, handlers ...hypcontext.HandlerFunc) {
+	r.Handle(http.MethodPatch, path, handlers...)
+}
+
+// OPTIONS 註冊 OPTIONS 路由
+func (r *Router) OPTIONS(path string, handlers ...hypcontext.HandlerFunc) {
+	r.Handle(http.MethodOptions, path, handlers...)
+}
+
+// HEAD 註冊 HEAD 路由
+func (r *Router) HEAD(path string, handlers ...hypcontext.HandlerFunc) {
+	r.Handle(http.MethodHead, path, handlers...)
+}
+
 // Static 服務靜態文件
 func (r *Router) Static(path string, dir string) {
 	fs := http.FileServer(http.Dir(dir))
@@ -186,6 +199,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	path := req.URL.Path
 	method := req.Method
+
+	// 如果啟用了 HTTP/3，設置相關標頭
+	if r.http3Config != nil && r.http3Config.Enabled {
+		// HTTP/3 特定處理
+		w.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
+	}
 
 	// 快取查找（如果啟用）
 	if r.enableCache {
@@ -703,4 +722,35 @@ func (r *Router) NotFound(handler hypcontext.HandlerFunc) {
 func (r *Router) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 	r.methodNotAllowed = handler
 	r.handleMethodNotAllowed = true
+}
+
+// EnableHTTP3 啟用 HTTP/3 支援
+func (r *Router) EnableHTTP3(config *HTTP3Config) {
+	if config == nil {
+		// 使用預設配置
+		config = &HTTP3Config{
+			Enabled:            true,
+			MaxHeaderBytes:     1 << 20, // 1MB
+			EnableDatagrams:    false,
+			EnableWebtransport: false,
+			MaxBidiStreams:     100,
+			MaxUniStreams:      100,
+		}
+	}
+
+	// 確保 Enabled 為 true
+	config.Enabled = true
+
+	// 設置配置
+	r.http3Config = config
+}
+
+// IsHTTP3Enabled 檢查是否啟用了 HTTP/3
+func (r *Router) IsHTTP3Enabled() bool {
+	return r.http3Config != nil && r.http3Config.Enabled
+}
+
+// GetHTTP3Config 獲取 HTTP/3 配置
+func (r *Router) GetHTTP3Config() *HTTP3Config {
+	return r.http3Config
 }
