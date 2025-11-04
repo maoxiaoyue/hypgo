@@ -46,9 +46,20 @@ type TLSConfig struct {
 	KeyFile  string `mapstructure:"key_file" yaml:"key_file"`
 }
 
+// RedisConfig Redis 配置
+type RedisConfig struct {
+	Addr     string `mapstructure:"addr" yaml:"addr"`
+	Password string `mapstructure:"password" yaml:"password"`
+	DB       int    `mapstructure:"db" yaml:"db"`
+}
+
 type DatabaseConfig struct {
-	Driver string `mapstructure:"driver" yaml:"driver"` // mysql, postgresql, tidb, redis
-	DSN    string `mapstructure:"dsn" yaml:"dsn"`
+	Driver       string `mapstructure:"driver" yaml:"driver"` // mysql, postgresql, tidb, redis
+	DSN          string `mapstructure:"dsn" yaml:"dsn"`
+	MaxIdleConns int    `mapstructure:"max_idle_conns" yaml:"max_idle_conns"`
+	MaxOpenConns int    `mapstructure:"max_open_conns" yaml:"max_open_conns"`
+	// Redis 配置
+	Redis RedisConfig `mapstructure:"redis" yaml:"redis"`
 }
 
 // ServerConfigInterface 服務器配置接口
@@ -181,6 +192,17 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Server.IdleTimeout == 0 {
 		c.Server.IdleTimeout = 120 // 120秒
+	}
+
+	// Database 預設值
+	if c.Database.MaxIdleConns == 0 {
+		c.Database.MaxIdleConns = 10
+	}
+	if c.Database.MaxOpenConns == 0 {
+		c.Database.MaxOpenConns = 100
+	}
+	if c.Database.Redis.Addr == "" {
+		c.Database.Redis.Addr = "localhost:6379"
 	}
 
 	// Logger 預設值
@@ -327,4 +349,134 @@ func ValidateDatabaseDriver(driver string) error {
 	default:
 		return fmt.Errorf("unsupported database driver: %s", driver)
 	}
+}
+
+// ===== ServerConfig 接口實現 =====
+
+// GetAddr 獲取服務器地址
+func (s *ServerConfig) GetAddr() string {
+	return s.Addr
+}
+
+// GetProtocol 獲取協議
+func (s *ServerConfig) GetProtocol() string {
+	return s.Protocol
+}
+
+// GetReadTimeout 獲取讀取超時（秒）
+func (s *ServerConfig) GetReadTimeout() int {
+	return int(s.ReadTimeout.Seconds())
+}
+
+// GetWriteTimeout 獲取寫入超時（秒）
+func (s *ServerConfig) GetWriteTimeout() int {
+	return int(s.WriteTimeout.Seconds())
+}
+
+// GetMaxHeaderBytes 獲取最大標頭字節數
+func (s *ServerConfig) GetMaxHeaderBytes() int {
+	return 1 << 20 // 1MB
+}
+
+// IsGracefulRestartEnabled 是否啟用優雅重啟
+func (s *ServerConfig) IsGracefulRestartEnabled() bool {
+	return s.EnableGracefulRestart
+}
+
+// ===== DatabaseConfig 接口實現 =====
+
+// GetDriver 獲取數據庫驅動
+func (d *DatabaseConfig) GetDriver() string {
+	return d.Driver
+}
+
+// GetDSN 獲取數據源名稱
+func (d *DatabaseConfig) GetDSN() string {
+	return d.DSN
+}
+
+// GetMaxIdleConns 獲取最大空閒連接數
+func (d *DatabaseConfig) GetMaxIdleConns() int {
+	if d.MaxIdleConns > 0 {
+		return d.MaxIdleConns
+	}
+	return 10 // 預設值
+}
+
+// GetMaxOpenConns 獲取最大開啟連接數
+func (d *DatabaseConfig) GetMaxOpenConns() int {
+	if d.MaxOpenConns > 0 {
+		return d.MaxOpenConns
+	}
+	return 100 // 預設值
+}
+
+// GetRedisConfig 獲取 Redis 配置
+func (d *DatabaseConfig) GetRedisConfig() RedisConfigInterface {
+	return &d.Redis
+}
+
+// ===== LoggerConfig 接口實現 =====
+
+// GetLevel 獲取日誌級別
+func (l *LoggerConfig) GetLevel() string {
+	return l.Level
+}
+
+// GetOutput 獲取輸出位置
+func (l *LoggerConfig) GetOutput() string {
+	return l.Output
+}
+
+// GetFormat 獲取日誌格式
+func (l *LoggerConfig) GetFormat() string {
+	return "json" // 預設使用 JSON 格式
+}
+
+// GetFilename 獲取日誌文件名
+func (l *LoggerConfig) GetFilename() string {
+	if l.Output == "file" {
+		return "logs/app.log"
+	}
+	return ""
+}
+
+// GetMaxSize 獲取最大文件大小（MB）
+func (l *LoggerConfig) GetMaxSize() int {
+	return l.MaxSize
+}
+
+// GetMaxAge 獲取最大保存天數
+func (l *LoggerConfig) GetMaxAge() int {
+	return l.MaxAge
+}
+
+// GetMaxBackups 獲取最大備份數量
+func (l *LoggerConfig) GetMaxBackups() int {
+	return 10 // 預設保留 10 個備份
+}
+
+// IsColorized 是否啟用彩色輸出
+func (l *LoggerConfig) IsColorized() bool {
+	return l.ColorEnabled
+}
+
+// ===== RedisConfig 接口實現 =====
+
+// GetAddr 獲取 Redis 地址
+func (r *RedisConfig) GetAddr() string {
+	if r.Addr == "" {
+		return "localhost:6379"
+	}
+	return r.Addr
+}
+
+// GetPassword 獲取 Redis 密碼
+func (r *RedisConfig) GetPassword() string {
+	return r.Password
+}
+
+// GetDB 獲取 Redis 數據庫編號
+func (r *RedisConfig) GetDB() int {
+	return r.DB
 }
