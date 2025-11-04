@@ -50,7 +50,6 @@ After implementing HypGo with HTTP/3 support in our staging environment, the res
 These results were too significant to keep private. Cross-border latency affects millions of applications worldwide, and developers shouldn't have to build HTTP/3 support from scratch. HypGo was born from real-world pain and delivers real-world results.
 
 Beyond just HTTP/3, I realized modern applications need:
-- **Plugin architecture** for clean separation of concerns
 - **Docker integration** for consistent deployments
 - **Hot reload** for developer productivity
 - **Message queues** for scalable architectures
@@ -60,17 +59,13 @@ Every feature in HypGo comes from actual production needs, tested under real tra
 ## Features
 
 - ⚡ **HTTP/2 & HTTP/3 support** - Native support for the latest protocols with automatic fallback
-- 🗄️ **Ent ORM integration** - Powerful entity framework with type-safe queries
 - 📨 **Message Queuing** - Plugin support for RabbitMQ, Kafka, and more
 - 🔍 **Advanced JSON Processing** - Field validation, type checking, and schema validation
 - 📝 **Log Rotation** - Built-in log management with compression and retention policies
 - ⚙️ **Viper Configuration** - YAML-based configuration with environment variable support
 - 🏗️ **MVC Architecture** - Clean separation of Controllers, Models, and Services
-- 🔌 **Plugin System** - Dynamically add features without modifying core code
 - 🐳 **Docker Integration** - One-command Docker image building and deployment
 - 🔥 **Hot Reload** - Automatic application restart during development
-- ♻️ **Zero-Downtime Deployment** - Graceful shutdown and restart capabilities
-- 🌐 **WebSocket Support** - Real-time bidirectional communication with channels
 
 ## Requirements
 
@@ -91,7 +86,7 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 
 ## Quick Start
 
-### 1. Create a New Project
+### Create a New Project
 
 #### Full-stack Project (with frontend)
 ```bash
@@ -102,29 +97,14 @@ hyp run
 ```
 
 #### API-only Project
+If the path has $GOPATH/bin
 ```bash
 hyp api myapi
 cd myapi
 go mod tidy
 hyp run
 ```
-
-### 2. Add Plugins
-
-```bash
-# Add message queue support
-hyp install rabbitmq
-hyp install kafka
-
-# Add database support
-hyp install mongodb
-hyp install cassandra
-
-# Add search capability
-hyp install elasticsearch
-```
-
-### 3. Build Docker Image
+### Build Docker Image
 
 ```bash
 # Auto-detect port and build image
@@ -168,28 +148,6 @@ The only reason is very fast. Especially when using smaller flows.
 
 ## Core Concepts
 
-### Plugin Architecture
-
-HypGo uses a modular plugin system that allows you to add functionality without modifying the core framework:
-
-```bash
-# Add a plugin
-hyp install <plugin-name>
-
-# Available plugins:
-- rabbitmq    # Message queue
-- kafka       # Streaming platform
-- cassandra   # NoSQL database
-- scylladb    # High-performance Cassandra
-- mongodb     # Document database
-- elasticsearch # Search engine
-```
-
-Each plugin creates:
-- Configuration file in `config/`
-- Service implementation in `app/plugins/`
-- Automatic dependency management
-
 ### Configuration Management
 
 ```yaml
@@ -217,7 +175,6 @@ app/
 ├── controllers/   # HTTP handlers
 ├── models/        # Data models (Ent schemas)
 ├── services/      # Business logic
-└── plugins/       # Plugin implementations
 ```
 
 ## CLI Commands
@@ -236,11 +193,6 @@ hyp restart        # Zero-downtime restart
 hyp generate controller <name>  # Generate controller
 hyp generate model <name>       # Generate model
 hyp generate service <name>     # Generate service
-```
-
-### Plugin Management
-```bash
-hyp install <plugin>  # Add plugin
 ```
 
 ### Deployment
@@ -324,23 +276,12 @@ func main() {
 }
 ```
 
-### Using Plugins
-
-```go
-// After running: hyp install kafka
-import "myapp/app/plugins/kafka"
-
-kafkaService, _ := kafka.New(config.GetPluginConfig("kafka"), logger)
-kafkaService.Publish("events", message)
-```
-
 ## Roadmap
 
 ### V0.1 (Current) ✅
 - [x] HTTP/1.1, HTTP/2, HTTP/3 support
 - [x] Basic MVC structure
 - [x] CLI tool with project generation
-- [x] Plugin system architecture
 - [x] Docker integration
 - [x] Hot reload development
 - [x] WebSocket support
@@ -348,7 +289,6 @@ kafkaService.Publish("events", message)
 
 ### V1.0 (In Progress) 🚧
 - [ ] Authentication & Authorization system
-- [ ] GraphQL support
 - [ ] gRPC integration
 - [ ] Database migration tools
 - [ ] API documentation generator

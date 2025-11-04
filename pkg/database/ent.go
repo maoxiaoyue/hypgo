@@ -1,8 +1,7 @@
-// hypgo/pkg/database/ent.go
 package database
 
 import (
-	"context"
+	stdcontext "context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -12,6 +11,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	"github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -21,7 +21,7 @@ type DatabasePlugin interface {
 	Init(config map[string]interface{}) error
 	Connect() error
 	Close() error
-	Ping(ctx context.Context) error
+	Ping(ctx *context.Context) error
 }
 
 // Database 數據庫管理器
@@ -261,9 +261,9 @@ func (d *Database) initRedis() (*Database, error) {
 		DB:       redisConfig.GetDB(),
 	})
 
-	// 測試連接
-	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
+	// 測試連接 - 使用標準 context
+	stdCtx := stdcontext.Background()
+	if err := client.Ping(stdCtx).Err(); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to ping redis: %w", err)
 	}
@@ -365,19 +365,25 @@ func (d *Database) Close() error {
 
 // IsConnected 檢查數據庫是否已連接
 func (d *Database) IsConnected() bool {
-	ctx := context.Background()
+	// 使用標準 context 進行檢查
+	stdCtx := stdcontext.Background()
 
 	if d.sqlDB != nil {
 		return d.sqlDB.Ping() == nil
 	}
 	if d.redisDB != nil {
-		return d.redisDB.Ping(ctx).Err() == nil
+		return d.redisDB.Ping(stdCtx).Err() == nil
 	}
 
 	// 檢查插件連接狀態
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	for _, plugin := range d.plugins {
+		// 創建一個臨時的 HypGo context 用於測試
+		// 由於這是內部檢查，不需要 HTTP 請求相關信息
+		ctx := &context.Context{
+			Keys: make(map[string]interface{}),
+		}
 		if err := plugin.Ping(ctx); err == nil {
 			return true
 		}
@@ -395,9 +401,53 @@ func (d *Database) Type() string {
 }
 
 // Transaction 執行事務（僅支持 SQL 數據庫）
-func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
+func (d *Database) Transaction(ctx *context.Context, fn func(*sql.Tx) error) error {
 	if d.sqlDB == nil {
 		return fmt.Errorf("no SQL database connection")
+	}
+
+	// 從 HypGo context 獲取標準 context
+	var stdCtx stdcontext.Context
+	if ctx != nil && ctx.Request != nil {
+		stdCtx = ctx.Request.Context()
+	} else {
+		stdCtx = stdcontext.Background()
+	}
+
+	tx, err := d.sqlDB.BeginTx(stdCtx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	if err := fn(tx); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			return fmt.Errorf("transaction failed: %v, rollback failed: %w", err, rbErr)
+		}
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// TransactionWithStdContext 使用標準 context 執行事務
+func (d *Database) TransactionWithStdContext(ctx stdcontext.Context, fn func(*sql.Tx) error) error {
+	if d.sqlDB == nil {
+		return fmt.Errorf("no SQL database connection")
+	}
+
+	if ctx == nil {
+		ctx = stdcontext.Background()
 	}
 
 	tx, err := d.sqlDB.BeginTx(ctx, nil)
@@ -427,7 +477,45 @@ func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) erro
 }
 
 // HealthCheck 健康檢查
-func (d *Database) HealthCheck(ctx context.Context) error {
+func (d *Database) HealthCheck(ctx *context.Context) error {
+	// 從 HypGo context 獲取標準 context
+	var stdCtx stdcontext.Context
+	if ctx != nil && ctx.Request != nil {
+		stdCtx = ctx.Request.Context()
+	} else {
+		stdCtx = stdcontext.Background()
+	}
+
+	if d.sqlDB != nil {
+		if err := d.sqlDB.PingContext(stdCtx); err != nil {
+			return fmt.Errorf("SQL database unhealthy: %w", err)
+		}
+	}
+
+	if d.redisDB != nil {
+		if err := d.redisDB.Ping(stdCtx).Err(); err != nil {
+			return fmt.Errorf("Redis unhealthy: %w", err)
+		}
+	}
+
+	// 檢查插件健康狀態
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for name, plugin := range d.plugins {
+		if err := plugin.Ping(ctx); err != nil {
+			return fmt.Errorf("plugin %s unhealthy: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
+// HealthCheckWithStdContext 使用標準 context 進行健康檢查
+func (d *Database) HealthCheckWithStdContext(ctx stdcontext.Context) error {
+	if ctx == nil {
+		ctx = stdcontext.Background()
+	}
+
 	if d.sqlDB != nil {
 		if err := d.sqlDB.PingContext(ctx); err != nil {
 			return fmt.Errorf("SQL database unhealthy: %w", err)
@@ -443,8 +531,14 @@ func (d *Database) HealthCheck(ctx context.Context) error {
 	// 檢查插件健康狀態
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
+	// 創建一個臨時的 HypGo context 用於插件檢查
+	hypCtx := &context.Context{
+		Keys: make(map[string]interface{}),
+	}
+
 	for name, plugin := range d.plugins {
-		if err := plugin.Ping(ctx); err != nil {
+		if err := plugin.Ping(hypCtx); err != nil {
 			return fmt.Errorf("plugin %s unhealthy: %w", name, err)
 		}
 	}

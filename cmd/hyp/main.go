@@ -28,7 +28,104 @@ Features:
 func init() {
 	// 設置版本輸出模板
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
-Framework for building high-performance web applications with HTTP/3 support`)
+Framework for building high-performance web applications with HTTP/3 support
+`)
+	// 註冊所有命令
+	registerCommands()
+}
+
+// registerCommands 註冊所有可用的命令
+func registerCommands() {
+	// 註冊 new 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "new [project-name]",
+		Short: "Create a new HypGo project",
+		Long:  `Create a new HypGo project with complete structure including controllers, models, services, and a welcome HTML page.`,
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 new.go 中的實際實作
+			// RunNew(args[0])
+		},
+	})
+
+	// 註冊 api 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "api [project-name]",
+		Short: "Create a new API-only project",
+		Long:  `Create a new HypGo API project without static files and templates, only with API structure.`,
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 api.go 中的實際實作
+			// RunAPI(args[0])
+		},
+	})
+
+	// 註冊 run 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "run",
+		Short: "Run the HypGo application",
+		Long:  `Run the HypGo application with hot reload in development mode.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 run.go 中的實際實作
+			// RunServer()
+		},
+	})
+
+	// 註冊 list 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List all available plugins",
+		Long:  `List all available HypGo plugins that can be installed.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 list 功能
+			// RunList()
+		},
+	})
+
+	// 註冊 restart 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "restart",
+		Short: "Hot restart the application",
+		Long:  `Perform a zero-downtime hot restart of the running HypGo application.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 restart.go 中的實際實作
+			// RunRestart()
+		},
+	})
+
+	// 註冊 docker 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "docker",
+		Short: "Build Docker image for the project",
+		Long:  `Build a Docker image for the HypGo project based on config.yaml settings.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 docker.go 中的實際實作
+			// RunDocker()
+		},
+	})
+
+	// 註冊 generate 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "generate [type] [name]",
+		Short: "Generate code for controllers, models, or services",
+		Long:  `Generate boilerplate code for controllers, models, or services.`,
+		Args:  cobra.MinimumNArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 generate.go 中的實際實作
+			// RunGenerate(args[0], args[1])
+		},
+	})
+
+	// 註冊 health 命令
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "health",
+		Short: "Check application health status",
+		Long:  `Check the health status of the running HypGo application.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// 這裡應該呼叫 health.go 中的實際實作
+			// RunHealth()
+		},
+	})
 }
 
 // Execute 允許其他包執行根命令
@@ -122,42 +219,6 @@ func (r *PluginRegistry) initialize() {
 		Repository:   "github.com/maoxiaoyue/hypgo/plugins/rabbitmq",
 		ConfigFile:   "rabbitmq.yaml",
 		Dependencies: []string{"github.com/streadway/amqp"},
-		Author:       "HypGo Team",
-		License:      "MIT",
-	})
-
-	r.Register(PluginMetadata{
-		Name:         "redis",
-		Version:      "1.0.0",
-		Description:  "Redis in-memory data structure store",
-		Category:     "Cache",
-		Repository:   "github.com/maoxiaoyue/hypgo/plugins/redis",
-		ConfigFile:   "redis.yaml",
-		Dependencies: []string{"github.com/go-redis/redis/v8"},
-		Author:       "HypGo Team",
-		License:      "MIT",
-	})
-
-	r.Register(PluginMetadata{
-		Name:         "nats",
-		Version:      "1.0.0",
-		Description:  "NATS messaging system",
-		Category:     "Message Queue",
-		Repository:   "github.com/maoxiaoyue/hypgo/plugins/nats",
-		ConfigFile:   "nats.yaml",
-		Dependencies: []string{"github.com/nats-io/nats.go"},
-		Author:       "HypGo Team",
-		License:      "MIT",
-	})
-
-	r.Register(PluginMetadata{
-		Name:         "mongodb",
-		Version:      "1.0.0",
-		Description:  "MongoDB document-oriented database",
-		Category:     "NoSQL Database",
-		Repository:   "github.com/maoxiaoyue/hypgo/plugins/mongodb",
-		ConfigFile:   "mongodb.yaml",
-		Dependencies: []string{"go.mongodb.org/mongo-driver"},
 		Author:       "HypGo Team",
 		License:      "MIT",
 	})

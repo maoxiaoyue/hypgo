@@ -24,12 +24,32 @@ const (
 
 // Logger 日誌介面
 type Logger struct {
+	debug    *log.Logger
+	info     *log.Logger
+	warning  *log.Logger
 	level    Level
 	logger   *log.Logger
 	file     *os.File
 	mu       sync.Mutex
 	rotator  *LogRotator
 	colorize bool
+}
+
+func New(level string, output string, writer io.Writer, colorEnabled bool) (*Logger, error) {
+	var w io.Writer
+	if writer != nil {
+		w = writer
+	} else if output == "stdout" {
+		w = os.Stdout
+	} else {
+		w = os.Stderr
+	}
+
+	return &Logger{
+		debug:   log.New(w, "[DEBUG] ", log.LstdFlags),
+		info:    log.New(w, "[INFO] ", log.LstdFlags),
+		warning: log.New(w, "[WARNING] ", log.LstdFlags),
+	}, nil
 }
 
 // LogRotator 日誌輪轉器

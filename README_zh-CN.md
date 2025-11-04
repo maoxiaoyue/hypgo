@@ -49,7 +49,6 @@ HypGo 是一个现代化的 Go Web 框架，提供 HTTP/2 和 HTTP/3 支持、En
 这些结果太重要了，不能保持私有。跨境延迟影响着全球数百万个应用程序，开发者不应该从头开始构建 HTTP/3 支持。HypGo 源于现实世界的痛点，并提供现实世界的结果。
 
 除了 HTTP/3，我意识到现代应用程序还需要：
-- **插件架构**，实现关注点的清晰分离
 - **Docker 集成**，确保一致的部署
 - **热重载**，提高开发者生产力
 - **消息队列**，构建可扩展的架构
@@ -59,13 +58,11 @@ HypGo 的每个功能都来自实际的生产需求，在真实流量下测试�
 ## 功能特点
 
 - ⚡ **HTTP/2 & HTTP/3 支持** - 原生支持最新协议，自动降级
-- 🗄️ **Ent ORM 集成** - 强大的实体框架，类型安全查询
 - 📨 **消息队列** - 插件支持 RabbitMQ、Kafka 等
 - 🔍 **高级 JSON 处理** - 字段验证、类型检查和模式验证
 - 📝 **日志轮转** - 内置日志管理，支持压缩和保留策略
 - ⚙️ **Viper 配置** - 基于 YAML 的配置，支持环境变量
 - 🏗️ **MVC 架构** - Controllers、Models、Services 清晰分层
-- 🔌 **插件系统** - 动态添加功能，无需修改核心代码
 - 🐳 **Docker 集成** - 一键构建和部署 Docker 镜像
 - 🔥 **热重载** - 开发期间自动重启应用程序
 - ♻️ **零停机部署** - 优雅关闭和重启功能
@@ -90,9 +87,10 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 
 ## 快速开始
 
-### 1. 创建新项目
+### 创建新项目
 
 #### 全栈项目（包含前端）
+如果PATH包含go的執行文件
 ```bash
 hyp new myapp
 cd myapp
@@ -108,22 +106,7 @@ go mod tidy
 hyp run
 ```
 
-### 2. 添加插件
-
-```bash
-# 添加消息队列支持
-hyp install rabbitmq
-hyp install kafka
-
-# 添加数据库支持
-hyp install mongodb
-hyp install cassandra
-
-# 添加搜索功能
-hyp install elasticsearch
-```
-
-### 3. 构建 Docker 镜像
+### 构建 Docker 镜像
 
 ```bash
 # 自动检测端口并构建镜像
@@ -166,29 +149,6 @@ hyp docker -r docker.io/username --no-push=false
 - [HTTP vs. HTTP/2 vs. HTTP/3: What's the Difference?](https://www.pubnub.com/blog/http-vs-http-2-vs-http-3-whats-the-difference/)
 
 ## 核心概念
-
-### 插件架构
-
-HypGo 使用模块化插件系统，允许您在不修改核心框架的情况下添加功能：
-
-```bash
-# 添加插件
-hyp install <插件名称>
-
-# 可用插件：
-- rabbitmq      # 消息队列
-- kafka         # 流平台
-- cassandra     # NoSQL 数据库
-- scylladb      # 高性能 Cassandra
-- mongodb       # 文档数据库
-- elasticsearch # 搜索引擎
-```
-
-每个插件会创建：
-- `config/` 中的配置文件
-- `app/plugins/` 中的服务实现
-- 自动依赖管理
-
 ### 配置管理
 
 ```yaml
@@ -235,11 +195,6 @@ hyp restart        # 零停机重启
 hyp generate controller <名称>  # 生成控制器
 hyp generate model <名称>       # 生成模型
 hyp generate service <名称>     # 生成服务
-```
-
-### 插件管理
-```bash
-hyp install <插件>    # 添加插件
 ```
 
 ### 部署
@@ -323,23 +278,12 @@ func main() {
 }
 ```
 
-### 使用插件
-
-```go
-// 执行后：hyp install kafka
-import "myapp/app/plugins/kafka"
-
-kafkaService, _ := kafka.New(config.GetPluginConfig("kafka"), logger)
-kafkaService.Publish("events", message)
-```
-
 ## 发展路线图
 
 ### V0.1（当前版本）✅
 - [x] HTTP/1.1、HTTP/2、HTTP/3 支持
 - [x] 基本 MVC 结构
 - [x] CLI 工具与项目生成
-- [x] 插件系统架构
 - [x] Docker 集成
 - [x] 热重载开发
 - [x] WebSocket 支持
@@ -347,7 +291,6 @@ kafkaService.Publish("events", message)
 
 ### V1.0（进行中）🚧
 - [ ] 认证与授权系统
-- [ ] GraphQL 支持
 - [ ] gRPC 集成
 - [ ] 数据库迁移工具
 - [ ] API 文档生成器

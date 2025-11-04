@@ -9,7 +9,7 @@ import (
 func TestLogger(t *testing.T) {
 	var buf bytes.Buffer
 
-	log, err := New("debug", "stdout", nil, false)
+	log, err := New("debug", "stdout", &buf, false)
 	if err != nil {
 		t.Fatalf("Failed to create logger: %v", err)
 	}
