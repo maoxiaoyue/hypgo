@@ -8,11 +8,13 @@ import (
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
+// Router 主結構
 type Router struct {
-	trees      map[string]*radixNode // 每個 HTTP 方法一棵樹
-	cache      *routeCache           // 路由快取
-	pool       *sync.Pool            // 參數池
-	middleware []hypcontext.HandlerFunc
+	Group                              // 嵌入根路由組
+	trees     map[string]*radixNode    // 每個 HTTP 方法一棵 Radix Tree
+	cache     *routeCache              // LRU 路由快取
+	paramPool *sync.Pool               // 參數對象池
+	globalMW  []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
 
 	// 配置
 	maxParams              int
@@ -21,59 +23,23 @@ type Router struct {
 	caseSensitive          bool
 	strictSlash            bool
 	handleMethodNotAllowed bool
+
 	// HTTP/3 配置
 	http3Config *HTTP3Config
+
 	// 404/405 處理器
 	notFound         hypcontext.HandlerFunc
 	methodNotAllowed hypcontext.HandlerFunc
 }
 
+// HTTP3Config HTTP/3 配置
 type HTTP3Config struct {
-	Enabled            bool  // 是否啟用 HTTP/3
-	MaxHeaderBytes     int   // 最大標頭大小
-	EnableDatagrams    bool  // 是否啟用數據報
-	EnableWebtransport bool  // 是否啟用 WebTransport
-	MaxBidiStreams     int64 // 最大雙向流數量
-	MaxUniStreams      int64 // 最大單向流數量
-}
-
-// radixNode Radix Tree 節點
-type radixNode struct {
-	path      string
-	indices   string       // 子節點的第一個字元索引
-	wildChild bool         // 是否有通配符子節點
-	nType     nodeType     // 節點類型
-	priority  uint32       // 優先級（命中次數）
-	children  []*radixNode // 子節點
-	handlers  []hypcontext.HandlerFunc
-	fullPath  string
-}
-
-type nodeType uint8
-
-const (
-	static   nodeType = iota // 靜態節點
-	root                     // 根節點
-	param                    // 參數節點 :id
-	catchAll                 // 捕獲所有 *filepath
-)
-
-// routeCache 路由快取（LRU）
-type routeCache struct {
-	mu       sync.RWMutex
-	items    map[string]*cacheItem
-	head     *cacheItem
-	tail     *cacheItem
-	capacity int
-	size     int
-}
-
-type cacheItem struct {
-	key      string
-	handlers []hypcontext.HandlerFunc
-	params   []Param
-	prev     *cacheItem
-	next     *cacheItem
+	Enabled            bool
+	MaxHeaderBytes     int
+	EnableDatagrams    bool
+	EnableWebtransport bool
+	MaxBidiStreams     int64
+	MaxUniStreams      int64
 }
 
 // Param 路由參數
@@ -82,35 +48,15 @@ type Param struct {
 	Value string
 }
 
-// New 創建新的路由器
-func New() *Router {
-	return &Router{
-		trees:                  make(map[string]*radixNode),
-		cache:                  newRouteCache(1000),
-		middleware:             make([]hypcontext.HandlerFunc, 0),
-		maxParams:              10,
-		enableCache:            true,
-		cacheSize:              1000,
-		caseSensitive:          false,
-		strictSlash:            false,
-		handleMethodNotAllowed: true,
-		http3Config:            nil, // 預設不啟用
-		pool: &sync.Pool{
-			New: func() interface{} {
-				return make(map[string]string)
-			},
-		},
-	}
-}
-
 // RouterOption 路由器選項
 type RouterOption func(*Router)
 
-// WithCache 設置快取
+// WithCache 設置快取大小
 func WithCache(size int) RouterOption {
 	return func(r *Router) {
 		r.enableCache = true
 		r.cacheSize = size
+		r.cache = newRouteCache(size)
 	}
 }
 
@@ -121,18 +67,74 @@ func WithMaxParams(n int) RouterOption {
 	}
 }
 
-// ===== 路由註冊 =====
-
-// Handle 註冊路由
-func (r *Router) Handle(method, path string, handlers ...hypcontext.HandlerFunc) {
-	if path == "" {
-		panic("path cannot be empty")
+// WithStrictSlash 設置嚴格斜線模式
+func WithStrictSlash(enabled bool) RouterOption {
+	return func(r *Router) {
+		r.strictSlash = enabled
 	}
-	if path[0] != '/' {
-		panic("path must begin with '/'")
+}
+
+// WithMethodNotAllowed 設置是否處理 405
+func WithMethodNotAllowed(enabled bool) RouterOption {
+	return func(r *Router) {
+		r.handleMethodNotAllowed = enabled
+	}
+}
+
+// New 創建新的路由器
+// EX:
+//
+//	r := router.New()
+//	r.GET("/ping", pingHandler)
+//
+//	api := r.NewGroup("/api/v1")
+//	api.GET("/users", listUsers)
+func New(opts ...RouterOption) *Router {
+	r := &Router{
+		trees:                  make(map[string]*radixNode),
+		cache:                  newRouteCache(1000),
+		globalMW:               make([]hypcontext.HandlerFunc, 0),
+		maxParams:              10,
+		enableCache:            true,
+		cacheSize:              1000,
+		caseSensitive:          false,
+		strictSlash:            false,
+		handleMethodNotAllowed: true,
+		http3Config:            nil,
+		paramPool: &sync.Pool{
+			New: func() interface{} {
+				return make([]Param, 0, 10)
+			},
+		},
+	}
+
+	// 初始化嵌入的根 Group
+	r.Group = Group{
+		basePath:   "/",
+		middleware: nil,
+		router:     r,
+		isRoot:     true,
+	}
+
+	// 套用選項
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// addRoute 註冊路由到 Radix Tree
+// 這是所有路由的最終入口，由 Group.handle() 調用
+func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.HandlerFunc) {
+	if absolutePath == "" {
+		panic("router: path cannot be empty")
+	}
+	if absolutePath[0] != '/' {
+		panic("router: path must begin with '/'")
 	}
 	if len(handlers) == 0 {
-		panic("must provide at least one handler")
+		panic("router: must provide at least one handler")
 	}
 
 	// 獲取或創建方法樹
@@ -141,74 +143,30 @@ func (r *Router) Handle(method, path string, handlers ...hypcontext.HandlerFunc)
 	}
 
 	root := r.trees[method]
-	root.addRoute(path, handlers)
+	root.addRoute(absolutePath, handlers)
 
 	// 更新最大參數數
-	if pc := countParams(path); pc > r.maxParams {
+	if pc := countParams(absolutePath); pc > r.maxParams {
 		r.maxParams = pc
 	}
 }
 
-// GET 註冊 GET 路由
-func (r *Router) GET(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodGet, path, handlers...)
-}
-
-// POST 註冊 POST 路由
-func (r *Router) POST(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodPost, path, handlers...)
-}
-
-// PUT 註冊 PUT 路由
-func (r *Router) PUT(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodPut, path, handlers...)
-}
-
-// DELETE 註冊 DELETE 路由
-func (r *Router) DELETE(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodDelete, path, handlers...)
-}
-
-// PATCH 註冊 PATCH 路由
-func (r *Router) PATCH(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodPatch, path, handlers...)
-}
-
-// OPTIONS 註冊 OPTIONS 路由
-func (r *Router) OPTIONS(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodOptions, path, handlers...)
-}
-
-// HEAD 註冊 HEAD 路由
-func (r *Router) HEAD(path string, handlers ...hypcontext.HandlerFunc) {
-	r.Handle(http.MethodHead, path, handlers...)
-}
-
-// Static 服務靜態文件
-func (r *Router) Static(path string, dir string) {
-	fs := http.FileServer(http.Dir(dir))
-	r.GET(path+"/*filepath", func(c *hypcontext.Context) {
-		http.StripPrefix(path, fs).ServeHTTP(c.Writer, c.Request)
-	})
-}
-
-// ServeHTTP 實現 http.Handler
+// ServeHTTP 實現 http.Handler 介面
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := hypcontext.New(w, req)
 	defer c.Release()
 
-	path := req.URL.Path
+	urlPath := req.URL.Path
 	method := req.Method
 
-	// 如果啟用了 HTTP/3，設置相關標頭
+	// HTTP/3 Alt-Svc 標頭
 	if r.http3Config != nil && r.http3Config.Enabled {
-		// HTTP/3 特定處理
 		w.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
 	}
 
-	// 快取查找（如果啟用）
+	// 快取查找
 	if r.enableCache {
-		cacheKey := method + path
+		cacheKey := method + urlPath
 		if entry := r.cache.get(cacheKey); entry != nil {
 			c.Params = r.makeContextParams(entry.params)
 			r.executeHandlers(c, entry.handlers)
@@ -216,15 +174,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Radix tree 查找
+	// Radix Tree 查找
 	if root := r.trees[method]; root != nil {
-		handlers, params := root.search(path, r.getParams())
+		handlers, params := root.search(urlPath, r.getParams())
 		if handlers != nil {
 			c.Params = r.makeContextParams(params)
 
-			// 加入快取
-			if r.enableCache && len(params) == 0 { // 只快取靜態路由
-				r.cache.put(method+path, handlers, params)
+			// 只快取靜態路由（無參數）
+			if r.enableCache && len(params) == 0 {
+				r.cache.put(method+urlPath, handlers, params)
 			}
 
 			r.executeHandlers(c, handlers)
@@ -234,13 +192,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.putParams(params)
 	}
 
-	// 檢查其他方法（405）
+	// 405 Method Not Allowed
 	if r.handleMethodNotAllowed {
-		for m := range r.trees {
+		for m, tree := range r.trees {
 			if m == method {
 				continue
 			}
-			if handlers, _ := r.trees[m].search(path, nil); handlers != nil {
+			if handlers, _ := tree.search(urlPath, nil); handlers != nil {
 				if r.methodNotAllowed != nil {
 					r.methodNotAllowed(c)
 				} else {
@@ -251,7 +209,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 404
+	// 404 Not Found
 	if r.notFound != nil {
 		r.notFound(c)
 	} else {
@@ -259,458 +217,34 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// search 在 Radix Tree 中搜索
-func (n *radixNode) search(path string, params []Param) ([]hypcontext.HandlerFunc, []Param) {
-	var (
-		//handlers []hypcontext.HandlerFunc
-		p = params
-	)
-
-walk:
-	for {
-		if len(path) > len(n.path) {
-			if path[:len(n.path)] == n.path {
-				path = path[len(n.path):]
-
-				// 尋找子節點
-				if !n.wildChild {
-					// 使用索引快速查找
-					c := path[0]
-					for i, index := range []byte(n.indices) {
-						if c == index {
-							n = n.children[i]
-							continue walk
-						}
-					}
-
-					// 沒找到
-					return nil, p
-				}
-
-				// 處理通配符
-				n = n.children[0]
-				switch n.nType {
-				case param:
-					// 提取參數值
-					end := 0
-					for end < len(path) && path[end] != '/' {
-						end++
-					}
-
-					if p == nil {
-						p = make([]Param, 0, 4)
-					}
-					p = append(p, Param{
-						Key:   n.path[1:],
-						Value: path[:end],
-					})
-
-					if end < len(path) {
-						if len(n.children) > 0 {
-							path = path[end:]
-							n = n.children[0]
-							continue walk
-						}
-						return nil, p
-					}
-
-					return n.handlers, p
-
-				case catchAll:
-					// 捕獲所有剩餘路徑
-					if p == nil {
-						p = make([]Param, 0, 4)
-					}
-					p = append(p, Param{
-						Key:   n.path[2:],
-						Value: path,
-					})
-					return n.handlers, p
-				}
-			}
-		} else if path == n.path {
-			// 完全匹配
-			return n.handlers, p
-		}
-
-		// 不匹配
-		return nil, p
-	}
+// Use 添加全域中間件，全域中間件在 executeHandlers 中優先於 Group 中間件執行
+//
+// EX：
+//
+//	r := router.New()
+//	r.Use(loggerMiddleware, recoveryMiddleware)
+func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
+	r.globalMW = append(r.globalMW, middleware...)
 }
-
-// addRoute 添加路由到樹
-func (n *radixNode) addRoute(path string, handlers []hypcontext.HandlerFunc) {
-	fullPath := path
-	n.priority++
-
-	// 空樹
-	if len(n.path) == 0 && len(n.children) == 0 {
-		n.insertChild(path, fullPath, handlers)
-		n.nType = root
-		return
-	}
-
-	// 查找最長公共前綴
-	i := longestCommonPrefix(path, n.path)
-
-	// 需要分割當前節點
-	if i < len(n.path) {
-		child := &radixNode{
-			path:      n.path[i:],
-			wildChild: n.wildChild,
-			nType:     static,
-			indices:   n.indices,
-			children:  n.children,
-			handlers:  n.handlers,
-			priority:  n.priority - 1,
-		}
-
-		n.children = []*radixNode{child}
-		n.indices = string(n.path[i])
-		n.path = path[:i]
-		n.handlers = nil
-		n.wildChild = false
-	}
-
-	// 插入新節點
-	if i < len(path) {
-		path = path[i:]
-
-		if n.wildChild {
-			n = n.children[0]
-			n.priority++
-
-			// 檢查通配符
-			if len(path) >= len(n.path) && n.path == path[:len(n.path)] &&
-				n.nType != catchAll &&
-				(len(n.path) >= len(path) || path[len(n.path)] == '/') {
-				n.addRoute(path, handlers)
-			} else {
-				panic("path conflict")
-			}
-			return
-		}
-
-		// 尋找子節點插入點
-		c := path[0]
-
-		// 處理參數
-		if n.nType == param && c == '/' && len(n.children) == 1 {
-			n = n.children[0]
-			n.priority++
-			n.addRoute(path, handlers)
-			return
-		}
-
-		// 檢查子節點
-		for i, index := range []byte(n.indices) {
-			if c == index {
-				n = n.children[i]
-				n.priority++
-				n.addRoute(path, handlers)
-				return
-			}
-		}
-
-		// 插入新子節點
-		if c != ':' && c != '*' {
-			n.indices += string(c)
-			child := &radixNode{}
-			n.children = append(n.children, child)
-			n = child
-		}
-
-		n.insertChild(path, fullPath, handlers)
-		return
-	}
-
-	// 設置處理器
-	if n.handlers != nil {
-		panic("handlers already registered")
-	}
-	n.handlers = handlers
-}
-
-// insertChild 插入子節點
-func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.HandlerFunc) {
-	for {
-		// 查找通配符
-		wildcard, i, valid := findWildcard(path)
-		if i < 0 {
-			break
-		}
-
-		if !valid {
-			panic("invalid wildcard")
-		}
-
-		if wildcard[0] == ':' { // 參數
-			if i > 0 {
-				n.path = path[:i]
-				path = path[i:]
-			}
-
-			child := &radixNode{
-				nType:    param,
-				path:     wildcard,
-				fullPath: fullPath,
-			}
-			n.children = []*radixNode{child}
-			n.wildChild = true
-			n = child
-
-			if len(wildcard) < len(path) {
-				path = path[len(wildcard):]
-				child := &radixNode{
-					priority: 1,
-					fullPath: fullPath,
-				}
-				n.children = []*radixNode{child}
-				n = child
-				continue
-			}
-
-			n.handlers = handlers
-			return
-		} else { // catchAll
-			if i+len(wildcard) != len(path) {
-				panic("catch-all must be at end")
-			}
-
-			if i > 0 {
-				n.path = path[:i]
-			}
-
-			child := &radixNode{
-				wildChild: true,
-				nType:     catchAll,
-				fullPath:  fullPath,
-			}
-			n.children = []*radixNode{child}
-			n.indices = string('/')
-			n = child
-
-			child = &radixNode{
-				path:     path[i:],
-				nType:    catchAll,
-				handlers: handlers,
-				fullPath: fullPath,
-			}
-			n.children = []*radixNode{child}
-			return
-		}
-	}
-
-	// 靜態路徑
-	n.path = path
-	n.handlers = handlers
-	n.fullPath = fullPath
-}
-
-// ===== 輔助函數 =====
 
 // executeHandlers 執行處理器鏈
+// 順序：全域中間件 → (Group 中間件 + 路由 Handler)，其中 Group 中間件已在 Group.handle() 中與 Handler 合併
 func (r *Router) executeHandlers(c *hypcontext.Context, handlers []hypcontext.HandlerFunc) {
-	// 執行全域中間件
-	for _, h := range r.middleware {
+	// 1. 全域中間件
+	for _, h := range r.globalMW {
 		h(c)
 		if c.Response.Written() {
 			return
 		}
 	}
 
-	// 執行路由處理器
+	// 2. Group 中間件 + 路由 Handler（已合併為一個 slice）
 	for _, h := range handlers {
 		h(c)
 		if c.Response.Written() {
 			return
 		}
 	}
-}
-
-// getParams 從池中獲取參數切片
-func (r *Router) getParams() []Param {
-	return r.pool.Get().([]Param)
-}
-
-// putParams 返回參數切片到池
-func (r *Router) putParams(params []Param) {
-	if params != nil {
-		params = params[:0]
-		r.pool.Put(params)
-	}
-}
-
-// makeContextParams 轉換參數格式
-func (r *Router) makeContextParams(params []Param) hypcontext.Params {
-	if len(params) == 0 {
-		return nil
-	}
-
-	cp := make(hypcontext.Params, len(params))
-	for i, p := range params {
-		cp[i] = hypcontext.Param{
-			Key:   p.Key,
-			Value: p.Value,
-		}
-	}
-	return cp
-}
-
-// longestCommonPrefix 最長公共前綴
-func longestCommonPrefix(a, b string) int {
-	max := len(a)
-	if len(b) < max {
-		max = len(b)
-	}
-
-	// 使用 unsafe 加速比較
-	if max > 0 {
-		ap := *(*[]byte)(unsafe.Pointer(&a))
-		bp := *(*[]byte)(unsafe.Pointer(&b))
-		for i := 0; i < max; i++ {
-			if ap[i] != bp[i] {
-				return i
-			}
-		}
-	}
-	return max
-}
-
-// findWildcard 查找通配符
-func findWildcard(path string) (string, int, bool) {
-	for i := 0; i < len(path); i++ {
-		c := path[i]
-		if c != ':' && c != '*' {
-			continue
-		}
-
-		valid := true
-		for j := i + 1; j < len(path); j++ {
-			switch path[j] {
-			case '/':
-				return path[i:j], i, valid
-			case ':', '*':
-				valid = false
-			}
-		}
-		return path[i:], i, valid
-	}
-	return "", -1, false
-}
-
-// countParams 計算參數數量
-func countParams(path string) int {
-	n := 0
-	for i := 0; i < len(path); i++ {
-		if path[i] == ':' || path[i] == '*' {
-			n++
-		}
-	}
-	return n
-}
-
-// newRouteCache 創建路由快取
-func newRouteCache(size int) *routeCache {
-	return &routeCache{
-		items: make(map[string]*cacheItem),
-		size:  size,
-	}
-}
-
-func (c *routeCache) get(key string) *cacheItem {
-	c.mu.RLock()
-	entry, exists := c.items[key]
-	c.mu.RUnlock()
-
-	if !exists {
-		return nil
-	}
-
-	// 移到頭部（LRU）
-	c.mu.Lock()
-	c.moveToHead(entry)
-	c.mu.Unlock()
-
-	return entry
-}
-
-func (c *routeCache) put(key string, handlers []hypcontext.HandlerFunc, params []Param) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if entry, exists := c.items[key]; exists {
-		entry.handlers = handlers
-		entry.params = params
-		c.moveToHead(entry)
-		return
-	}
-
-	// 新增項目
-	entry := &cacheItem{
-		key:      key,
-		handlers: handlers,
-		params:   params,
-	}
-
-	c.items[key] = entry
-	c.addToHead(entry)
-	c.size++
-
-	// 超過容量，移除最舊的
-	if c.size > c.capacity {
-		c.removeTail()
-	}
-}
-
-func (c *routeCache) moveToHead(entry *cacheItem) {
-	c.removeEntry(entry)
-	c.addToHead(entry)
-}
-
-func (c *routeCache) addToHead(entry *cacheItem) {
-	entry.prev = nil
-	entry.next = c.head
-
-	if c.head != nil {
-		c.head.prev = entry
-	}
-	c.head = entry
-
-	if c.tail == nil {
-		c.tail = entry
-	}
-}
-
-func (c *routeCache) removeEntry(entry *cacheItem) {
-	if entry.prev != nil {
-		entry.prev.next = entry.next
-	} else {
-		c.head = entry.next
-	}
-
-	if entry.next != nil {
-		entry.next.prev = entry.prev
-	} else {
-		c.tail = entry.prev
-	}
-}
-
-func (c *routeCache) removeTail() {
-	if c.tail == nil {
-		return
-	}
-
-	delete(c.items, c.tail.key)
-	c.removeEntry(c.tail)
-	c.size--
-}
-
-// ===== 公開方法 =====
-
-// Use 添加全域中間件
-func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
-	r.middleware = append(r.middleware, middleware...)
 }
 
 // NotFound 設置 404 處理器
@@ -727,7 +261,6 @@ func (r *Router) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 // EnableHTTP3 啟用 HTTP/3 支援
 func (r *Router) EnableHTTP3(config *HTTP3Config) {
 	if config == nil {
-		// 使用預設配置
 		config = &HTTP3Config{
 			Enabled:            true,
 			MaxHeaderBytes:     1 << 20, // 1MB
@@ -737,11 +270,7 @@ func (r *Router) EnableHTTP3(config *HTTP3Config) {
 			MaxUniStreams:      100,
 		}
 	}
-
-	// 確保 Enabled 為 true
 	config.Enabled = true
-
-	// 設置配置
 	r.http3Config = config
 }
 
@@ -753,4 +282,136 @@ func (r *Router) IsHTTP3Enabled() bool {
 // GetHTTP3Config 獲取 HTTP/3 配置
 func (r *Router) GetHTTP3Config() *HTTP3Config {
 	return r.http3Config
+}
+
+// getParams 從池中獲取參數切片，參數池 & 轉換
+func (r *Router) getParams() []Param {
+	ps := r.paramPool.Get().([]Param)
+	return ps[:0]
+}
+
+// putParams 返回參數切片到池
+func (r *Router) putParams(params []Param) {
+	if params != nil {
+		r.paramPool.Put(params[:0])
+	}
+}
+
+// makeContextParams 轉換路由參數為 Context 參數格式
+func (r *Router) makeContextParams(params []Param) hypcontext.Params {
+	if len(params) == 0 {
+		return nil
+	}
+	cp := make(hypcontext.Params, len(params))
+	for i, p := range params {
+		cp[i] = hypcontext.Param{
+			Key:   p.Key,
+			Value: p.Value,
+		}
+	}
+	return cp
+}
+
+// RouteInfo 路由信息
+type RouteInfo struct {
+	Method   string
+	Path     string
+	Handlers int // handler 數量
+}
+
+// Routes 返回已註冊的所有路由信息
+func (r *Router) Routes() []RouteInfo {
+	routes := make([]RouteInfo, 0)
+	for method, root := range r.trees {
+		routes = collectRoutes("", method, routes, root)
+	}
+	return routes
+}
+
+// collectRoutes 遞歸收集路由信息
+func collectRoutes(prefix, method string, routes []RouteInfo, n *radixNode) []RouteInfo {
+	if n == nil {
+		return routes
+	}
+	fullPath := prefix + n.path
+	if len(n.handlers) > 0 {
+		routes = append(routes, RouteInfo{
+			Method:   method,
+			Path:     fullPath,
+			Handlers: len(n.handlers),
+		})
+	}
+	for _, child := range n.children {
+		routes = collectRoutes(fullPath, method, routes, child)
+	}
+	return routes
+}
+
+// 共用工具函數
+
+// joinPaths 連接路徑
+func joinPaths(base, relative string) string {
+	if relative == "" {
+		return base
+	}
+
+	finalPath := base
+	if base[len(base)-1] != '/' && relative[0] != '/' {
+		finalPath += "/"
+	} else if base[len(base)-1] == '/' && relative[0] == '/' {
+		relative = relative[1:]
+	}
+	finalPath += relative
+
+	return finalPath
+}
+
+// longestCommonPrefix 最長公共前綴（使用 unsafe 加速）
+func longestCommonPrefix(a, b string) int {
+	max := len(a)
+	if len(b) < max {
+		max = len(b)
+	}
+	if max > 0 {
+		ap := *(*[]byte)(unsafe.Pointer(&a))
+		bp := *(*[]byte)(unsafe.Pointer(&b))
+		for i := 0; i < max; i++ {
+			if ap[i] != bp[i] {
+				return i
+			}
+		}
+	}
+	return max
+}
+
+// findWildcard 查找路徑中的通配符
+func findWildcard(path string) (string, int, bool) {
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c != ':' && c != '*' {
+			continue
+		}
+		valid := true
+		for j := i + 1; j < len(path); j++ {
+			switch path[j] {
+			case '/':
+				return path[i:j], i, valid
+			case ':', '*':
+				valid = false
+			}
+		}
+		return path[i:], i, valid
+	}
+	return "", -1, false
+}
+
+// countParams 計算路徑中的參數數量
+func countParams(path string) int {
+	n := 0
+	for i := 0; i < len(path); i++ {
+		if path[i] == ':' || path[i] == '*' {
+			n++
+		}
+	}
+	return n
 }
