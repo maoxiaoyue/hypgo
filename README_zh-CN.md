@@ -10,7 +10,7 @@
 
 ## 描述
 
-HypGo 是一个现代化的 Go Web 框架，提供 HTTP/2 和 HTTP/3 支持、Ent ORM 集成、消息队列和高级 JSON 验证功能。HTTP/3.0 的速度比 HTTP/1.1 快近 10 倍。在我的使用案例中，这是非常有用且重要的，因此我尝试设计了这个框架。
+HypGo 是一个现代化的 Go Web 框架，提供 HTTP/2 和 HTTP/3 支持、Bun ORM 集成、消息队列和高级 JSON 验证功能。HTTP/3.0 的速度比 HTTP/1.1 快近 10 倍。在我的使用案例中，这是非常有用且重要的，因此我尝试设计了这个框架。
 
 这个框架具有强大的插件系统，允许您通过简单的 CLI 命令添加 Kafka、RabbitMQ、Cassandra 等功能。它还包括自动 Docker 镜像构建、热重载开发和零停机部署功能。
 
@@ -174,7 +174,7 @@ logger:
 ```
 app/
 ├── controllers/   # HTTP 处理器
-├── models/        # 数据模型（Ent schemas）
+├── models/        # 数据模型（Bun models）
 ├── services/      # 业务逻辑
 └── plugins/       # 插件实现
 ```

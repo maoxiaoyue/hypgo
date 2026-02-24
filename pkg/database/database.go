@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"sync"
 
-	"entgo.io/ent/dialect"
-	entsql "entgo.io/ent/dialect/sql"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/redis/go-redis/v9"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/mysqldialect"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 // DatabasePlugin 數據庫插件接口
@@ -26,10 +27,10 @@ type DatabasePlugin interface {
 
 // Database 數據庫管理器
 type Database struct {
-	config    config.DatabaseConfigInterface
-	sqlDB     *sql.DB
-	entDriver *entsql.Driver
-	redisDB   *redis.Client
+	config  config.DatabaseConfigInterface
+	sqlDB   *sql.DB
+	bunDB   *bun.DB
+	redisDB *redis.Client
 
 	// 插件系統
 	plugins map[string]DatabasePlugin
@@ -203,7 +204,7 @@ func (d *Database) initMySQL() (*Database, error) {
 	}
 
 	d.sqlDB = db
-	d.entDriver = entsql.OpenDB(dialect.MySQL, db)
+	d.bunDB = bun.NewDB(db, mysqldialect.New())
 
 	return d, nil
 }
@@ -238,7 +239,7 @@ func (d *Database) initPostgres() (*Database, error) {
 	}
 
 	d.sqlDB = db
-	d.entDriver = entsql.OpenDB(dialect.Postgres, db)
+	d.bunDB = bun.NewDB(db, pgdialect.New())
 
 	return d, nil
 }
@@ -314,9 +315,9 @@ func (d *Database) LoadPlugin(name string, config map[string]interface{}) error 
 	return nil
 }
 
-// EntDriver 獲取 Ent 驅動
-func (d *Database) EntDriver() *entsql.Driver {
-	return d.entDriver
+// BunDB 獲取 Bun ORM 數據庫實例
+func (d *Database) BunDB() *bun.DB {
+	return d.bunDB
 }
 
 // Redis 獲取 Redis 客戶端
@@ -330,11 +331,17 @@ func (d *Database) SQL() *sql.DB {
 }
 
 // Close 關閉數據庫連接
+// 注意：bun.DB.Close() 會關閉底層 sql.DB，因此不需要重複關閉
 func (d *Database) Close() error {
 	var errs []error
 
-	// 關閉 SQL 連接
-	if d.sqlDB != nil {
+	// 關閉 Bun（會同時關閉底層 sql.DB）
+	if d.bunDB != nil {
+		if err := d.bunDB.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close Bun database: %w", err))
+		}
+	} else if d.sqlDB != nil {
+		// 僅在沒有 bunDB 時直接關閉 sqlDB（例如 Redis-only 模式）
 		if err := d.sqlDB.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close SQL database: %w", err))
 		}
@@ -400,7 +407,7 @@ func (d *Database) Type() string {
 	return ""
 }
 
-// Transaction 執行事務（僅支持 SQL 數據庫）
+// Transaction 執行事務（僅支持 SQL 數據庫，使用原始 sql.Tx）
 func (d *Database) Transaction(ctx *context.Context, fn func(*sql.Tx) error) error {
 	if d.sqlDB == nil {
 		return fmt.Errorf("no SQL database connection")
@@ -474,6 +481,40 @@ func (d *Database) TransactionWithStdContext(ctx stdcontext.Context, fn func(*sq
 	}
 
 	return nil
+}
+
+// BunTransaction 使用 Bun ORM 執行事務
+// 透過 bun.Tx 提供完整的 ORM 查詢能力
+func (d *Database) BunTransaction(ctx stdcontext.Context, fn func(stdcontext.Context, bun.Tx) error) error {
+	if d.bunDB == nil {
+		return fmt.Errorf("no Bun database connection")
+	}
+
+	if ctx == nil {
+		ctx = stdcontext.Background()
+	}
+
+	return d.bunDB.RunInTx(ctx, nil, func(ctx stdcontext.Context, tx bun.Tx) error {
+		return fn(ctx, tx)
+	})
+}
+
+// BunTransactionWithHypContext 使用 HypGo Context 執行 Bun 事務
+func (d *Database) BunTransactionWithHypContext(ctx *context.Context, fn func(stdcontext.Context, bun.Tx) error) error {
+	if d.bunDB == nil {
+		return fmt.Errorf("no Bun database connection")
+	}
+
+	var stdCtx stdcontext.Context
+	if ctx != nil && ctx.Request != nil {
+		stdCtx = ctx.Request.Context()
+	} else {
+		stdCtx = stdcontext.Background()
+	}
+
+	return d.bunDB.RunInTx(stdCtx, nil, func(ctx stdcontext.Context, tx bun.Tx) error {
+		return fn(ctx, tx)
+	})
 }
 
 // HealthCheck 健康檢查

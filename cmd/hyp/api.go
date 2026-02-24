@@ -528,56 +528,61 @@ func Error(format string, args ...interface{}) {
 const modelsInitContent = `package models
 
 import (
+	"context"
 	"fmt"
-	
-	"gorm.io/gorm"
+
+	"github.com/uptrace/bun"
 	"{{.ProjectName}}/internal/database"
 )
 
-// AutoMigrate 自動遷移所有模型
-func AutoMigrate(db *gorm.DB) error {
+// AutoMigrate 自動遷移所有模型（使用 CreateTable IfNotExists）
+func AutoMigrate(db *bun.DB) error {
+	ctx := context.Background()
+
 	models := []interface{}{
-		&User{},
-		&Role{},
-		&Permission{},
+		(*User)(nil),
+		(*Role)(nil),
+		(*Permission)(nil),
 	}
-	
+
 	for _, model := range models {
-		if err := db.AutoMigrate(model); err != nil {
-			return fmt.Errorf("failed to migrate %T: %w", model, err)
+		if _, err := db.NewCreateTable().Model(model).IfNotExists().Exec(ctx); err != nil {
+			return fmt.Errorf("failed to create table for %T: %w", model, err)
 		}
 	}
-	
+
 	// 創建默認角色
-	if err := createDefaultRoles(db); err != nil {
+	if err := createDefaultRoles(ctx, db); err != nil {
 		return fmt.Errorf("failed to create default roles: %w", err)
 	}
-	
+
 	return nil
 }
 
 // createDefaultRoles 創建默認角色
-func createDefaultRoles(db *gorm.DB) error {
+func createDefaultRoles(ctx context.Context, db *bun.DB) error {
 	defaultRoles := []Role{
 		{Name: "admin", Description: "Administrator with full access"},
 		{Name: "user", Description: "Regular user with limited access"},
 	}
-	
+
 	for _, role := range defaultRoles {
-		var count int64
-		db.Model(&Role{}).Where("name = ?", role.Name).Count(&count)
+		count, err := db.NewSelect().Model((*Role)(nil)).Where("name = ?", role.Name).Count(ctx)
+		if err != nil {
+			return err
+		}
 		if count == 0 {
-			if err := db.Create(&role).Error; err != nil {
+			if _, err := db.NewInsert().Model(&role).Exec(ctx); err != nil {
 				return err
 			}
 		}
 	}
-	
+
 	return nil
 }
 
-// GetDB 獲取數據庫實例
-func GetDB() *gorm.DB {
+// GetDB 獲取 Bun 數據庫實例
+func GetDB() *bun.DB {
 	return database.GetDB()
 }
 `
@@ -585,14 +590,16 @@ func GetDB() *gorm.DB {
 const databaseInitContent = `package database
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/mysqldialect"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 type Config struct {
@@ -606,11 +613,12 @@ type Config struct {
 }
 
 var (
-	db *gorm.DB
+	bunDB *bun.DB
+	sqlDB *sql.DB
 )
 
 // Init 初始化數據庫連接
-func Init(cfg Config) (*gorm.DB, error) {
+func Init(cfg Config) (*bun.DB, error) {
 	// 設置默認值
 	if cfg.Driver == "" {
 		cfg.Driver = "postgres"
@@ -631,44 +639,20 @@ func Init(cfg Config) (*gorm.DB, error) {
 		lifetime = time.Hour
 	}
 
-	// 設置日誌級別
-	logLevel := logger.Silent
-	switch cfg.LogLevel {
-	case "debug":
-		logLevel = logger.Info
-	case "info":
-		logLevel = logger.Warn
-	case "warn", "warning":
-		logLevel = logger.Error
-	}
-
-	// GORM 配置
-	gormConfig := &gorm.Config{
-		Logger:                 logger.Default.LogMode(logLevel),
-		PrepareStmt:            true,
-		SkipDefaultTransaction: true,
-	}
-
 	// 根據驅動創建連接
+	var driverName string
 	switch cfg.Driver {
 	case "postgres", "postgresql":
-		db, err = gorm.Open(postgres.Open(cfg.DSN), gormConfig)
+		driverName = "postgres"
 	case "mysql":
-		db, err = gorm.Open(mysql.Open(cfg.DSN), gormConfig)
-	case "sqlite", "sqlite3":
-		db, err = gorm.Open(sqlite.Open(cfg.DSN), gormConfig)
+		driverName = "mysql"
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Driver)
 	}
 
+	sqlDB, err = sql.Open(driverName, cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
-	}
-
-	// 獲取底層 SQL 數據庫
-	sqlDB, err := db.DB()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get underlying SQL database: %w", err)
 	}
 
 	// 設置連接池
@@ -681,29 +665,40 @@ func Init(cfg Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return db, nil
+	// 創建 Bun ORM 實例
+	switch cfg.Driver {
+	case "postgres", "postgresql":
+		bunDB = bun.NewDB(sqlDB, pgdialect.New())
+	case "mysql":
+		bunDB = bun.NewDB(sqlDB, mysqldialect.New())
+	}
+
+	return bunDB, nil
 }
 
-// GetDB 獲取數據庫實例
-func GetDB() *gorm.DB {
-	return db
+// GetDB 獲取 Bun 數據庫實例
+func GetDB() *bun.DB {
+	return bunDB
+}
+
+// GetSQLDB 獲取原始 SQL 數據庫連接
+func GetSQLDB() *sql.DB {
+	return sqlDB
 }
 
 // Close 關閉數據庫連接
 func Close() error {
-	if db != nil {
-		sqlDB, err := db.DB()
-		if err != nil {
-			return err
-		}
-		return sqlDB.Close()
+	if bunDB != nil {
+		return bunDB.Close()
 	}
 	return nil
 }
 
 // Transaction 執行事務
-func Transaction(fn func(*gorm.DB) error) error {
-	return db.Transaction(fn)
+func Transaction(ctx context.Context, fn func(ctx context.Context, tx bun.Tx) error) error {
+	return bunDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		return fn(ctx, tx)
+	})
 }
 `
 
@@ -1192,7 +1187,7 @@ import (
 	"net/http"
 	"runtime"
 	"time"
-	
+
 	"github.com/maoxiaoyue/hypgo/context"
 	"{{.ProjectName}}/internal/cache"
 	"{{.ProjectName}}/internal/database"
@@ -1203,14 +1198,13 @@ func HealthCheck(ctx *context.Context) {
 	// 檢查數據庫
 	dbStatus := "healthy"
 	if db := database.GetDB(); db != nil {
-		sqlDB, err := db.DB()
-		if err != nil || sqlDB.Ping() != nil {
+		if err := db.Ping(); err != nil {
 			dbStatus = "unhealthy"
 		}
 	} else {
 		dbStatus = "not connected"
 	}
-	
+
 	// 檢查 Redis
 	redisStatus := "healthy"
 	if client := cache.GetClient(); client != nil {
@@ -1220,11 +1214,11 @@ func HealthCheck(ctx *context.Context) {
 	} else {
 		redisStatus = "not connected"
 	}
-	
+
 	// 系統信息
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	
+
 	ctx.JSON(http.StatusOK, context.H{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
@@ -1344,14 +1338,17 @@ const userModelContent = `user model`
 const userServiceContent = `user service`
 const userValidatorContent = `user validator`
 const authServiceContent = `package services
+
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"time"
-	
+
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/uptrace/bun"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
-	
+
 	"{{.ProjectName}}/app/models"
 )
 
@@ -1362,12 +1359,12 @@ var (
 
 // AuthService 認證服務
 type AuthService struct {
-	db     *gorm.DB
+	db     *bun.DB
 	secret string
 }
 
 // NewAuthService 創建認證服務
-func NewAuthService(db *gorm.DB) *AuthService {
+func NewAuthService(db *bun.DB) *AuthService {
 	return &AuthService{
 		db:     db,
 		secret: "your-secret-key", // 應從配置讀取
@@ -1375,58 +1372,62 @@ func NewAuthService(db *gorm.DB) *AuthService {
 }
 
 // Login 用戶登入
-func (s *AuthService) Login(username, password string) (*models.User, string, error) {
+func (s *AuthService) Login(ctx context.Context, username, password string) (*models.User, string, error) {
 	var user models.User
-	
-	err := s.db.Where("username = ? OR email = ?", username, username).
-		Preload("Roles").
-		First(&user).Error
-		
+
+	err := s.db.NewSelect().
+		Model(&user).
+		Where("username = ? OR email = ?", username, username).
+		Scan(ctx)
+
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, "", ErrInvalidCredentials
 		}
 		return nil, "", err
 	}
-	
+
 	// 驗證密碼
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
 		return nil, "", ErrInvalidCredentials
 	}
-	
+
 	// 檢查用戶狀態
 	if !user.IsActive {
 		return nil, "", ErrUserDisabled
 	}
-	
+
 	// 生成 JWT
 	token, err := s.generateToken(&user)
 	if err != nil {
 		return nil, "", err
 	}
-	
+
 	user.Password = ""
 	return &user, token, nil
 }
 
 // Register 用戶註冊
-func (s *AuthService) Register(req models.RegisterRequest) (*models.User, string, error) {
+func (s *AuthService) Register(ctx context.Context, req models.RegisterRequest) (*models.User, string, error) {
 	// 檢查用戶是否存在
-	var count int64
-	s.db.Model(&models.User{}).
+	count, err := s.db.NewSelect().
+		Model((*models.User)(nil)).
 		Where("username = ? OR email = ?", req.Username, req.Email).
-		Count(&count)
-		
+		Count(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+
 	if count > 0 {
 		return nil, "", ErrDuplicate
 	}
-	
+
 	// 加密密碼
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, "", err
 	}
-	
+
 	// 創建用戶
 	user := &models.User{
 		Username:  req.Username,
@@ -1436,43 +1437,31 @@ func (s *AuthService) Register(req models.RegisterRequest) (*models.User, string
 		LastName:  req.LastName,
 		IsActive:  true,
 	}
-	
-	// 分配默認角色
-	var userRole models.Role
-	if err := s.db.Where("name = ?", "user").First(&userRole).Error; err == nil {
-		user.Roles = []models.Role{userRole}
-	}
-	
-	if err := s.db.Create(user).Error; err != nil {
+
+	if _, err := s.db.NewInsert().Model(user).Exec(ctx); err != nil {
 		return nil, "", err
 	}
-	
+
 	// 生成 token
 	token, err := s.generateToken(user)
 	if err != nil {
 		return nil, "", err
 	}
-	
+
 	user.Password = ""
 	return user, token, nil
 }
 
 func (s *AuthService) generateToken(user *models.User) (string, error) {
-	roles := make([]string, len(user.Roles))
-	for i, role := range user.Roles {
-		roles[i] = role.Name
-	}
-	
 	claims := jwt.MapClaims{
 		"user_id":  user.ID,
 		"username": user.Username,
 		"email":    user.Email,
-		"roles":    roles,
 		"exp":      time.Now().Add(24 * time.Hour).Unix(),
 		"iat":      time.Now().Unix(),
 		"iss":      "hypgo-api",
 	}
-	
+
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.secret))
 }
@@ -1940,15 +1929,16 @@ go 1.21
 
 require (
 	github.com/maoxiaoyue/hypgo v0.1.0
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/golang-jwt/jwt/v5 v5.2.0
+	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.3.0
 	github.com/spf13/viper v1.18.2
+	github.com/uptrace/bun v1.2.17
+	github.com/uptrace/bun/dialect/mysqldialect v1.2.17
+	github.com/uptrace/bun/dialect/pgdialect v1.2.17
 	golang.org/x/crypto v0.17.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-	gorm.io/driver/mysql v1.5.2
-	gorm.io/driver/postgres v1.5.4
-	gorm.io/driver/sqlite v1.5.4
-	gorm.io/gorm v1.25.5
 )`
 
 const createUsersUpSQL = `
