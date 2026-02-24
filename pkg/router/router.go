@@ -83,6 +83,7 @@ func WithMethodNotAllowed(enabled bool) RouterOption {
 
 // New 創建新的路由器
 // EX:
+//
 //	r := router.New()
 //	r.GET("/ping", pingHandler)
 //
@@ -219,6 +220,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // Use 添加全域中間件，全域中間件在 executeHandlers 中優先於 Group 中間件執行
 //
 // EX：
+//
 //	r := router.New()
 //	r.Use(loggerMiddleware, recoveryMiddleware)
 func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
