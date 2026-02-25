@@ -144,41 +144,27 @@ func generateModel(name string) error {
 
 import (
     "time"
-    
-    "entgo.io/ent"
-    "entgo.io/ent/schema/field"
+
+    "github.com/uptrace/bun"
 )
 
-// {{.Name}} holds the schema definition for the {{.Name}} entity.
+// {{.Name}} 數據模型
 type {{.Name}} struct {
-    ent.Schema
-}
+    bun.BaseModel ` + "`bun:\"table:{{.TableName}},alias:{{.Alias}}\"`" + `
 
-// Fields of the {{.Name}}.
-func ({{.Name}}) Fields() []ent.Field {
-    return []ent.Field{
-        field.String("name").
-            NotEmpty(),
-        field.Text("description").
-            Optional(),
-        field.Bool("active").
-            Default(true),
-        field.Time("created_at").
-            Default(time.Now),
-        field.Time("updated_at").
-            Default(time.Now).
-            UpdateDefault(time.Now),
-    }
-}
-
-// Edges of the {{.Name}}.
-func ({{.Name}}) Edges() []ent.Edge {
-    return nil
+    ID          int64     ` + "`bun:\"id,pk,autoincrement\"`" + `
+    Name        string    ` + "`bun:\"name,notnull\"`" + `
+    Description string    ` + "`bun:\"description\"`" + `
+    Active      bool      ` + "`bun:\"active,notnull,default:true\"`" + `
+    CreatedAt   time.Time ` + "`bun:\"created_at,nullzero,notnull,default:current_timestamp\"`" + `
+    UpdatedAt   time.Time ` + "`bun:\"updated_at,nullzero,notnull,default:current_timestamp\"`" + `
 }
 `
 
 	return generateFile("app/models", strings.ToLower(name)+".go", tmpl, map[string]string{
-		"Name": capitalize(name),
+		"Name":      capitalize(name),
+		"TableName": strings.ToLower(name) + "s",
+		"Alias":     strings.ToLower(name)[:1],
 	})
 }
 

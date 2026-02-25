@@ -39,3 +39,4 @@ hypgo.pid
 # Build artifacts
 #hypgo-app
 Dockerfile.tmp.*
+/.claude/

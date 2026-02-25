@@ -53,6 +53,19 @@ type RedisConfig struct {
 	DB       int    `mapstructure:"db" yaml:"db"`
 }
 
+// ReplicaConfig 讀取副本配置
+type ReplicaConfig struct {
+	DSN          string `mapstructure:"dsn" yaml:"dsn"`
+	MaxIdleConns int    `mapstructure:"max_idle_conns" yaml:"max_idle_conns"`
+	MaxOpenConns int    `mapstructure:"max_open_conns" yaml:"max_open_conns"`
+}
+
+// ReplicaConfigProvider 讀取副本配置提供者（可選介面）
+// 實現此介面即可啟用讀寫分離；不實現則自動回退到主庫
+type ReplicaConfigProvider interface {
+	GetReplicas() []ReplicaConfig
+}
+
 type DatabaseConfig struct {
 	Driver       string `mapstructure:"driver" yaml:"driver"` // mysql, postgresql, tidb, redis
 	DSN          string `mapstructure:"dsn" yaml:"dsn"`
@@ -60,6 +73,8 @@ type DatabaseConfig struct {
 	MaxOpenConns int    `mapstructure:"max_open_conns" yaml:"max_open_conns"`
 	// Redis 配置
 	Redis RedisConfig `mapstructure:"redis" yaml:"redis"`
+	// 讀取副本配置（讀寫分離）
+	Replicas []ReplicaConfig `mapstructure:"replicas" yaml:"replicas"`
 }
 
 // ServerConfigInterface 服務器配置接口
@@ -203,6 +218,15 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Database.Redis.Addr == "" {
 		c.Database.Redis.Addr = "localhost:6379"
+	}
+	// 讀取副本預設值：繼承主庫的連接池參數
+	for i := range c.Database.Replicas {
+		if c.Database.Replicas[i].MaxIdleConns == 0 {
+			c.Database.Replicas[i].MaxIdleConns = c.Database.MaxIdleConns
+		}
+		if c.Database.Replicas[i].MaxOpenConns == 0 {
+			c.Database.Replicas[i].MaxOpenConns = c.Database.MaxOpenConns
+		}
 	}
 
 	// Logger 預設值
@@ -414,6 +438,11 @@ func (d *DatabaseConfig) GetMaxOpenConns() int {
 // GetRedisConfig 獲取 Redis 配置
 func (d *DatabaseConfig) GetRedisConfig() RedisConfigInterface {
 	return &d.Redis
+}
+
+// GetReplicas 獲取讀取副本配置（實現 ReplicaConfigProvider 介面）
+func (d *DatabaseConfig) GetReplicas() []ReplicaConfig {
+	return d.Replicas
 }
 
 // ===== LoggerConfig 接口實現 =====

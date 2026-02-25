@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(find:*)",
+      "Bash(done)",
+      "Bash(go build:*)",
+      "Bash(go test:*)"
+    ]
+  }
+}
