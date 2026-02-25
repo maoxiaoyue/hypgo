@@ -1,7 +1,7 @@
 package database
 
 import (
-	stdcontext "context"
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -9,7 +9,6 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
-	"github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/redis/go-redis/v9"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/mysqldialect"
@@ -22,14 +21,14 @@ type DatabasePlugin interface {
 	Init(config map[string]interface{}) error
 	Connect() error
 	Close() error
-	Ping(ctx *context.Context) error
+	Ping(ctx context.Context) error
 }
 
 // Database 數據庫管理器
 type Database struct {
 	config  config.DatabaseConfigInterface
 	sqlDB   *sql.DB  // 主庫（寫入）
-	bunDB   *bun.DB  // 主庫 Bun ORM 實例（寫入）
+	hypDB   *bun.DB  // 主庫 HypDB ORM 實例（寫入）
 	redisDB *redis.Client
 
 	// 讀寫分離
@@ -212,7 +211,7 @@ func (d *Database) initMySQL() (*Database, error) {
 	}
 
 	d.sqlDB = db
-	d.bunDB = bun.NewDB(db, mysqldialect.New())
+	d.hypDB = bun.NewDB(db, mysqldialect.New())
 
 	// 初始化讀取副本
 	if err := d.initReplicas(); err != nil {
@@ -252,7 +251,7 @@ func (d *Database) initPostgres() (*Database, error) {
 	}
 
 	d.sqlDB = db
-	d.bunDB = bun.NewDB(db, pgdialect.New())
+	d.hypDB = bun.NewDB(db, pgdialect.New())
 
 	// 初始化讀取副本
 	if err := d.initReplicas(); err != nil {
@@ -310,9 +309,9 @@ func (d *Database) initRedis() (*Database, error) {
 		DB:       redisConfig.GetDB(),
 	})
 
-	// 測試連接 - 使用標準 context
-	stdCtx := stdcontext.Background()
-	if err := client.Ping(stdCtx).Err(); err != nil {
+	// 測試連接
+	ctx := context.Background()
+	if err := client.Ping(ctx).Err(); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to ping redis: %w", err)
 	}
@@ -363,26 +362,26 @@ func (d *Database) LoadPlugin(name string, config map[string]interface{}) error 
 	return nil
 }
 
-// BunDB 獲取主庫的 Bun ORM 數據庫實例（始終返回主庫，保持向後兼容）
-// 如需讀寫分離，請使用 ReadBunDB() / WriteBunDB()
-func (d *Database) BunDB() *bun.DB {
-	return d.bunDB
+// HypDB 獲取主庫的 HypDB ORM 數據庫實例（始終返回主庫，保持向後兼容）
+// 如需讀寫分離，請使用 ReadHypDB() / WriteHypDB()
+func (d *Database) HypDB() *bun.DB {
+	return d.hypDB
 }
 
-// ReadBunDB 獲取讀取用的 Bun ORM 實例
+// ReadHypDB 獲取讀取用的 HypDB ORM 實例
 // 如果有配置讀取副本，則從副本池中輪詢選擇；否則回退到主庫
-func (d *Database) ReadBunDB() *bun.DB {
+func (d *Database) ReadHypDB() *bun.DB {
 	if d.replicaPool != nil {
 		if db := d.replicaPool.Next(); db != nil {
 			return db
 		}
 	}
-	return d.bunDB
+	return d.hypDB
 }
 
-// WriteBunDB 獲取寫入用的 Bun ORM 實例（始終返回主庫）
-func (d *Database) WriteBunDB() *bun.DB {
-	return d.bunDB
+// WriteHypDB 獲取寫入用的 HypDB ORM 實例（始終返回主庫）
+func (d *Database) WriteHypDB() *bun.DB {
+	return d.hypDB
 }
 
 // Redis 獲取 Redis 客戶端
@@ -426,7 +425,7 @@ func (d *Database) ReplicaCount() int {
 }
 
 // Close 關閉數據庫連接
-// 注意：bun.DB.Close() 會關閉底層 sql.DB，因此不需要重複關閉
+// 注意：hypDB.Close() 會關閉底層 sql.DB，因此不需要重複關閉
 // 關閉順序：讀取副本 → 主庫 → Redis → 插件
 func (d *Database) Close() error {
 	var errs []error
@@ -439,13 +438,13 @@ func (d *Database) Close() error {
 		d.replicaPool = nil
 	}
 
-	// 關閉主庫 Bun（會同時關閉底層 sql.DB）
-	if d.bunDB != nil {
-		if err := d.bunDB.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close Bun database: %w", err))
+	// 關閉主庫 HypDB（會同時關閉底層 sql.DB）
+	if d.hypDB != nil {
+		if err := d.hypDB.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close HypDB database: %w", err))
 		}
 	} else if d.sqlDB != nil {
-		// 僅在沒有 bunDB 時直接關閉 sqlDB（例如 Redis-only 模式）
+		// 僅在沒有 hypDB 時直接關閉 sqlDB（例如 Redis-only 模式）
 		if err := d.sqlDB.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close SQL database: %w", err))
 		}
@@ -476,25 +475,19 @@ func (d *Database) Close() error {
 
 // IsConnected 檢查數據庫是否已連接
 func (d *Database) IsConnected() bool {
-	// 使用標準 context 進行檢查
-	stdCtx := stdcontext.Background()
+	ctx := context.Background()
 
 	if d.sqlDB != nil {
 		return d.sqlDB.Ping() == nil
 	}
 	if d.redisDB != nil {
-		return d.redisDB.Ping(stdCtx).Err() == nil
+		return d.redisDB.Ping(ctx).Err() == nil
 	}
 
 	// 檢查插件連接狀態
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	for _, plugin := range d.plugins {
-		// 創建一個臨時的 HypGo context 用於測試
-		// 由於這是內部檢查，不需要 HTTP 請求相關信息
-		ctx := &context.Context{
-			Keys: make(map[string]interface{}),
-		}
 		if err := plugin.Ping(ctx); err == nil {
 			return true
 		}
@@ -512,53 +505,14 @@ func (d *Database) Type() string {
 }
 
 // Transaction 執行事務（僅支持 SQL 數據庫，使用原始 sql.Tx）
-func (d *Database) Transaction(ctx *context.Context, fn func(*sql.Tx) error) error {
-	if d.sqlDB == nil {
-		return fmt.Errorf("no SQL database connection")
-	}
-
-	// 從 HypGo context 獲取標準 context
-	var stdCtx stdcontext.Context
-	if ctx != nil && ctx.Request != nil {
-		stdCtx = ctx.Request.Context()
-	} else {
-		stdCtx = stdcontext.Background()
-	}
-
-	tx, err := d.sqlDB.BeginTx(stdCtx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-
-	defer func() {
-		if p := recover(); p != nil {
-			tx.Rollback()
-			panic(p)
-		}
-	}()
-
-	if err := fn(tx); err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			return fmt.Errorf("transaction failed: %v, rollback failed: %w", err, rbErr)
-		}
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
-}
-
-// TransactionWithStdContext 使用標準 context 執行事務
-func (d *Database) TransactionWithStdContext(ctx stdcontext.Context, fn func(*sql.Tx) error) error {
+// 接受任何 context.Context，包括 HypGo *context.Context（因其實現 context.Context 介面）
+func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	if d.sqlDB == nil {
 		return fmt.Errorf("no SQL database connection")
 	}
 
 	if ctx == nil {
-		ctx = stdcontext.Background()
+		ctx = context.Background()
 	}
 
 	tx, err := d.sqlDB.BeginTx(ctx, nil)
@@ -587,87 +541,28 @@ func (d *Database) TransactionWithStdContext(ctx stdcontext.Context, fn func(*sq
 	return nil
 }
 
-// BunTransaction 使用 Bun ORM 執行事務
+// HypDBTransaction 使用 HypDB ORM 執行事務
 // 透過 bun.Tx 提供完整的 ORM 查詢能力
-func (d *Database) BunTransaction(ctx stdcontext.Context, fn func(stdcontext.Context, bun.Tx) error) error {
-	if d.bunDB == nil {
-		return fmt.Errorf("no Bun database connection")
+// 接受任何 context.Context，包括 HypGo *context.Context
+func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context, bun.Tx) error) error {
+	if d.hypDB == nil {
+		return fmt.Errorf("no HypDB database connection")
 	}
 
 	if ctx == nil {
-		ctx = stdcontext.Background()
+		ctx = context.Background()
 	}
 
-	return d.bunDB.RunInTx(ctx, nil, func(ctx stdcontext.Context, tx bun.Tx) error {
-		return fn(ctx, tx)
-	})
-}
-
-// BunTransactionWithHypContext 使用 HypGo Context 執行 Bun 事務
-func (d *Database) BunTransactionWithHypContext(ctx *context.Context, fn func(stdcontext.Context, bun.Tx) error) error {
-	if d.bunDB == nil {
-		return fmt.Errorf("no Bun database connection")
-	}
-
-	var stdCtx stdcontext.Context
-	if ctx != nil && ctx.Request != nil {
-		stdCtx = ctx.Request.Context()
-	} else {
-		stdCtx = stdcontext.Background()
-	}
-
-	return d.bunDB.RunInTx(stdCtx, nil, func(ctx stdcontext.Context, tx bun.Tx) error {
+	return d.hypDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		return fn(ctx, tx)
 	})
 }
 
 // HealthCheck 健康檢查（主庫 + 讀取副本 + Redis + 插件）
-func (d *Database) HealthCheck(ctx *context.Context) error {
-	// 從 HypGo context 獲取標準 context
-	var stdCtx stdcontext.Context
-	if ctx != nil && ctx.Request != nil {
-		stdCtx = ctx.Request.Context()
-	} else {
-		stdCtx = stdcontext.Background()
-	}
-
-	// 檢查主庫
-	if d.sqlDB != nil {
-		if err := d.sqlDB.PingContext(stdCtx); err != nil {
-			return fmt.Errorf("SQL database unhealthy: %w", err)
-		}
-	}
-
-	// 檢查讀取副本
-	if d.replicaPool != nil {
-		if replicaErrs := d.replicaPool.PingAll(); len(replicaErrs) > 0 {
-			return fmt.Errorf("read replicas unhealthy: %v", replicaErrs)
-		}
-	}
-
-	// 檢查 Redis
-	if d.redisDB != nil {
-		if err := d.redisDB.Ping(stdCtx).Err(); err != nil {
-			return fmt.Errorf("Redis unhealthy: %w", err)
-		}
-	}
-
-	// 檢查插件健康狀態
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	for name, plugin := range d.plugins {
-		if err := plugin.Ping(ctx); err != nil {
-			return fmt.Errorf("plugin %s unhealthy: %w", name, err)
-		}
-	}
-
-	return nil
-}
-
-// HealthCheckWithStdContext 使用標準 context 進行健康檢查（主庫 + 讀取副本 + Redis + 插件）
-func (d *Database) HealthCheckWithStdContext(ctx stdcontext.Context) error {
+// 接受任何 context.Context，包括 HypGo *context.Context
+func (d *Database) HealthCheck(ctx context.Context) error {
 	if ctx == nil {
-		ctx = stdcontext.Background()
+		ctx = context.Background()
 	}
 
 	// 檢查主庫
@@ -694,14 +589,8 @@ func (d *Database) HealthCheckWithStdContext(ctx stdcontext.Context) error {
 	// 檢查插件健康狀態
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-
-	// 創建一個臨時的 HypGo context 用於插件檢查
-	hypCtx := &context.Context{
-		Keys: make(map[string]interface{}),
-	}
-
 	for name, plugin := range d.plugins {
-		if err := plugin.Ping(hypCtx); err != nil {
+		if err := plugin.Ping(ctx); err != nil {
 			return fmt.Errorf("plugin %s unhealthy: %w", name, err)
 		}
 	}

@@ -2,6 +2,7 @@ package context
 
 // Package context 提供 HypGo 框架的核心上下文功能
 import (
+	stdcontext "context"
 	"net/http"
 	"net/url"
 	"sync"
@@ -9,6 +10,35 @@ import (
 
 	"github.com/quic-go/quic-go/http3"
 )
+
+// ===== 標準 context.Context 橋接 =====
+
+// hypContextKey 用於在標準 context.Context 中存放 *Context 的 key
+// 使用未匯出的 struct 確保不會與其他套件的 key 衝突
+type hypContextKey struct{}
+
+// NewContext 將 HypGo *Context 嵌入標準 context.Context 中
+// 讓下游接受 context.Context 的 API 可透過 FromContext 取回 HypGo Context
+func NewContext(parent stdcontext.Context, c *Context) stdcontext.Context {
+	return stdcontext.WithValue(parent, hypContextKey{}, c)
+}
+
+// FromContext 從標準 context.Context 中提取 HypGo *Context
+// 若 ctx 本身就是 *Context（因其實現 context.Context 介面），也能正確提取
+func FromContext(ctx stdcontext.Context) (*Context, bool) {
+	c, ok := ctx.Value(hypContextKey{}).(*Context)
+	return c, ok
+}
+
+// MustFromContext 同 FromContext，但不存在時 panic
+// 適用於框架內部保證 HypGo Context 存在的場景
+func MustFromContext(ctx stdcontext.Context) *Context {
+	c, ok := FromContext(ctx)
+	if !ok {
+		panic("hypgo: context.Context does not contain a *Context")
+	}
+	return c
+}
 
 // Context 是 HypGo 框架的核心上下文結構
 // 同時支援 HTTP/1.1, 2.0, 3.0
@@ -320,7 +350,12 @@ func (c *Context) Err() error {
 }
 
 // Value 實現 context.Context 介面
+// 查詢順序：hypContextKey → Request(key=0) → Keys map → Request.Context()
 func (c *Context) Value(key interface{}) interface{} {
+	// 允許 FromContext 直接從 *Context 提取（因 *Context 本身實現 context.Context）
+	if _, ok := key.(hypContextKey); ok {
+		return c
+	}
 	if key == 0 {
 		return c.Request
 	}
@@ -333,6 +368,19 @@ func (c *Context) Value(key interface{}) interface{} {
 		return nil
 	}
 	return c.Request.Context().Value(key)
+}
+
+// StdContext 返回攜帶 HypGo Context 的標準 context.Context
+// 繼承 Request.Context() 的 deadline、cancellation 和 values
+// 這是將 HypGo Context 傳入接受 context.Context 的 API 的推薦方式
+func (c *Context) StdContext() stdcontext.Context {
+	var parent stdcontext.Context
+	if c.Request != nil {
+		parent = c.Request.Context()
+	} else {
+		parent = stdcontext.Background()
+	}
+	return NewContext(parent, c)
 }
 
 // ===== 協議檢測 =====

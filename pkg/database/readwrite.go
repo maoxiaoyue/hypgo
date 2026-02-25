@@ -15,7 +15,7 @@ import (
 // ReadReplica 讀取副本連接
 type ReadReplica struct {
 	sqlDB *sql.DB
-	bunDB *bun.DB
+	hypDB *bun.DB
 }
 
 // ReplicaPool 讀取副本連接池（支持輪詢負載均衡）
@@ -39,7 +39,7 @@ func (rp *ReplicaPool) Add(replica ReadReplica) {
 	rp.replicas = append(rp.replicas, replica)
 }
 
-// Next 獲取下一個讀取副本的 Bun ORM 實例（輪詢）
+// Next 獲取下一個讀取副本的 HypDB ORM 實例（輪詢）
 // 如果沒有可用的讀取副本，返回 nil
 func (rp *ReplicaPool) Next() *bun.DB {
 	rp.mu.RLock()
@@ -50,7 +50,7 @@ func (rp *ReplicaPool) Next() *bun.DB {
 	}
 
 	idx := rp.counter.Add(1) - 1
-	return rp.replicas[idx%uint64(len(rp.replicas))].bunDB
+	return rp.replicas[idx%uint64(len(rp.replicas))].hypDB
 }
 
 // NextSQL 獲取下一個讀取副本的原始 SQL 連接（輪詢）
@@ -81,8 +81,8 @@ func (rp *ReplicaPool) Close() []error {
 
 	var errs []error
 	for i, replica := range rp.replicas {
-		if replica.bunDB != nil {
-			if err := replica.bunDB.Close(); err != nil {
+		if replica.hypDB != nil {
+			if err := replica.hypDB.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("failed to close read replica %d: %w", i, err))
 			}
 		}
@@ -142,17 +142,17 @@ func initReplica(driver string, replicaCfg config.ReplicaConfig) (ReadReplica, e
 		return ReadReplica{}, fmt.Errorf("failed to ping read replica: %w", err)
 	}
 
-	// 創建 Bun ORM 實例
-	var bunDB *bun.DB
+	// 創建 HypDB ORM 實例
+	var hypDB *bun.DB
 	switch driver {
 	case "mysql", "tidb":
-		bunDB = bun.NewDB(db, mysqldialect.New())
+		hypDB = bun.NewDB(db, mysqldialect.New())
 	case "postgres":
-		bunDB = bun.NewDB(db, pgdialect.New())
+		hypDB = bun.NewDB(db, pgdialect.New())
 	}
 
 	return ReadReplica{
 		sqlDB: db,
-		bunDB: bunDB,
+		hypDB: hypDB,
 	}, nil
 }

@@ -8,14 +8,14 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// mockBunDB 創建一個用於測試的 bun.DB 標識（不需要真實連接）
+// mockHypDB 創建一個用於測試的 bun.DB 標識（不需要真實連接）
 // 我們使用不同的指針地址來區分不同的副本
 func newMockReplica(id int) ReadReplica {
 	// 使用空的 bun.DB 指針作為標識，僅用於輪詢測試
 	// 在真實場景中這些會是實際的數據庫連接
 	return ReadReplica{
 		sqlDB: nil,
-		bunDB: &bun.DB{},
+		hypDB: &bun.DB{},
 	}
 }
 
@@ -37,7 +37,7 @@ func TestReplicaPoolRoundRobin(t *testing.T) {
 	for round := 0; round < 3; round++ {
 		for i := 0; i < 3; i++ {
 			got := pool.Next()
-			expected := replicas[i].bunDB
+			expected := replicas[i].hypDB
 			if got != expected {
 				t.Errorf("round %d, index %d: expected replica %d, got different replica", round, i, i)
 			}
@@ -56,7 +56,7 @@ func TestReplicaPoolNextSQL(t *testing.T) {
 	// 添加副本後應正常工作
 	replica := ReadReplica{
 		sqlDB: nil, // 測試中使用 nil，只驗證輪詢邏輯
-		bunDB: nil,
+		hypDB: nil,
 	}
 	pool.Add(replica)
 
@@ -137,7 +137,7 @@ func TestReplicaPoolClose(t *testing.T) {
 	}
 
 	// 添加帶 nil bunDB 的副本（Close 會跳過）
-	pool.Add(ReadReplica{sqlDB: nil, bunDB: nil})
+	pool.Add(ReadReplica{sqlDB: nil, hypDB: nil})
 	errs = pool.Close()
 	if len(errs) != 0 {
 		t.Errorf("expected no errors closing pool with nil connections, got %v", errs)
@@ -159,58 +159,58 @@ func TestReplicaPoolPingAll(t *testing.T) {
 	}
 
 	// 帶 nil sqlDB 的副本不會被 ping（跳過）
-	pool.Add(ReadReplica{sqlDB: nil, bunDB: nil})
+	pool.Add(ReadReplica{sqlDB: nil, hypDB: nil})
 	errs = pool.PingAll()
 	if len(errs) != 0 {
 		t.Errorf("expected no errors pinging pool with nil sqlDB, got %v", errs)
 	}
 }
 
-func TestReadBunDBFallback(t *testing.T) {
+func TestReadHypDBFallback(t *testing.T) {
 	// 模擬無讀取副本的 Database
 	masterDB := &bun.DB{}
 	db := &Database{
-		bunDB:       masterDB,
+		hypDB:       masterDB,
 		replicaPool: nil,
 		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 無副本：應回退到主庫
-	got := db.ReadBunDB()
+	got := db.ReadHypDB()
 	if got != masterDB {
-		t.Error("ReadBunDB should fallback to master when no replicas configured")
+		t.Error("ReadHypDB should fallback to master when no replicas configured")
 	}
 
-	// WriteBunDB 始終返回主庫
-	got = db.WriteBunDB()
+	// WriteHypDB 始終返回主庫
+	got = db.WriteHypDB()
 	if got != masterDB {
-		t.Error("WriteBunDB should always return master")
+		t.Error("WriteHypDB should always return master")
 	}
 }
 
-func TestReadBunDBWithReplicas(t *testing.T) {
+func TestReadHypDBWithReplicas(t *testing.T) {
 	masterDB := &bun.DB{}
 	replicaDB := &bun.DB{}
 
 	pool := NewReplicaPool()
-	pool.Add(ReadReplica{bunDB: replicaDB})
+	pool.Add(ReadReplica{hypDB: replicaDB})
 
 	db := &Database{
-		bunDB:       masterDB,
+		hypDB:       masterDB,
 		replicaPool: pool,
 		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 有副本：應返回副本
-	got := db.ReadBunDB()
+	got := db.ReadHypDB()
 	if got != replicaDB {
-		t.Error("ReadBunDB should return replica when replicas are configured")
+		t.Error("ReadHypDB should return replica when replicas are configured")
 	}
 
-	// WriteBunDB 仍應返回主庫
-	got = db.WriteBunDB()
+	// WriteHypDB 仍應返回主庫
+	got = db.WriteHypDB()
 	if got != masterDB {
-		t.Error("WriteBunDB should always return master even with replicas")
+		t.Error("WriteHypDB should always return master even with replicas")
 	}
 }
 
@@ -281,7 +281,7 @@ func TestReplicaPoolSingleReplica(t *testing.T) {
 	// 單個副本時，所有 Next() 都應返回同一個
 	for i := 0; i < 10; i++ {
 		got := pool.Next()
-		if got != replica.bunDB {
+		if got != replica.hypDB {
 			t.Errorf("iteration %d: expected the only replica, got different one", i)
 		}
 	}

@@ -581,7 +581,7 @@ func createDefaultRoles(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-// GetDB 獲取 Bun 數據庫實例
+// GetDB 獲取 HypDB 數據庫實例
 func GetDB() *bun.DB {
 	return database.GetDB()
 }
@@ -613,7 +613,7 @@ type Config struct {
 }
 
 var (
-	bunDB *bun.DB
+	hypDB *bun.DB
 	sqlDB *sql.DB
 )
 
@@ -665,20 +665,20 @@ func Init(cfg Config) (*bun.DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// 創建 Bun ORM 實例
+	// 創建 HypDB ORM 實例
 	switch cfg.Driver {
 	case "postgres", "postgresql":
-		bunDB = bun.NewDB(sqlDB, pgdialect.New())
+		hypDB = bun.NewDB(sqlDB, pgdialect.New())
 	case "mysql":
-		bunDB = bun.NewDB(sqlDB, mysqldialect.New())
+		hypDB = bun.NewDB(sqlDB, mysqldialect.New())
 	}
 
-	return bunDB, nil
+	return hypDB, nil
 }
 
-// GetDB 獲取 Bun 數據庫實例
+// GetDB 獲取 HypDB 數據庫實例
 func GetDB() *bun.DB {
-	return bunDB
+	return hypDB
 }
 
 // GetSQLDB 獲取原始 SQL 數據庫連接
@@ -688,15 +688,15 @@ func GetSQLDB() *sql.DB {
 
 // Close 關閉數據庫連接
 func Close() error {
-	if bunDB != nil {
-		return bunDB.Close()
+	if hypDB != nil {
+		return hypDB.Close()
 	}
 	return nil
 }
 
 // Transaction 執行事務
 func Transaction(ctx context.Context, fn func(ctx context.Context, tx bun.Tx) error) error {
-	return bunDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+	return hypDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		return fn(ctx, tx)
 	})
 }
