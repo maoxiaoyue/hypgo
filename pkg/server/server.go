@@ -3,13 +3,16 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -55,6 +58,29 @@ const (
 // SessionCache 0-RTT session 快取
 type SessionCache struct {
 	cache map[string][]byte
+	mu    sync.RWMutex
+}
+
+// Put 儲存 session
+func (c *SessionCache) Put(key string, state []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[key] = state
+}
+
+// Get 獲取 session
+func (c *SessionCache) Get(key string) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	state, ok := c.cache[key]
+	return state, ok
+}
+
+// Delete 刪除 session
+func (c *SessionCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.cache, key)
 }
 
 // New 創建新的伺服器實例
@@ -122,6 +148,36 @@ func (s *Server) startAutoProtocol() error {
 	return s.startHTTP2WithFallback()
 }
 
+// getTLSWrapSession 取得用於 TLS 1.3 0-RTT 的 WrapSession 函數
+func (s *Server) getTLSWrapSession() func(tls.ConnectionState, *tls.SessionState) ([]byte, error) {
+	return func(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
+		ticket := make([]byte, 32)
+		if _, err := rand.Read(ticket); err != nil {
+			return nil, err
+		}
+		stateBytes, err := ss.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		s.sessionCache.Put(hex.EncodeToString(ticket), stateBytes)
+		return ticket, nil
+	}
+}
+
+// getTLSUnwrapSession 取得用於 TLS 1.3 0-RTT 的 UnwrapSession 函數
+func (s *Server) getTLSUnwrapSession() func([]byte, tls.ConnectionState) (*tls.SessionState, error) {
+	return func(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
+		key := hex.EncodeToString(identity)
+		stateBytes, ok := s.sessionCache.Get(key)
+		if !ok {
+			return nil, nil // Not found
+		}
+		// 為了防止重放攻擊 (Anti-Replay) 支援 0-RTT，獲取後建議刪除
+		s.sessionCache.Delete(key)
+		return tls.ParseSessionState(stateBytes)
+	}
+}
+
 // startHTTP3 啟動 HTTP/3 伺服器
 func (s *Server) startHTTP3() error {
 	s.logger.Info("Starting HTTP/3 server on %s", s.config.Server.Addr)
@@ -132,9 +188,11 @@ func (s *Server) startHTTP3() error {
 
 	// 配置 TLS
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{s.loadCertificate()},
-		NextProtos:   []string{"h3"},
-		MinVersion:   tls.VersionTLS13,
+		Certificates:  []tls.Certificate{s.loadCertificate()},
+		NextProtos:    []string{"h3"},
+		MinVersion:    tls.VersionTLS13,
+		WrapSession:   s.getTLSWrapSession(),
+		UnwrapSession: s.getTLSUnwrapSession(),
 	}
 
 	// 創建 HTTP/3 伺服器
@@ -187,8 +245,10 @@ func (s *Server) startHTTP2WithFallback() error {
 	// TLS 配置
 	if s.config.Server.TLS.Enabled {
 		s.httpServer.TLSConfig = &tls.Config{
-			NextProtos: []string{"h2", "http/1.1"},
-			MinVersion: tls.VersionTLS12,
+			NextProtos:    []string{"h2", "http/1.1"},
+			MinVersion:    tls.VersionTLS12,
+			WrapSession:   s.getTLSWrapSession(),
+			UnwrapSession: s.getTLSUnwrapSession(),
 			CipherSuites: []uint16{
 				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
