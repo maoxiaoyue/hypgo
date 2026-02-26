@@ -342,12 +342,14 @@ func (s *Server) wrapH3Handler() http.Handler {
 // detectProtocol 檢測請求使用的協議
 func (s *Server) detectProtocol(r *http.Request) string {
 	// 檢查請求的協議版本
-	if r.ProtoMajor == 3 {
+	switch r.ProtoMajor {
+	case 3:
 		return "HTTP/3"
-	} else if r.ProtoMajor == 2 {
+	case 2:
 		return "HTTP/2"
+	default:
+		return "HTTP/1.1"
 	}
-	return "HTTP/1.1"
 }
 
 // getListener 創建或繼承監聽器
@@ -436,11 +438,11 @@ func (s *Server) handleGracefulRestart() {
 
 		// 優雅關閉
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
 
 		if err := s.Shutdown(ctx); err != nil {
 			s.logger.Emergency("Failed to shutdown gracefully: %v", err)
 		}
+		cancel()
 
 		// 移除 PID 檔案
 		s.removePIDFile()
