@@ -75,6 +75,7 @@ func AcquireContext(w http.ResponseWriter, r *http.Request) *Context {
 	c.reset()
 	c.Request = r
 	c.Response = acquireResponseWriter(w)
+	c.Writer = c.Response // Gin 兼容別名，必須設置
 	c.metrics = acquireMetrics()
 	c.startTime = time.Now()
 
