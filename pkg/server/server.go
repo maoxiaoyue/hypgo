@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -360,7 +359,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // handleGracefulRestart 處理優雅重啟
 func (s *Server) handleGracefulRestart() {
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGUSR2)
+	signal.Notify(sigChan, restartSignals...)
 
 	for {
 		<-sigChan
