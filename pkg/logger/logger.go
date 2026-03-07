@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -24,9 +25,6 @@ const (
 
 // Logger 日誌介面
 type Logger struct {
-	debug    *log.Logger
-	info     *log.Logger
-	warning  *log.Logger
 	level    Level
 	logger   *log.Logger
 	file     *os.File
@@ -46,10 +44,30 @@ func New(level string, output string, writer io.Writer, colorEnabled bool) (*Log
 	}
 
 	return &Logger{
-		debug:   log.New(w, "[DEBUG] ", log.LstdFlags),
-		info:    log.New(w, "[INFO] ", log.LstdFlags),
-		warning: log.New(w, "[WARNING] ", log.LstdFlags),
+		logger:   log.New(w, "", log.LstdFlags),
+		level:    parseLevel(level),
+		colorize: colorEnabled,
 	}, nil
+}
+
+// parseLevel 將字串轉換為 Level
+func parseLevel(level string) Level {
+	switch level {
+	case "debug", "DEBUG":
+		return DEBUG
+	case "info", "INFO":
+		return INFO
+	case "notice", "NOTICE":
+		return NOTICE
+	case "warning", "WARNING", "warn", "WARN":
+		return WARNING
+	case "error", "ERROR":
+		return ERROR
+	case "emergency", "EMERGENCY":
+		return EMERGENCY
+	default:
+		return INFO
+	}
 }
 
 // LogRotator 日誌輪轉器
@@ -155,6 +173,9 @@ func (l *Logger) formatMessage(level Level, msg string, keysAndValues ...interfa
 		for i := 0; i < len(keysAndValues); i += 2 {
 			if i+1 < len(keysAndValues) {
 				extra += fmt.Sprintf(" %v=%v", keysAndValues[i], keysAndValues[i+1])
+			} else {
+				// 奇數個參數：最後一個 key 沒有對應的 value
+				extra += fmt.Sprintf(" %v=(MISSING)", keysAndValues[i])
 			}
 		}
 	}
@@ -333,7 +354,8 @@ func (l *Logger) cleanOldBackups() {
 
 	// 如果備份數量超過限制，刪除最舊的
 	if len(files) > l.rotator.maxBackups {
-		// 按時間排序（最舊的在前）
+		// 按檔名排序（時間戳格式 20060102-150405 保證字典序 = 時間序）
+		sort.Strings(files)
 		for i := 0; i < len(files)-l.rotator.maxBackups; i++ {
 			os.Remove(files[i])
 		}
