@@ -3,6 +3,7 @@ package websocket
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -53,17 +54,35 @@ var (
 
 // ===== 配置 =====
 
+// TLSConfig 獨立 WSS 伺服器的 TLS 配置
+// 當 websocket 不透過 HypGo server 使用時，提供 wss:// 支援
+type TLSConfig struct {
+	CertFile  string      // TLS 證書檔案路徑
+	KeyFile   string      // TLS 金鑰檔案路徑
+	TLSConfig *tls.Config // 可選：預配置的 tls.Config（優先使用）
+}
+
+// CompressionConfig permessage-deflate 壓縮配置
+type CompressionConfig struct {
+	Enabled bool // 是否啟用壓縮（預設 true）
+	Level   int  // flate 壓縮等級 1-9，0 表示使用預設值
+}
+
 // Config WebSocket 配置
 type Config struct {
 	ReadBufferSize    int
 	WriteBufferSize   int
 	HandshakeTimeout  time.Duration
-	EnableCompression bool
+	EnableCompression bool // 向後兼容：Compression 為 nil 時使用此欄位
 	CheckOrigin       func(*http.Request) bool
 	MaxMessageSize    int64
 	PingInterval      time.Duration
 	PongTimeout       time.Duration
 	WriteTimeout      time.Duration
+	Subprotocols      []string           // 支援的子協議（JSON/Protobuf/FlatBuffers/MessagePack）
+	TLS               *TLSConfig         // nil = ws://，non-nil = wss://（獨立模式）
+	Security          *SecurityConfig    // nil = 無安全層（AES + HMAC）
+	Compression       *CompressionConfig // nil 時回退 EnableCompression
 }
 
 // DefaultConfig 預設配置
@@ -76,6 +95,7 @@ var DefaultConfig = Config{
 	PingInterval:      54 * time.Second,
 	PongTimeout:       60 * time.Second,
 	WriteTimeout:      10 * time.Second,
+	Subprotocols:      []string{"json", "protobuf", "flatbuffers", "msgpack"},
 }
 
 // ===== Upgrader =====
@@ -95,13 +115,25 @@ func NewUpgrader(config Config) *Upgrader {
 		}
 	}
 
+	subprotocols := config.Subprotocols
+	if len(subprotocols) == 0 {
+		subprotocols = []string{"json", "protobuf", "flatbuffers", "msgpack"}
+	}
+
+	// 決定壓縮啟用狀態
+	enableCompression := config.EnableCompression
+	if config.Compression != nil {
+		enableCompression = config.Compression.Enabled
+	}
+
 	return &Upgrader{
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:    config.ReadBufferSize,
 			WriteBufferSize:   config.WriteBufferSize,
 			HandshakeTimeout:  config.HandshakeTimeout,
-			EnableCompression: config.EnableCompression,
+			EnableCompression: enableCompression,
 			CheckOrigin:       config.CheckOrigin,
+			Subprotocols:      subprotocols,
 		},
 		config: config,
 	}
@@ -151,6 +183,8 @@ type Client struct {
 	Hub          *Hub
 	Channels     map[string]bool
 	Context      *hypcontext.Context // 整合 HypGo Context
+	codec        Codec               // 協商的序列化 codec（JSON/Protobuf/FlatBuffers/MessagePack）
+	wsFrameType  int                 // websocket.TextMessage 或 BinaryMessage（快取）
 	mu           sync.RWMutex
 	pingTicker   *time.Ticker
 	isClosing    bool
@@ -159,14 +193,21 @@ type Client struct {
 }
 
 // AcquireClient 從池中獲取 Client
-func AcquireClient(id string, conn *websocket.Conn, hub *Hub) *Client {
+func AcquireClient(id string, conn *websocket.Conn, hub *Hub, codec Codec) *Client {
 	client := clientPool.Get().(*Client)
 	client.reset()
 	client.ID = id
 	client.Conn = conn
 	client.Hub = hub
+	client.codec = codec
+	client.wsFrameType = codec.WebSocketMessageType()
 	client.lastActivity = time.Now()
 	return client
+}
+
+// Codec 獲取客戶端使用的序列化 Codec
+func (c *Client) Codec() Codec {
+	return c.codec
 }
 
 // Release 釋放 Client 回池中
@@ -181,6 +222,8 @@ func (c *Client) reset() {
 	c.Conn = nil
 	c.Hub = nil
 	c.Context = nil
+	c.codec = nil
+	c.wsFrameType = 0
 	c.isClosing = false
 
 	// 清空但保留容量
@@ -215,12 +258,22 @@ func (c *Client) GetMetadata(key string) (interface{}, bool) {
 	return val, ok
 }
 
+// SetEncryptionKey 設置 per-client AES 加密金鑰（覆寫 hub 層預設）
+func (c *Client) SetEncryptionKey(key []byte) {
+	c.SetMetadata("_aes_key", key)
+}
+
+// SetHMACKey 設置 per-client HMAC 簽名金鑰（覆寫 hub 層預設）
+func (c *Client) SetHMACKey(key []byte) {
+	c.SetMetadata("_hmac_key", key)
+}
+
 // ===== Hub =====
 
 // Hub WebSocket 中心
 type Hub struct {
 	clients    map[string]*Client
-	broadcast  chan []byte
+	broadcast  chan *Message
 	register   chan *Client
 	unregister chan *Client
 	channels   map[string]map[*Client]bool
@@ -228,6 +281,7 @@ type Hub struct {
 	logger     *logger.Logger
 	config     Config
 	upgrader   *Upgrader
+	security   *SecurityConfig // AES + HMAC 安全管線配置
 	mu         sync.RWMutex
 
 	// 統計資訊
@@ -251,7 +305,7 @@ type Hub struct {
 func NewHub(logger *logger.Logger, config Config) *Hub {
 	return &Hub{
 		clients:    make(map[string]*Client),
-		broadcast:  make(chan []byte, 256),
+		broadcast:  make(chan *Message, 256),
 		register:   make(chan *Client, 16),
 		unregister: make(chan *Client, 16),
 		channels:   make(map[string]map[*Client]bool),
@@ -259,6 +313,7 @@ func NewHub(logger *logger.Logger, config Config) *Hub {
 		logger:     logger,
 		config:     config,
 		upgrader:   NewUpgrader(config),
+		security:   config.Security,
 	}
 }
 
@@ -293,6 +348,7 @@ func (h *Hub) Run(ctx context.Context) {
 
 		case message := <-h.broadcast:
 			h.handleBroadcast(message)
+			message.Release()
 
 		case <-cleanupTicker.C:
 			h.cleanupInactiveClients()
@@ -348,8 +404,8 @@ func (h *Hub) handleUnregister(client *Client) {
 	h.logger.Info("Client %s disconnected", client.ID)
 }
 
-// handleBroadcast 處理廣播
-func (h *Hub) handleBroadcast(message []byte) {
+// handleBroadcast 處理廣播（支持跨協議序列化 + 安全管線）
+func (h *Hub) handleBroadcast(msg *Message) {
 	h.mu.RLock()
 	clients := make([]*Client, 0, len(h.clients))
 	for _, client := range h.clients {
@@ -357,16 +413,10 @@ func (h *Hub) handleBroadcast(message []byte) {
 	}
 	h.mu.RUnlock()
 
-	for _, client := range clients {
-		select {
-		case client.Send <- message:
-			h.stats.MessagesSent++
-			h.stats.BytesSent += int64(len(message))
-		default:
-			// 發送緩衝區滿，關閉連接
-			h.unregister <- client
-		}
-	}
+	marshalForClients(msg, clients, h.security, func(n int64) {
+		h.stats.MessagesSent++
+		h.stats.BytesSent += n
+	})
 }
 
 // cleanupInactiveClients 清理不活躍的客戶端
@@ -407,9 +457,20 @@ func (h *Hub) ServeHTTP(c *hypcontext.Context) {
 		}
 	}
 
+	// 根據協商的子協議選擇 Codec
+	codec := CodecByName(conn.Subprotocol())
+
 	// 從池中獲取客戶端
-	client := AcquireClient(clientID, conn, h)
+	client := AcquireClient(clientID, conn, h, codec)
 	client.Context = c // 關聯 HypGo Context
+
+	// 套用 permessage-deflate 壓縮配置
+	if h.config.Compression != nil {
+		conn.EnableWriteCompression(h.config.Compression.Enabled)
+		if h.config.Compression.Level != 0 {
+			conn.SetCompressionLevel(h.config.Compression.Level)
+		}
+	}
 
 	// 設置連接參數
 	conn.SetReadLimit(h.config.MaxMessageSize)
@@ -450,12 +511,22 @@ func (c *Client) readPump(config Config) {
 		c.Hub.stats.MessagesReceived++
 		c.Hub.stats.BytesReceived += int64(len(data))
 
+		// 安全管線：解密 + 驗證簽名
+		if c.Hub.security != nil {
+			var secErr error
+			data, secErr = applySecurityIn(data, c, c.Hub.security)
+			if secErr != nil {
+				c.Hub.logger.Warning("Security verification failed for client %s: %v", c.ID, secErr)
+				continue
+			}
+		}
+
 		// 從池中獲取 Message
 		msg := AcquireMessage()
-		defer msg.Release()
 
-		if err := json.Unmarshal(data, msg); err != nil {
+		if err := c.codec.Unmarshal(data, msg); err != nil {
 			c.Hub.logger.Warning("Invalid message format from client %s: %v", c.ID, err)
+			msg.Release()
 			continue
 		}
 
@@ -467,6 +538,7 @@ func (c *Client) readPump(config Config) {
 		}
 
 		c.handleMessage(msg)
+		msg.Release()
 	}
 }
 
@@ -487,13 +559,13 @@ func (c *Client) writePump(config Config) {
 				return
 			}
 
-			// 批量發送優化
-			c.Conn.WriteMessage(websocket.TextMessage, message)
+			// 批量發送優化（使用協商的 frame 類型）
+			c.Conn.WriteMessage(c.wsFrameType, message)
 
 			// 檢查是否有更多消息可以批量發送
 			n := len(c.Send)
 			for i := 0; i < n; i++ {
-				c.Conn.WriteMessage(websocket.TextMessage, <-c.Send)
+				c.Conn.WriteMessage(c.wsFrameType, <-c.Send)
 			}
 
 		case <-ticker.C:
@@ -505,45 +577,63 @@ func (c *Client) writePump(config Config) {
 	}
 }
 
+// extractChannel 從控制訊息的 data 欄位提取頻道名稱（codec 感知）
+// 若 codec 實現 ControlDecoder 介面則使用其自訂解析，否則預設 JSON
+func (c *Client) extractChannel(data []byte) string {
+	if cd, ok := c.codec.(ControlDecoder); ok {
+		return cd.DecodeChannel(data)
+	}
+	var parsed struct {
+		Channel string `json:"channel"`
+	}
+	if err := json.Unmarshal(data, &parsed); err == nil {
+		return parsed.Channel
+	}
+	return ""
+}
+
+// extractRoomID 從控制訊息的 data 欄位提取房間 ID（codec 感知）
+// 若 codec 實現 ControlDecoder 介面則使用其自訂解析，否則預設 JSON
+func (c *Client) extractRoomID(data []byte) string {
+	if cd, ok := c.codec.(ControlDecoder); ok {
+		return cd.DecodeRoomID(data)
+	}
+	var parsed struct {
+		RoomID string `json:"room_id"`
+	}
+	if err := json.Unmarshal(data, &parsed); err == nil {
+		return parsed.RoomID
+	}
+	return ""
+}
+
 // handleMessage 處理訊息
 func (c *Client) handleMessage(msg *Message) {
 	switch msg.Type {
 	case "subscribe":
-		var data struct {
-			Channel string `json:"channel"`
-		}
-		if err := json.Unmarshal(msg.Data, &data); err == nil {
-			c.Subscribe(data.Channel)
+		if ch := c.extractChannel(msg.Data); ch != "" {
+			c.Subscribe(ch)
 		}
 
 	case "unsubscribe":
-		var data struct {
-			Channel string `json:"channel"`
-		}
-		if err := json.Unmarshal(msg.Data, &data); err == nil {
-			c.Unsubscribe(data.Channel)
+		if ch := c.extractChannel(msg.Data); ch != "" {
+			c.Unsubscribe(ch)
 		}
 
 	case "publish":
-		c.Hub.PublishToChannel(msg.Channel, msg.Data)
+		c.Hub.PublishToChannel(msg.Channel, msg)
 
 	case "broadcast":
-		c.Hub.Broadcast(msg.Data)
+		c.Hub.BroadcastMessage(msg)
 
 	case "join_room":
-		var data struct {
-			RoomID string `json:"room_id"`
-		}
-		if err := json.Unmarshal(msg.Data, &data); err == nil {
-			c.JoinRoom(data.RoomID)
+		if roomID := c.extractRoomID(msg.Data); roomID != "" {
+			c.JoinRoom(roomID)
 		}
 
 	case "leave_room":
-		var data struct {
-			RoomID string `json:"room_id"`
-		}
-		if err := json.Unmarshal(msg.Data, &data); err == nil {
-			c.LeaveRoom(data.RoomID)
+		if roomID := c.extractRoomID(msg.Data); roomID != "" {
+			c.LeaveRoom(roomID)
 		}
 	}
 }
@@ -639,7 +729,7 @@ func (r *Room) RemoveClient(client *Client) {
 	r.lastActivity = time.Now()
 }
 
-// Broadcast 房間廣播
+// Broadcast 房間廣播（原始位元組，向後兼容）
 func (r *Room) Broadcast(data []byte) {
 	r.mu.RLock()
 	clients := make([]*Client, 0, len(r.Clients))
@@ -655,6 +745,25 @@ func (r *Room) Broadcast(data []byte) {
 			// 緩衝區滿，跳過
 		}
 	}
+}
+
+// BroadcastMessage 房間廣播（結構化 Message，支持跨協議序列化 + 安全管線）
+// 透過客戶端的 Hub 取得安全配置
+func (r *Room) BroadcastMessage(msg *Message) {
+	r.mu.RLock()
+	clients := make([]*Client, 0, len(r.Clients))
+	for client := range r.Clients {
+		clients = append(clients, client)
+	}
+	r.mu.RUnlock()
+
+	// 從第一個客戶端取得 Hub 的安全配置
+	var security *SecurityConfig
+	if len(clients) > 0 && clients[0].Hub != nil {
+		security = clients[0].Hub.security
+	}
+
+	marshalForClients(msg, clients, security, nil)
 }
 
 // JoinRoom 加入房間
@@ -693,13 +802,30 @@ func (c *Client) LeaveRoom(roomID string) {
 
 // ===== Hub 便利方法 =====
 
-// Broadcast 廣播訊息
+// Broadcast 廣播訊息（原始位元組，向後兼容）
+// 將 data 包裝為 Message 後發送到廣播通道
 func (h *Hub) Broadcast(data []byte) {
-	h.broadcast <- data
+	msg := AcquireMessage()
+	msg.Type = "broadcast"
+	msg.Data = data
+	h.broadcast <- msg
 }
 
-// PublishToChannel 發布到頻道
-func (h *Hub) PublishToChannel(channel string, data []byte) {
+// BroadcastMessage 廣播結構化 Message（支持跨協議序列化）
+func (h *Hub) BroadcastMessage(msg *Message) {
+	// 複製 Message 以避免在 readPump 中被釋放
+	clone := AcquireMessage()
+	clone.Type = msg.Type
+	clone.Channel = msg.Channel
+	clone.Data = make(json.RawMessage, len(msg.Data))
+	copy(clone.Data, msg.Data)
+	clone.Timestamp = msg.Timestamp
+	clone.ClientID = msg.ClientID
+	h.broadcast <- clone
+}
+
+// PublishToChannel 發布結構化 Message 到頻道（支持跨協議序列化）
+func (h *Hub) PublishToChannel(channel string, msg *Message) {
 	h.mu.RLock()
 	clients := make([]*Client, 0)
 	if channelClients, ok := h.channels[channel]; ok {
@@ -709,31 +835,38 @@ func (h *Hub) PublishToChannel(channel string, data []byte) {
 	}
 	h.mu.RUnlock()
 
-	msg := AcquireMessage()
-	defer msg.Release()
-
-	msg.Type = "message"
-	msg.Channel = channel
-	msg.Data = data
-
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		h.logger.Warning("Failed to marshal message: %v", err)
+	if len(clients) == 0 {
 		return
 	}
 
-	for _, client := range clients {
-		select {
-		case client.Send <- msgBytes:
-			h.stats.MessagesSent++
-			h.stats.BytesSent += int64(len(msgBytes))
-		default:
-			// 緩衝區滿，跳過
-		}
-	}
+	// 確保 channel 和 type 正確
+	pubMsg := AcquireMessage()
+	defer pubMsg.Release()
+
+	pubMsg.Type = "message"
+	pubMsg.Channel = channel
+	pubMsg.Data = msg.Data
+	pubMsg.Timestamp = msg.Timestamp
+	pubMsg.ClientID = msg.ClientID
+
+	marshalForClients(pubMsg, clients, h.security, func(n int64) {
+		h.stats.MessagesSent++
+		h.stats.BytesSent += n
+	})
 }
 
-// SendToClient 發送給特定客戶端
+// PublishToChannelRaw 發布原始位元組到頻道（向後兼容）
+func (h *Hub) PublishToChannelRaw(channel string, data []byte) {
+	msg := AcquireMessage()
+	defer msg.Release()
+	msg.Type = "message"
+	msg.Channel = channel
+	msg.Data = data
+	h.PublishToChannel(channel, msg)
+}
+
+// SendToClient 發送給特定客戶端（codec 感知）
+// 支持 *Message 結構體或任意 data（後者回退 json.Marshal）
 func (h *Hub) SendToClient(clientID string, data interface{}) error {
 	h.mu.RLock()
 	client, ok := h.clients[clientID]
@@ -743,9 +876,25 @@ func (h *Hub) SendToClient(clientID string, data interface{}) error {
 		return fmt.Errorf("client %s not found", clientID)
 	}
 
-	msgBytes, err := json.Marshal(data)
+	var msgBytes []byte
+	var err error
+
+	// 若為 *Message 則使用客戶端的 codec 序列化
+	if msg, isMsg := data.(*Message); isMsg {
+		msgBytes, err = client.codec.Marshal(msg)
+	} else {
+		msgBytes, err = json.Marshal(data)
+	}
 	if err != nil {
 		return err
+	}
+
+	// 安全管線：簽名 + 加密
+	if h.security != nil {
+		msgBytes, err = applySecurityOut(msgBytes, client, h.security)
+		if err != nil {
+			return fmt.Errorf("security pipeline failed: %w", err)
+		}
 	}
 
 	select {
@@ -788,6 +937,27 @@ func (h *Hub) GetStats() map[string]interface{} {
 		"channels":           channelStats,
 		"rooms":              roomStats,
 	}
+}
+
+// ListenAndServeTLS 啟動獨立 WSS 伺服器
+// 此為便利方法，當 WebSocket Hub 不透過 HypGo server 使用時提供 wss:// 支援
+func (h *Hub) ListenAndServeTLS(addr string, handler http.Handler) error {
+	if h.config.TLS == nil {
+		return fmt.Errorf("TLS config is nil; use standard http.ListenAndServe for ws://")
+	}
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+
+	// 使用預配置的 tls.Config（若有）
+	if h.config.TLS.TLSConfig != nil {
+		srv.TLSConfig = h.config.TLS.TLSConfig
+		return srv.ListenAndServeTLS("", "")
+	}
+
+	return srv.ListenAndServeTLS(h.config.TLS.CertFile, h.config.TLS.KeyFile)
 }
 
 // Shutdown 關閉 Hub

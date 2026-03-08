@@ -1,4 +1,4 @@
-package database
+package hidb
 
 import (
 	"context"
@@ -6,14 +6,28 @@ import (
 	"fmt"
 	"sync"
 
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/redis/go-redis/v9"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/mysqldialect"
-	"github.com/uptrace/bun/dialect/pgdialect"
+	"github.com/uptrace/bun/schema"
 )
+
+// Dialect SQL 方言介面（類似 bun 的 dialect 模式）
+// 由 hidb/mysql 和 hidb/pg 子套件實現
+type Dialect interface {
+	DriverName() string        // sql.Open 使用的驅動名稱（"mysql" / "postgres"）
+	BunDialect() schema.Dialect // bun ORM 使用的方言實例
+}
+
+// Option 設定選項（functional options 模式）
+type Option func(*Database)
+
+// WithDialect 設定 SQL 方言
+func WithDialect(d Dialect) Option {
+	return func(db *Database) {
+		db.dialect = d
+	}
+}
 
 // DatabasePlugin 數據庫插件接口
 type DatabasePlugin interface {
@@ -27,8 +41,9 @@ type DatabasePlugin interface {
 // Database 數據庫管理器
 type Database struct {
 	config  config.DatabaseConfigInterface
-	sqlDB   *sql.DB  // 主庫（寫入）
-	hypDB   *bun.DB  // 主庫 HypDB ORM 實例（寫入）
+	dialect Dialect   // SQL 方言（由 WithDialect 設定）
+	sqlDB   *sql.DB   // 主庫（寫入）
+	hypDB   *bun.DB   // 主庫 HypDB ORM 實例（寫入）
 	redisDB *redis.Client
 
 	// 讀寫分離
@@ -40,7 +55,7 @@ type Database struct {
 }
 
 // NewWithInterface 使用接口創建數據庫實例
-func NewWithInterface(cfg config.DatabaseConfigInterface) (*Database, error) {
+func NewWithInterface(cfg config.DatabaseConfigInterface, opts ...Option) (*Database, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("database config is nil")
 	}
@@ -50,41 +65,48 @@ func NewWithInterface(cfg config.DatabaseConfigInterface) (*Database, error) {
 		plugins: make(map[string]DatabasePlugin),
 	}
 
+	// 應用選項
+	for _, opt := range opts {
+		opt(db)
+	}
+
 	driver := cfg.GetDriver()
 	if driver == "" {
 		// 允許沒有數據庫配置
 		return db, nil
 	}
 
-	switch driver {
-	case "mysql", "tidb":
-		return db.initMySQL()
-	case "postgres":
-		return db.initPostgres()
-	case "redis":
-		return db.initRedis()
-	default:
-		// 嘗試作為插件加載
-		if plugin, exists := db.GetPlugin(driver); exists {
-			if err := plugin.Connect(); err != nil {
-				return nil, fmt.Errorf("failed to connect to %s: %w", driver, err)
-			}
-			return db, nil
-		}
-		return nil, fmt.Errorf("unsupported database driver: %s", driver)
+	// 如果有設定方言，使用通用 SQL 初始化
+	if db.dialect != nil {
+		return db.initSQL()
 	}
+
+	// Redis 不需要 dialect
+	if driver == "redis" {
+		return db.initRedis()
+	}
+
+	// 嘗試作為插件加載
+	if plugin, exists := db.GetPlugin(driver); exists {
+		if err := plugin.Connect(); err != nil {
+			return nil, fmt.Errorf("failed to connect to %s: %w", driver, err)
+		}
+		return db, nil
+	}
+
+	return nil, fmt.Errorf("unsupported database driver: %s (did you forget to use WithDialect?)", driver)
 }
 
 // New 向後兼容的創建方法（需要具體配置結構）
-func New(cfg interface{}) (*Database, error) {
+func New(cfg interface{}, opts ...Option) (*Database, error) {
 	// 嘗試轉換為接口
 	if configInterface, ok := cfg.(config.DatabaseConfigInterface); ok {
-		return NewWithInterface(configInterface)
+		return NewWithInterface(configInterface, opts...)
 	}
 
 	// 為了向後兼容，提供一個適配器
 	adapter := &DatabaseConfigAdapter{cfg: cfg}
-	return NewWithInterface(adapter)
+	return NewWithInterface(adapter, opts...)
 }
 
 // DatabaseConfigAdapter 配置適配器（用於向後兼容）
@@ -93,7 +115,6 @@ type DatabaseConfigAdapter struct {
 }
 
 func (a *DatabaseConfigAdapter) GetDriver() string {
-	// 使用反射獲取 Driver 欄位
 	if cfg, ok := a.cfg.(struct {
 		Driver string
 	}); ok {
@@ -130,7 +151,6 @@ func (a *DatabaseConfigAdapter) GetMaxOpenConns() int {
 }
 
 func (a *DatabaseConfigAdapter) GetRedisConfig() config.RedisConfigInterface {
-	// 簡化的 Redis 配置適配
 	return &RedisConfigAdapter{cfg: a.cfg}
 }
 
@@ -145,7 +165,6 @@ type RedisConfigAdapter struct {
 }
 
 func (r *RedisConfigAdapter) GetAddr() string {
-	// 嘗試從嵌套結構獲取
 	type redisConfig struct {
 		Redis struct {
 			Addr string
@@ -181,16 +200,16 @@ func (r *RedisConfigAdapter) GetDB() int {
 	return 0
 }
 
-// initMySQL 初始化 MySQL/TiDB 連接
-func (d *Database) initMySQL() (*Database, error) {
+// initSQL 通用 SQL 數據庫初始化（使用 Dialect）
+func (d *Database) initSQL() (*Database, error) {
 	dsn := d.config.GetDSN()
 	if dsn == "" {
-		return nil, fmt.Errorf("MySQL DSN is required")
+		return nil, fmt.Errorf("%s DSN is required", d.dialect.DriverName())
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(d.dialect.DriverName(), dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open mysql: %w", err)
+		return nil, fmt.Errorf("failed to open %s: %w", d.dialect.DriverName(), err)
 	}
 
 	// 設置連接池參數
@@ -207,51 +226,11 @@ func (d *Database) initMySQL() (*Database, error) {
 	// 測試連接
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to ping mysql: %w", err)
+		return nil, fmt.Errorf("failed to ping %s: %w", d.dialect.DriverName(), err)
 	}
 
 	d.sqlDB = db
-	d.hypDB = bun.NewDB(db, mysqldialect.New())
-
-	// 初始化讀取副本
-	if err := d.initReplicas(); err != nil {
-		return nil, err
-	}
-
-	return d, nil
-}
-
-// initPostgres 初始化 PostgreSQL 連接
-func (d *Database) initPostgres() (*Database, error) {
-	dsn := d.config.GetDSN()
-	if dsn == "" {
-		return nil, fmt.Errorf("PostgreSQL DSN is required")
-	}
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open postgres: %w", err)
-	}
-
-	// 設置連接池參數
-	maxIdleConns := d.config.GetMaxIdleConns()
-	if maxIdleConns > 0 {
-		db.SetMaxIdleConns(maxIdleConns)
-	}
-
-	maxOpenConns := d.config.GetMaxOpenConns()
-	if maxOpenConns > 0 {
-		db.SetMaxOpenConns(maxOpenConns)
-	}
-
-	// 測試連接
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to ping postgres: %w", err)
-	}
-
-	d.sqlDB = db
-	d.hypDB = bun.NewDB(db, pgdialect.New())
+	d.hypDB = bun.NewDB(db, d.dialect.BunDialect())
 
 	// 初始化讀取副本
 	if err := d.initReplicas(); err != nil {
@@ -274,11 +253,14 @@ func (d *Database) initReplicas() error {
 		return nil // 無副本配置
 	}
 
-	driver := d.config.GetDriver()
+	if d.dialect == nil {
+		return fmt.Errorf("dialect is required for read replicas")
+	}
+
 	d.replicaPool = NewReplicaPool()
 
 	for i, replicaCfg := range replicas {
-		replica, err := initReplica(driver, replicaCfg)
+		replica, err := initReplica(d.dialect, replicaCfg)
 		if err != nil {
 			// 關閉已初始化的副本
 			d.replicaPool.Close()

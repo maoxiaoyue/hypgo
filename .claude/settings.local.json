@@ -5,7 +5,10 @@
       "Bash(find:*)",
       "Bash(done)",
       "Bash(go build:*)",
-      "Bash(go test:*)"
+      "Bash(go test:*)",
+      "Bash(go vet ./pkg/websocket/...)",
+      "Bash(go get github.com/google/flatbuffers/go)",
+      "Bash(go mod tidy)"
     ]
   }
 }

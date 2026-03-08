@@ -41,16 +41,16 @@ import (
     "net/http"
 
     "github.com/gorilla/mux"
-    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/hidb"
     "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type {{.Name}}Controller struct {
-    db     *database.Database
+    db     *hidb.Database
     logger *logger.Logger
 }
 
-func New{{.Name}}Controller(db *database.Database, logger *logger.Logger) *{{.Name}}Controller {
+func New{{.Name}}Controller(db *hidb.Database, logger *logger.Logger) *{{.Name}}Controller {
     return &{{.Name}}Controller{
         db:     db,
         logger: logger,
@@ -175,16 +175,16 @@ import (
     "context"
     "fmt"
 
-    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/hidb"
     "github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
 type {{.Name}}Service struct {
-    db     *database.Database
+    db     *hidb.Database
     logger *logger.Logger
 }
 
-func New{{.Name}}Service(db *database.Database, logger *logger.Logger) *{{.Name}}Service {
+func New{{.Name}}Service(db *hidb.Database, logger *logger.Logger) *{{.Name}}Service {
     return &{{.Name}}Service{
         db:     db,
         logger: logger,
