@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package hypgo.websocket;
+
+option go_package = "github.com/maoxiaoyue/hypgo/pkg/websocket/proto;wspb";
+
+// WsMessage 是 WebSocket 訊息的 protobuf 表示
+// 與 websocket.Message struct 對應
+message WsMessage {
+  string type      = 1;  // 訊息類型（subscribe, publish, broadcast 等）
+  string channel   = 2;  // 頻道名稱
+  bytes  data      = 3;  // 不透明載荷，對應 json.RawMessage
+  int64  timestamp = 4;  // 伺服器時間戳
+  string client_id = 5;  // 客戶端標識
+}
+
+// ChannelRequest 頻道操作請求（subscribe / unsubscribe 的 data 欄位）
+message ChannelRequest {
+  string channel = 1;
+}
+
+// RoomRequest 房間操作請求（join_room / leave_room 的 data 欄位）
+message RoomRequest {
+  string room_id = 1;
+}

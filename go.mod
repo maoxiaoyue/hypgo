@@ -9,6 +9,8 @@ require (
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/go-playground/validator/v10 v10.26.0
 	github.com/go-sql-driver/mysql v1.9.3
+	github.com/gocql/gocql v1.7.0
+	github.com/google/flatbuffers v25.12.19+incompatible
 	github.com/google/go-containerregistry v0.20.6
 	github.com/gorilla/websocket v1.5.0
 	github.com/lib/pq v1.10.9
@@ -19,8 +21,10 @@ require (
 	github.com/uptrace/bun v1.2.17
 	github.com/uptrace/bun/dialect/mysqldialect v1.2.17
 	github.com/uptrace/bun/dialect/pgdialect v1.2.17
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.43.0
 	golang.org/x/time v0.12.0
+	google.golang.org/protobuf v1.36.8
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -49,6 +53,8 @@ require (
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang/snappy v0.0.3 // indirect
+	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
@@ -73,7 +79,6 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
 	github.com/vbatts/tar-split v0.12.1 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
@@ -91,5 +96,5 @@ require (
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
-	google.golang.org/protobuf v1.36.8 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
 )

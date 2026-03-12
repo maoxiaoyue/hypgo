@@ -1,4 +1,4 @@
-package database
+package hidb
 
 import (
 	"database/sql"
@@ -8,8 +8,6 @@ import (
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/mysqldialect"
-	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 // ReadReplica 讀取副本連接
@@ -107,23 +105,13 @@ func (rp *ReplicaPool) PingAll() []error {
 	return errs
 }
 
-// initReplica 初始化單個讀取副本
-func initReplica(driver string, replicaCfg config.ReplicaConfig) (ReadReplica, error) {
+// initReplica 初始化單個讀取副本（使用 Dialect）
+func initReplica(dialect Dialect, replicaCfg config.ReplicaConfig) (ReadReplica, error) {
 	if replicaCfg.DSN == "" {
 		return ReadReplica{}, fmt.Errorf("replica DSN is required")
 	}
 
-	var driverName string
-	switch driver {
-	case "mysql", "tidb":
-		driverName = "mysql"
-	case "postgres":
-		driverName = "postgres"
-	default:
-		return ReadReplica{}, fmt.Errorf("unsupported driver for read replica: %s", driver)
-	}
-
-	db, err := sql.Open(driverName, replicaCfg.DSN)
+	db, err := sql.Open(dialect.DriverName(), replicaCfg.DSN)
 	if err != nil {
 		return ReadReplica{}, fmt.Errorf("failed to open read replica: %w", err)
 	}
@@ -143,13 +131,7 @@ func initReplica(driver string, replicaCfg config.ReplicaConfig) (ReadReplica, e
 	}
 
 	// 創建 HypDB ORM 實例
-	var hypDB *bun.DB
-	switch driver {
-	case "mysql", "tidb":
-		hypDB = bun.NewDB(db, mysqldialect.New())
-	case "postgres":
-		hypDB = bun.NewDB(db, pgdialect.New())
-	}
+	hypDB := bun.NewDB(db, dialect.BunDialect())
 
 	return ReadReplica{
 		sqlDB: db,

@@ -160,7 +160,7 @@ import (
     "time"
 
     "github.com/maoxiaoyue/hypgo/pkg/config"
-    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/hidb"
     "github.com/maoxiaoyue/hypgo/pkg/logger"
     "github.com/maoxiaoyue/hypgo/pkg/server"
     "{{.ProjectName}}/app/controllers"
@@ -186,7 +186,7 @@ func main() {
     defer log.Close()
 
     // 初始化數據庫
-    db, err := database.New(&cfg.Database)
+    db, err := hidb.New(&cfg.Database)
     if err != nil {
         log.Emergency("Failed to initialize database: %v", err)
         os.Exit(1)
@@ -252,7 +252,7 @@ import (
     "encoding/json"
 
     "github.com/gorilla/mux"
-    "github.com/maoxiaoyue/hypgo/pkg/database"
+    "github.com/maoxiaoyue/hypgo/pkg/hidb"
     "github.com/maoxiaoyue/hypgo/pkg/logger"
     "github.com/maoxiaoyue/hypgo/pkg/websocket"
 )
@@ -265,7 +265,7 @@ type Response struct {
 
 var wsHub *websocket.Hub
 
-func RegisterRoutes(router *mux.Router, db *database.Database, log *logger.Logger) {
+func RegisterRoutes(router *mux.Router, db *hidb.Database, log *logger.Logger) {
     // 初始化 WebSocket Hub
     wsHub = websocket.NewHub(log)
     go wsHub.Run()
