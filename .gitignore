@@ -40,3 +40,4 @@ hypgo.pid
 #hypgo-app
 Dockerfile.tmp.*
 /.claude/
+/md

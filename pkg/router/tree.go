@@ -87,8 +87,8 @@ walk:
 						p = make([]Param, 0, 4)
 					}
 					p = append(p, Param{
-						Key:   n.path[2:], // 去掉前導 '*' 和 '/'
-						Value: path,
+						Key:   n.path[1:],   // 去掉前導 '*'
+						Value: "/" + path, // 補回被父節點消費的前導 '/'
 					})
 					return n.handlers, p
 				}
@@ -263,19 +263,12 @@ func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.Han
 				n.path = path[:i]
 			}
 
-			// 創建 catchAll 中間節點
-			child := &radixNode{
-				wildChild: true,
-				nType:     catchAll,
-				fullPath:  fullPath,
-			}
-			n.children = []*radixNode{child}
-			n.indices = string('/')
-			n = child
-			n.priority++
+			// 標記父節點擁有通配符子節點（與 :param 路徑一致）
+			n.wildChild = true
 
-			// 創建 catchAll 葉節點
-			child = &radixNode{
+			// 直接創建 catchAll 節點作為子節點
+			// 無需中間節點，search 透過 wildChild 直接跳到 children[0]
+			child := &radixNode{
 				path:     path[i:],
 				nType:    catchAll,
 				handlers: handlers,
@@ -283,6 +276,7 @@ func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.Han
 				fullPath: fullPath,
 			}
 			n.children = []*radixNode{child}
+			n.indices = string('/')
 			return
 		}
 	}

@@ -203,6 +203,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 					r.methodNotAllowed(c)
 				} else {
 					c.Status(http.StatusMethodNotAllowed)
+					c.Writer.WriteHeaderNow()
 				}
 				return
 			}
@@ -214,6 +215,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.notFound(c)
 	} else {
 		c.Status(http.StatusNotFound)
+		c.Writer.WriteHeaderNow()
 	}
 }
 
