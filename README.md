@@ -8,16 +8,15 @@ A modern Go web framework with HTTP/3, HTTP/2 support and plugin architecture.
 
 [English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md)
 
-
 ## Description
 
-HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Bun ORM integration, message queues, and advanced JSON validation. HTTP/3.0 is nearly 10 times faster than HTTP/1.1. In my case, it's useful and important. So, I try design this framework.
+HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Bun ORM integration, message queues, and advanced JSON validation. HTTP/3.0 is nearly 10 times faster than HTTP/1.1. In my case, it's useful and important, so I started designing this framework in 2025.
 
 The framework features a powerful plugin system that allows you to add functionality like Kafka, RabbitMQ, Cassandra, and more through simple CLI commands. It also includes automatic Docker image building, hot reload development, and zero-downtime deployment capabilities.
 
 ## Story
 
-As a backend engineer working on a global e-commerce platform, I faced a critical challenge: our Asian customers were experiencing significant delays when accessing our US-based servers. With average response times exceeding 700ms for simple API calls and image loading times stretching to several seconds, user experience was suffering, directly impacting our conversion rates.
+As a backend engineer working on a global platform, I faced a critical challenge: our Asian customers were experiencing significant delays when accessing our US-based servers. With average response times exceeding 700ms for simple API calls and image loading times stretching to several seconds, user experience was suffering, directly impacting our conversion rates.
 
 ### The Breaking Point
 
@@ -47,12 +46,11 @@ After implementing HypGo with HTTP/3 support in our staging environment, the res
 
 ### Why I Open-Sourced HypGo
 
-These results were too significant to keep private. Cross-border latency affects millions of applications worldwide, and developers shouldn't have to build HTTP/3 support from scratch. HypGo was born from real-world pain and delivers real-world results.
+These results were too significant — I wanted to share them publicly. Cross-border latency affects millions of applications worldwide, and developers shouldn't have to build HTTP/3 support from scratch. HypGo was born from real-world pain and delivers real-world results.
 
 Beyond just HTTP/3, I realized modern applications need:
 - **Docker integration** for consistent deployments
 - **Hot reload** for developer productivity
-- **Message queues** for scalable architectures
 
 Every feature in HypGo comes from actual production needs, tested under real traffic, and proven to deliver results.
 
@@ -66,6 +64,8 @@ Every feature in HypGo comes from actual production needs, tested under real tra
 - 🏗️ **MVC Architecture** - Clean separation of Controllers, Models, and Services
 - 🐳 **Docker Integration** - One-command Docker image building and deployment
 - 🔥 **Hot Reload** - Automatic application restart during development
+- ♻️ **Zero-Downtime Deployment** - Graceful shutdown and restart capabilities
+- 🌐 **WebSocket Support** - Real-time bidirectional communication with channel support
 
 ## Requirements
 
@@ -87,7 +87,7 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ## Quick Start
 
 ### Create a New Project
-
+$GOPATH/bin must be included in $PATH
 #### Full-stack Project (with frontend)
 ```bash
 hyp new myapp
@@ -97,13 +97,13 @@ hyp run
 ```
 
 #### API-only Project
-If the path has $GOPATH/bin
 ```bash
 hyp api myapi
 cd myapi
 go mod tidy
 hyp run
 ```
+
 ### Build Docker Image
 
 ```bash
@@ -270,15 +270,14 @@ import (
 func main() {
     cfg, _ := config.Load("config/config.yaml")
     srv := server.New(cfg, logger)
-    
+
     controllers.RegisterRoutes(srv.Router(), db, logger)
     srv.Start()
 }
 ```
-
 ## Roadmap
 
-### V0.1 (Current) ✅
+### V0.7 (Current) ✅
 - [x] HTTP/1.1, HTTP/2, HTTP/3 support
 - [x] Basic MVC structure
 - [x] CLI tool with project generation
@@ -288,23 +287,16 @@ func main() {
 - [x] Basic middleware (CORS, Logger, RateLimit)
 
 ### V1.0 (In Progress) 🚧
-- [ ] Authentication & Authorization system
 - [ ] gRPC integration
 - [ ] Database migration tools
-- [ ] API documentation generator
 - [ ] Performance monitoring
 - [ ] Distributed tracing
 - [ ] Circuit breaker pattern
-- [ ] Service mesh ready
 
 ### V2.0 (Planned) 📋
-- [ ] Microservices toolkit
-- [ ] Event sourcing support
 - [ ] CQRS implementation
 - [ ] Kubernetes operator
-- [ ] Multi-tenant support
 - [ ] Real-time analytics
-- [ ] AI/ML integration helpers
 - [ ] Edge computing support
 - [ ] Blockchain integration
 
@@ -320,9 +312,11 @@ HTTP/1.1 vs HTTP/2 vs HTTP/3 (1000 concurrent requests)
 │ HTTP/3      │ 152,456  │ 6.6ms      │ 183.2 MB/s  │
 └─────────────┴──────────┴────────────┴─────────────┘
 ```
+
 ## License
 
 HypGo is released under the [MIT License](LICENSE).
 
+---
 
 Made with ❤️ by Maoxiaoyu From Taiwan
