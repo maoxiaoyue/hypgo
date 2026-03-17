@@ -303,38 +303,26 @@ func (s *Server) startHTTP1() error {
 	return s.httpServer.Serve(listener)
 }
 
-// wrapHandler 包裝處理器以注入協議資訊
+// wrapHandler 包裝處理器以注入 Alt-Svc 標頭
+// 注意：不在此處建立 Context，避免與 Router.ServeHTTP 重複建立
+// Context 的 detectProtocol() 已能自動偵測協議
 func (s *Server) wrapHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 創建 HypGo Context
-		c := hypcontext.New(w, r)
-		defer c.Release()
-
-		// 設置協議資訊
-		protocol := s.detectProtocol(r)
-		c.Set("protocol", protocol)
-
 		// 如果是 HTTP/3，添加 Alt-Svc 頭
-		if s.config.Server.TLS.Enabled && protocol != "HTTP/3" {
+		if s.config.Server.TLS.Enabled && r.ProtoMajor < 3 {
 			w.Header().Set("Alt-Svc", fmt.Sprintf(`h3="%s"; ma=86400`, s.config.Server.Addr))
 		}
 
-		// 處理請求
+		// 直接交由下游 handler（Router）處理，由其建立唯一的 Context
 		h.ServeHTTP(w, r)
 	})
 }
 
 // wrapH3Handler 包裝 HTTP/3 處理器
+// 注意：不在此處建立 Context，由 Router.ServeHTTP 統一建立
+// Context 的 detectProtocol() 透過 r.ProtoMajor 自動偵測 HTTP/3
 func (s *Server) wrapH3Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 創建 HypGo Context
-		c := hypcontext.New(w, r)
-		defer c.Release()
-
-		// 設置 HTTP/3 協議資訊
-		c.Set("protocol", "HTTP/3")
-
-		// 處理請求
 		s.router.ServeHTTP(w, r)
 	})
 }

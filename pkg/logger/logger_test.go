@@ -175,6 +175,58 @@ func TestParseLevel(t *testing.T) {
 	}
 }
 
+// TestFormatMessagePrintfStyle Bug5 修復驗證：%s/%v/%d 格式動詞必須展開
+func TestFormatMessagePrintfStyle(t *testing.T) {
+	l, _ := New("debug", "stdout", &bytes.Buffer{}, false)
+
+	// %s 展開
+	msg := l.formatMessage(INFO, "hello %s", "world")
+	if !strings.Contains(msg, "hello world") {
+		t.Errorf("expected 'hello world', got: %s", msg)
+	}
+
+	// %v 展開
+	msg = l.formatMessage(ERROR, "error: %v", "something failed")
+	if !strings.Contains(msg, "error: something failed") {
+		t.Errorf("expected 'error: something failed', got: %s", msg)
+	}
+
+	// %d 展開
+	msg = l.formatMessage(INFO, "port: %d", 8080)
+	if !strings.Contains(msg, "port: 8080") {
+		t.Errorf("expected 'port: 8080', got: %s", msg)
+	}
+
+	// 多參數
+	msg = l.formatMessage(INFO, "server %s on :%d", "started", 9090)
+	if !strings.Contains(msg, "server started on :9090") {
+		t.Errorf("expected 'server started on :9090', got: %s", msg)
+	}
+
+	// 不含 % 的結構化 KV 模式仍應正常運作
+	msg = l.formatMessage(INFO, "request completed", "status", 200, "latency", "5ms")
+	if !strings.Contains(msg, "status=200") || !strings.Contains(msg, "latency=5ms") {
+		t.Errorf("expected KV pairs, got: %s", msg)
+	}
+}
+
+// TestNilLoggerSafety Bug6 修復驗證：nil *Logger 不應 panic
+func TestNilLoggerSafety(t *testing.T) {
+	var l *Logger
+
+	// 所有方法都不應 panic
+	l.Debug("test")
+	l.Info("test")
+	l.Notice("test")
+	l.Warn("test")
+	l.Warning("test")
+	l.Error("test")
+	l.Emergency("test")
+	l.SetLevel(DEBUG)
+	l.SetOutput(nil)
+	l.Close()
+}
+
 func TestFormatMessageOddKeysAndValues(t *testing.T) {
 	l, _ := New("debug", "stdout", &bytes.Buffer{}, false)
 

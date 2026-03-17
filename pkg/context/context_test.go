@@ -2,8 +2,10 @@ package context
 
 import (
 	stdcontext "context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -131,6 +133,72 @@ func TestStdContextPreservesValues(t *testing.T) {
 	userID := got.GetInt("user_id")
 	if userID != 42 {
 		t.Errorf("expected user_id=42, got %d", userID)
+	}
+}
+
+// TestResponseWriterReadFrom Bug2 修復驗證：responseWriter 實作 io.ReaderFrom
+func TestResponseWriterReadFrom(t *testing.T) {
+	w := httptest.NewRecorder()
+	rw := newResponseWriter(w)
+
+	// 驗證 io.ReaderFrom 介面
+	rf, ok := rw.(io.ReaderFrom)
+	if !ok {
+		t.Fatal("responseWriter should implement io.ReaderFrom")
+	}
+
+	// 透過 ReadFrom 寫入資料
+	src := strings.NewReader("hello from ReadFrom")
+	n, err := rf.ReadFrom(src)
+	if err != nil {
+		t.Fatalf("ReadFrom returned error: %v", err)
+	}
+	if n != 19 {
+		t.Errorf("expected 19 bytes written, got %d", n)
+	}
+
+	// 驗證 body 正確寫入
+	if w.Body.String() != "hello from ReadFrom" {
+		t.Errorf("expected body 'hello from ReadFrom', got %q", w.Body.String())
+	}
+
+	// 驗證 size 正確追蹤
+	if rw.Size() != 19 {
+		t.Errorf("expected size 19, got %d", rw.Size())
+	}
+
+	// 驗證 written 狀態
+	if !rw.Written() {
+		t.Error("expected Written() to be true after ReadFrom")
+	}
+}
+
+// TestResponseWriterReadFromWithStatus Bug2 修復驗證：ReadFrom 前設定狀態碼
+func TestResponseWriterReadFromWithStatus(t *testing.T) {
+	w := httptest.NewRecorder()
+	rw := newResponseWriter(w)
+
+	rw.WriteHeader(http.StatusPartialContent)
+
+	rf := rw.(io.ReaderFrom)
+	src := strings.NewReader("partial content")
+	rf.ReadFrom(src)
+
+	if w.Code != http.StatusPartialContent {
+		t.Errorf("expected status 206, got %d", w.Code)
+	}
+}
+
+// TestResponseWriter404Status Bug4 修復驗證：404 狀態碼必須正確寫入
+func TestResponseWriter404Status(t *testing.T) {
+	w := httptest.NewRecorder()
+	rw := newResponseWriter(w)
+
+	rw.WriteHeader(http.StatusNotFound)
+	rw.WriteHeaderNow()
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", w.Code)
 	}
 }
 

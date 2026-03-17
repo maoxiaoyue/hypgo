@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -121,6 +122,9 @@ func InitLogger(config interface{}) {
 
 // SetLevel 設定日誌級別
 func (l *Logger) SetLevel(level Level) {
+	if l == nil {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.level = level
@@ -128,6 +132,9 @@ func (l *Logger) SetLevel(level Level) {
 
 // SetOutput 設定輸出
 func (l *Logger) SetOutput(w io.Writer) {
+	if l == nil {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.logger.SetOutput(w)
@@ -162,11 +169,20 @@ func (l *Logger) SetFile(filename string) error {
 }
 
 // formatMessage 格式化訊息
+// 支援兩種使用方式：
+//  1. Printf-style：msg 含 %v/%s/%d 等格式動詞時，keysAndValues 作為 Sprintf 參數
+//  2. 結構化 KV：msg 為純文字，keysAndValues 為成對的 key=value
 func (l *Logger) formatMessage(level Level, msg string, keysAndValues ...interface{}) string {
 	levelStr := l.getLevelString(level)
 	color := l.getLevelColor(level)
 
-	// 格式化額外的鍵值對
+	// 偵測 printf-style 格式字串（含 %v, %s, %d, %f, %w, %x, %t, %p, %e, %g, %q 等）
+	if len(keysAndValues) > 0 && strings.ContainsRune(msg, '%') {
+		msg = fmt.Sprintf(msg, keysAndValues...)
+		keysAndValues = nil
+	}
+
+	// 格式化額外的鍵值對（結構化日誌模式）
 	extra := ""
 	if len(keysAndValues) > 0 {
 		extra = " |"
@@ -229,6 +245,9 @@ func (l *Logger) getLevelColor(level Level) string {
 
 // log 通用日誌方法
 func (l *Logger) log(level Level, msg string, keysAndValues ...interface{}) {
+	if l == nil || l.logger == nil {
+		return
+	}
 	if level < l.level {
 		return
 	}
@@ -371,6 +390,9 @@ func (l *Logger) SetRotator(rotator *LogRotator) {
 
 // Close 關閉Logger
 func (l *Logger) Close() {
+	if l == nil {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
