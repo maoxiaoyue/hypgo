@@ -2,7 +2,7 @@
 
 一个支持 HTTP/3、HTTP/2 和插件架构的现代化 Go Web 框架。
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.1.0-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
 
@@ -10,13 +10,13 @@
 
 ## 描述
 
-HypGo 是一个现代化的 Go Web 框架，提供 HTTP/2 和 HTTP/3 支持、Bun ORM 集成、消息队列和高级 JSON 验证功能。HTTP/3.0 的速度比 HTTP/1.1 快近 10 倍。在我的使用案例中，这是非常有用且重要的，因此我尝试设计了这个框架。
+HypGo 是一个现代化的 Go Web 框架，提供 HTTP/2 和 HTTP/3 支持、Bun ORM 集成、消息队列和高级 JSON 验证功能。HTTP/3.0 的速度比 HTTP/1.1 快近 10 倍。在我的使用案例中，这是非常有用且重要的，因此我在2025年开始，尝试设计了这个框架。
 
 这个框架具有强大的插件系统，允许您通过简单的 CLI 命令添加 Kafka、RabbitMQ、Cassandra 等功能。它还包括自动 Docker 镜像构建、热重载开发和零停机部署功能。
 
 ## 开发故事
 
-作为一名在全球电商平台工作的后端工程师，我面临着一个关键挑战：我们的亚洲客户在访问美国服务器时遇到了显著的延迟。简单的 API 调用平均响应时间超过 700ms，图片加载时间延长到数秒，用户体验受到严重影响，直接影响了我们的转化率。
+作为一名在全球平台工作的后端工程师，我面临着一个关键挑战：我们的亚洲客户在访问美国服务器时遇到了显著的延迟。简单的 API 调用平均响应时间超过 700ms，图片加载时间延长到数秒，用户体验受到严重影响，直接影响了我们的转化率。
 
 ### 临界点
 
@@ -46,12 +46,11 @@ HypGo 是一个现代化的 Go Web 框架，提供 HTTP/2 和 HTTP/3 支持、Bu
 
 ### 为什么我开源了 HypGo
 
-这些结果太重要了，不能保持私有。跨境延迟影响着全球数百万个应用程序，开发者不应该从头开始构建 HTTP/3 支持。HypGo 源于现实世界的痛点，并提供现实世界的结果。
+这些结果太重要了，希望可以公开。跨境延迟影响着全球数百万个应用程序，开发者不应该从头开始构建 HTTP/3 支持。HypGo 源于现实世界的痛点，并提供现实世界的结果。
 
 除了 HTTP/3，我意识到现代应用程序还需要：
 - **Docker 集成**，确保一致的部署
 - **热重载**，提高开发者生产力
-- **消息队列**，构建可扩展的架构
 
 HypGo 的每个功能都来自实际的生产需求，在真实流量下测试，并被证明能够提供结果。
 
@@ -88,9 +87,8 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ## 快速开始
 
 ### 创建新项目
-
+必须包含 $GOPATH/bin 于 $PATH 中
 #### 全栈项目（包含前端）
-如果PATH包含go的執行文件
 ```bash
 hyp new myapp
 cd myapp
@@ -149,6 +147,7 @@ hyp docker -r docker.io/username --no-push=false
 - [HTTP vs. HTTP/2 vs. HTTP/3: What's the Difference?](https://www.pubnub.com/blog/http-vs-http-2-vs-http-3-whats-the-difference/)
 
 ## 核心概念
+
 ### 配置管理
 
 ```yaml
@@ -176,7 +175,6 @@ app/
 ├── controllers/   # HTTP 处理器
 ├── models/        # 数据模型（Bun models）
 ├── services/      # 业务逻辑
-└── plugins/       # 插件实现
 ```
 
 ## CLI 命令
@@ -272,15 +270,14 @@ import (
 func main() {
     cfg, _ := config.Load("config/config.yaml")
     srv := server.New(cfg, logger)
-    
+
     controllers.RegisterRoutes(srv.Router(), db, logger)
     srv.Start()
 }
 ```
-
 ## 发展路线图
 
-### V0.1（当前版本）✅
+### V0.7（当前版本）✅
 - [x] HTTP/1.1、HTTP/2、HTTP/3 支持
 - [x] 基本 MVC 结构
 - [x] CLI 工具与项目生成
@@ -290,23 +287,16 @@ func main() {
 - [x] 基本中间件（CORS、Logger、RateLimit）
 
 ### V1.0（进行中）🚧
-- [ ] 认证与授权系统
 - [ ] gRPC 集成
 - [ ] 数据库迁移工具
-- [ ] API 文档生成器
 - [ ] 性能监控
 - [ ] 分布式追踪
 - [ ] 断路器模式
-- [ ] Service Mesh 就绪
 
 ### V2.0（计划中）📋
-- [ ] 微服务工具包
-- [ ] 事件溯源支持
 - [ ] CQRS 实现
 - [ ] Kubernetes 操作器
-- [ ] 多租户支持
 - [ ] 实时分析
-- [ ] AI/ML 集成助手
 - [ ] 边缘计算支持
 - [ ] 区块链集成
 
@@ -327,4 +317,6 @@ HTTP/1.1 vs HTTP/2 vs HTTP/3（1000 个并发请求）
 
 HypGo 采用 [MIT 许可证](LICENSE) 发布。
 
-由 卯小月 用❤️制作
+---
+
+由 台湾卯小月 用❤️制作
