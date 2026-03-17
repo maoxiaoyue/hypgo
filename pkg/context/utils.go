@@ -143,6 +143,26 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("the ResponseWriter doesn't support hijacking")
 }
 
+// ReadFrom 實現 io.ReaderFrom 介面
+// 確保 http.ServeFile 等函式在 HTTP/2 下能正確傳輸 body
+func (w *responseWriter) ReadFrom(src io.Reader) (n int64, err error) {
+	w.WriteHeaderNow()
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		n, err = rf.ReadFrom(src)
+	} else {
+		// 包裝以避免 io.Copy 遞迴檢查 ReaderFrom
+		n, err = io.Copy(writerOnly{w.ResponseWriter}, src)
+	}
+	w.size += int(n)
+	return
+}
+
+// writerOnly 將 io.Writer 包裝為純 Writer，隱藏其他介面
+// 防止 io.Copy 遞迴偵測 ReaderFrom
+type writerOnly struct {
+	io.Writer
+}
+
 // Flush 實現 http.Flusher 介面
 func (w *responseWriter) Flush() {
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
