@@ -546,13 +546,21 @@ func (c *Client) readPump(config Config) {
 func (c *Client) writePump(config Config) {
 	ticker := time.NewTicker(config.PingInterval)
 	defer func() {
+		if r := recover(); r != nil {
+			// 防止 nil Conn 導致 panic 崩潰整個程式
+		}
 		ticker.Stop()
-		c.Conn.Close()
+		if c.Conn != nil {
+			c.Conn.Close()
+		}
 	}()
 
 	for {
 		select {
 		case message, ok := <-c.Send:
+			if c.Conn == nil {
+				return
+			}
 			c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
 			if !ok {
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
