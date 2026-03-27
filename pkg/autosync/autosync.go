@@ -54,6 +54,7 @@ func New(cfg Config, r *router.Router, appCfg *config.Config, log *logger.Logger
 
 // Sync 立即同步 manifest 到檔案
 // 安全考量：不包含敏感資訊（密碼、token、DSN）
+// 使用原子寫入（temp file + rename）防止中途損壞
 func (a *AutoSync) Sync() error {
 	if !a.config.Enabled {
 		return nil
@@ -69,8 +70,15 @@ func (a *AutoSync) Sync() error {
 	collector := manifest.NewCollector(a.router, a.appCfg)
 	m := collector.Collect()
 
-	// 寫入檔案（權限 0644：owner 可讀寫，others 只讀）
-	if err := manifest.SaveToFile(a.config.Path, m, a.config.Format); err != nil {
+	// 原子寫入：先寫 temp file，再 rename
+	// 防止寫入中途斷電或磁碟滿導致 context.yaml 損壞
+	tmpPath := a.config.Path + ".tmp"
+	if err := manifest.SaveToFile(tmpPath, m, a.config.Format); err != nil {
+		os.Remove(tmpPath) // 清理失敗的 temp file
+		return err
+	}
+	if err := os.Rename(tmpPath, a.config.Path); err != nil {
+		os.Remove(tmpPath)
 		return err
 	}
 

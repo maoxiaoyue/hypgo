@@ -7,6 +7,18 @@ type ModelRegistry struct {
 	models []interface{}
 }
 
+// globalRegistry 全域 Model 註冊表（供 CLI 使用）
+var globalRegistry = &ModelRegistry{
+	models: make([]interface{}, 0),
+}
+
+// GlobalRegistry 返回全域 Model 註冊表
+// 應用程式啟動時呼叫 GlobalRegistry().Register() 註冊 models
+// CLI `hyp migrate` 會讀取此 registry
+func GlobalRegistry() *ModelRegistry {
+	return globalRegistry
+}
+
 // NewRegistry 建立新的 ModelRegistry
 func NewRegistry() *ModelRegistry {
 	return &ModelRegistry{

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -205,6 +206,7 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 		config.Timeout = 30 * time.Second
 	}
 
+	var mu sync.Mutex
 	state := StateClosed
 	failureCount := 0
 	successCount := 0
@@ -212,6 +214,7 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 	concurrentCalls := 0
 
 	return func(c *hypcontext.Context) {
+		mu.Lock()
 		// 檢查熔斷器狀態
 		switch state {
 		case StateOpen:
@@ -224,6 +227,7 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 					config.OnStateChange("open", "half-open")
 				}
 			} else {
+				mu.Unlock()
 				// 快速失敗
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				c.String(http.StatusServiceUnavailable, "Circuit breaker is open")
@@ -233,6 +237,7 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 		case StateHalfOpen:
 			// 限制並發請求
 			if config.MaxConcurrentCalls > 0 && concurrentCalls >= config.MaxConcurrentCalls {
+				mu.Unlock()
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				c.String(http.StatusServiceUnavailable, "Too many concurrent requests")
 				return
@@ -241,7 +246,7 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 
 		// 執行請求
 		concurrentCalls++
-		defer func() { concurrentCalls-- }()
+		mu.Unlock() // 釋放鎖再執行 handler（避免阻塞其他請求）
 
 		// 記錄開始時間
 		startTime := time.Now()
@@ -255,6 +260,10 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 
 		// 判斷請求是否成功
 		isSuccess := statusCode < 500
+
+		// 重新取得鎖更新狀態
+		mu.Lock()
+		concurrentCalls--
 
 		// 更新熔斷器狀態
 		switch state {
@@ -291,8 +300,11 @@ func CircuitBreaker(config CircuitBreakerConfig) hypcontext.HandlerFunc {
 			}
 		}
 
+		currentState := state
+		mu.Unlock()
+
 		// 記錄指標
-		c.Set("circuit_breaker_state", state)
+		c.Set("circuit_breaker_state", currentState)
 		c.Set("request_elapsed", elapsed)
 	}
 }

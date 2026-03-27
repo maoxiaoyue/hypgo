@@ -3,6 +3,8 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,9 +18,14 @@ import (
 
 // ===== 核心工具函數 =====
 
-// fastrand 快速隨機數生成
-func fastrand() uint32 {
-	return uint32(time.Now().UnixNano())
+// secureRandHex 使用 crypto/rand 生成安全隨機 hex 字串
+func secureRandHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// fallback: 用時間戳（極端情況）
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // ===== 日誌中間件 =====
@@ -125,7 +132,14 @@ type RateLimiterConfig struct {
 // KeyFunc 獲取速率限制鍵的函數
 type KeyFunc func(c *hypcontext.Context) string
 
+// rateLimiterEntry 帶時間戳的限制器，用於過期清理
+type rateLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
 // RateLimiter 創建速率限制中間件
+// 修復：加入定期清理機制，防止 sync.Map 因大量唯一 IP 導致記憶體洩漏
 func RateLimiter(config RateLimiterConfig) hypcontext.HandlerFunc {
 	limiters := &sync.Map{}
 
@@ -139,12 +153,37 @@ func RateLimiter(config RateLimiterConfig) hypcontext.HandlerFunc {
 		config.StatusCode = http.StatusTooManyRequests
 	}
 
+	// 定期清理過期的限制器（每 5 分鐘，清除 10 分鐘未見的 key）
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			limiters.Range(func(key, value interface{}) bool {
+				if entry, ok := value.(*rateLimiterEntry); ok {
+					if now.Sub(entry.lastSeen) > 10*time.Minute {
+						limiters.Delete(key)
+					}
+				}
+				return true
+			})
+		}
+	}()
+
 	return func(c *hypcontext.Context) {
 		key := config.KeyFunc(c)
 
-		// 獲取或創建限制器
-		limiterInterface, _ := limiters.LoadOrStore(key, rate.NewLimiter(rate.Limit(config.Rate), config.Burst))
-		limiter := limiterInterface.(*rate.Limiter)
+		// 獲取或創建限制器（帶時間戳）
+		now := time.Now()
+		entryInterface, loaded := limiters.LoadOrStore(key, &rateLimiterEntry{
+			limiter:  rate.NewLimiter(rate.Limit(config.Rate), config.Burst),
+			lastSeen: now,
+		})
+		entry := entryInterface.(*rateLimiterEntry)
+		if loaded {
+			entry.lastSeen = now // 更新最後見到時間
+		}
+		limiter := entry.limiter
 
 		// HTTP/3 優化：使用 QUIC 的流控制特性
 		if config.UseHTTP3 {
@@ -425,6 +464,53 @@ func (g *Group) Use(middlewares ...hypcontext.HandlerFunc) {
 func (g *Group) Handle(handler hypcontext.HandlerFunc) hypcontext.HandlerFunc {
 	chain := NewChain(g.middlewares...)
 	return chain.Then(handler)
+}
+
+// ===== BodyLimit 中間件 =====
+
+// BodyLimitConfig 請求 body 大小限制配置
+type BodyLimitConfig struct {
+	MaxBytes    int64  // 最大 body 大小（bytes），預設 1MB
+	ErrorMsg    string // 自訂錯誤訊息
+}
+
+// BodyLimit 限制請求 body 大小，防止大 payload 攻擊
+func BodyLimit(config BodyLimitConfig) hypcontext.HandlerFunc {
+	if config.MaxBytes <= 0 {
+		config.MaxBytes = 1 << 20 // 1MB
+	}
+	if config.ErrorMsg == "" {
+		config.ErrorMsg = "Request body too large"
+	}
+
+	return func(c *hypcontext.Context) {
+		if c.Request.ContentLength > config.MaxBytes {
+			c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+			c.String(http.StatusRequestEntityTooLarge, config.ErrorMsg)
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Response, c.Request.Body, config.MaxBytes)
+		c.Next()
+	}
+}
+
+// ===== MethodOverride 中間件 =====
+
+// MethodOverride 支援透過 header 或表單參數覆蓋 HTTP 方法
+// 用於不支援 PUT/DELETE/PATCH 的客戶端（如 HTML 表單）
+func MethodOverride() hypcontext.HandlerFunc {
+	return func(c *hypcontext.Context) {
+		if c.Request.Method == http.MethodPost {
+			// 檢查 X-HTTP-Method-Override header
+			if override := c.GetHeader("X-HTTP-Method-Override"); override != "" {
+				c.Request.Method = strings.ToUpper(override)
+			} else if override := c.Request.FormValue("_method"); override != "" {
+				// 檢查 _method 表單參數
+				c.Request.Method = strings.ToUpper(override)
+			}
+		}
+		c.Next()
+	}
 }
 
 // ===== 預設中間件配置 =====

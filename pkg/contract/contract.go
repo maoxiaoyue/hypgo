@@ -99,9 +99,18 @@ func testInternal(t *testing.T, r *router.Router, tc TestCase) {
 		s, ok := schema.Global().Get(method, lookupPath)
 		if !ok {
 			t.Errorf("[%s] no schema registered for validation", tc.Route)
-		} else if s.Output != nil {
-			if err := validateResponse(w.Body.Bytes(), s.Output); err != nil {
-				t.Errorf("[%s] response schema validation failed: %v", tc.Route, err)
+		} else {
+			// 驗證 Input schema（請求 body）
+			if s.Input != nil && tc.Input != "" {
+				if err := validateRequest([]byte(tc.Input), s.Input); err != nil {
+					t.Errorf("[%s] request schema validation failed: %v", tc.Route, err)
+				}
+			}
+			// 驗證 Output schema（回應 body）
+			if s.Output != nil {
+				if err := validateResponse(w.Body.Bytes(), s.Output); err != nil {
+					t.Errorf("[%s] response schema validation failed: %v", tc.Route, err)
+				}
 			}
 		}
 	}

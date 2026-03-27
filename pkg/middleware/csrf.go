@@ -1,11 +1,13 @@
 package middleware
 
 import (
+	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
@@ -93,11 +95,14 @@ func isSafeMethod(method string) bool {
 		method == http.MethodOptions
 }
 
-// generateCSRFToken 生成 CSRF token
+// generateCSRFToken 使用 crypto/rand 生成安全 CSRF token
 func generateCSRFToken(length int) string {
 	b := make([]byte, length)
-	for i := range b {
-		b[i] = byte(fastrand() % 256)
+	if _, err := crand.Read(b); err != nil {
+		// fallback（極端情況）
+		for i := range b {
+			b[i] = byte(time.Now().UnixNano() % 256)
+		}
 	}
 	return base64.URLEncoding.EncodeToString(b)
 }

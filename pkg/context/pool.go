@@ -116,6 +116,9 @@ func ReleaseContext(c *Context) {
 }
 
 // reset 重置 Context
+// GC 優化：使用 map 重建替代逐一 delete
+// 逐一 delete 會觸發 N 次 hash 操作和 GC write barrier
+// 重建 map 只產生一次分配，且舊 map 由 GC 整體回收
 func (c *Context) reset() {
 	c.Request = nil
 	c.Response = nil
@@ -127,22 +130,12 @@ func (c *Context) reset() {
 	c.handlers = c.handlers[:0]
 	c.Errors = c.Errors[:0]
 
-	// 清理 map
-	for k := range c.Keys {
-		delete(c.Keys, k)
-	}
+	// GC 優化：重建 map 替代逐一 delete
+	c.Keys = make(map[string]interface{}, 8)
 
-	// 清理快取
-	if c.queryCache != nil {
-		for k := range c.queryCache {
-			delete(c.queryCache, k)
-		}
-	}
-	if c.formCache != nil {
-		for k := range c.formCache {
-			delete(c.formCache, k)
-		}
-	}
+	// 清理快取：直接置 nil，下次使用時延遲初始化
+	c.queryCache = nil
+	c.formCache = nil
 
 	c.index = -1
 	c.protocol = 0
@@ -260,6 +253,36 @@ func (q *QuicConnection) reset() {
 	q.bytesRead = 0
 }
 
+// ===== Params 池操作 =====
+
+// paramsPool 路由參數池，避免每請求分配新 Params slice
+var paramsPool = &sync.Pool{
+	New: func() interface{} {
+		p := make(Params, 0, 8)
+		return &p
+	},
+}
+
+// AcquireParams 從池中獲取 Params slice
+func AcquireParams(size int) Params {
+	pp := paramsPool.Get().(*Params)
+	p := *pp
+	if cap(p) >= size {
+		return p[:size]
+	}
+	// 容量不足時重新分配
+	return make(Params, size)
+}
+
+// ReleaseParams 將 Params 歸還池中
+func ReleaseParams(p Params) {
+	if cap(p) > 32 {
+		return // 過大的不歸還
+	}
+	p = p[:0]
+	paramsPool.Put(&p)
+}
+
 // ===== 緩衝區池操作 =====
 
 // AcquireBuffer 從池中獲取緩衝區
@@ -285,13 +308,11 @@ func ReleaseBuffer(buf *bytes.Buffer) {
 // ===== URL Values 池操作 =====
 
 // AcquireURLValues 從池中獲取 URL Values
+// GC 優化：重建 map 替代逐一 delete
 func AcquireURLValues() url.Values {
-	v := urlValuesPool.Get().(url.Values)
-	// 清空但保留容量
-	for k := range v {
-		delete(v, k)
-	}
-	return v
+	// 舊 map 由 GC 整體回收，比逐一 delete 更高效
+	_ = urlValuesPool.Get()
+	return make(url.Values, 8)
 }
 
 // ReleaseURLValues 將 URL Values 返回池中

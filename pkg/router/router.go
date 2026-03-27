@@ -196,6 +196,37 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.putParams(params)
 	}
 
+	// HEAD 自動回應：若無 HEAD handler，使用 GET handler
+	if method == "HEAD" {
+		if root := r.trees["GET"]; root != nil {
+			handlers, params := root.search(urlPath, r.getParams())
+			if handlers != nil {
+				c.Params = r.makeContextParams(params)
+				r.executeHandlers(c, handlers)
+				r.putParams(params)
+				return
+			}
+			r.putParams(params)
+		}
+	}
+
+	// 尾部斜線重導向
+	if r.strictSlash {
+		var tryPath string
+		if urlPath[len(urlPath)-1] == '/' {
+			tryPath = urlPath[:len(urlPath)-1]
+		} else {
+			tryPath = urlPath + "/"
+		}
+		if root := r.trees[method]; root != nil {
+			if handlers, _ := root.search(tryPath, nil); handlers != nil {
+				req.URL.Path = tryPath
+				http.Redirect(w, req, tryPath, http.StatusMovedPermanently)
+				return
+			}
+		}
+	}
+
 	// 405 Method Not Allowed
 	if r.handleMethodNotAllowed {
 		for m, tree := range r.trees {
@@ -304,11 +335,12 @@ func (r *Router) putParams(params []Param) {
 }
 
 // makeContextParams 轉換路由參數為 Context 參數格式
+// GC 優化：使用 Params pool 避免每請求分配新 slice
 func (r *Router) makeContextParams(params []Param) hypcontext.Params {
 	if len(params) == 0 {
 		return nil
 	}
-	cp := make(hypcontext.Params, len(params))
+	cp := hypcontext.AcquireParams(len(params))
 	for i, p := range params {
 		cp[i] = hypcontext.Param{
 			Key:   p.Key,

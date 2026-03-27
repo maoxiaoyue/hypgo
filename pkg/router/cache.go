@@ -26,6 +26,13 @@ type cacheItem struct {
 	next     *cacheItem
 }
 
+// cacheItemPool GC 優化：快取項目池，避免每次 cache miss 都分配新 struct
+var cacheItemPool = &sync.Pool{
+	New: func() interface{} {
+		return &cacheItem{}
+	},
+}
+
 // newRouteCache 創建路由快取
 func newRouteCache(capacity int) *routeCache {
 	return &routeCache{
@@ -65,12 +72,13 @@ func (c *routeCache) put(key string, handlers []hypcontext.HandlerFunc, params [
 		return
 	}
 
-	// 新增項目
-	entry := &cacheItem{
-		key:      key,
-		handlers: handlers,
-		params:   params,
-	}
+	// GC 優化：從 pool 取得 cacheItem
+	entry := cacheItemPool.Get().(*cacheItem)
+	entry.key = key
+	entry.handlers = handlers
+	entry.params = params
+	entry.prev = nil
+	entry.next = nil
 
 	c.items[key] = entry
 	c.addToHead(entry)
@@ -120,7 +128,16 @@ func (c *routeCache) removeTail() {
 	if c.tail == nil {
 		return
 	}
-	delete(c.items, c.tail.key)
-	c.removeEntry(c.tail)
+	evicted := c.tail
+	delete(c.items, evicted.key)
+	c.removeEntry(evicted)
 	c.size--
+
+	// GC 優化：歸還被淘汰的 cacheItem 到 pool
+	evicted.key = ""
+	evicted.handlers = nil
+	evicted.params = nil
+	evicted.prev = nil
+	evicted.next = nil
+	cacheItemPool.Put(evicted)
 }

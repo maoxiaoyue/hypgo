@@ -119,6 +119,9 @@ func registerCommands() {
 	// 註冊 context 命令（AI 協作用 manifest 生成）
 	rootCmd.AddCommand(contextCmd)
 
+	// 註冊 migrate 命令（Migration Diff CLI）
+	rootCmd.AddCommand(migrateCmd)
+
 	// 註冊 chkcomment 命令（Annotation Protocol 檢查）
 	rootCmd.AddCommand(chkcommentCmd)
 

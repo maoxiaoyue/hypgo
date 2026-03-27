@@ -86,6 +86,18 @@ func TestTestWithSchema(t *testing.T) {
 	})
 }
 
+func TestTestWithSchemaInputValidation(t *testing.T) {
+	r := setupTestRouter()
+
+	// 有效的 input — 應該通過
+	Test(t, r, TestCase{
+		Route:        "POST /api/users",
+		Input:        `{"name":"alice","email":"alice@test.com"}`,
+		ExpectStatus: 201,
+		ExpectSchema: true,
+	})
+}
+
 func TestTestWithBody(t *testing.T) {
 	r := setupTestRouter()
 

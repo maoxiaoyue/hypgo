@@ -26,11 +26,13 @@ var (
 	}
 
 	// Client 物件池
+	// GC 優化：預分配 metadata map，避免延遲初始化的額外分配
 	clientPool = &sync.Pool{
 		New: func() interface{} {
 			return &Client{
 				Send:     make(chan []byte, 256),
-				Channels: make(map[string]bool),
+				Channels: make(map[string]bool, 4),
+				metadata: make(map[string]interface{}, 4),
 			}
 		},
 	}
@@ -48,6 +50,15 @@ var (
 	bufferPool = &sync.Pool{
 		New: func() interface{} {
 			return make([]byte, 0, 4096)
+		},
+	}
+
+	// GC 優化：broadcast 用的 client slice pool
+	// 避免每次廣播都 make 新 slice（10k 客戶端 × 100msg/s = 100萬次分配/s）
+	clientSlicePool = &sync.Pool{
+		New: func() interface{} {
+			s := make([]*Client, 0, 256)
+			return &s
 		},
 	}
 )
@@ -217,6 +228,7 @@ func (c *Client) Release() {
 }
 
 // reset 重置 Client
+// GC 優化：map 重建替代逐一 delete，channel 非阻塞 drain
 func (c *Client) reset() {
 	c.ID = ""
 	c.Conn = nil
@@ -226,27 +238,25 @@ func (c *Client) reset() {
 	c.wsFrameType = 0
 	c.isClosing = false
 
-	// 清空但保留容量
-	for k := range c.Channels {
-		delete(c.Channels, k)
-	}
-	for k := range c.metadata {
-		delete(c.metadata, k)
-	}
+	// GC 優化：重建 map 替代逐一 delete
+	c.Channels = make(map[string]bool, 4)
+	c.metadata = make(map[string]interface{}, 4)
 
-	// 清空通道
-	for len(c.Send) > 0 {
-		<-c.Send
+	// 非阻塞 drain channel：避免持有大量 []byte 引用
+	for {
+		select {
+		case <-c.Send:
+		default:
+			return
+		}
 	}
 }
 
 // SetMetadata 設置客戶端元數據
+// metadata 已在 pool New() 中預分配，無需延遲初始化
 func (c *Client) SetMetadata(key string, value interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.metadata == nil {
-		c.metadata = make(map[string]interface{})
-	}
 	c.metadata[key] = value
 }
 
@@ -405,9 +415,13 @@ func (h *Hub) handleUnregister(client *Client) {
 }
 
 // handleBroadcast 處理廣播（支持跨協議序列化 + 安全管線）
+// GC 優化：使用 clientSlicePool 避免每次廣播分配新 slice
 func (h *Hub) handleBroadcast(msg *Message) {
+	// 從 pool 取得 client slice
+	slicePtr := clientSlicePool.Get().(*[]*Client)
+	clients := (*slicePtr)[:0]
+
 	h.mu.RLock()
-	clients := make([]*Client, 0, len(h.clients))
 	for _, client := range h.clients {
 		clients = append(clients, client)
 	}
@@ -417,6 +431,14 @@ func (h *Hub) handleBroadcast(msg *Message) {
 		h.stats.MessagesSent++
 		h.stats.BytesSent += n
 	})
+
+	// 清除引用防止 client 被 pool 持有而無法 GC
+	for i := range clients {
+		clients[i] = nil
+	}
+	clients = clients[:0]
+	*slicePtr = clients
+	clientSlicePool.Put(slicePtr)
 }
 
 // cleanupInactiveClients 清理不活躍的客戶端
