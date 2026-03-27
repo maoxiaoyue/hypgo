@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/redis/go-redis/v9"
@@ -222,6 +223,10 @@ func (d *Database) initSQL() (*Database, error) {
 	if maxOpenConns > 0 {
 		db.SetMaxOpenConns(maxOpenConns)
 	}
+
+	// GC 優化：設定連線最大存活時間，防止持有過期狀態的長連線
+	// 預設 30 分鐘，確保連線定期回收
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// 測試連接
 	if err := db.Ping(); err != nil {

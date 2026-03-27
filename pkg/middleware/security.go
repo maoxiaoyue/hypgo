@@ -26,46 +26,49 @@ type SecurityConfig struct {
 }
 
 // Security 創建安全頭中間件
+// GC 優化：所有 header 值在初始化時預計算，避免每請求的 fmt.Sprintf 和字串拼接
 func Security(config SecurityConfig) hypcontext.HandlerFunc {
+	// GC 優化：預計算所有 header 值（閉包捕獲不可變值）
+	xss := config.XSSProtection
+	if xss == "" {
+		xss = "1; mode=block"
+	}
+
+	nosniff := config.ContentTypeNosniff
+	if nosniff == "" {
+		nosniff = "nosniff"
+	}
+
+	frame := config.XFrameOptions
+	if frame == "" {
+		frame = "DENY"
+	}
+
+	// HSTS 值預計算：避免每請求 fmt.Sprintf + 字串拼接
+	var hstsValue string
+	if config.HSTSMaxAge > 0 {
+		hstsValue = fmt.Sprintf("max-age=%d", config.HSTSMaxAge)
+		if config.HSTSIncludeSubdomains {
+			hstsValue += "; includeSubDomains"
+		}
+	}
+
+	csp := config.ContentSecurityPolicy
+	referrer := config.ReferrerPolicy
+
 	return func(c *hypcontext.Context) {
-		// XSS 保護
-		if config.XSSProtection != "" {
-			c.Header("X-XSS-Protection", config.XSSProtection)
-		} else {
-			c.Header("X-XSS-Protection", "1; mode=block")
-		}
+		c.Header("X-XSS-Protection", xss)
+		c.Header("X-Content-Type-Options", nosniff)
+		c.Header("X-Frame-Options", frame)
 
-		// 防止 MIME 類型嗅探
-		if config.ContentTypeNosniff != "" {
-			c.Header("X-Content-Type-Options", config.ContentTypeNosniff)
-		} else {
-			c.Header("X-Content-Type-Options", "nosniff")
+		if hstsValue != "" {
+			c.Header("Strict-Transport-Security", hstsValue)
 		}
-
-		// 防止點擊劫持
-		if config.XFrameOptions != "" {
-			c.Header("X-Frame-Options", config.XFrameOptions)
-		} else {
-			c.Header("X-Frame-Options", "DENY")
+		if csp != "" {
+			c.Header("Content-Security-Policy", csp)
 		}
-
-		// HSTS
-		if config.HSTSMaxAge > 0 {
-			value := fmt.Sprintf("max-age=%d", config.HSTSMaxAge)
-			if config.HSTSIncludeSubdomains {
-				value += "; includeSubDomains"
-			}
-			c.Header("Strict-Transport-Security", value)
-		}
-
-		// CSP
-		if config.ContentSecurityPolicy != "" {
-			c.Header("Content-Security-Policy", config.ContentSecurityPolicy)
-		}
-
-		// Referrer Policy
-		if config.ReferrerPolicy != "" {
-			c.Header("Referrer-Policy", config.ReferrerPolicy)
+		if referrer != "" {
+			c.Header("Referrer-Policy", referrer)
 		}
 
 		c.Next()
@@ -152,10 +155,12 @@ type JWTConfig struct {
 	TokenLookup   string // "header:Authorization" or "query:token" or "cookie:token"
 	TokenHeadName string // "Bearer"
 	Claims        interface{}
+	Validator     func(token string) (interface{}, error) // 必須提供：驗證 token 並回傳 claims
 	ErrorHandler  func(c *hypcontext.Context, err error)
 }
 
 // JWT 創建 JWT 中間件
+// 需要提供 Validator 函式來驗證 token，否則一律拒絕（安全預設）
 func JWT(config JWTConfig) hypcontext.HandlerFunc {
 	if config.ContextKey == "" {
 		config.ContextKey = "user"
@@ -173,22 +178,34 @@ func JWT(config JWTConfig) hypcontext.HandlerFunc {
 		// 提取 token
 		token := extractToken(c, config.TokenLookup, config.TokenHeadName)
 		if token == "" {
-			if config.ErrorHandler != nil {
-				config.ErrorHandler(c, fmt.Errorf("token not found"))
-			} else {
-				c.AbortWithStatus(http.StatusUnauthorized)
-			}
+			jwtError(c, config, fmt.Errorf("token not found"))
 			return
 		}
 
-		// 驗證 token
-		// 這裡需要實際的 JWT 驗證邏輯
-		// claims, err := validateToken(token, config.SigningKey)
+		// 使用 Validator 驗證 token（必須由使用者提供）
+		if config.Validator == nil {
+			jwtError(c, config, fmt.Errorf("JWT validator not configured"))
+			return
+		}
 
-		// 設置使用者資訊
-		// c.Set(config.ContextKey, claims)
+		claims, err := config.Validator(token)
+		if err != nil {
+			jwtError(c, config, fmt.Errorf("token validation failed: %w", err))
+			return
+		}
 
+		// 設置使用者資訊到 context
+		c.Set(config.ContextKey, claims)
 		c.Next()
+	}
+}
+
+// jwtError 統一 JWT 錯誤處理
+func jwtError(c *hypcontext.Context, config JWTConfig, err error) {
+	if config.ErrorHandler != nil {
+		config.ErrorHandler(c, err)
+	} else {
+		c.AbortWithStatus(http.StatusUnauthorized)
 	}
 }
 

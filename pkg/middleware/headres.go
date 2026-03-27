@@ -46,16 +46,8 @@ func Compression(config CompressionConfig) hypcontext.HandlerFunc {
 		// 檢查客戶端支援的編碼
 		acceptEncoding := c.GetHeader("Accept-Encoding")
 
-		// HTTP/3 優化：優先使用 Brotli
-		if config.PreferBrotli {
-			if protoValue, exists := c.Get("protocol"); exists {
-				if proto, ok := protoValue.(string); ok && proto == "HTTP/3" && strings.Contains(acceptEncoding, "br") {
-					// 使用 Brotli 壓縮
-					c.Header("Content-Encoding", "br")
-					// 實現 Brotli 壓縮邏輯
-				}
-			}
-		} else if strings.Contains(acceptEncoding, "gzip") {
+		// 壓縮：僅支援 gzip（Brotli 需要額外依賴，暫不啟用避免發送假 header）
+		if strings.Contains(acceptEncoding, "gzip") {
 			// 使用 Gzip 壓縮
 			c.Header("Content-Encoding", "gzip")
 			c.Header("Vary", "Accept-Encoding")
@@ -113,9 +105,9 @@ func RequestID(config RequestIDConfig) hypcontext.HandlerFunc {
 	}
 }
 
-// generateRequestID 生成請求 ID
+// generateRequestID 生成安全的請求 ID
 func generateRequestID() string {
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), fastrand())
+	return secureRandHex(16)
 }
 
 // ===== HTTP/3 Server Push 中間件 =====

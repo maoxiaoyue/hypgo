@@ -2,10 +2,14 @@ package router
 
 import (
 	"net/http"
+	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"unsafe"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
 // Router 主結構
@@ -192,6 +196,37 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.putParams(params)
 	}
 
+	// HEAD 自動回應：若無 HEAD handler，使用 GET handler
+	if method == "HEAD" {
+		if root := r.trees["GET"]; root != nil {
+			handlers, params := root.search(urlPath, r.getParams())
+			if handlers != nil {
+				c.Params = r.makeContextParams(params)
+				r.executeHandlers(c, handlers)
+				r.putParams(params)
+				return
+			}
+			r.putParams(params)
+		}
+	}
+
+	// 尾部斜線重導向
+	if r.strictSlash {
+		var tryPath string
+		if urlPath[len(urlPath)-1] == '/' {
+			tryPath = urlPath[:len(urlPath)-1]
+		} else {
+			tryPath = urlPath + "/"
+		}
+		if root := r.trees[method]; root != nil {
+			if handlers, _ := root.search(tryPath, nil); handlers != nil {
+				req.URL.Path = tryPath
+				http.Redirect(w, req, tryPath, http.StatusMovedPermanently)
+				return
+			}
+		}
+	}
+
 	// 405 Method Not Allowed
 	if r.handleMethodNotAllowed {
 		for m, tree := range r.trees {
@@ -300,11 +335,12 @@ func (r *Router) putParams(params []Param) {
 }
 
 // makeContextParams 轉換路由參數為 Context 參數格式
+// GC 優化：使用 Params pool 避免每請求分配新 slice
 func (r *Router) makeContextParams(params []Param) hypcontext.Params {
 	if len(params) == 0 {
 		return nil
 	}
-	cp := make(hypcontext.Params, len(params))
+	cp := hypcontext.AcquireParams(len(params))
 	for i, p := range params {
 		cp[i] = hypcontext.Param{
 			Key:   p.Key,
@@ -316,9 +352,10 @@ func (r *Router) makeContextParams(params []Param) hypcontext.Params {
 
 // RouteInfo 路由信息
 type RouteInfo struct {
-	Method   string
-	Path     string
-	Handlers int // handler 數量
+	Method       string
+	Path         string
+	Handlers     int      // handler 數量
+	HandlerNames []string // handler 函式名稱
 }
 
 // Routes 返回已註冊的所有路由信息
@@ -337,16 +374,54 @@ func collectRoutes(prefix, method string, routes []RouteInfo, n *radixNode) []Ro
 	}
 	fullPath := prefix + n.path
 	if len(n.handlers) > 0 {
+		names := make([]string, len(n.handlers))
+		for i, h := range n.handlers {
+			names[i] = nameOfFunction(h)
+		}
 		routes = append(routes, RouteInfo{
-			Method:   method,
-			Path:     fullPath,
-			Handlers: len(n.handlers),
+			Method:       method,
+			Path:         fullPath,
+			Handlers:     len(n.handlers),
+			HandlerNames: names,
 		})
 	}
 	for _, child := range n.children {
 		routes = collectRoutes(fullPath, method, routes, child)
 	}
 	return routes
+}
+
+// Schema 開始 schema-first 路由註冊
+//
+// 使用範例：
+//
+//	r.Schema(schema.Route{
+//	    Method:  "POST",
+//	    Path:    "/api/users",
+//	    Summary: "建立使用者",
+//	    Input:   CreateUserRequest{},
+//	    Output:  UserResponse{},
+//	}).Handle(createUserHandler)
+func (r *Router) Schema(route schema.Route) *schema.SchemaRoute {
+	return schema.NewSchemaRoute(route, r)
+}
+
+// registerSchema 實作 schema.SchemaRegistrar 介面
+func (r *Router) RegisterSchema(route schema.Route, handlers ...hypcontext.HandlerFunc) {
+	r.Group.handle(route.Method, route.Path, handlers)
+	schema.Global().Register(route)
+}
+
+// nameOfFunction 透過反射取得函式名稱（短名稱）
+func nameOfFunction(f interface{}) string {
+	full := runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+	// 取最後一段（移除 package path）
+	if idx := strings.LastIndex(full, "/"); idx >= 0 {
+		full = full[idx+1:]
+	}
+	// 移除 -fm 後綴（method value）
+	full = strings.TrimSuffix(full, "-fm")
+	return full
 }
 
 // 共用工具函數

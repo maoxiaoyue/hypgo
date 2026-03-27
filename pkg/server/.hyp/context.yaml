@@ -1,0 +1,8 @@
+version: "1.0"
+framework: HypGo
+generated_at: 2026-03-27T11:39:55.9445561+08:00
+server:
+  addr: 127.0.0.1:0
+  protocol: http2
+  tls: false
+routes: []

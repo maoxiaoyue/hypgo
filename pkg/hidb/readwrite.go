@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/uptrace/bun"
@@ -17,59 +18,60 @@ type ReadReplica struct {
 }
 
 // ReplicaPool 讀取副本連接池（支持輪詢負載均衡）
+// GC 優化：讀路徑使用 atomic.Pointer 避免 RWMutex 競爭
+// 寫操作（Add/Close）仍使用 Mutex 保護
 type ReplicaPool struct {
-	replicas []ReadReplica
+	replicas atomic.Pointer[[]ReadReplica] // GC 優化：讀路徑無鎖
 	counter  atomic.Uint64
-	mu       sync.RWMutex
+	mu       sync.Mutex // 僅保護寫操作
 }
 
 // NewReplicaPool 創建讀取副本池
 func NewReplicaPool() *ReplicaPool {
-	return &ReplicaPool{
-		replicas: make([]ReadReplica, 0),
-	}
+	rp := &ReplicaPool{}
+	empty := make([]ReadReplica, 0)
+	rp.replicas.Store(&empty)
+	return rp
 }
 
 // Add 添加讀取副本
+// 寫操作：使用 Mutex 保護，copy-on-write 更新 atomic.Pointer
 func (rp *ReplicaPool) Add(replica ReadReplica) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
-	rp.replicas = append(rp.replicas, replica)
+
+	old := rp.replicas.Load()
+	newSlice := make([]ReadReplica, len(*old)+1)
+	copy(newSlice, *old)
+	newSlice[len(*old)] = replica
+	rp.replicas.Store(&newSlice)
 }
 
 // Next 獲取下一個讀取副本的 HypDB ORM 實例（輪詢）
-// 如果沒有可用的讀取副本，返回 nil
+// GC 優化：讀路徑完全無鎖，使用 atomic.Pointer 讀取
 func (rp *ReplicaPool) Next() *bun.DB {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-
-	if len(rp.replicas) == 0 {
+	replicas := *rp.replicas.Load()
+	if len(replicas) == 0 {
 		return nil
 	}
-
 	idx := rp.counter.Add(1) - 1
-	return rp.replicas[idx%uint64(len(rp.replicas))].hypDB
+	return replicas[idx%uint64(len(replicas))].hypDB
 }
 
 // NextSQL 獲取下一個讀取副本的原始 SQL 連接（輪詢）
-// 如果沒有可用的讀取副本，返回 nil
+// GC 優化：讀路徑完全無鎖
 func (rp *ReplicaPool) NextSQL() *sql.DB {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-
-	if len(rp.replicas) == 0 {
+	replicas := *rp.replicas.Load()
+	if len(replicas) == 0 {
 		return nil
 	}
-
 	idx := rp.counter.Add(1) - 1
-	return rp.replicas[idx%uint64(len(rp.replicas))].sqlDB
+	return replicas[idx%uint64(len(replicas))].sqlDB
 }
 
 // Len 返回副本數量
 func (rp *ReplicaPool) Len() int {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-	return len(rp.replicas)
+	return len(*rp.replicas.Load())
 }
 
 // Close 關閉所有讀取副本連接
@@ -77,25 +79,25 @@ func (rp *ReplicaPool) Close() []error {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
 
+	replicas := *rp.replicas.Load()
 	var errs []error
-	for i, replica := range rp.replicas {
+	for i, replica := range replicas {
 		if replica.hypDB != nil {
 			if err := replica.hypDB.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("failed to close read replica %d: %w", i, err))
 			}
 		}
 	}
-	rp.replicas = nil
+	empty := make([]ReadReplica, 0)
+	rp.replicas.Store(&empty)
 	return errs
 }
 
 // PingAll 對所有讀取副本進行健康檢查
 func (rp *ReplicaPool) PingAll() []error {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-
+	replicas := *rp.replicas.Load()
 	var errs []error
-	for i, replica := range rp.replicas {
+	for i, replica := range replicas {
 		if replica.sqlDB != nil {
 			if err := replica.sqlDB.Ping(); err != nil {
 				errs = append(errs, fmt.Errorf("read replica %d unhealthy: %w", i, err))
@@ -123,6 +125,9 @@ func initReplica(dialect Dialect, replicaCfg config.ReplicaConfig) (ReadReplica,
 	if replicaCfg.MaxOpenConns > 0 {
 		db.SetMaxOpenConns(replicaCfg.MaxOpenConns)
 	}
+
+	// GC 優化：Replica 也設定 ConnMaxLifetime，防止長連線持有過期狀態
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// 測試連接
 	if err := db.Ping(); err != nil {
