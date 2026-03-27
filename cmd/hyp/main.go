@@ -116,6 +116,9 @@ func registerCommands() {
 		},
 	})
 
+	// 註冊 context 命令（AI 協作用 manifest 生成）
+	rootCmd.AddCommand(contextCmd)
+
 	// 註冊 health 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "health",

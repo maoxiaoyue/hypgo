@@ -18,6 +18,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
+	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/middleware"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/quic-go/quic-go/http3"
@@ -524,6 +525,13 @@ func (s *Server) GetProtocol() string {
 	default:
 		return "AUTO"
 	}
+}
+
+// Manifest 生成應用程式的結構描述
+// 包含路由、中間件、伺服器設定等完整資訊
+func (s *Server) Manifest() *manifest.Manifest {
+	c := manifest.NewCollector(s.router, s.config)
+	return c.Collect()
 }
 
 // EnableHTTP3 啟用 HTTP/3

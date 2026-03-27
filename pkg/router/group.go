@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
 // IRoutes 定義路由註冊介面
@@ -221,6 +222,21 @@ func (g *Group) StaticFS(relativePath string, fs http.FileSystem) IRoutes {
 	g.handle(http.MethodGet, urlPattern, []hypcontext.HandlerFunc{handler})
 	g.handle(http.MethodHead, urlPattern, []hypcontext.HandlerFunc{handler})
 	return g.returnObj()
+}
+
+// Schema 開始 schema-first 路由註冊（Group 版本）
+// 自動將 Group 的 basePath 前綴加到 route.Path
+func (g *Group) Schema(route schema.Route) *schema.SchemaRoute {
+	route.Path = joinPaths(g.basePath, route.Path)
+	return schema.NewSchemaRoute(route, g)
+}
+
+// registerSchema 實作 schema.SchemaRegistrar 介面（Group 版本）
+func (g *Group) RegisterSchema(route schema.Route, handlers ...hypcontext.HandlerFunc) {
+	// route.Path 已由 Schema() 計算為絕對路徑
+	finalHandlers := g.combineHandlers(handlers)
+	g.router.addRoute(route.Method, route.Path, finalHandlers)
+	schema.Global().Register(route)
 }
 
 // combineHandlers 合併中間件鏈
