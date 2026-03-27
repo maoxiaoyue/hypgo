@@ -1,317 +1,372 @@
 # HypGo
 
-A modern Go web framework with HTTP/3, HTTP/2 support and plugin architecture.
+**A Modern Go Web Framework Designed for AI-Human Collaborative Development**
 
-[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.1.0-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
+[![Version](https://img.shields.io/badge/Version-0.7.0-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
 
 [English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md)
 
-## Description
+## What is HypGo?
 
-HypGo is a modern Go web framework that provides HTTP/2 and HTTP/3 support, Bun ORM integration, message queues, and advanced JSON validation. HTTP/3.0 is nearly 10 times faster than HTTP/1.1. In my case, it's useful and important, so I started designing this framework in 2025.
+HypGo is a modern Go web framework with native HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) support, featuring a built-in **AI-human collaborative development** toolchain. The framework optimizes not just human coding efficiency, but also enables AI to quickly understand, correctly generate, and immediately validate code.
 
-The framework features a powerful plugin system that allows you to add functionality like Kafka, RabbitMQ, Cassandra, and more through simple CLI commands. It also includes automatic Docker image building, hot reload development, and zero-downtime deployment capabilities.
+### Why HypGo?
 
-## Story
+Traditional frameworks only solve the "human writes code" problem. In the age of AI-assisted development, frameworks also need to solve:
 
-As a backend engineer working on a global platform, I faced a critical challenge: our Asian customers were experiencing significant delays when accessing our US-based servers. With average response times exceeding 700ms for simple API calls and image loading times stretching to several seconds, user experience was suffering, directly impacting our conversion rates.
+1. **Discoverability** — AI understands the entire project with minimal tokens
+2. **Predictability** — Strict conventions ensure AI-generated code is placed and styled consistently
+3. **Verifiability** — Generated code can be validated immediately without manual line-by-line review
 
-### The Breaking Point
+Every feature in HypGo is designed around these three principles.
 
-In late 2023, during a major product launch, our monitoring systems painted a grim picture:
-- API response times from Shanghai to our US West servers: **742ms average**
-- Product image loading (500KB average): **2.3 seconds**
-- Shopping cart abandonment rate for Asian users: **68%** (vs 23% for US users)
+## Core Features
 
-Traditional optimization techniques had reached their limits. CDNs helped but weren't enough. We needed a fundamental change in how we handled cross-border data transmission.
+### High-Performance Network Layer
 
-### The HTTP/3 Revelation
+| Feature | Description |
+|---------|-------------|
+| HTTP/1.1 + HTTP/2 + HTTP/3 | Three protocols running simultaneously with automatic ALPN negotiation and Alt-Svc upgrade |
+| 0-RTT Session Cache | TLS 1.3 fast resumption with LRU + TTL + replay attack protection |
+| Radix Tree Router | O(k) path lookup + LRU cache + parameter pooling, zero GC pressure |
+| WebSocket Multi-Protocol | JSON / Protobuf / FlatBuffers / MessagePack + AES-256-GCM encryption |
+| Graceful Shutdown | Parallel HTTP/1+2 and HTTP/3 shutdown with atomic race protection |
+| Graceful Restart | Unix SIGUSR2 triggered, FD passing + poll wait, zero downtime |
 
-While researching solutions, I discovered that HTTP/3's QUIC protocol could theoretically solve our head-of-line blocking issues and reduce connection establishment overhead. But existing Go frameworks lacked proper HTTP/3 support, and adding it to our legacy system seemed impossible.
+### AI Collaboration Toolchain
 
-That's when I decided to build HypGo.
+| Feature | Description |
+|---------|-------------|
+| **Schema-first Routes** | Routes carry Input/Output types, descriptions, tags — AI understands API behavior directly |
+| **Project Manifest** | `hyp context` generates YAML/JSON project description — AI grasps everything at once |
+| **Contract Testing** | `contract.TestAll(t, router)` validates all schema routes in one line |
+| **Typed Error Catalog** | Predefined structured error codes (`E1001`), unified handler error format |
+| **Migration Diff** | Auto-generates up/down SQL migrations from Model struct changes |
+| **Annotation Protocol** | `// @ai:constraint` structured annotations — AI reads business constraints from comments |
+| **Change Impact** | `hyp impact <file>` analyzes affected routes, tests, and downstream modules |
+| **AutoSync** | Automatically updates `.hyp/context.yaml` on Server start — always in sync with code |
+| **Diagnostic Endpoint** | `GET /_debug/state` returns complete system snapshot in one request |
 
-### The Results That Changed Everything
+### Developer Experience
 
-After implementing HypGo with HTTP/3 support in our staging environment, the results were stunning:
+| Feature | Description |
+|---------|-------------|
+| Smart Scaffold | `hyp gen` generates code integrated with Schema + Error Catalog |
+| Test Fixture Builder | `fixture.Request(router).POST("/api").WithJSON(body).Expect(201).Run(t)` |
+| Hot Reload | Structured file monitoring + debounce + categorized change summary |
+| BodyLimit | Limits request body size to prevent DoS |
+| MethodOverride | Supports `X-HTTP-Method-Override` header and `_method` parameter |
 
-| Metric | Before (HTTP/2) | After (HTTP/3) | Improvement |
-|--------|-----------------|----------------|-------------|
-| API Response (Shanghai → US) | 742ms | 198ms | **73% faster** |
-| Image Load Time (500KB) | 2,341ms | 512ms | **78% faster** |
-| Cart Abandonment (Asia) | 68% | 29% | **57% reduction** |
-| Customer Satisfaction | 3.2/5 | 4.6/5 | **44% increase** |
+### Database
 
-### Why I Open-Sourced HypGo
-
-These results were too significant — I wanted to share them publicly. Cross-border latency affects millions of applications worldwide, and developers shouldn't have to build HTTP/3 support from scratch. HypGo was born from real-world pain and delivers real-world results.
-
-Beyond just HTTP/3, I realized modern applications need:
-- **Docker integration** for consistent deployments
-- **Hot reload** for developer productivity
-
-Every feature in HypGo comes from actual production needs, tested under real traffic, and proven to deliver results.
-
-## Features
-
-- ⚡ **HTTP/2 & HTTP/3 support** - Native support for the latest protocols with automatic fallback
-- 📨 **Message Queuing** - Plugin support for RabbitMQ, Kafka, and more
-- 🔍 **Advanced JSON Processing** - Field validation, type checking, and schema validation
-- 📝 **Log Rotation** - Built-in log management with compression and retention policies
-- ⚙️ **Viper Configuration** - YAML-based configuration with environment variable support
-- 🏗️ **MVC Architecture** - Clean separation of Controllers, Models, and Services
-- 🐳 **Docker Integration** - One-command Docker image building and deployment
-- 🔥 **Hot Reload** - Automatic application restart during development
-- ♻️ **Zero-Downtime Deployment** - Graceful shutdown and restart capabilities
-- 🌐 **WebSocket Support** - Real-time bidirectional communication with channel support
+| Feature | Description |
+|---------|-------------|
+| Bun ORM | MySQL / PostgreSQL / TiDB read-write splitting (lock-free round-robin) |
+| Redis / KeyDB | 35 high-level methods (KV, Hash, List, Set, ZSet, Pub/Sub, Pipeline) |
+| Cassandra | Plugin system for dynamic loading |
+| ConnMaxLifetime | Unified 30-minute limit to prevent stale connections |
 
 ## Requirements
 
-- Go Version 1.21 or above
+- Go 1.24 or above
 - Docker (optional, for containerization)
 
 ## Installation
 
-### Install HypGo Framework
 ```bash
+# Install framework
 go get -u github.com/maoxiaoyue/hypgo
-```
 
-### Install CLI Tool
-```bash
+# Install CLI tool (ensure $GOPATH/bin is in your $PATH)
 go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ```
 
 ## Quick Start
 
-### Create a New Project
-$GOPATH/bin must be included in $PATH
-#### Full-stack Project (with frontend)
-```bash
-hyp new myapp
-cd myapp
-go mod tidy
-hyp run
-```
-
-#### API-only Project
-```bash
-hyp api myapi
-cd myapi
-go mod tidy
-hyp run
-```
-
-### Build Docker Image
+### Create a Project
 
 ```bash
-# Auto-detect port and build image
-hyp docker
+# Full-stack project (with frontend templates)
+hyp new myapp && cd myapp && go mod tidy && hyp run
 
-# Custom image name and tag
-hyp docker -n myapp -t v1.0.0
-
-# Build and push to registry
-hyp docker -r docker.io/username --no-push=false
+# API-only project
+hyp api myapi && cd myapi && go mod tidy && hyp run
 ```
 
-## Why HTTP/2.0 And HTTP/3.0?
-
-The only reason is very fast. Especially when using smaller flows.
-
-### Performance Comparison
-
-| Protocol | Latency | Throughput | Connection Overhead |
-|----------|---------|------------|-------------------|
-| HTTP/1.1 | High    | Low        | High (multiple TCP) |
-| HTTP/2   | Medium  | High       | Low (multiplexing) |
-| HTTP/3   | Low     | Very High  | Very Low (QUIC/UDP) |
-
-### Key Advantages:
-
-1. **HTTP/2**:
-   - Multiplexing: Multiple requests over single connection
-   - Server push capability
-   - Header compression (HPACK)
-   - Binary protocol
-
-2. **HTTP/3**:
-   - Built on QUIC (UDP-based)
-   - 0-RTT connection establishment
-   - Better performance on unstable networks
-   - Independent stream error correction
-
-### References
-- [HTTP vs. HTTP/2 vs. HTTP/3: What's the Difference?](https://www.pubnub.com/blog/http-vs-http-2-vs-http-3-whats-the-difference/)
-
-## Core Concepts
-
-### Configuration Management
-
-```yaml
-# config/config.yaml
-server:
-  protocol: http3  # http1, http2, http3
-  addr: :8080
-  enable_graceful_restart: true
-
-database:
-  driver: mysql
-  dsn: "user:pass@tcp(localhost:3306)/db"
-
-logger:
-  level: debug
-  rotation:
-    max_size: 100MB
-    max_age: 7d
-```
-
-### MVC Structure
-
-```
-app/
-├── controllers/   # HTTP handlers
-├── models/        # Data models (Bun models)
-├── services/      # Business logic
-```
-
-## CLI Commands
-
-### Project Management
-```bash
-hyp new <name>     # Create full-stack project
-hyp api <name>     # Create API project
-hyp run            # Run application
-hyp run -w         # Run with hot reload
-hyp restart        # Zero-downtime restart
-```
-
-### Code Generation
-```bash
-hyp generate controller <name>  # Generate controller
-hyp generate model <name>       # Generate model
-hyp generate service <name>     # Generate service
-```
-
-### Deployment
-```bash
-hyp docker         # Build Docker image
-hyp docker -n <name> -t <tag>  # Custom image
-```
-
-## Advanced Features
-
-### WebSocket Support
-
-```go
-// Server-side
-wsHub := websocket.NewHub(logger)
-go wsHub.Run()
-router.HandleFunc("/ws", wsHub.ServeWS)
-
-// Broadcast to all clients
-wsHub.BroadcastJSON(data)
-
-// Send to specific channel
-wsHub.PublishToChannelJSON("updates", data)
-```
-
-```javascript
-// Client-side
-const ws = new WebSocket('ws://localhost:8080/ws');
-ws.send(JSON.stringify({
-    type: 'subscribe',
-    data: { channel: 'updates' }
-}));
-```
-
-### Hot Reload Development
-
-```bash
-# Automatic restart on file changes
-hyp run -w
-```
-
-### Zero-Downtime Deployment
-
-```bash
-# Graceful restart without dropping connections
-hyp restart
-```
-
-### Docker Integration
-
-```bash
-# One-command Docker build
-hyp docker
-
-# Generated Dockerfile includes:
-# - Multi-stage build
-# - Non-root user
-# - Health checks
-# - Optimized layers
-```
-
-## Project Examples
-
-### Basic API Server
+### Minimal Working Example
 
 ```go
 package main
 
 import (
-    "github.com/maoxiaoyue/hypgo/pkg/server"
     "github.com/maoxiaoyue/hypgo/pkg/config"
-    "myapp/app/controllers"
+    "github.com/maoxiaoyue/hypgo/pkg/context"
+    "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/schema"
+    "github.com/maoxiaoyue/hypgo/pkg/server"
 )
 
-func main() {
-    cfg, _ := config.Load("config/config.yaml")
-    srv := server.New(cfg, logger)
+type CreateUserReq struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
 
-    controllers.RegisterRoutes(srv.Router(), db, logger)
+type UserResp struct {
+    ID    int    `json:"id"`
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+func main() {
+    cfg := &config.Config{}
+    cfg.ApplyDefaults()
+    log := logger.NewLogger()
+
+    srv := server.New(cfg, log)
+    r := srv.Router()
+
+    // Schema-first route — AI understands API directly from metadata
+    r.Schema(schema.Route{
+        Method:  "POST",
+        Path:    "/api/users",
+        Summary: "Create user",
+        Tags:    []string{"users"},
+        Input:   CreateUserReq{},
+        Output:  UserResp{},
+    }).Handle(func(c *context.Context) {
+        c.JSON(201, UserResp{ID: 1, Name: "test", Email: "test@test.com"})
+    })
+
+    // Traditional routes work too
+    r.GET("/health", func(c *context.Context) {
+        c.JSON(200, map[string]string{"status": "ok"})
+    })
+
     srv.Start()
 }
 ```
-## Roadmap
 
-### V0.7 (Current) ✅
-- [x] HTTP/1.1, HTTP/2, HTTP/3 support
-- [x] Basic MVC structure
-- [x] CLI tool with project generation
-- [x] Docker integration
-- [x] Hot reload development
-- [x] WebSocket support
-- [x] Basic middleware (CORS, Logger, RateLimit)
+### Configuration Example
 
-### V1.0 (In Progress) 🚧
-- [ ] gRPC integration
-- [ ] Database migration tools
-- [ ] Performance monitoring
-- [ ] Distributed tracing
-- [ ] Circuit breaker pattern
+```yaml
+# app/config/config.yaml
+server:
+  addr: ":8080"
+  protocol: "auto"          # http1, http2, http3, auto
+  tls:
+    enabled: true
+    cert_file: "cert.pem"
+    key_file: "key.pem"
 
-### V2.0 (Planned) 📋
-- [ ] CQRS implementation
-- [ ] Kubernetes operator
-- [ ] Real-time analytics
-- [ ] Edge computing support
-- [ ] Blockchain integration
+database:
+  driver: postgres
+  dsn: "postgres://user:pass@localhost:5432/mydb"
+  max_idle_conns: 10
+  max_open_conns: 100
+  redis:
+    addr: "localhost:6379"
+    password: ""
+    db: 0
 
-## Performance Benchmarks
+logger:
+  level: info
+  output: stdout
+  colors: true
+```
+
+## AI Collaborative Development Workflow
+
+HypGo's AI collaboration is not "AI autocompletes your code" — it is a complete **Understand → Generate → Validate** loop:
+
+### 1. AI Understands the Project
+
+```bash
+# Generate project manifest (this is all AI needs to read)
+hyp context -o .hyp/manifest.yaml
+```
+
+```yaml
+# .hyp/manifest.yaml — AI's "map"
+routes:
+  - method: POST
+    path: /api/users
+    summary: "Create user"
+    input_type: CreateUserReq
+    output_type: UserResp
+    handler_names: [main.createUser]
+```
+
+### 2. AI Generates Code
+
+AI generates handlers based on manifest + schema:
+
+```go
+// AI knows Input is CreateUserReq, Output is UserResp
+// AI knows to use errors.Define for error codes
+// AI knows to register with router.Schema()
+```
+
+### 3. Automatic Validation
+
+```go
+// Test all schema routes in one line
+contract.TestAll(t, router)
+
+// Or test a specific route manually
+contract.Test(t, router, contract.TestCase{
+    Route:        "POST /api/users",
+    Input:        `{"name":"test","email":"test@test.com"}`,
+    ExpectStatus: 201,
+    ExpectSchema: true,  // auto-validates response matches UserResp schema
+})
+```
+
+### 4. Pre-Change Impact Analysis
+
+```bash
+hyp impact pkg/errors/catalog.go
+# → 3 packages depend on this, 43 tests affected, Risk: MEDIUM
+```
+
+### 5. Comment Checking
+
+```bash
+hyp chkcomment controllers/user.go
+# → 2/4 blocks have comments (50%)
+# → run with --fix to add suggestions
+```
+
+## CLI Commands
+
+```bash
+# Project Management
+hyp new <name>          # Create full-stack project
+hyp api <name>          # Create API-only project
+hyp run                 # Start with hot reload
+hyp restart             # Zero-downtime restart
+
+# AI Collaboration
+hyp context             # Generate project manifest (YAML)
+hyp context -f json     # JSON format
+hyp chkcomment <file>   # Check comment completeness
+hyp impact <file>       # Change impact analysis
+
+# Code Generation
+hyp generate controller <name>
+hyp generate model <name>
+hyp generate service <name>
+
+# Database
+hyp migrate diff        # Compare models with snapshot, generate SQL
+hyp migrate snapshot    # Save current schema snapshot
+
+# Deployment
+hyp docker              # Build Docker image
+hyp health              # Health check
+```
+
+## Token Efficiency: Why HypGo Dramatically Reduces AI Development Costs
+
+In AI-assisted development, **tokens are cost**. Every time AI needs to understand your project, it consumes massive tokens reading source code. HypGo solves this at the architecture level:
+
+### Traditional Framework vs HypGo
+
+| Scenario | Traditional | HypGo | Token Savings |
+|----------|------------|-------|---------------|
+| AI understands API structure | Read all handler files (~5,000 tokens) | Read manifest.yaml (~500 tokens) | **90%** |
+| AI understands single route | Read handler + service + model (~2,000 tokens) | Read schema metadata (~200 tokens) | **90%** |
+| AI validates generated code | Manually write tests (~1,500 tokens) | `contract.TestAll()` one line (~50 tokens) | **97%** |
+| AI assesses change impact | Search imports file-by-file (~3,000 tokens) | `hyp impact` (~100 tokens) | **97%** |
+
+### How It Works
+
+Traditional frameworks require AI to read massive source code to understand a project. HypGo front-loads critical information into **structured metadata**:
 
 ```
-HTTP/1.1 vs HTTP/2 vs HTTP/3 (1000 concurrent requests)
-┌─────────────┬──────────┬────────────┬─────────────┐
-│ Protocol    │ Req/sec  │ Latency    │ Throughput  │
-├─────────────┼──────────┼────────────┼─────────────┤
-│ HTTP/1.1    │ 15,234   │ 65.7ms     │ 18.3 MB/s   │
-│ HTTP/2      │ 45,821   │ 21.8ms     │ 55.1 MB/s   │
-│ HTTP/3      │ 152,456  │ 6.6ms      │ 183.2 MB/s  │
-└─────────────┴──────────┴────────────┴─────────────┘
+Traditional: AI reads handler → infers Input/Output → guesses constraints → generates → manual test
+HypGo:       AI reads manifest → knows Input/Output → knows constraints → generates → auto-validates
 ```
+
+For a 20-route project, each AI interaction saves **4,000-8,000 tokens**. Over time, this is a significant cost difference.
+
+### Beyond Cost Savings
+
+Token savings create cascading benefits:
+
+- **Faster responses** — AI reads less code, responds faster
+- **More accurate generation** — Structured information is harder to misinterpret than free text
+- **Longer context** — Saved tokens can be used for more complex reasoning
+- **Lower error rates** — Automated validation replaces manual review, reducing oversights
+
+## Security & Performance: The Hidden Cost of AI Collaboration and HypGo's Solution
+
+Giving AI access to project information improves efficiency but introduces risk. HypGo's design principle: **Let AI see structure, not secrets. Keep the system fast — collaboration mechanisms must not slow things down.**
+
+### Security: What AI Can and Cannot See
+
+| Layer | AI Can See | AI Cannot See | Mechanism |
+|-------|-----------|---------------|-----------|
+| **Manifest** | Route paths, methods, type names | DSN, passwords, tokens, API keys | AutoSync auto-filters sensitive fields |
+| **Diagnostic** | Route count, connection status, memory usage | Database contents, user data | DSN redact (`***@host:port/db`) |
+| **Schema** | Input/Output struct field names and types | Actual data values | Stores type metadata only, never instances |
+| **Annotation** | `@ai:constraint`, `@ai:security` tags | Business logic implementation details | Pure AST analysis, never executes code |
+| **Impact** | Import dependency graph, test counts | File contents, variable values | Scans import paths only, never reads function bodies |
+
+**Design principle**: AI collaboration tools expose only "structure" (routes, types, dependencies), never "data" (passwords, tokens, user content).
+
+### Security: Framework-Level Defense Chain
+
+```
+Request enters
+  │
+  ├─ BodyLimit ────────── Limits payload size, prevents large-body DoS
+  ├─ RateLimiter ─────── Token bucket throttling + periodic cleanup (prevents memory leak)
+  ├─ Security Headers ── HSTS / XSS / nosniff / CSP / Referrer-Policy (precomputed, zero GC)
+  ├─ CORS ─────────────── Origin whitelist + preflight caching
+  ├─ CSRF ─────────────── crypto/rand token generation, constant-time validation
+  ├─ JWT ──────────────── Mandatory Validator function, rejects by default if unconfigured (secure default)
+  ├─ BasicAuth ────────── Constant-time password comparison, prevents timing attacks
+  └─ CircuitBreaker ──── sync.Mutex state protection, prevents race conditions
+```
+
+Every security middleware follows these considerations:
+
+- **Secure defaults** — JWT rejects all requests if no Validator is provided
+- **Cryptographic security** — CSRF tokens and Request IDs use `crypto/rand`, not predictable timestamps
+- **Race safety** — Server shutdown uses `atomic.Bool`, CircuitBreaker uses `sync.Mutex`
+- **Resource protection** — RateLimiter periodically cleans expired keys, SessionCache has LRU + TTL limits
+
+### Performance: Collaboration Mechanisms Don't Slow the System
+
+AI collaboration features have near-zero runtime performance impact because most work happens at **startup** or **development time**, not on the per-request hot path:
+
+| Mechanism | When It Runs | Hot Path Impact |
+|-----------|-------------|-----------------|
+| Schema Registry | Route registration (startup) | Zero — just an in-memory map lookup |
+| Manifest Generation | `hyp context` or `Server.Start()` (startup) | Zero — not on request path |
+| AutoSync | Writes file once on Server start | Zero — atomic write, doesn't block requests |
+| Contract Testing | During `go test` (development) | Zero — doesn't enter production |
+| Impact Analysis | During `hyp impact` (development) | Zero — CLI tool, doesn't enter production |
+| Annotation Check | During `hyp chkcomment` (development) | Zero — CLI tool, doesn't enter production |
+| Diagnostic Endpoint | When requested (on-demand) | Very low — rate limited (10/min) |
+
+### Performance: Hot Path Optimizations
+
+Every request processing path in the framework core is GC-optimized:
+
+```
+Request enters → Radix Tree lookup (O(k))
+              → LRU cache hit (O(1), cacheItem pool recycled)
+              → Context acquired from sync.Pool (zero allocation)
+              → Params acquired from pool (zero allocation)
+              → Security headers precomputed strings (zero Sprintf)
+              → Replica round-robin (atomic.Pointer, zero lock contention)
+              → Request complete → Context returned to pool
+```
+
+**Result**: AI collaboration metadata storage (Schema Registry, Manifest) only consumes minimal memory at startup, with zero impact on per-request latency. You get both an AI-friendly development experience and production performance identical to hand-crafted frameworks.
 
 ## License
 
@@ -319,4 +374,4 @@ HypGo is released under the [MIT License](LICENSE).
 
 ---
 
-Made with ❤️ by Maoxiaoyu From Taiwan
+Made from Taiwan
