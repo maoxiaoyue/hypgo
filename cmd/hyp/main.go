@@ -119,6 +119,12 @@ func registerCommands() {
 	// 註冊 context 命令（AI 協作用 manifest 生成）
 	rootCmd.AddCommand(contextCmd)
 
+	// 註冊 chkcomment 命令（Annotation Protocol 檢查）
+	rootCmd.AddCommand(chkcommentCmd)
+
+	// 註冊 impact 命令（Change Impact Analysis）
+	rootCmd.AddCommand(impactCmd)
+
 	// 註冊 health 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "health",
