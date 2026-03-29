@@ -13,11 +13,32 @@ import (
 var contextCmd = &cobra.Command{
 	Use:   "context",
 	Short: "Generate project manifest for AI collaboration",
-	Long: `Scan the HypGo application and output a machine-readable manifest
-describing routes, middleware, configuration, and schema metadata.
+	Long: `Generate a machine-readable project manifest (YAML or JSON) describing
+routes, middleware, configuration, and schema metadata.
 
-The manifest enables AI tools to understand the project structure
-with minimal context, accelerating AI-human collaborative development.`,
+The manifest enables AI tools to understand the project structure with
+minimal tokens (~500 tokens vs ~5,000 for reading source files).
+
+Output includes:
+  - Server configuration (addr, protocol, TLS)
+  - All registered routes with method, path, and handler names
+  - Schema metadata (Input/Output types, summary, tags) if available
+  - Database configuration (driver, replicas)
+  - Middleware stack
+
+The manifest is also auto-generated on Server.Start() via AutoSync
+and saved to .hyp/context.yaml. This command allows you to generate
+it manually or in a different format.
+
+Flags:
+  -o, --output   Output file path (default: stdout)
+  -f, --format   Output format: yaml or json (default: yaml)
+
+Examples:
+  hyp context                              Print YAML to stdout
+  hyp context -f json                      Print JSON to stdout
+  hyp context -o .hyp/manifest.yaml        Save YAML to file
+  hyp context -o manifest.json -f json     Save JSON to file`,
 	RunE: runContext,
 }
 
