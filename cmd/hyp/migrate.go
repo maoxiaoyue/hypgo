@@ -14,23 +14,56 @@ var migrateCmd = &cobra.Command{
 	Short: "Database migration tools",
 	Long: `Database migration tools for generating and managing schema migrations.
 
+HypGo's migration system scans Go model structs (with bun ORM tags),
+compares them against a stored JSON snapshot, and auto-generates
+up/down SQL migration files.
+
+Workflow:
+  1. Define or modify your model structs with bun tags
+  2. Run "hyp migrate diff" to generate SQL migration files
+  3. Review and apply the generated SQL
+  4. The snapshot is automatically updated after diff
+
 Subcommands:
-  diff     Compare current models with snapshot and generate SQL migrations
-  snapshot Save current model schema as snapshot for future diff`,
+  diff       Compare current models with snapshot, generate SQL migrations
+  snapshot   Save current model schema as a baseline snapshot
+
+The snapshot is stored at .hyp/schema_snapshot.json by default.
+
+Examples:
+  hyp migrate diff                    Generate PostgreSQL migration
+  hyp migrate diff --dialect mysql    Generate MySQL migration
+  hyp migrate snapshot                Save current schema snapshot`,
 }
 
 var migrateDiffCmd = &cobra.Command{
 	Use:   "diff",
 	Short: "Generate migration SQL from model changes",
-	Long: `Compare current Go model structs (registered via ModelRegistry) against
-the stored snapshot, and generate up/down SQL migration files.
+	Long: `Compare current Go model structs (registered via GlobalRegistry) against
+the stored schema snapshot, and generate up/down SQL migration files.
 
-The snapshot is stored at .hyp/schema_snapshot.json by default.
+Detected change types:
+  - AddTable      New model struct added
+  - DropTable     Model struct removed
+  - AddColumn     New field added to existing struct
+  - DropColumn    Field removed from existing struct
+  - AlterColumn   Field type or constraints changed
+
+Supported bun tags: pk, autoincrement, notnull, unique, type, default
+
+The generated files include both UP (apply) and DOWN (rollback) SQL.
+After generating, the snapshot is automatically updated to reflect
+the current model state.
+
+Flags:
+  -d, --dialect    SQL dialect: postgres or mysql (default: postgres)
+  -o, --output     Output directory for migration files (default: migrations/)
+  -s, --snapshot   Snapshot file path (default: .hyp/schema_snapshot.json)
 
 Examples:
-  hyp migrate diff
-  hyp migrate diff --dialect postgres
-  hyp migrate diff --dialect mysql --output migrations/`,
+  hyp migrate diff                              PostgreSQL, default paths
+  hyp migrate diff --dialect mysql              MySQL dialect
+  hyp migrate diff -o db/migrations/ -d mysql   Custom output directory`,
 	RunE: runMigrateDiff,
 }
 
@@ -38,7 +71,21 @@ var migrateSnapshotCmd = &cobra.Command{
 	Use:   "snapshot",
 	Short: "Save current schema as snapshot",
 	Long: `Scan all registered models and save the current schema to the snapshot file.
-This snapshot is used as the baseline for future diff operations.`,
+
+This snapshot is used as the baseline for future "hyp migrate diff" operations.
+Run this command to establish or reset the baseline after:
+  - Initial project setup
+  - Manually applying SQL changes outside of HypGo migrations
+  - Resolving merge conflicts in the snapshot file
+
+The snapshot is stored as JSON at .hyp/schema_snapshot.json by default.
+
+Flags:
+  -s, --snapshot   Snapshot file path (default: .hyp/schema_snapshot.json)
+
+Examples:
+  hyp migrate snapshot
+  hyp migrate snapshot -s db/schema.json`,
 	RunE: runMigrateSnapshot,
 }
 
