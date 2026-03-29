@@ -11,16 +11,38 @@ var (
 	version = "0.4.0"
 	rootCmd = &cobra.Command{
 		Use:   "hyp",
-		Short: "HypGo CLI - A powerful web framework with HTTP/3 support",
+		Short: "HypGo CLI - Modern Go web framework with AI collaboration",
 		Long: `HypGo CLI is a command-line tool for the HypGo framework.
-It helps you create and manage HypGo projects with ease.
 
-Features:
-  - HTTP/3 with QUIC support
-  - Hot reload development
-  - Database migrations
-  - Plugin management
-  - Docker integration`,
+HypGo is a modern Go web framework with native HTTP/1.1, HTTP/2, HTTP/3 (QUIC)
+support and built-in AI-human collaborative development toolchain.
+
+Project Management:
+  new            Create a full-stack project (with frontend templates)
+  api            Create an API-only project
+  run            Start the application with hot reload
+  restart        Zero-downtime hot restart (Unix SIGUSR2)
+
+AI Collaboration:
+  context        Generate project manifest (YAML/JSON) for AI tools
+  ai-rules       Generate configuration files for AI coding tools
+  chkcomment     Check annotation completeness in Go source files
+  impact         Analyze change impact before modifying shared packages
+
+Code Generation:
+  generate       Generate boilerplate code (controller, model, service)
+
+Database:
+  migrate        Generate SQL migrations from model struct changes
+
+Deployment:
+  docker         Build Docker image
+  health         Check running application health
+
+Other:
+  list           List available plugins
+
+Use "hyp [command] --help" for detailed information about each command.`,
 		Version: version,
 	}
 )
@@ -40,8 +62,30 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "new [project-name]",
 		Short: "Create a new HypGo project",
-		Long:  `Create a new HypGo project with complete structure including controllers, models, services, and a welcome HTML page.`,
-		Args:  cobra.ExactArgs(1),
+		Long: `Create a new full-stack HypGo project with complete MVC directory structure.
+
+Generated structure:
+  myapp/
+  ├── app/
+  │   ├── controllers/   HTTP request handlers
+  │   ├── models/        Database models (Bun ORM)
+  │   ├── services/      Business logic layer
+  │   └── config/        config.yaml (server, database, logger)
+  ├── public/            Static files (CSS, JS, images)
+  ├── views/             HTML templates (welcome page included)
+  ├── main.go            Application entry point
+  ├── go.mod             Go module definition
+  └── Dockerfile         Docker build configuration
+
+After creation:
+  cd myapp && go mod tidy && hyp run
+
+For an API-only project (no static files or templates), use "hyp api" instead.
+
+Examples:
+  hyp new myapp
+  hyp new my-web-service`,
+		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 new.go 中的實際實作
 			// RunNew(args[0])
@@ -52,8 +96,34 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "api [project-name]",
 		Short: "Create a new API-only project",
-		Long:  `Create a new HypGo API project without static files and templates, only with API structure.`,
-		Args:  cobra.ExactArgs(1),
+		Long: `Create a new HypGo API-only project without static files, templates, or views.
+
+This is the recommended starting point for microservices, REST APIs, and
+backend services that don't serve HTML pages.
+
+Generated structure:
+  myapi/
+  ├── app/
+  │   ├── controllers/   HTTP request handlers
+  │   ├── models/        Database models (Bun ORM)
+  │   ├── services/      Business logic layer
+  │   └── config/        config.yaml
+  ├── main.go            Application entry point
+  ├── go.mod             Go module definition
+  └── Dockerfile         Docker build configuration
+
+Compared to "hyp new":
+  - No public/ directory (no static files)
+  - No views/ directory (no HTML templates)
+  - Leaner project structure focused on API endpoints
+
+After creation:
+  cd myapi && go mod tidy && hyp run
+
+Examples:
+  hyp api myapi
+  hyp api user-service`,
+		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 api.go 中的實際實作
 			// RunAPI(args[0])
@@ -64,7 +134,26 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "run",
 		Short: "Run the HypGo application",
-		Long:  `Run the HypGo application with hot reload in development mode.`,
+		Long: `Start the HypGo application in development mode with hot reload.
+
+In development mode, the file watcher monitors your source files and
+automatically rebuilds and restarts the server when changes are detected.
+A change summary is displayed after each reload:
+
+  === Change Summary [15:04:05] ===
+    Modified (2):
+      ~ app/controllers/user.go
+      ~ app/models/user.go
+    Total: 2 changes
+
+On startup, AutoSync automatically generates .hyp/context.yaml with the
+current project manifest (routes, types, config) for AI tool consumption.
+
+The server reads configuration from app/config/config.yaml, which controls
+protocol (http1/http2/http3/auto), TLS, database, logger, and more.
+
+Examples:
+  hyp run`,
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 run.go 中的實際實作
 			// RunServer()
@@ -75,7 +164,22 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "list",
 		Short: "List all available plugins",
-		Long:  `List all available HypGo plugins that can be installed.`,
+		Long: `List all available HypGo plugins that can be installed.
+
+Displays each plugin's name, version, description, and category.
+Available categories include Search Engine, Message Queue, and NoSQL Database.
+
+Currently available plugins:
+  elasticsearch  Elasticsearch search and analytics engine
+  kafka          Apache Kafka distributed streaming platform
+  cassandra      Apache Cassandra distributed NoSQL database
+  rabbitmq       RabbitMQ message queue support
+
+Plugins are configured via their own YAML config files (e.g., kafka.yaml)
+placed in the project's config directory.
+
+Examples:
+  hyp list`,
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 list 功能
 			// RunList()
@@ -86,7 +190,24 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "restart",
 		Short: "Hot restart the application",
-		Long:  `Perform a zero-downtime hot restart of the running HypGo application.`,
+		Long: `Perform a zero-downtime hot restart of the running HypGo application.
+
+On Unix systems, this sends a SIGUSR2 signal to the running process, which
+triggers the graceful restart sequence:
+
+  1. Fork a new child process, passing the listening socket FD
+  2. Child starts and begins accepting new connections
+  3. Parent stops accepting new connections
+  4. Parent waits for in-flight requests to complete (with timeout)
+  5. Parent exits cleanly
+
+During the restart, no connections are dropped — the old and new processes
+overlap briefly to ensure continuous service.
+
+Note: This command is NOT supported on Windows.
+
+Examples:
+  hyp restart`,
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 restart.go 中的實際實作
 			// RunRestart()
@@ -97,7 +218,23 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "docker",
 		Short: "Build Docker image for the project",
-		Long:  `Build a Docker image for the HypGo project based on config.yaml settings.`,
+		Long: `Build a Docker image for the current HypGo project.
+
+Uses a multi-stage Dockerfile to produce a minimal production image:
+
+  Stage 1 (builder): Compiles the Go binary with CGO_DISABLED=1
+  Stage 2 (runtime): Copies the binary into a scratch/alpine image
+
+The image includes:
+  - Compiled Go binary
+  - config.yaml (from app/config/)
+  - TLS certificates (if configured)
+  - Static files and templates (for full-stack projects)
+
+Image settings (name, tag, base image) are read from app/config/config.yaml.
+
+Examples:
+  hyp docker`,
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 docker.go 中的實際實作
 			// RunDocker()
@@ -108,8 +245,32 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "generate [type] [name]",
 		Short: "Generate code for controllers, models, or services",
-		Long:  `Generate boilerplate code for controllers, models, or services.`,
-		Args:  cobra.MinimumNArgs(2),
+		Long: `Generate boilerplate code that follows HypGo conventions.
+
+The generated code automatically integrates with HypGo's AI collaboration
+toolchain, including Schema-first routes and Typed Error Catalog.
+
+Available types:
+  controller    Generate a controller with Schema-first route registration
+                and structured error handling (errors.Define)
+  model         Generate a Bun ORM model with bun struct tags
+  service       Generate a service layer with Error Catalog integration
+
+Generated file locations:
+  controller → app/controllers/<name>.go
+  model      → app/models/<name>.go
+  service    → app/services/<name>.go
+
+The generated controller includes:
+  - router.Schema() registration with Input/Output types
+  - Typed error definitions (errors.Define)
+  - Standard CRUD handler stubs
+
+Examples:
+  hyp generate controller user
+  hyp generate model order
+  hyp generate service payment`,
+		Args: cobra.MinimumNArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 generate.go 中的實際實作
 			// RunGenerate(args[0], args[1])
@@ -128,11 +289,26 @@ func registerCommands() {
 	// 註冊 impact 命令（Change Impact Analysis）
 	rootCmd.AddCommand(impactCmd)
 
+	// 註冊 ai-rules 命令（跨 AI 工具配置檔生成）
+	rootCmd.AddCommand(aiRulesCmd)
+
 	// 註冊 health 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "health",
 		Short: "Check application health status",
-		Long:  `Check the health status of the running HypGo application.`,
+		Long: `Check the health status of the running HypGo application.
+
+Sends a request to the application's health endpoint and reports:
+  - Server status (running / shutting down / unreachable)
+  - Protocol in use (HTTP/1.1, HTTP/2, HTTP/3)
+  - Uptime
+  - Active connections
+
+This command is also used internally by "hyp restart" to verify the new
+process is ready before shutting down the old one.
+
+Examples:
+  hyp health`,
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 health.go 中的實際實作
 			// RunHealth()
