@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"sync"
 
@@ -25,6 +26,12 @@ Features:
 	}
 )
 
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
 func init() {
 	// 設置版本輸出模板
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
@@ -48,72 +55,62 @@ func registerCommands() {
 		},
 	})
 
-	// 註冊 api 命令
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "api [project-name]",
-		Short: "Create a new API-only project",
-		Long:  `Create a new HypGo API project without static files and templates, only with API structure.`,
-		Args:  cobra.ExactArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 api.go 中的實際實作
-			// RunAPI(args[0])
-		},
-	})
+	// api 命令已在 api.go init() 中註冊
+	// list 命令已在 list.go init() 中註冊
+	// version 命令已在 version.go init() 中註冊
+	// health 命令已在 health.go init() 中註冊
 
-	// 註冊 run 命令
+	// 以下命令目前只有佔位實作，定義在 registerCommands 中
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "run",
 		Short: "Run the HypGo application",
-		Long:  `Run the HypGo application with hot reload in development mode.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 run.go 中的實際實作
-			// RunServer()
-		},
+		Long: `Start the HypGo application in development mode with hot reload.
+
+On startup, AutoSync automatically generates .hyp/context.yaml with the
+current project manifest for AI tool consumption.
+
+Examples:
+  hyp run`,
+		Run: func(cmd *cobra.Command, args []string) {},
 	})
 
-	// 註冊 list 命令
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "list",
-		Short: "List all available plugins",
-		Long:  `List all available HypGo plugins that can be installed.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 list 功能
-			// RunList()
-		},
-	})
-
-	// 註冊 restart 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "restart",
 		Short: "Hot restart the application",
-		Long:  `Perform a zero-downtime hot restart of the running HypGo application.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 restart.go 中的實際實作
-			// RunRestart()
-		},
+		Long: `Perform a zero-downtime hot restart of the running HypGo application.
+Sends SIGUSR2 signal, forks a new process, then gracefully shuts down.
+Note: NOT supported on Windows.
+
+Examples:
+  hyp restart`,
+		Run: func(cmd *cobra.Command, args []string) {},
 	})
 
-	// 註冊 docker 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "docker",
 		Short: "Build Docker image for the project",
-		Long:  `Build a Docker image for the HypGo project based on config.yaml settings.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 docker.go 中的實際實作
-			// RunDocker()
-		},
+		Long: `Build a Docker image for the current HypGo project using a
+multi-stage Dockerfile based on config.yaml settings.
+
+Examples:
+  hyp docker`,
+		Run: func(cmd *cobra.Command, args []string) {},
 	})
 
-	// 註冊 generate 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "generate [type] [name]",
 		Short: "Generate code for controllers, models, or services",
-		Long:  `Generate boilerplate code for controllers, models, or services.`,
-		Args:  cobra.MinimumNArgs(2),
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 generate.go 中的實際實作
-			// RunGenerate(args[0], args[1])
-		},
+		Long: `Generate boilerplate code that follows HypGo conventions.
+Generated code integrates Schema-first routes and Typed Error Catalog.
+
+Available types: controller, model, service
+
+Examples:
+  hyp generate controller user
+  hyp generate model order
+  hyp generate service payment`,
+		Args: cobra.MinimumNArgs(2),
+		Run:  func(cmd *cobra.Command, args []string) {},
 	})
 
 	// 註冊 context 命令（AI 協作用 manifest 生成）
@@ -128,16 +125,8 @@ func registerCommands() {
 	// 註冊 impact 命令（Change Impact Analysis）
 	rootCmd.AddCommand(impactCmd)
 
-	// 註冊 health 命令
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "health",
-		Short: "Check application health status",
-		Long:  `Check the health status of the running HypGo application.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 health.go 中的實際實作
-			// RunHealth()
-		},
-	})
+	// ai-rules 命令已在 airules.go init() 中註冊
+	// health 命令已在 health.go init() 中註冊
 }
 
 // Execute 允許其他包執行根命令
