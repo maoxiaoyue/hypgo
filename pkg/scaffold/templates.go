@@ -1,13 +1,12 @@
 package scaffold
 
-// controllerTemplate 使用 HypGo 原生 API（Schema-first 路由 + Error Catalog）
+// controllerTemplate — 只放 handler 邏輯，路由定義移至 routers/
 const controllerTemplate = `package controllers
 
 import (
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/errors"
-	"github.com/maoxiaoyue/hypgo/pkg/router"
-	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"{{.ModuleName}}/app/models"
 )
 
 // {{.Name}}Controller handles {{.LowerName}} CRUD operations
@@ -19,60 +18,25 @@ var (
 	Err{{.Name}}Invalid  = errors.Define("E_{{.LowerName}}_002", 400, "Invalid {{.LowerName}} data", "{{.LowerName}}")
 )
 
-// RegisterRoutes 註冊 {{.Name}} 相關路由（使用 Schema-first）
-func (ctrl *{{.Name}}Controller) RegisterRoutes(r *router.Router) {
-	r.Schema(schema.Route{
-		Method:  "GET",
-		Path:    "/api/{{.LowerName}}",
-		Summary: "List all {{.LowerName}}s",
-		Tags:    []string{"{{.LowerName}}"},
-	}).Handle(ctrl.List)
-
-	r.Schema(schema.Route{
-		Method:  "POST",
-		Path:    "/api/{{.LowerName}}",
-		Summary: "Create {{.LowerName}}",
-		Tags:    []string{"{{.LowerName}}"},
-		Responses: map[int]schema.ResponseSchema{
-			201: {Description: "{{.Name}} created"},
-		},
-	}).Handle(ctrl.Create)
-
-	r.Schema(schema.Route{
-		Method:  "GET",
-		Path:    "/api/{{.LowerName}}/:id",
-		Summary: "Get {{.LowerName}} by ID",
-		Tags:    []string{"{{.LowerName}}"},
-	}).Handle(ctrl.Get)
-
-	r.Schema(schema.Route{
-		Method:  "PUT",
-		Path:    "/api/{{.LowerName}}/:id",
-		Summary: "Update {{.LowerName}}",
-		Tags:    []string{"{{.LowerName}}"},
-	}).Handle(ctrl.Update)
-
-	r.Schema(schema.Route{
-		Method:  "DELETE",
-		Path:    "/api/{{.LowerName}}/:id",
-		Summary: "Delete {{.LowerName}}",
-		Tags:    []string{"{{.LowerName}}"},
-		Responses: map[int]schema.ResponseSchema{
-			204: {Description: "{{.Name}} deleted"},
-		},
-	}).Handle(ctrl.Delete)
-}
-
 func (ctrl *{{.Name}}Controller) List(c *hypcontext.Context) {
-	c.JSON(200, map[string]interface{}{
-		"data": []interface{}{},
+	// TODO: Fetch from database
+	c.JSON(200, models.{{.Name}}ListResp{
+		Data:  []models.{{.Name}}Resp{},
+		Total: 0,
 	})
 }
 
 func (ctrl *{{.Name}}Controller) Create(c *hypcontext.Context) {
-	// TODO: Parse and validate input
-	c.JSON(201, map[string]interface{}{
-		"message": "{{.Name}} created",
+	var req models.Create{{.Name}}Req
+	if err := c.ShouldBindJSON(&req); err != nil {
+		errors.AbortWithAppError(c, Err{{.Name}}Invalid.With("reason", err.Error()))
+		return
+	}
+
+	// TODO: Save to database
+	c.JSON(201, models.{{.Name}}Resp{
+		ID:   1,
+		Name: req.Name,
 	})
 }
 
@@ -84,8 +48,8 @@ func (ctrl *{{.Name}}Controller) Get(c *hypcontext.Context) {
 	}
 
 	// TODO: Fetch from database
-	c.JSON(200, map[string]interface{}{
-		"id": id,
+	c.JSON(200, models.{{.Name}}Resp{
+		ID: 1,
 	})
 }
 
@@ -96,10 +60,15 @@ func (ctrl *{{.Name}}Controller) Update(c *hypcontext.Context) {
 		return
 	}
 
-	// TODO: Parse input and update
-	c.JSON(200, map[string]interface{}{
-		"id":      id,
-		"message": "{{.Name}} updated",
+	var req models.Update{{.Name}}Req
+	if err := c.ShouldBindJSON(&req); err != nil {
+		errors.AbortWithAppError(c, Err{{.Name}}Invalid.With("reason", err.Error()))
+		return
+	}
+
+	// TODO: Update in database
+	c.JSON(200, models.{{.Name}}Resp{
+		ID: 1,
 	})
 }
 
@@ -116,7 +85,126 @@ func (ctrl *{{.Name}}Controller) Delete(c *hypcontext.Context) {
 }
 `
 
-// modelTemplate 使用 bun ORM 格式
+// routerTemplate — 單一資源的 Schema-first 路由定義
+const routerTemplate = `package routers
+
+import (
+	"github.com/maoxiaoyue/hypgo/pkg/router"
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"{{.ModuleName}}/app/controllers"
+	"{{.ModuleName}}/app/models"
+)
+
+// Register{{.Name}}Routes 註冊 {{.Name}} 相關路由（Schema-first）
+func Register{{.Name}}Routes(r *router.Router) {
+	ctrl := &controllers.{{.Name}}Controller{}
+
+	r.Schema(schema.Route{
+		Method:  "GET",
+		Path:    "/api/{{.LowerName}}",
+		Summary: "List all {{.LowerName}}s",
+		Tags:    []string{"{{.LowerName}}"},
+		Output:  models.{{.Name}}ListResp{},
+	}).Handle(ctrl.List)
+
+	r.Schema(schema.Route{
+		Method:  "POST",
+		Path:    "/api/{{.LowerName}}",
+		Summary: "Create {{.LowerName}}",
+		Tags:    []string{"{{.LowerName}}"},
+		Input:   models.Create{{.Name}}Req{},
+		Output:  models.{{.Name}}Resp{},
+		Responses: map[int]schema.ResponseSchema{
+			201: {Description: "{{.Name}} created"},
+			400: {Description: "Invalid input"},
+		},
+	}).Handle(ctrl.Create)
+
+	r.Schema(schema.Route{
+		Method:  "GET",
+		Path:    "/api/{{.LowerName}}/:id",
+		Summary: "Get {{.LowerName}} by ID",
+		Tags:    []string{"{{.LowerName}}"},
+		Output:  models.{{.Name}}Resp{},
+		Responses: map[int]schema.ResponseSchema{
+			200: {Description: "{{.Name}} found"},
+			404: {Description: "{{.Name}} not found"},
+		},
+	}).Handle(ctrl.Get)
+
+	r.Schema(schema.Route{
+		Method:  "PUT",
+		Path:    "/api/{{.LowerName}}/:id",
+		Summary: "Update {{.LowerName}}",
+		Tags:    []string{"{{.LowerName}}"},
+		Input:   models.Update{{.Name}}Req{},
+		Output:  models.{{.Name}}Resp{},
+		Responses: map[int]schema.ResponseSchema{
+			200: {Description: "{{.Name}} updated"},
+			400: {Description: "Invalid input"},
+			404: {Description: "{{.Name}} not found"},
+		},
+	}).Handle(ctrl.Update)
+
+	r.Schema(schema.Route{
+		Method:  "DELETE",
+		Path:    "/api/{{.LowerName}}/:id",
+		Summary: "Delete {{.LowerName}}",
+		Tags:    []string{"{{.LowerName}}"},
+		Responses: map[int]schema.ResponseSchema{
+			204: {Description: "{{.Name}} deleted"},
+			404: {Description: "{{.Name}} not found"},
+		},
+	}).Handle(ctrl.Delete)
+}
+`
+
+// routerSetupTemplate — routers/router.go 總入口（只在首次生成）
+const routerSetupTemplate = `package routers
+
+import (
+	"github.com/maoxiaoyue/hypgo/pkg/router"
+	"github.com/maoxiaoyue/hypgo/pkg/middleware"
+)
+
+// Setup 設定所有路由和中間件
+// 在 main.go 中呼叫：routers.Setup(srv.Router())
+func Setup(r *router.Router) {
+	// 全域中間件
+	r.Use(middleware.DefaultMiddleware()...)
+
+	// 在此註冊各資源的路由
+	// Register{{.Name}}Routes(r)
+}
+`
+
+// middlewareTemplate — routers/middleware.go 中間件配置
+const middlewareTemplate = `package routers
+
+import (
+	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/middleware"
+)
+
+// APIMiddleware 回傳 API 路由群組專用的中間件鏈
+func APIMiddleware() []hypcontext.HandlerFunc {
+	return []hypcontext.HandlerFunc{
+		middleware.Logger(middleware.LoggerConfig{}),
+		// middleware.JWT(middleware.JWTConfig{...}),
+		// middleware.RateLimit(100),
+	}
+}
+
+// WebMiddleware 回傳 Web 頁面路由群組專用的中間件鏈
+func WebMiddleware() []hypcontext.HandlerFunc {
+	return []hypcontext.HandlerFunc{
+		middleware.Logger(middleware.LoggerConfig{}),
+		// middleware.CSRF(middleware.CSRFConfig{...}),
+	}
+}
+`
+
+// modelTemplate — bun ORM 模型 + Request/Response struct
 const modelTemplate = `package models
 
 import (
@@ -125,7 +213,7 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// {{.Name}} 資料模型
+// {{.Name}} 資料模型（DB schema）
 type {{.Name}} struct {
 	bun.BaseModel ` + "`" + `bun:"table:{{.TableName}},alias:{{.Alias}}"` + "`" + `
 
@@ -136,9 +224,38 @@ type {{.Name}} struct {
 	CreatedAt   time.Time ` + "`" + `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"` + "`" + `
 	UpdatedAt   time.Time ` + "`" + `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"` + "`" + `
 }
+
+// Create{{.Name}}Req 建立 {{.Name}} 的請求（Schema Input）
+type Create{{.Name}}Req struct {
+	Name        string ` + "`" + `json:"name"` + "`" + `
+	Description string ` + "`" + `json:"description,omitempty"` + "`" + `
+}
+
+// Update{{.Name}}Req 更新 {{.Name}} 的請求（Schema Input）
+type Update{{.Name}}Req struct {
+	Name        string ` + "`" + `json:"name,omitempty"` + "`" + `
+	Description string ` + "`" + `json:"description,omitempty"` + "`" + `
+	Active      *bool  ` + "`" + `json:"active,omitempty"` + "`" + `
+}
+
+// {{.Name}}Resp 回應（Schema Output）
+type {{.Name}}Resp struct {
+	ID          int64  ` + "`" + `json:"id"` + "`" + `
+	Name        string ` + "`" + `json:"name"` + "`" + `
+	Description string ` + "`" + `json:"description,omitempty"` + "`" + `
+	Active      bool   ` + "`" + `json:"active"` + "`" + `
+	CreatedAt   string ` + "`" + `json:"created_at"` + "`" + `
+	UpdatedAt   string ` + "`" + `json:"updated_at"` + "`" + `
+}
+
+// {{.Name}}ListResp 列表回應（Schema Output）
+type {{.Name}}ListResp struct {
+	Data  []{{.Name}}Resp ` + "`" + `json:"data"` + "`" + `
+	Total int            ` + "`" + `json:"total"` + "`" + `
+}
 `
 
-// serviceTemplate 使用 Error Catalog
+// serviceTemplate — 業務邏輯 + Error Catalog
 const serviceTemplate = `package services
 
 import (

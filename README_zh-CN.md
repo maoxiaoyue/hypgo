@@ -89,10 +89,10 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 
 ```bash
 # 全栈项目（含前端模板）
-hyp new myapp && cd myapp && go mod tidy && hyp run
+hyp new myapp && cd myapp && go mod tidy
 
 # 纯 API 项目
-hyp api myapi && cd myapi && go mod tidy && hyp run
+hyp api myapi && cd myapi && go mod tidy
 ```
 
 ### 最小可执行示例
