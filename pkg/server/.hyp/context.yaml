@@ -1,6 +1,6 @@
 version: "1.0"
 framework: HypGo
-generated_at: 2026-03-30T22:38:56.3225223+08:00
+generated_at: 2026-03-31T00:34:12.4002507+08:00
 server:
   addr: 127.0.0.1:0
   protocol: http2
