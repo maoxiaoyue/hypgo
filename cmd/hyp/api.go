@@ -195,7 +195,7 @@ import (
 	"{{.ProjectName}}/internal/logger"
 	
 	"github.com/maoxiaoyue/hypgo/pkg/server"
-	hypContext "github.com/maoxiaoyue/hypgo/context"
+	hypContext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
 func main() {
@@ -982,7 +982,7 @@ import (
 	"net/http"
 	"strconv"
 	
-	"github.com/maoxiaoyue/hypgo/context"
+	"github.com/maoxiaoyue/hypgo/pkg/context"
 	"{{.ProjectName}}/app/models"
 	"{{.ProjectName}}/app/services"
 	"{{.ProjectName}}/internal/database"
@@ -1188,7 +1188,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/maoxiaoyue/hypgo/context"
+	"github.com/maoxiaoyue/hypgo/pkg/context"
 	"{{.ProjectName}}/internal/cache"
 	"{{.ProjectName}}/internal/database"
 )
@@ -1255,7 +1255,7 @@ import (
 	"strings"
 	
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/maoxiaoyue/hypgo/context"
+	"github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
 // Auth JWT 認證中間件
@@ -1928,7 +1928,7 @@ const goModContent = `module {{.ProjectName}}
 go 1.21
 
 require (
-	github.com/maoxiaoyue/hypgo v0.1.0
+	github.com/maoxiaoyue/hypgo v0.8.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/lib/pq v1.10.9
