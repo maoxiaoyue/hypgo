@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"sync"
 
@@ -47,6 +48,12 @@ Use "hyp [command] --help" for detailed information about each command.`,
 	}
 )
 
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
 func init() {
 	// 設置版本輸出模板
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
@@ -92,6 +99,12 @@ Examples:
 		},
 	})
 
+<<<<<<< dev_20260328
+	// api 命令已在 api.go init() 中註冊
+	// list 命令已在 list.go init() 中註冊
+	// version 命令已在 version.go init() 中註冊
+	// health 命令已在 health.go init() 中註冊
+=======
 	// 註冊 api 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "api [project-name]",
@@ -129,12 +142,22 @@ Examples:
 			// RunAPI(args[0])
 		},
 	})
+>>>>>>> main
 
-	// 註冊 run 命令
+	// 以下命令目前只有佔位實作，定義在 registerCommands 中
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "run",
 		Short: "Run the HypGo application",
 		Long: `Start the HypGo application in development mode with hot reload.
+<<<<<<< dev_20260328
+
+On startup, AutoSync automatically generates .hyp/context.yaml with the
+current project manifest for AI tool consumption.
+
+Examples:
+  hyp run`,
+		Run: func(cmd *cobra.Command, args []string) {},
+=======
 
 In development mode, the file watcher monitors your source files and
 automatically rebuilds and restarts the server when changes are detected.
@@ -184,13 +207,21 @@ Examples:
 			// 這裡應該呼叫 list 功能
 			// RunList()
 		},
+>>>>>>> main
 	})
 
-	// 註冊 restart 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "restart",
 		Short: "Hot restart the application",
 		Long: `Perform a zero-downtime hot restart of the running HypGo application.
+<<<<<<< dev_20260328
+Sends SIGUSR2 signal, forks a new process, then gracefully shuts down.
+Note: NOT supported on Windows.
+
+Examples:
+  hyp restart`,
+		Run: func(cmd *cobra.Command, args []string) {},
+=======
 
 On Unix systems, this sends a SIGUSR2 signal to the running process, which
 triggers the graceful restart sequence:
@@ -212,12 +243,20 @@ Examples:
 			// 這裡應該呼叫 restart.go 中的實際實作
 			// RunRestart()
 		},
+>>>>>>> main
 	})
 
-	// 註冊 docker 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "docker",
 		Short: "Build Docker image for the project",
+<<<<<<< dev_20260328
+		Long: `Build a Docker image for the current HypGo project using a
+multi-stage Dockerfile based on config.yaml settings.
+
+Examples:
+  hyp docker`,
+		Run: func(cmd *cobra.Command, args []string) {},
+=======
 		Long: `Build a Docker image for the current HypGo project.
 
 Uses a multi-stage Dockerfile to produce a minimal production image:
@@ -239,13 +278,18 @@ Examples:
 			// 這裡應該呼叫 docker.go 中的實際實作
 			// RunDocker()
 		},
+>>>>>>> main
 	})
 
-	// 註冊 generate 命令
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "generate [type] [name]",
 		Short: "Generate code for controllers, models, or services",
 		Long: `Generate boilerplate code that follows HypGo conventions.
+<<<<<<< dev_20260328
+Generated code integrates Schema-first routes and Typed Error Catalog.
+
+Available types: controller, model, service
+=======
 
 The generated code automatically integrates with HypGo's AI collaboration
 toolchain, including Schema-first routes and Typed Error Catalog.
@@ -265,16 +309,21 @@ The generated controller includes:
   - router.Schema() registration with Input/Output types
   - Typed error definitions (errors.Define)
   - Standard CRUD handler stubs
+>>>>>>> main
 
 Examples:
   hyp generate controller user
   hyp generate model order
   hyp generate service payment`,
 		Args: cobra.MinimumNArgs(2),
+<<<<<<< dev_20260328
+		Run:  func(cmd *cobra.Command, args []string) {},
+=======
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 generate.go 中的實際實作
 			// RunGenerate(args[0], args[1])
 		},
+>>>>>>> main
 	})
 
 	// 註冊 context 命令（AI 協作用 manifest 生成）
@@ -289,6 +338,10 @@ Examples:
 	// 註冊 impact 命令（Change Impact Analysis）
 	rootCmd.AddCommand(impactCmd)
 
+<<<<<<< dev_20260328
+	// ai-rules 命令已在 airules.go init() 中註冊
+	// health 命令已在 health.go init() 中註冊
+=======
 	// 註冊 ai-rules 命令（跨 AI 工具配置檔生成）
 	rootCmd.AddCommand(aiRulesCmd)
 
@@ -314,6 +367,7 @@ Examples:
 			// RunHealth()
 		},
 	})
+>>>>>>> main
 }
 
 // Execute 允許其他包執行根命令

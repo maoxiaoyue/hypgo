@@ -17,6 +17,22 @@ var aiRulesCmd = &cobra.Command{
 	Long: `Generate configuration files for AI coding tools so they understand
 HypGo conventions and can collaborate more efficiently.
 
+<<<<<<< dev_20260328
+Supported tools:
+  agents    AGENTS.md                         Codex, Cursor, Aider, OpenHands
+  gemini    GEMINI.md                         Google Gemini CLI / AI Studio
+  copilot   .github/copilot-instructions.md   GitHub Copilot
+  cursor    .cursor/rules/hypgo.mdc           Cursor (scoped rules)
+  windsurf  .windsurf/rules/hypgo.md          Windsurf
+
+Files with the auto-generated marker are overwritten on re-run.
+Manually created files (without the marker) are never overwritten.
+
+Examples:
+  hyp ai-rules
+  hyp ai-rules --only agents,gemini
+  hyp ai-rules --dry-run`,
+=======
 When a developer opens your project with any AI coding tool, that tool
 reads its configuration file to learn the project's conventions. Without
 these files, the AI starts from scratch every time — wasting tokens and
@@ -57,10 +73,15 @@ Examples:
   hyp ai-rules --only agents,gemini     Only AGENTS.md and GEMINI.md
   hyp ai-rules --dry-run                Preview without writing
   hyp ai-rules --dir ./myproject        Specify project root`,
+>>>>>>> main
 	RunE: runAIRules,
 }
 
 func init() {
+<<<<<<< dev_20260328
+	rootCmd.AddCommand(aiRulesCmd)
+=======
+>>>>>>> main
 	aiRulesCmd.Flags().String("only", "", "Comma-separated list of targets (e.g., agents,gemini,copilot)")
 	aiRulesCmd.Flags().String("dir", ".", "Project root directory")
 	aiRulesCmd.Flags().Bool("dry-run", false, "Preview output without writing files")
@@ -71,28 +92,42 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 	dir, _ := cmd.Flags().GetString("dir")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 
+<<<<<<< dev_20260328
+	m := loadManifestIfExists(dir)
+
+=======
 	// 嘗試讀取 manifest
 	m := loadManifestIfExists(dir)
 
 	// 篩選目標
+>>>>>>> main
 	targets := airules.FilterTargets(airules.AllTargets(), only)
 	if len(targets) == 0 {
 		return fmt.Errorf("no matching targets found for: %s", only)
 	}
 
+<<<<<<< dev_20260328
+=======
 	// 生成
+>>>>>>> main
 	results, err := airules.GenerateAll(dir, targets, m, dryRun)
 	if err != nil {
 		return err
 	}
 
+<<<<<<< dev_20260328
+=======
 	// 輸出結果
+>>>>>>> main
 	for _, r := range results {
 		rel, _ := filepath.Rel(dir, r.Path)
 		if rel == "" {
 			rel = r.Path
 		}
+<<<<<<< dev_20260328
+=======
 
+>>>>>>> main
 		switch r.Status {
 		case airules.StatusCreated:
 			fmt.Printf("  + %s\n", rel)
@@ -120,7 +155,10 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+<<<<<<< dev_20260328
+=======
 // loadManifestIfExists 嘗試載入 .hyp/context.yaml
+>>>>>>> main
 func loadManifestIfExists(dir string) *manifest.Manifest {
 	path := filepath.Join(dir, ".hyp", "context.yaml")
 	data, err := os.ReadFile(path)
