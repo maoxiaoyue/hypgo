@@ -61,8 +61,30 @@ func registerCommands() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "new [project-name]",
 		Short: "Create a new HypGo project",
-		Long:  `Create a new HypGo project with complete structure including controllers, models, services, and a welcome HTML page.`,
-		Args:  cobra.ExactArgs(1),
+		Long: `Create a new full-stack HypGo project with complete MVC directory structure.
+
+Generated structure:
+  myapp/
+  ├── app/
+  │   ├── controllers/   HTTP request handlers
+  │   ├── models/        Database models (Bun ORM)
+  │   ├── services/      Business logic layer
+  │   └── config/        config.yaml (server, database, logger)
+  ├── public/            Static files (CSS, JS, images)
+  ├── views/             HTML templates (welcome page included)
+  ├── main.go            Application entry point
+  ├── go.mod             Go module definition
+  └── Dockerfile         Docker build configuration
+
+After creation:
+  cd myapp && go mod tidy && hyp run
+
+For an API-only project (no static files or templates), use "hyp api" instead.
+
+Examples:
+  hyp new myapp
+  hyp new my-web-service`,
+		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 這裡應該呼叫 new.go 中的實際實作
 			// RunNew(args[0])

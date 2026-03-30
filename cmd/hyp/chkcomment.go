@@ -11,15 +11,41 @@ import (
 var chkcommentCmd = &cobra.Command{
 	Use:   "chkcomment [file.go]",
 	Short: "Check and add standardized comments to Go source files",
-	Long: `Scan a Go source file and check all exported blocks (package, type, func,
-method, const, var) for standardized documentation comments.
+	Long: `Scan a Go source file for exported blocks (package, type, func, method,
+const, var) and check whether each has a standardized documentation comment.
 
-Missing comments will be reported with suggested text. Use --fix to
-automatically add the suggested comments to the file.
+This command helps maintain consistent code documentation, which is
+essential for AI collaboration — AI tools use comments to understand
+business constraints and code intent without reading implementation details.
+
+Output includes:
+  - Coverage summary (e.g., "3/5 blocks have comments (60%)")
+  - Per-block results showing which blocks are missing comments
+  - Suggested comment text for each missing block
+
+The --fix flag automatically adds the suggested comments to the file.
+Before modifying, it creates a .bak backup of the original file.
+
+Annotation Protocol support:
+  This checker recognizes @ai: annotations in comments:
+    // @ai:constraint max_items=100
+    // @ai:deprecated use V2 instead
+    // @ai:security requires_auth
+    // @ai:impact routes=/api/users
+    // @ai:owner team=backend
+
+Flags:
+  --fix   Automatically add suggested comments (creates .bak backup)
+
+Safety:
+  - Pure AST analysis — never executes your code
+  - Only accepts .go files, rejects symlinks
+  - --fix always creates a backup before modifying
 
 Examples:
-  hyp chkcomment controllers/user.go
-  hyp chkcomment --fix models/order.go`,
+  hyp chkcomment controllers/user.go             Check and report
+  hyp chkcomment --fix models/order.go            Auto-add comments
+  hyp chkcomment pkg/errors/catalog.go            Check a pkg file`,
 	Args: cobra.ExactArgs(1),
 	RunE: runChkComment,
 }
