@@ -133,21 +133,7 @@ Examples:
 		Run: func(cmd *cobra.Command, args []string) {},
 	})
 
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "generate [type] [name]",
-		Short: "Generate code for controllers, models, or services",
-		Long: `Generate boilerplate code that follows HypGo conventions.
-Generated code integrates Schema-first routes and Typed Error Catalog.
-
-Available types: controller, model, service
-
-Examples:
-  hyp generate controller user
-  hyp generate model order
-  hyp generate service payment`,
-		Args: cobra.MinimumNArgs(2),
-		Run:  func(cmd *cobra.Command, args []string) {},
-	})
+	// generate 命令已在 generate.go init() 中註冊
 
 	// 註冊 context 命令（AI 協作用 manifest 生成）
 	rootCmd.AddCommand(contextCmd)

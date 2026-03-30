@@ -14,15 +14,50 @@ import (
 // validName 只允許字母、數字、底線（防止目錄穿越和 code injection）
 var validName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 
-// GenerateController 生成使用 HypGo 原生 API 的 controller
-func GenerateController(dir, name string) error {
+// GenerateController 生成 controller（只含 handler 邏輯，路由在 routers/ 中）
+func GenerateController(dir, name, moduleName string) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
-	return generateFile(dir, strings.ToLower(name)+"_controller.go", controllerTemplate, templateData(name))
+	if moduleName == "" {
+		moduleName = "myapp"
+	}
+	data := templateData(name)
+	data["ModuleName"] = moduleName
+	return generateFile(dir, strings.ToLower(name)+"_controller.go", controllerTemplate, data)
 }
 
-// GenerateModel 生成使用 bun ORM 的 model（含 migration 註冊）
+// GenerateRouter 生成單一資源的 Schema-first 路由定義（routers/<name>.go）
+func GenerateRouter(dir, name, moduleName string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if moduleName == "" {
+		moduleName = "myapp"
+	}
+	data := templateData(name)
+	data["ModuleName"] = moduleName
+	return generateFile(dir, strings.ToLower(name)+".go", routerTemplate, data)
+}
+
+// GenerateRouterSetup 生成 routers/router.go 總入口（只在首次執行）
+func GenerateRouterSetup(dir, name, moduleName string) error {
+	if moduleName == "" {
+		moduleName = "myapp"
+	}
+	data := map[string]string{
+		"Name":       capitalize(name),
+		"ModuleName": moduleName,
+	}
+	return generateFile(dir, "router.go", routerSetupTemplate, data)
+}
+
+// GenerateMiddleware 生成 routers/middleware.go 中間件配置（只在首次執行）
+func GenerateMiddleware(dir string) error {
+	return generateFile(dir, "middleware.go", middlewareTemplate, nil)
+}
+
+// GenerateModel 生成使用 bun ORM 的 model（含 Request/Response struct）
 func GenerateModel(dir, name string) error {
 	if err := validateName(name); err != nil {
 		return err

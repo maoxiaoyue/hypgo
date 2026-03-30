@@ -17,13 +17,13 @@ func TestValidateName(t *testing.T) {
 		{"UserProfile", false},
 		{"user_profile", false},
 		{"user123", false},
-		{"", true},                    // empty
-		{"123user", true},             // starts with digit
-		{"user-name", true},           // hyphen
-		{"user.name", true},           // dot
-		{"../../../etc/passwd", true}, // path traversal
-		{"user/name", true},           // slash
-		{strings.Repeat("a", 65), true}, // too long
+		{"", true},
+		{"123user", true},
+		{"user-name", true},
+		{"user.name", true},
+		{"../../../etc/passwd", true},
+		{"user/name", true},
+		{strings.Repeat("a", 65), true},
 	}
 
 	for _, tt := range tests {
@@ -36,7 +36,7 @@ func TestValidateName(t *testing.T) {
 
 func TestGenerateController(t *testing.T) {
 	dir := t.TempDir()
-	if err := GenerateController(dir, "Product"); err != nil {
+	if err := GenerateController(dir, "Product", "myapp"); err != nil {
 		t.Fatalf("GenerateController failed: %v", err)
 	}
 
@@ -46,13 +46,8 @@ func TestGenerateController(t *testing.T) {
 	}
 
 	s := string(content)
-
-	// 驗證使用 HypGo 原生 API
 	if !strings.Contains(s, "hypcontext") {
 		t.Error("should use hypcontext")
-	}
-	if !strings.Contains(s, "schema.Route") {
-		t.Error("should use schema.Route")
 	}
 	if !strings.Contains(s, "errors.Define") {
 		t.Error("should use errors.Define")
@@ -60,8 +55,88 @@ func TestGenerateController(t *testing.T) {
 	if !strings.Contains(s, "ProductController") {
 		t.Error("should contain ProductController")
 	}
-	if !strings.Contains(s, "ErrProductNotFound") {
-		t.Error("should define ErrProductNotFound")
+	// Controller 不應有 Schema 路由（已移至 routers/）
+	if strings.Contains(s, "schema.Route") {
+		t.Error("controller should NOT contain schema.Route (moved to routers/)")
+	}
+	// 但應引用 models
+	if !strings.Contains(s, `"myapp/app/models"`) {
+		t.Error("should import models package")
+	}
+}
+
+func TestGenerateRouter(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateRouter(dir, "Product", "myapp"); err != nil {
+		t.Fatalf("GenerateRouter failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "product.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := string(content)
+	if !strings.Contains(s, "schema.Route") {
+		t.Error("router should contain schema.Route")
+	}
+	if !strings.Contains(s, "RegisterProductRoutes") {
+		t.Error("should contain RegisterProductRoutes")
+	}
+	if !strings.Contains(s, "models.CreateProductReq{}") {
+		t.Error("should reference Input type")
+	}
+	if !strings.Contains(s, "models.ProductResp{}") {
+		t.Error("should reference Output type")
+	}
+	if !strings.Contains(s, "models.ProductListResp{}") {
+		t.Error("should reference List Output type")
+	}
+	if !strings.Contains(s, `"myapp/app/controllers"`) {
+		t.Error("should import controllers package")
+	}
+	if !strings.Contains(s, `"myapp/app/models"`) {
+		t.Error("should import models package")
+	}
+}
+
+func TestGenerateRouterSetup(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateRouterSetup(dir, "Product", "myapp"); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "router.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := string(content)
+	if !strings.Contains(s, "func Setup") {
+		t.Error("should contain Setup function")
+	}
+	if !strings.Contains(s, "middleware.DefaultMiddleware") {
+		t.Error("should reference default middleware")
+	}
+}
+
+func TestGenerateMiddleware(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateMiddleware(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "middleware.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := string(content)
+	if !strings.Contains(s, "APIMiddleware") {
+		t.Error("should contain APIMiddleware")
+	}
+	if !strings.Contains(s, "WebMiddleware") {
+		t.Error("should contain WebMiddleware")
 	}
 }
 
@@ -83,8 +158,17 @@ func TestGenerateModel(t *testing.T) {
 	if !strings.Contains(s, `table:orders`) {
 		t.Error("should have table:orders")
 	}
-	if !strings.Contains(s, "pk,autoincrement") {
-		t.Error("should have pk,autoincrement")
+	if !strings.Contains(s, "CreateOrderReq") {
+		t.Error("should define CreateOrderReq")
+	}
+	if !strings.Contains(s, "UpdateOrderReq") {
+		t.Error("should define UpdateOrderReq")
+	}
+	if !strings.Contains(s, "OrderResp") {
+		t.Error("should define OrderResp")
+	}
+	if !strings.Contains(s, "OrderListResp") {
+		t.Error("should define OrderListResp")
 	}
 }
 
@@ -106,20 +190,14 @@ func TestGenerateService(t *testing.T) {
 	if !strings.Contains(s, "PaymentService") {
 		t.Error("should contain PaymentService")
 	}
-	if !strings.Contains(s, "ErrSvcPaymentNotFound") {
-		t.Error("should define ErrSvcPaymentNotFound")
-	}
 }
 
 func TestGenerateNoOverwrite(t *testing.T) {
 	dir := t.TempDir()
-
-	if err := GenerateController(dir, "User"); err != nil {
+	if err := GenerateController(dir, "User", "myapp"); err != nil {
 		t.Fatal(err)
 	}
-
-	// 再次生成應該失敗
-	err := GenerateController(dir, "User")
+	err := GenerateController(dir, "User", "myapp")
 	if err == nil {
 		t.Error("should fail when file exists")
 	}
@@ -130,7 +208,7 @@ func TestGenerateNoOverwrite(t *testing.T) {
 
 func TestGenerateInvalidName(t *testing.T) {
 	dir := t.TempDir()
-	if err := GenerateController(dir, "../hack"); err == nil {
+	if err := GenerateController(dir, "../hack", ""); err == nil {
 		t.Error("should reject path traversal")
 	}
 }

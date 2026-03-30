@@ -89,10 +89,10 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 
 ```bash
 # Full-stack project (with frontend templates)
-hyp new myapp && cd myapp && go mod tidy && hyp run
+hyp new myapp && cd myapp && go mod tidy
 
 # API-only project
-hyp api myapi && cd myapi && go mod tidy && hyp run
+hyp api myapi && cd myapi && go mod tidy
 ```
 
 ### Minimal Working Example
