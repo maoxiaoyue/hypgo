@@ -9,19 +9,33 @@ import (
 )
 
 var (
-	version = "0.4.0"
+	version = "0.8.0"
 	rootCmd = &cobra.Command{
 		Use:   "hyp",
-		Short: "HypGo CLI - A powerful web framework with HTTP/3 support",
-		Long: `HypGo CLI is a command-line tool for the HypGo framework.
-It helps you create and manage HypGo projects with ease.
+		Short: "HypGo CLI - AI-Human Collaborative Go Web Framework",
+		Long: `HypGo CLI - Modern Go web framework with AI-human collaborative development.
 
-Features:
-  - HTTP/3 with QUIC support
-  - Hot reload development
-  - Database migrations
-  - Plugin management
-  - Docker integration`,
+AI Collaboration:
+  context        Generate project manifest for AI tools (~500 tokens vs ~5,000)
+  ai-rules       Generate config files for Codex, Gemini, Cursor, Copilot, Windsurf
+  chkcomment     Check annotation completeness in Go source files
+  impact         Analyze change impact before modifying shared packages
+
+Project Management:
+  new / api      Create full-stack or API-only project
+  run            Start with hot reload + AutoSync (.hyp/context.yaml)
+  restart        Zero-downtime hot restart (Unix SIGUSR2)
+  generate       Generate controller / model / service with Schema + Error Catalog
+
+Database:
+  migrate diff      Generate SQL migration from model struct changes
+  migrate snapshot  Save current schema as baseline
+
+Deployment:
+  docker         Build Docker image
+  health         Check running application health
+
+Use "hyp [command] --help" for detailed information about each command.`,
 		Version: version,
 	}
 )
@@ -35,7 +49,7 @@ func main() {
 func init() {
 	// 設置版本輸出模板
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
-Framework for building high-performance web applications with HTTP/3 support
+AI-Human Collaborative Go Web Framework (HTTP/1.1 + HTTP/2 + HTTP/3)
 `)
 	// 註冊所有命令
 	registerCommands()
