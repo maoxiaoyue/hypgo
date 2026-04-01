@@ -57,40 +57,7 @@ AI-Human Collaborative Go Web Framework (HTTP/1.1 + HTTP/2 + HTTP/3)
 
 // registerCommands 註冊所有可用的命令
 func registerCommands() {
-	// 註冊 new 命令
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "new [project-name]",
-		Short: "Create a new HypGo project",
-		Long: `Create a new full-stack HypGo project with complete MVC directory structure.
-
-Generated structure:
-  myapp/
-  ├── app/
-  │   ├── controllers/   HTTP request handlers
-  │   ├── models/        Database models (Bun ORM)
-  │   ├── services/      Business logic layer
-  │   └── config/        config.yaml (server, database, logger)
-  ├── public/            Static files (CSS, JS, images)
-  ├── views/             HTML templates (welcome page included)
-  ├── main.go            Application entry point
-  ├── go.mod             Go module definition
-  └── Dockerfile         Docker build configuration
-
-After creation:
-  cd myapp && go mod tidy && hyp run
-
-For an API-only project (no static files or templates), use "hyp api" instead.
-
-Examples:
-  hyp new myapp
-  hyp new my-web-service`,
-		Args: cobra.ExactArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			// 這裡應該呼叫 new.go 中的實際實作
-			// RunNew(args[0])
-		},
-	})
-
+	// new 命令已在 new.go init() 中註冊
 	// api 命令已在 api.go init() 中註冊
 	// list 命令已在 list.go init() 中註冊
 	// version 命令已在 version.go init() 中註冊

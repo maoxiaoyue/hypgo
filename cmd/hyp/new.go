@@ -21,6 +21,10 @@ var newCmd = &cobra.Command{
 	RunE:  runNew,
 }
 
+func init() {
+	rootCmd.AddCommand(newCmd)
+}
+
 func runNew(cmd *cobra.Command, args []string) error {
 	projectName := args[0]
 
