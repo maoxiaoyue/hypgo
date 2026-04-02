@@ -1928,7 +1928,7 @@ const goModContent = `module {{.ProjectName}}
 go 1.21
 
 require (
-	github.com/maoxiaoyue/hypgo v0.8.1
+	github.com/maoxiaoyue/hypgo v0.8.1-alpha
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/lib/pq v1.10.9
