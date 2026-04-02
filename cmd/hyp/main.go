@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	version = "0.8.0"
+	version = "0.8.1"
 	rootCmd = &cobra.Command{
 		Use:   "hyp",
 		Short: "HypGo CLI - AI-Human Collaborative Go Web Framework",
