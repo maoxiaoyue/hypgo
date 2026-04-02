@@ -4,7 +4,7 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.8.0-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
+[![Version](https://img.shields.io/badge/Version-0.8.1-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
 
 [English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md)
 
