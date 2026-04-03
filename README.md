@@ -104,7 +104,12 @@ hyp api myservice && cd myservice && go mod tidy
 # Generate a resource (model + controller + router in one step)
 hyp generate model user
 hyp generate controller user
+
+# ⚡ Essential: Generate AI collaboration files
+hyp ai-rules
 ```
+
+> **`hyp ai-rules` is not optional.** It generates `AGENTS.md`, `GEMINI.md`, `.github/copilot-instructions.md`, `.cursor/rules/hypgo.mdc`, and `.windsurf/rules/hypgo.md` — these files tell AI tools your project's conventions. Without them, AI starts from scratch every session and wastes thousands of tokens re-learning your codebase. **Run it once after project creation, and again after adding new routes.**
 
 This creates:
 
@@ -118,6 +123,11 @@ myservice/
 │   │   ├── router.go                    ← Setup() entry point
 │   │   └── middleware.go                ← Middleware config
 │   └── services/
+├── AGENTS.md                            ← Codex, Cursor, Aider, OpenHands
+├── GEMINI.md                            ← Google Gemini CLI / AI Studio
+├── .github/copilot-instructions.md      ← GitHub Copilot
+├── .cursor/rules/hypgo.mdc              ← Cursor
+├── .windsurf/rules/hypgo.md             ← Windsurf
 └── go.mod
 ```
 

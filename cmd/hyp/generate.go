@@ -11,26 +11,26 @@ import (
 
 var generateCmd = &cobra.Command{
 	Use:   "generate [type] [name]",
-	Short: "Generate code for controllers, models, or services",
+	Short: "Generate code for controllers, models, services, or commands",
 	Long: `Generate boilerplate code that follows HypGo conventions.
 
 Available types:
-  controller    Controller (handler) + Router (Schema routes) + Middleware setup
+  controller    Controller (handler) + Router (Schema routes) + Middleware
   model         Bun ORM model + Request/Response structs
   service       Service layer with Error Catalog
+  command       CLI subcommand (Cobra) for CLI projects
 
 Generated file locations:
-  controller → app/controllers/<name>_controller.go   (handlers only)
-             + app/routers/<name>.go                   (Schema routes)
-             + app/routers/router.go                   (setup entry, first time only)
-             + app/routers/middleware.go                (middleware config, first time only)
+  controller → app/controllers/<name>_controller.go + app/routers/<name>.go
   model      → app/models/<name>.go
   service    → app/services/<name>_service.go
+  command    → app/commands/<name>.go
 
 Examples:
   hyp generate controller user
   hyp generate model order
-  hyp generate service payment`,
+  hyp generate service payment
+  hyp generate command process`,
 	Args: cobra.ExactArgs(2),
 	RunE: runGenerate,
 }
@@ -56,35 +56,32 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return generateModel(name)
 	case "service":
 		return generateService(name, moduleName)
+	case "command":
+		return generateCommand(name)
 	default:
-		return fmt.Errorf("unknown type: %s (use controller, model, or service)", genType)
+		return fmt.Errorf("unknown type: %s (use controller, model, service, or command)", genType)
 	}
 }
 
-// generateControllerFull 生成 controller + router + middleware（一次到位）
+// generateControllerFull 生成 controller + router + middleware（Web 專案）
 func generateControllerFull(name, moduleName string) error {
 	lowerName := strings.ToLower(name)
 	capName := strings.ToUpper(name[:1]) + name[1:]
 
-	// 1. Controller（handler 邏輯）
 	if err := scaffold.GenerateController("app/controllers", name, moduleName); err != nil {
 		return err
 	}
 	fmt.Printf("  + app/controllers/%s_controller.go\n", lowerName)
 
-	// 2. Router（Schema 路由定義）
 	if err := scaffold.GenerateRouter("app/routers", name, moduleName); err != nil {
 		return err
 	}
 	fmt.Printf("  + app/routers/%s.go\n", lowerName)
 
-	// 3. Router setup（首次才生成）
 	if err := scaffold.GenerateRouterSetup("app/routers", name, moduleName); err == nil {
 		fmt.Printf("  + app/routers/router.go\n")
 	}
-	// 已存在則跳過，不報錯
 
-	// 4. Middleware（首次才生成）
 	if err := scaffold.GenerateMiddleware("app/routers"); err == nil {
 		fmt.Printf("  + app/routers/middleware.go\n")
 	}
@@ -94,7 +91,6 @@ func generateControllerFull(name, moduleName string) error {
 	fmt.Printf("   1. Run: hyp generate model %s\n", lowerName)
 	fmt.Printf("   2. Edit app/routers/router.go → add: Register%sRoutes(r)\n", capName)
 	fmt.Printf("   3. In main.go → call: routers.Setup(srv.Router())\n")
-
 	return nil
 }
 
@@ -121,6 +117,20 @@ func generateService(name, moduleName string) error {
 	return nil
 }
 
+// generateCommand 生成 CLI 子命令（CLI 專案用）
+func generateCommand(name string) error {
+	lowerName := strings.ToLower(name)
+	capName := strings.ToUpper(name[:1]) + name[1:]
+
+	if err := scaffold.GenerateCommand("app/commands", name); err != nil {
+		return err
+	}
+	fmt.Printf("✅ Generated: app/commands/%s.go\n", lowerName)
+	fmt.Printf("   Command: %s %s\n", detectAppName(), lowerName)
+	fmt.Printf("   Edit app/commands/%s.go to implement %s logic\n", lowerName, capName)
+	return nil
+}
+
 // detectModuleName 從 go.mod 中自動偵測 module 名稱
 func detectModuleName() string {
 	data, err := os.ReadFile("go.mod")
@@ -134,4 +144,11 @@ func detectModuleName() string {
 		}
 	}
 	return "myapp"
+}
+
+// detectAppName 從 go.mod module 路徑取得應用名稱（最後一段）
+func detectAppName() string {
+	mod := detectModuleName()
+	parts := strings.Split(mod, "/")
+	return parts[len(parts)-1]
 }
