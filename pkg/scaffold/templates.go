@@ -419,3 +419,109 @@ require (
 	github.com/spf13/cobra v1.9.1
 )
 `
+
+// ============================================================
+// Desktop 專案模板（Fyne）
+// ============================================================
+
+// desktopMainTemplate — Desktop 專案的 main.go
+const desktopMainTemplate = `package main
+
+import (
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+
+	"{{.ModuleName}}/app/views"
+)
+
+func main() {
+	a := app.New()
+	w := a.NewWindow("{{.Name}}")
+	w.Resize(fyne.NewSize(800, 600))
+
+	// 載入主畫面
+	w.SetContent(views.MainView(w))
+
+	w.ShowAndRun()
+}
+`
+
+// desktopViewTemplate — Desktop 專案的 app/views/main_view.go
+const desktopViewTemplate = `package views
+
+import (
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
+)
+
+// MainView 回傳應用程式主畫面
+func MainView(w fyne.Window) fyne.CanvasObject {
+	title := widget.NewLabel("Welcome to {{.Name}}")
+	title.TextStyle = fyne.TextStyle{Bold: true}
+
+	info := widget.NewLabel("Built with HypGo + Fyne")
+
+	return container.NewVBox(
+		title,
+		widget.NewSeparator(),
+		info,
+		widget.NewButton("Click me", func() {
+			info.SetText("Button clicked!")
+		}),
+	)
+}
+`
+
+// desktopCustomViewTemplate — 自訂 view 模板
+const desktopCustomViewTemplate = `package views
+
+import (
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
+)
+
+// {{.Name}}View 回傳 {{.Name}} 畫面
+func {{.Name}}View(w fyne.Window) fyne.CanvasObject {
+	title := widget.NewLabel("{{.Name}}")
+	title.TextStyle = fyne.TextStyle{Bold: true}
+
+	// TODO: implement {{.LowerName}} view layout
+
+	return container.NewVBox(
+		title,
+		widget.NewSeparator(),
+		widget.NewLabel("{{.Name}} view content goes here"),
+	)
+}
+`
+
+// desktopConfigTemplate — Desktop 專案的 config.yaml
+const desktopConfigTemplate = `# {{.Name}} Configuration
+app:
+  name: "{{.LowerName}}"
+  version: "0.1.0"
+  width: 800
+  height: 600
+
+database:
+  driver: ""
+  dsn: ""
+
+logger:
+  level: info
+  output: stdout
+  colors: true
+`
+
+// desktopGoModTemplate — Desktop 專案的 go.mod
+const desktopGoModTemplate = `module {{.ModuleName}}
+
+go 1.24
+
+require (
+	fyne.io/fyne/v2 v2.5.4
+	github.com/maoxiaoyue/hypgo v0.8.1-alpha
+)
+`

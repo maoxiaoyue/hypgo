@@ -20,14 +20,15 @@ var newCmd = &cobra.Command{
 	Short: "Create a new HypGo project",
 	Long: `Create a new HypGo project. Specify the project type:
 
-  hyp new <name>          Full-stack web project (default)
-  hyp new web <name>      Full-stack web project (explicit)
-  hyp new cli <name>      CLI tool project (Cobra + services)
+  hyp new <name>              Full-stack web project (default)
+  hyp new web <name>          Full-stack web project (explicit)
+  hyp new cli <name>          CLI tool project (Cobra + services)
+  hyp new desktop <name>      Desktop application (Fyne GUI + services)
 
 Examples:
-  hyp new myapp           Full-stack web project
-  hyp new web myapp       Same as above
-  hyp new cli mytool      CLI tool project`,
+  hyp new myapp               Full-stack web project
+  hyp new cli mytool           CLI tool project
+  hyp new desktop mydesktop    Desktop application`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {
@@ -42,8 +43,10 @@ Examples:
 			return runNew(cmd, []string{projectName})
 		case "cli":
 			return runNewCLI(projectName)
+		case "desktop":
+			return runNewDesktop(projectName)
 		default:
-			return fmt.Errorf("unknown project type: %s (use web or cli)", projectType)
+			return fmt.Errorf("unknown project type: %s (use web, cli, or desktop)", projectType)
 		}
 	},
 }
@@ -76,9 +79,41 @@ Add subcommands:
 	},
 }
 
+var newDesktopCmd = &cobra.Command{
+	Use:   "desktop [project-name]",
+	Short: "Create a new Desktop application (Fyne GUI)",
+	Long: `Create a new Desktop application using Fyne GUI toolkit.
+
+Generated structure:
+  myapp/
+  ├── app/
+  │   ├── views/         GUI views (Fyne widgets + layouts)
+  │   │   └── main_view.go
+  │   ├── models/        Data structures
+  │   ├── services/      Business logic + Error Catalog
+  │   └── config/
+  │       └── config.yaml
+  ├── main.go            Entry point (Fyne app + window)
+  └── go.mod
+
+After creation:
+  cd myapp && go mod tidy && go run .
+
+Add views:
+  hyp generate view settings
+  hyp generate view dashboard
+
+Requires: C compiler (gcc) for CGO (Fyne dependency)`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runNewDesktop(args[0])
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(newCmd)
 	newCmd.AddCommand(newCLICmd)
+	newCmd.AddCommand(newDesktopCmd)
 }
 
 // runNewCLI 生成 CLI 專案
@@ -106,6 +141,36 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("\n📝 Add subcommands:\n")
 	fmt.Printf("   hyp generate command process\n")
 	fmt.Printf("   hyp generate command export\n")
+
+	return nil
+}
+
+// runNewDesktop 生成 Desktop 專案（Fyne）
+func runNewDesktop(projectName string) error {
+	if err := scaffold.GenerateDesktopProject(projectName, projectName, projectName); err != nil {
+		return fmt.Errorf("failed to create desktop project: %w", err)
+	}
+
+	fmt.Printf("\n✨ Successfully created Desktop project: %s\n", projectName)
+	fmt.Printf("📁 Project structure:\n")
+	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   ├── app/\n")
+	fmt.Printf("   │   ├── views/\n")
+	fmt.Printf("   │   │   └── main_view.go\n")
+	fmt.Printf("   │   ├── models/\n")
+	fmt.Printf("   │   ├── services/\n")
+	fmt.Printf("   │   └── config/\n")
+	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   ├── main.go\n")
+	fmt.Printf("   └── go.mod\n")
+	fmt.Printf("\n🚀 Get started:\n")
+	fmt.Printf("   cd %s\n", projectName)
+	fmt.Printf("   go mod tidy\n")
+	fmt.Printf("   go run .\n")
+	fmt.Printf("\n📝 Add views:\n")
+	fmt.Printf("   hyp generate view settings\n")
+	fmt.Printf("   hyp generate view dashboard\n")
+	fmt.Printf("\n⚠️  Requires: C compiler (gcc) for CGO (Fyne dependency)\n")
 
 	return nil
 }

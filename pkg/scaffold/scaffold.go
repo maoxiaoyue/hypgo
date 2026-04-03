@@ -124,6 +124,62 @@ func GenerateCommand(dir, name string) error {
 	return generateFile(dir, strings.ToLower(name)+".go", cliCommandTemplate, templateData(name))
 }
 
+// ============================================================
+// Desktop 專案生成（Fyne）
+// ============================================================
+
+// GenerateDesktopProject 生成完整的 Desktop 專案骨架（Fyne）
+func GenerateDesktopProject(baseDir, name, moduleName string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if moduleName == "" {
+		moduleName = name
+	}
+
+	data := templateData(name)
+	data["ModuleName"] = moduleName
+
+	// 建立目錄結構
+	dirs := []string{
+		filepath.Join(baseDir, "app", "views"),
+		filepath.Join(baseDir, "app", "models"),
+		filepath.Join(baseDir, "app", "services"),
+		filepath.Join(baseDir, "app", "config"),
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("scaffold: failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// 生成檔案
+	files := []struct {
+		dir, filename, tmpl string
+	}{
+		{baseDir, "main.go", desktopMainTemplate},
+		{filepath.Join(baseDir, "app", "views"), "main_view.go", desktopViewTemplate},
+		{filepath.Join(baseDir, "app", "config"), "config.yaml", desktopConfigTemplate},
+		{baseDir, "go.mod", desktopGoModTemplate},
+	}
+
+	for _, f := range files {
+		if err := generateFile(f.dir, f.filename, f.tmpl, data); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// GenerateView 生成 Desktop 自訂 view（app/views/<name>_view.go）
+func GenerateView(dir, name string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	return generateFile(dir, strings.ToLower(name)+"_view.go", desktopCustomViewTemplate, templateData(name))
+}
+
 // GenerateService 生成使用 Error Catalog 的 service
 func GenerateService(dir, name string) error {
 	if err := validateName(name); err != nil {
