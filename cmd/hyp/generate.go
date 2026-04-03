@@ -19,12 +19,14 @@ Available types:
   model         Bun ORM model + Request/Response structs
   service       Service layer with Error Catalog
   command       CLI subcommand (Cobra) for CLI projects
+  view          Desktop GUI view (Fyne) for desktop projects
 
 Generated file locations:
   controller → app/controllers/<name>_controller.go + app/routers/<name>.go
   model      → app/models/<name>.go
   service    → app/services/<name>_service.go
   command    → app/commands/<name>.go
+  view       → app/views/<name>_view.go
 
 Examples:
   hyp generate controller user
@@ -58,8 +60,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return generateService(name, moduleName)
 	case "command":
 		return generateCommand(name)
+	case "view":
+		return generateView(name)
 	default:
-		return fmt.Errorf("unknown type: %s (use controller, model, service, or command)", genType)
+		return fmt.Errorf("unknown type: %s (use controller, model, service, command, or view)", genType)
 	}
 }
 
@@ -128,6 +132,19 @@ func generateCommand(name string) error {
 	fmt.Printf("✅ Generated: app/commands/%s.go\n", lowerName)
 	fmt.Printf("   Command: %s %s\n", detectAppName(), lowerName)
 	fmt.Printf("   Edit app/commands/%s.go to implement %s logic\n", lowerName, capName)
+	return nil
+}
+
+// generateView 生成 Desktop GUI view（Desktop 專案用）
+func generateView(name string) error {
+	lowerName := strings.ToLower(name)
+	capName := strings.ToUpper(name[:1]) + name[1:]
+
+	if err := scaffold.GenerateView("app/views", name); err != nil {
+		return err
+	}
+	fmt.Printf("✅ Generated: app/views/%s_view.go\n", lowerName)
+	fmt.Printf("   Function: views.%sView(w)\n", capName)
 	return nil
 }
 

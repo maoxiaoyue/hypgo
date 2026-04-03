@@ -265,6 +265,75 @@ func TestGenerateCommand(t *testing.T) {
 	}
 }
 
+// --- Desktop 專案測試 ---
+
+func TestGenerateDesktopProject(t *testing.T) {
+	dir := t.TempDir()
+	projectDir := filepath.Join(dir, "mydesktop")
+
+	if err := GenerateDesktopProject(projectDir, "mydesktop", "mydesktop"); err != nil {
+		t.Fatalf("GenerateDesktopProject failed: %v", err)
+	}
+
+	expected := []string{
+		"main.go",
+		"go.mod",
+		filepath.Join("app", "views", "main_view.go"),
+		filepath.Join("app", "config", "config.yaml"),
+	}
+	for _, f := range expected {
+		path := filepath.Join(projectDir, f)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("missing file: %s", f)
+		}
+	}
+
+	// main.go 應引用 views 和 fyne
+	mainContent, _ := os.ReadFile(filepath.Join(projectDir, "main.go"))
+	s := string(mainContent)
+	if !strings.Contains(s, "fyne.io/fyne/v2") {
+		t.Error("main.go should import fyne")
+	}
+	if !strings.Contains(s, "views.MainView") {
+		t.Error("main.go should call views.MainView")
+	}
+
+	// main_view.go 應有 MainView 函式
+	viewContent, _ := os.ReadFile(filepath.Join(projectDir, "app", "views", "main_view.go"))
+	if !strings.Contains(string(viewContent), "func MainView") {
+		t.Error("main_view.go should define MainView function")
+	}
+
+	// go.mod 應有 fyne 依賴
+	modContent, _ := os.ReadFile(filepath.Join(projectDir, "go.mod"))
+	if !strings.Contains(string(modContent), "fyne.io/fyne/v2") {
+		t.Error("go.mod should require fyne")
+	}
+}
+
+func TestGenerateView(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateView(dir, "settings"); err != nil {
+		t.Fatalf("GenerateView failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "settings_view.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := string(content)
+	if !strings.Contains(s, "SettingsView") {
+		t.Error("should define SettingsView function")
+	}
+	if !strings.Contains(s, "fyne.Window") {
+		t.Error("should accept fyne.Window parameter")
+	}
+	if !strings.Contains(s, "container.NewVBox") {
+		t.Error("should use VBox container")
+	}
+}
+
 func TestGenerateNoOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	if err := GenerateController(dir, "User", "myapp"); err != nil {
