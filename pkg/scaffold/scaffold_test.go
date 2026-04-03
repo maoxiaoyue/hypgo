@@ -192,6 +192,79 @@ func TestGenerateService(t *testing.T) {
 	}
 }
 
+// --- CLI 專案測試 ---
+
+func TestGenerateCLIProject(t *testing.T) {
+	dir := t.TempDir()
+	projectDir := filepath.Join(dir, "mytool")
+
+	if err := GenerateCLIProject(projectDir, "mytool", "mytool"); err != nil {
+		t.Fatalf("GenerateCLIProject failed: %v", err)
+	}
+
+	// 檢查目錄結構
+	expected := []string{
+		"main.go",
+		"go.mod",
+		filepath.Join("app", "commands", "root.go"),
+		filepath.Join("app", "config", "config.yaml"),
+	}
+	for _, f := range expected {
+		path := filepath.Join(projectDir, f)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("missing file: %s", f)
+		}
+	}
+
+	// 檢查 main.go 內容
+	mainContent, _ := os.ReadFile(filepath.Join(projectDir, "main.go"))
+	if !strings.Contains(string(mainContent), "commands.Execute") {
+		t.Error("main.go should call commands.Execute()")
+	}
+
+	// 檢查 root.go 內容
+	rootContent, _ := os.ReadFile(filepath.Join(projectDir, "app", "commands", "root.go"))
+	s := string(rootContent)
+	if !strings.Contains(s, "rootCmd") {
+		t.Error("root.go should define rootCmd")
+	}
+	if !strings.Contains(s, "cobra.Command") {
+		t.Error("root.go should use cobra.Command")
+	}
+
+	// 檢查 go.mod
+	modContent, _ := os.ReadFile(filepath.Join(projectDir, "go.mod"))
+	if !strings.Contains(string(modContent), "module mytool") {
+		t.Error("go.mod should have correct module name")
+	}
+}
+
+func TestGenerateCommand(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateCommand(dir, "process"); err != nil {
+		t.Fatalf("GenerateCommand failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "process.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := string(content)
+	if !strings.Contains(s, "processCmd") {
+		t.Error("should define processCmd")
+	}
+	if !strings.Contains(s, "rootCmd.AddCommand") {
+		t.Error("should register with rootCmd")
+	}
+	if !strings.Contains(s, "runProcess") {
+		t.Error("should have runProcess function")
+	}
+	if !strings.Contains(s, "cobra.Command") {
+		t.Error("should use cobra.Command")
+	}
+}
+
 func TestGenerateNoOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	if err := GenerateController(dir, "User", "myapp"); err != nil {

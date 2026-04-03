@@ -104,7 +104,12 @@ hyp api myservice && cd myservice && go mod tidy
 # 一步生成完整资源（model + controller + router）
 hyp generate model user
 hyp generate controller user
+
+# ⚡ 必要步骤：生成 AI 协作文件
+hyp ai-rules
 ```
+
+> **`hyp ai-rules` 不是可选的。** 它生成 `AGENTS.md`、`GEMINI.md`、`.github/copilot-instructions.md`、`.cursor/rules/hypgo.mdc`、`.windsurf/rules/hypgo.md` — 这些文件告诉 AI 工具你的项目惯例。没有它们，AI 每次打开项目都从零开始，浪费数千 tokens 重新学习你的 codebase。**创建项目后跑一次，新增路由后再跑一次。**
 
 生成的结构：
 
@@ -118,6 +123,11 @@ myservice/
 │   │   ├── router.go                    ← Setup() 总入口
 │   │   └── middleware.go                ← 中间件配置
 │   └── services/
+├── AGENTS.md                            ← Codex, Cursor, Aider, OpenHands
+├── GEMINI.md                            ← Google Gemini CLI / AI Studio
+├── .github/copilot-instructions.md      ← GitHub Copilot
+├── .cursor/rules/hypgo.mdc              ← Cursor
+├── .windsurf/rules/hypgo.md             ← Windsurf
 └── go.mod
 ```
 

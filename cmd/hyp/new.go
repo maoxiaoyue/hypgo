@@ -11,18 +11,103 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
 )
 
 var newCmd = &cobra.Command{
-	Use:   "new [project-name]",
-	Short: "Create a new HypGo full-stack project",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runNew,
+	Use:   "new [type] [project-name]",
+	Short: "Create a new HypGo project",
+	Long: `Create a new HypGo project. Specify the project type:
+
+  hyp new <name>          Full-stack web project (default)
+  hyp new web <name>      Full-stack web project (explicit)
+  hyp new cli <name>      CLI tool project (Cobra + services)
+
+Examples:
+  hyp new myapp           Full-stack web project
+  hyp new web myapp       Same as above
+  hyp new cli mytool      CLI tool project`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 1 {
+			// hyp new <name> → web 專案（預設）
+			return runNew(cmd, args)
+		}
+		// hyp new <type> <name>
+		projectType := args[0]
+		projectName := args[1]
+		switch projectType {
+		case "web":
+			return runNew(cmd, []string{projectName})
+		case "cli":
+			return runNewCLI(projectName)
+		default:
+			return fmt.Errorf("unknown project type: %s (use web or cli)", projectType)
+		}
+	},
+}
+
+var newCLICmd = &cobra.Command{
+	Use:   "cli [project-name]",
+	Short: "Create a new CLI tool project",
+	Long: `Create a new CLI tool project with Cobra command structure.
+
+Generated structure:
+  mytool/
+  ├── app/
+  │   ├── commands/      CLI subcommands (Cobra)
+  │   │   └── root.go    Root command
+  │   ├── models/        Data structures
+  │   ├── services/      Business logic + Error Catalog
+  │   └── config/        config.yaml
+  ├── main.go            Entry point
+  └── go.mod
+
+After creation:
+  cd mytool && go mod tidy && go run .
+
+Add subcommands:
+  hyp generate command process
+  hyp generate command export`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runNewCLI(args[0])
+	},
 }
 
 func init() {
 	rootCmd.AddCommand(newCmd)
+	newCmd.AddCommand(newCLICmd)
+}
+
+// runNewCLI 生成 CLI 專案
+func runNewCLI(projectName string) error {
+	if err := scaffold.GenerateCLIProject(projectName, projectName, projectName); err != nil {
+		return fmt.Errorf("failed to create CLI project: %w", err)
+	}
+
+	fmt.Printf("\n✨ Successfully created CLI project: %s\n", projectName)
+	fmt.Printf("📁 Project structure:\n")
+	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   ├── app/\n")
+	fmt.Printf("   │   ├── commands/\n")
+	fmt.Printf("   │   │   └── root.go\n")
+	fmt.Printf("   │   ├── models/\n")
+	fmt.Printf("   │   ├── services/\n")
+	fmt.Printf("   │   └── config/\n")
+	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   ├── main.go\n")
+	fmt.Printf("   └── go.mod\n")
+	fmt.Printf("\n🚀 Get started:\n")
+	fmt.Printf("   cd %s\n", projectName)
+	fmt.Printf("   go mod tidy\n")
+	fmt.Printf("   go run .\n")
+	fmt.Printf("\n📝 Add subcommands:\n")
+	fmt.Printf("   hyp generate command process\n")
+	fmt.Printf("   hyp generate command export\n")
+
+	return nil
 }
 
 func runNew(cmd *cobra.Command, args []string) error {

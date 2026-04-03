@@ -312,3 +312,110 @@ func (s *{{.Name}}Service) List(ctx context.Context) ([]interface{}, error) {
 	return nil, nil
 }
 `
+
+// ============================================================
+// CLI 專案模板
+// ============================================================
+
+// cliMainTemplate — CLI 專案的 main.go
+const cliMainTemplate = `package main
+
+import (
+	"fmt"
+	"os"
+
+	"{{.ModuleName}}/app/commands"
+)
+
+func main() {
+	if err := commands.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+`
+
+// cliRootTemplate — CLI 專案的 app/commands/root.go
+const cliRootTemplate = `package commands
+
+import (
+	"github.com/spf13/cobra"
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "{{.LowerName}}",
+	Short: "{{.Name}} CLI tool",
+	Long:  "{{.Name}} is a CLI tool built with HypGo scaffold.",
+}
+
+// Execute 執行根命令
+func Execute() error {
+	return rootCmd.Execute()
+}
+
+func init() {
+	// 全域 flags
+	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file")
+}
+`
+
+// cliCommandTemplate — CLI 子命令模板
+const cliCommandTemplate = `package commands
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+)
+
+var {{.LowerName}}Cmd = &cobra.Command{
+	Use:   "{{.LowerName}}",
+	Short: "{{.Name}} command",
+	Long:  "Execute the {{.LowerName}} operation.",
+	RunE:  run{{.Name}},
+}
+
+func init() {
+	rootCmd.AddCommand({{.LowerName}}Cmd)
+
+	// 命令 flags
+	// {{.LowerName}}Cmd.Flags().StringP("input", "i", "", "Input file path")
+	// {{.LowerName}}Cmd.Flags().StringP("output", "o", "", "Output file path")
+	// {{.LowerName}}Cmd.Flags().BoolP("verbose", "v", false, "Verbose output")
+}
+
+func run{{.Name}}(cmd *cobra.Command, args []string) error {
+	fmt.Println("Running {{.LowerName}} command...")
+
+	// TODO: implement {{.LowerName}} logic
+
+	return nil
+}
+`
+
+// cliConfigTemplate — CLI 專案的 config.yaml
+const cliConfigTemplate = `# {{.Name}} Configuration
+app:
+  name: "{{.LowerName}}"
+  version: "0.1.0"
+
+database:
+  driver: ""
+  dsn: ""
+
+logger:
+  level: info
+  output: stdout
+  colors: true
+`
+
+// cliGoModTemplate — CLI 專案的 go.mod 模板
+const cliGoModTemplate = `module {{.ModuleName}}
+
+go 1.24
+
+require (
+	github.com/maoxiaoyue/hypgo v0.8.1-alpha
+	github.com/spf13/cobra v1.9.1
+)
+`
