@@ -773,14 +773,14 @@ body {
 func createGoMod(projectName string) error {
 	latestTag, err := getLatestGitTag("github.com/maoxiaoyue/hypgo")
 	if err != nil {
-		// 如果無法獲取標籤，使用佔位版本
-		latestTag = "v0.0.0"
+		// 如果無法獲取標籤，使用目前版本
+		latestTag = "v0.8.1-alpha"
 		fmt.Fprintf(os.Stderr, "Warning: Failed to get latest tag, using %s: %v\n", latestTag, err)
 	}
 
 	content := fmt.Sprintf(`module %s
 
-go 1.21
+go 1.24
 
 require github.com/maoxiaoyue/hypgo %s
 `, projectName, latestTag)
