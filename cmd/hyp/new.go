@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"text/template"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
@@ -302,11 +301,10 @@ logger:
 }
 
 func createMainFile(projectName string) error {
-	mainTemplate := `package main
+	mainContent := `package main
 
 import (
     "context"
-    "fmt"
     "log"
     "os"
     "os/signal"
@@ -314,50 +312,69 @@ import (
     "time"
 
     "github.com/maoxiaoyue/hypgo/pkg/config"
-    "github.com/maoxiaoyue/hypgo/pkg/hidb"
+    hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
     "github.com/maoxiaoyue/hypgo/pkg/logger"
+    "github.com/maoxiaoyue/hypgo/pkg/schema"
     "github.com/maoxiaoyue/hypgo/pkg/server"
-    "{{.ProjectName}}/app/controllers"
 )
 
 func main() {
     // 載入配置
-    cfg, err := config.Load("config/config.yaml")
-    if err != nil {
+    cfg := &config.Config{}
+    loader := config.NewConfigLoader("config/config.yaml")
+    if err := loader.Load("config/config.yaml", cfg); err != nil {
         log.Fatal("Failed to load config:", err)
     }
+    cfg.ApplyDefaults()
 
     // 初始化日誌
-    log, err := logger.New(
-        cfg.Logger.Level,
-        cfg.Logger.Output,
-        &cfg.Logger.Rotation,
-        cfg.Logger.Colors,
-    )
-    if err != nil {
-        log.Fatal("Failed to initialize logger:", err)
-    }
-    defer log.Close()
-
-    // 初始化數據庫
-    db, err := hidb.New(&cfg.Database)
-    if err != nil {
-        log.Emergency("Failed to initialize database: %v", err)
-        os.Exit(1)
-    }
-    defer db.Close()
+    appLog := logger.NewLogger()
+    defer appLog.Close()
 
     // 創建服務器
-    srv := server.New(cfg, log)
-    
-    // 註冊路由
-    controllers.RegisterRoutes(srv.Router(), db, log)
+    srv := server.New(cfg, appLog)
+    r := srv.Router()
+
+    // 靜態檔案
+    r.Static("/static", "./static")
+
+    // 首頁
+    r.GET("/", func(c *hypcontext.Context) {
+        c.File("templates/welcome.html")
+    })
+
+    // API 路由（Schema-first）
+    r.Schema(schema.Route{
+        Method:  "GET",
+        Path:    "/api/health",
+        Summary: "Health check",
+    }).Handle(func(c *hypcontext.Context) {
+        c.JSON(200, map[string]interface{}{
+            "success": true,
+            "message": "Server is healthy",
+        })
+    })
+
+    r.Schema(schema.Route{
+        Method:  "GET",
+        Path:    "/api/info",
+        Summary: "Server info",
+    }).Handle(func(c *hypcontext.Context) {
+        c.JSON(200, map[string]interface{}{
+            "success": true,
+            "message": "HypGo Framework",
+            "data": map[string]interface{}{
+                "version":  "0.8.1-alpha",
+                "protocol": c.Request.Proto,
+            },
+        })
+    })
 
     // 啟動服務器
     go func() {
-        log.Info("Starting HypGo server...")
+        appLog.Info("Starting HypGo server on %s", cfg.Server.Addr)
         if err := srv.Start(); err != nil {
-            log.Emergency("Server error: %v", err)
+            appLog.Error("Server error: %v", err)
             os.Exit(1)
         }
     }()
@@ -367,119 +384,49 @@ func main() {
     signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
     <-quit
 
-    log.Info("Shutting down server...")
-    
+    appLog.Info("Shutting down server...")
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
-    
-    if err := srv.Shutdown(ctx); err != nil {
-        log.Emergency("Server forced to shutdown: %v", err)
-    }
 
-    log.Info("Server exited")
+    if err := srv.Shutdown(ctx); err != nil {
+        appLog.Error("Server forced to shutdown: %v", err)
+    }
+    appLog.Info("Server exited")
 }
 `
 
-	tmpl, err := template.New("main").Parse(mainTemplate)
-	if err != nil {
-		return err
-	}
-
-	file, err := os.Create(filepath.Join(projectName, "main.go"))
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	return tmpl.Execute(file, map[string]string{
-		"ProjectName": projectName,
-	})
+	filename := filepath.Join(projectName, "main.go")
+	return os.WriteFile(filename, []byte(mainContent), 0644)
 }
 
 func createFullStackController(projectName string) error {
 	controllerContent := `package controllers
 
 import (
-    "html/template"
-    "net/http"
-    "path/filepath"
-    "encoding/json"
-
-    "github.com/gorilla/mux"
-    "github.com/maoxiaoyue/hypgo/pkg/hidb"
-    "github.com/maoxiaoyue/hypgo/pkg/logger"
-    "github.com/maoxiaoyue/hypgo/pkg/websocket"
+    hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
-type Response struct {
-    Success bool        ` + "`json:\"success\"`" + `
-    Message string      ` + "`json:\"message\"`" + `
-    Data    interface{} ` + "`json:\"data,omitempty\"`" + `
+// HomeController 處理首頁相關路由
+type HomeController struct{}
+
+func (ctrl *HomeController) Home(c *hypcontext.Context) {
+    c.File("templates/welcome.html")
 }
 
-var wsHub *websocket.Hub
-
-func RegisterRoutes(router *mux.Router, db *hidb.Database, log *logger.Logger) {
-    // 初始化 WebSocket Hub
-    wsHub = websocket.NewHub(log)
-    go wsHub.Run()
-
-    // 靜態文件
-    router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-    
-    // 頁面路由
-    router.HandleFunc("/", HomeHandler).Methods("GET")
-    
-    // API 路由
-    router.HandleFunc("/api/health", HealthHandler).Methods("GET")
-    router.HandleFunc("/api/info", InfoHandler).Methods("GET")
-    
-    // WebSocket 路由
-    router.HandleFunc("/ws", websocket.AuthMiddleware(wsHub.ServeWS)).Methods("GET")
-}
-
-func HomeHandler(w http.ResponseWriter, r *http.Request) {
-    tmplPath := filepath.Join("templates", "welcome.html")
-    tmpl, err := template.ParseFiles(tmplPath)
-    if err != nil {
-        http.Error(w, "Template not found", http.StatusInternalServerError)
-        return
-    }
-
-    data := struct {
-        Title    string
-        Protocol string
-    }{
-        Title:    "Welcome to HypGo",
-        Protocol: r.Proto,
-    }
-
-    tmpl.Execute(w, data)
-}
-
-func HealthHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(Response{
-        Success: true,
-        Message: "Server is healthy",
+func (ctrl *HomeController) Health(c *hypcontext.Context) {
+    c.JSON(200, map[string]interface{}{
+        "success": true,
+        "message": "Server is healthy",
     })
 }
 
-func InfoHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(Response{
-        Success: true,
-        Message: "HypGo Framework",
-        Data: map[string]interface{}{
-            "version":  "1.0.0",
-            "protocol": r.Proto,
-            "features": []string{
-                "HTTP/3.0 Support",
-                "WebSocket Support",
-                "Multiple Databases",
-                "Hot Reload",
-                "MVC Architecture",
-            },
+func (ctrl *HomeController) Info(c *hypcontext.Context) {
+    c.JSON(200, map[string]interface{}{
+        "success": true,
+        "message": "HypGo Framework",
+        "data": map[string]interface{}{
+            "version":  "0.8.1-alpha",
+            "protocol": c.Request.Proto,
         },
     })
 }
