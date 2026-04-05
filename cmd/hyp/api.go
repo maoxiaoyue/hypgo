@@ -1925,7 +1925,7 @@ MIT License`
 
 const goModContent = `module {{.ProjectName}}
 
-go 1.21
+go 1.24
 
 require (
 	github.com/maoxiaoyue/hypgo v0.8.1-alpha
