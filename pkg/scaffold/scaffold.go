@@ -180,6 +180,85 @@ func GenerateView(dir, name string) error {
 	return generateFile(dir, strings.ToLower(name)+"_view.go", desktopCustomViewTemplate, templateData(name))
 }
 
+// ============================================================
+// gRPC 專案生成
+// ============================================================
+
+// GenerateGRPCProject 生成完整的 gRPC 微服務專案骨架
+func GenerateGRPCProject(baseDir, name, moduleName string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if moduleName == "" {
+		moduleName = name
+	}
+
+	data := templateData(name)
+	data["ModuleName"] = moduleName
+
+	// 建立目錄結構
+	dirs := []string{
+		filepath.Join(baseDir, "app", "proto", strings.ToLower(name)+"pb"),
+		filepath.Join(baseDir, "app", "rpc"),
+		filepath.Join(baseDir, "app", "models"),
+		filepath.Join(baseDir, "app", "services"),
+		filepath.Join(baseDir, "app", "config"),
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("scaffold: failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	lowerName := strings.ToLower(name)
+
+	// 生成檔案
+	files := []struct {
+		dir, filename, tmpl string
+	}{
+		{baseDir, "main.go", grpcMainTemplate},
+		{filepath.Join(baseDir, "app", "proto", lowerName+"pb"), lowerName + ".proto", grpcProtoTemplate},
+		{filepath.Join(baseDir, "app", "rpc"), lowerName + "_server.go", grpcServerTemplate},
+		{filepath.Join(baseDir, "app", "config"), "config.yaml", grpcConfigTemplate},
+		{baseDir, "go.mod", grpcGoModTemplate},
+		{baseDir, "Makefile", grpcMakefileTemplate},
+	}
+
+	for _, f := range files {
+		if err := generateFile(f.dir, f.filename, f.tmpl, data); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// GenerateProto 生成新的 .proto 定義 + gRPC server 實作
+func GenerateProto(baseDir, name, moduleName string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if moduleName == "" {
+		moduleName = "myapp"
+	}
+
+	data := templateData(name)
+	data["ModuleName"] = moduleName
+	lowerName := strings.ToLower(name)
+
+	protoDir := filepath.Join(baseDir, "app", "proto", lowerName+"pb")
+	rpcDir := filepath.Join(baseDir, "app", "rpc")
+
+	if err := generateFile(protoDir, lowerName+".proto", grpcProtoTemplate, data); err != nil {
+		return err
+	}
+	if err := generateFile(rpcDir, lowerName+"_server.go", grpcServerTemplate, data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // GenerateService 生成使用 Error Catalog 的 service
 func GenerateService(dir, name string) error {
 	if err := validateName(name); err != nil {

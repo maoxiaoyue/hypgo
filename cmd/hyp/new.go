@@ -23,11 +23,13 @@ var newCmd = &cobra.Command{
   hyp new web <name>          Full-stack web project (explicit)
   hyp new cli <name>          CLI tool project (Cobra + services)
   hyp new desktop <name>      Desktop application (Fyne GUI + services)
+  hyp new grpc <name>         gRPC microservice (Protobuf + services)
 
 Examples:
   hyp new myapp               Full-stack web project
   hyp new cli mytool           CLI tool project
-  hyp new desktop mydesktop    Desktop application`,
+  hyp new desktop mydesktop    Desktop application
+  hyp new grpc userservice     gRPC microservice`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {
@@ -44,8 +46,10 @@ Examples:
 			return runNewCLI(projectName)
 		case "desktop":
 			return runNewDesktop(projectName)
+		case "grpc":
+			return runNewGRPC(projectName)
 		default:
-			return fmt.Errorf("unknown project type: %s (use web, cli, or desktop)", projectType)
+			return fmt.Errorf("unknown project type: %s (use web, cli, desktop, or grpc)", projectType)
 		}
 	},
 }
@@ -109,10 +113,44 @@ Requires: C compiler (gcc) for CGO (Fyne dependency)`,
 	},
 }
 
+var newGRPCCmd = &cobra.Command{
+	Use:   "grpc [project-name]",
+	Short: "Create a new gRPC microservice project",
+	Long: `Create a new gRPC microservice project with Protobuf definitions.
+
+Generated structure:
+  myservice/
+  ├── app/
+  │   ├── proto/<name>pb/    Protobuf definitions (.proto)
+  │   ├── rpc/               gRPC server implementations
+  │   ├── models/            Data structures
+  │   ├── services/          Business logic + Error Catalog
+  │   └── config/
+  │       └── config.yaml
+  ├── main.go                gRPC server entry point
+  ├── Makefile               protoc compilation commands
+  └── go.mod
+
+After creation:
+  cd myservice && go mod tidy
+  make proto                 Compile .proto → Go code
+  go run .
+
+Add more services:
+  hyp generate proto order
+
+Requires: protoc + protoc-gen-go + protoc-gen-go-grpc`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runNewGRPC(args[0])
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(newCmd)
 	newCmd.AddCommand(newCLICmd)
 	newCmd.AddCommand(newDesktopCmd)
+	newCmd.AddCommand(newGRPCCmd)
 }
 
 // runNewCLI 生成 CLI 專案
@@ -170,6 +208,42 @@ func runNewDesktop(projectName string) error {
 	fmt.Printf("   hyp generate view settings\n")
 	fmt.Printf("   hyp generate view dashboard\n")
 	fmt.Printf("\n⚠️  Requires: C compiler (gcc) for CGO (Fyne dependency)\n")
+
+	return nil
+}
+
+// runNewGRPC 生成 gRPC 微服務專案
+func runNewGRPC(projectName string) error {
+	if err := scaffold.GenerateGRPCProject(projectName, projectName, projectName); err != nil {
+		return fmt.Errorf("failed to create gRPC project: %w", err)
+	}
+
+	lowerName := strings.ToLower(projectName)
+	fmt.Printf("\n✨ Successfully created gRPC project: %s\n", projectName)
+	fmt.Printf("📁 Project structure:\n")
+	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   ├── app/\n")
+	fmt.Printf("   │   ├── proto/%spb/\n", lowerName)
+	fmt.Printf("   │   │   └── %s.proto\n", lowerName)
+	fmt.Printf("   │   ├── rpc/\n")
+	fmt.Printf("   │   │   └── %s_server.go\n", lowerName)
+	fmt.Printf("   │   ├── models/\n")
+	fmt.Printf("   │   ├── services/\n")
+	fmt.Printf("   │   └── config/\n")
+	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   ├── main.go\n")
+	fmt.Printf("   ├── Makefile\n")
+	fmt.Printf("   └── go.mod\n")
+	fmt.Printf("\n🚀 Get started:\n")
+	fmt.Printf("   cd %s\n", projectName)
+	fmt.Printf("   go mod tidy\n")
+	fmt.Printf("   make proto              # compile .proto → Go code\n")
+	fmt.Printf("   go run .\n")
+	fmt.Printf("\n📝 Add more services:\n")
+	fmt.Printf("   hyp generate proto order\n")
+	fmt.Printf("\n⚠️  Requires: protoc + protoc-gen-go + protoc-gen-go-grpc\n")
+	fmt.Printf("   go install google.golang.org/protobuf/cmd/protoc-gen-go@latest\n")
+	fmt.Printf("   go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest\n")
 
 	return nil
 }

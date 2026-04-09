@@ -525,3 +525,262 @@ require (
 	github.com/maoxiaoyue/hypgo v0.8.1-alpha
 )
 `
+
+// ============================================================
+// gRPC 專案模板
+// ============================================================
+
+// grpcMainTemplate — gRPC 專案的 main.go
+const grpcMainTemplate = `package main
+
+import (
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+
+	"{{.ModuleName}}/app/rpc"
+	pb "{{.ModuleName}}/app/proto/{{.LowerName}}pb"
+)
+
+func main() {
+	addr := ":9090"
+
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	s := grpc.NewServer(
+		// Interceptor（中間件）可在此加入：
+		// grpc.UnaryInterceptor(interceptor.Logger()),
+		// grpc.ChainUnaryInterceptor(interceptor.Recovery(), interceptor.Auth()),
+	)
+
+	// 註冊服務
+	pb.Register{{.Name}}ServiceServer(s, rpc.New{{.Name}}Server())
+
+	// 啟用 gRPC reflection（方便 grpcurl 偵錯）
+	reflection.Register(s)
+
+	log.Printf("gRPC server listening on %s", addr)
+
+	// 優雅關閉
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down gRPC server...")
+	s.GracefulStop()
+	log.Println("Server stopped")
+}
+`
+
+// grpcProtoTemplate — gRPC 專案的 .proto 檔案
+const grpcProtoTemplate = `syntax = "proto3";
+
+package {{.LowerName}}pb;
+
+option go_package = "{{.ModuleName}}/app/proto/{{.LowerName}}pb";
+
+// {{.Name}}Service 定義 {{.Name}} 相關的 gRPC 服務
+service {{.Name}}Service {
+  // Create{{.Name}} 建立新的 {{.Name}}
+  rpc Create{{.Name}} (Create{{.Name}}Request) returns ({{.Name}}Response);
+
+  // Get{{.Name}} 根據 ID 取得 {{.Name}}
+  rpc Get{{.Name}} (Get{{.Name}}Request) returns ({{.Name}}Response);
+
+  // List{{.Name}}s 列出所有 {{.Name}}
+  rpc List{{.Name}}s (List{{.Name}}sRequest) returns (List{{.Name}}sResponse);
+
+  // Update{{.Name}} 更新 {{.Name}}
+  rpc Update{{.Name}} (Update{{.Name}}Request) returns ({{.Name}}Response);
+
+  // Delete{{.Name}} 刪除 {{.Name}}
+  rpc Delete{{.Name}} (Delete{{.Name}}Request) returns (Delete{{.Name}}Response);
+}
+
+// Create{{.Name}}Request 建立請求
+message Create{{.Name}}Request {
+  string name = 1;
+  string description = 2;
+}
+
+// Get{{.Name}}Request 查詢請求
+message Get{{.Name}}Request {
+  int64 id = 1;
+}
+
+// List{{.Name}}sRequest 列表請求
+message List{{.Name}}sRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+}
+
+// Update{{.Name}}Request 更新請求
+message Update{{.Name}}Request {
+  int64 id = 1;
+  string name = 2;
+  string description = 3;
+}
+
+// Delete{{.Name}}Request 刪除請求
+message Delete{{.Name}}Request {
+  int64 id = 1;
+}
+
+// {{.Name}}Response 單筆回應
+message {{.Name}}Response {
+  int64 id = 1;
+  string name = 2;
+  string description = 3;
+  string created_at = 4;
+  string updated_at = 5;
+}
+
+// List{{.Name}}sResponse 列表回應
+message List{{.Name}}sResponse {
+  repeated {{.Name}}Response items = 1;
+  int32 total = 2;
+}
+
+// Delete{{.Name}}Response 刪除回應
+message Delete{{.Name}}Response {
+  bool success = 1;
+}
+`
+
+// grpcServerTemplate — gRPC 服務實作（app/rpc/<name>_server.go）
+const grpcServerTemplate = `package rpc
+
+import (
+	"context"
+	"fmt"
+
+	pb "{{.ModuleName}}/app/proto/{{.LowerName}}pb"
+)
+
+// {{.Name}}Server 實作 {{.Name}}Service gRPC 服務
+type {{.Name}}Server struct {
+	pb.Unimplemented{{.Name}}ServiceServer
+}
+
+// New{{.Name}}Server 建立新的 {{.Name}} gRPC 服務
+func New{{.Name}}Server() *{{.Name}}Server {
+	return &{{.Name}}Server{}
+}
+
+func (s *{{.Name}}Server) Create{{.Name}}(ctx context.Context, req *pb.Create{{.Name}}Request) (*pb.{{.Name}}Response, error) {
+	// TODO: implement create logic
+	fmt.Printf("Create{{.Name}}: name=%s\n", req.Name)
+
+	return &pb.{{.Name}}Response{
+		Id:   1,
+		Name: req.Name,
+		Description: req.Description,
+	}, nil
+}
+
+func (s *{{.Name}}Server) Get{{.Name}}(ctx context.Context, req *pb.Get{{.Name}}Request) (*pb.{{.Name}}Response, error) {
+	// TODO: implement get logic
+	fmt.Printf("Get{{.Name}}: id=%d\n", req.Id)
+
+	return &pb.{{.Name}}Response{
+		Id:   req.Id,
+		Name: "example",
+	}, nil
+}
+
+func (s *{{.Name}}Server) List{{.Name}}s(ctx context.Context, req *pb.List{{.Name}}sRequest) (*pb.List{{.Name}}sResponse, error) {
+	// TODO: implement list logic
+	return &pb.List{{.Name}}sResponse{
+		Items: []*pb.{{.Name}}Response{},
+		Total: 0,
+	}, nil
+}
+
+func (s *{{.Name}}Server) Update{{.Name}}(ctx context.Context, req *pb.Update{{.Name}}Request) (*pb.{{.Name}}Response, error) {
+	// TODO: implement update logic
+	return &pb.{{.Name}}Response{
+		Id:   req.Id,
+		Name: req.Name,
+	}, nil
+}
+
+func (s *{{.Name}}Server) Delete{{.Name}}(ctx context.Context, req *pb.Delete{{.Name}}Request) (*pb.Delete{{.Name}}Response, error) {
+	// TODO: implement delete logic
+	return &pb.Delete{{.Name}}Response{
+		Success: true,
+	}, nil
+}
+`
+
+// grpcConfigTemplate — gRPC 專案的 config.yaml
+const grpcConfigTemplate = `# {{.Name}} gRPC Service Configuration
+app:
+  name: "{{.LowerName}}"
+  version: "0.1.0"
+
+grpc:
+  addr: ":9090"
+  # tls:
+  #   enabled: false
+  #   cert_file: ""
+  #   key_file: ""
+
+database:
+  driver: ""
+  dsn: ""
+
+logger:
+  level: info
+  output: stdout
+  colors: true
+`
+
+// grpcGoModTemplate — gRPC 專案的 go.mod
+const grpcGoModTemplate = `module {{.ModuleName}}
+
+go 1.24
+
+require (
+	github.com/maoxiaoyue/hypgo v0.8.1-alpha
+	google.golang.org/grpc v1.72.0
+	google.golang.org/protobuf v1.36.8
+)
+`
+
+// grpcMakefileTemplate — gRPC 專案的 Makefile（protoc 編譯）
+const grpcMakefileTemplate = `# Generate Go code from .proto files
+.PHONY: proto
+proto:
+	protoc --go_out=. --go_opt=paths=source_relative \
+	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	       app/proto/{{.LowerName}}pb/{{.LowerName}}.proto
+
+# Run the server
+.PHONY: run
+run:
+	go run main.go
+
+# Test
+.PHONY: test
+test:
+	go test ./...
+
+# Build
+.PHONY: build
+build:
+	go build -o bin/{{.LowerName}} .
+`

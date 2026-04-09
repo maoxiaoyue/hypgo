@@ -20,6 +20,7 @@ Available types:
   service       Service layer with Error Catalog
   command       CLI subcommand (Cobra) for CLI projects
   view          Desktop GUI view (Fyne) for desktop projects
+  proto         Protobuf service definition + gRPC server for gRPC projects
 
 Generated file locations:
   controller → app/controllers/<name>_controller.go + app/routers/<name>.go
@@ -27,6 +28,7 @@ Generated file locations:
   service    → app/services/<name>_service.go
   command    → app/commands/<name>.go
   view       → app/views/<name>_view.go
+  proto      → app/proto/<name>pb/<name>.proto + app/rpc/<name>_server.go
 
 Examples:
   hyp generate controller user
@@ -62,8 +64,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return generateCommand(name)
 	case "view":
 		return generateView(name)
+	case "proto":
+		return generateProto(name, moduleName)
 	default:
-		return fmt.Errorf("unknown type: %s (use controller, model, service, command, or view)", genType)
+		return fmt.Errorf("unknown type: %s (use controller, model, service, command, view, or proto)", genType)
 	}
 }
 
@@ -145,6 +149,21 @@ func generateView(name string) error {
 	}
 	fmt.Printf("✅ Generated: app/views/%s_view.go\n", lowerName)
 	fmt.Printf("   Function: views.%sView(w)\n", capName)
+	return nil
+}
+
+// generateProto 生成 .proto 定義 + gRPC server（gRPC 專案用）
+func generateProto(name, moduleName string) error {
+	lowerName := strings.ToLower(name)
+	capName := strings.ToUpper(name[:1]) + name[1:]
+
+	if err := scaffold.GenerateProto(".", name, moduleName); err != nil {
+		return err
+	}
+	fmt.Printf("  + app/proto/%spb/%s.proto\n", lowerName, lowerName)
+	fmt.Printf("  + app/rpc/%s_server.go\n", lowerName)
+	fmt.Printf("\n✅ Proto generated: %s\n", capName)
+	fmt.Printf("   Next: make proto    (compile .proto → Go code)\n")
 	return nil
 }
 

@@ -334,6 +334,101 @@ func TestGenerateView(t *testing.T) {
 	}
 }
 
+// --- gRPC 專案測試 ---
+
+func TestGenerateGRPCProject(t *testing.T) {
+	dir := t.TempDir()
+	projectDir := filepath.Join(dir, "mygrpc")
+
+	if err := GenerateGRPCProject(projectDir, "mygrpc", "mygrpc"); err != nil {
+		t.Fatalf("GenerateGRPCProject failed: %v", err)
+	}
+
+	expected := []string{
+		"main.go",
+		"go.mod",
+		"Makefile",
+		filepath.Join("app", "proto", "mygrpcpb", "mygrpc.proto"),
+		filepath.Join("app", "rpc", "mygrpc_server.go"),
+		filepath.Join("app", "config", "config.yaml"),
+	}
+	for _, f := range expected {
+		path := filepath.Join(projectDir, f)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("missing file: %s", f)
+		}
+	}
+
+	// main.go 應引用 grpc 和 proto
+	mainContent, _ := os.ReadFile(filepath.Join(projectDir, "main.go"))
+	s := string(mainContent)
+	if !strings.Contains(s, "google.golang.org/grpc") {
+		t.Error("main.go should import grpc")
+	}
+	if !strings.Contains(s, "reflection.Register") {
+		t.Error("main.go should enable grpc reflection")
+	}
+
+	// .proto 應有 service 和 message 定義
+	protoContent, _ := os.ReadFile(filepath.Join(projectDir, "app", "proto", "mygrpcpb", "mygrpc.proto"))
+	ps := string(protoContent)
+	if !strings.Contains(ps, "service MygrpcService") {
+		t.Error(".proto should define service")
+	}
+	if !strings.Contains(ps, "message CreateMygrpcRequest") {
+		t.Error(".proto should define request message")
+	}
+
+	// server 實作應有 Unimplemented 嵌入
+	serverContent, _ := os.ReadFile(filepath.Join(projectDir, "app", "rpc", "mygrpc_server.go"))
+	ss := string(serverContent)
+	if !strings.Contains(ss, "UnimplementedMygrpcServiceServer") {
+		t.Error("server should embed UnimplementedServer")
+	}
+
+	// go.mod 應有 grpc 依賴
+	modContent, _ := os.ReadFile(filepath.Join(projectDir, "go.mod"))
+	if !strings.Contains(string(modContent), "google.golang.org/grpc") {
+		t.Error("go.mod should require grpc")
+	}
+
+	// Makefile 應有 protoc 命令
+	makeContent, _ := os.ReadFile(filepath.Join(projectDir, "Makefile"))
+	if !strings.Contains(string(makeContent), "protoc") {
+		t.Error("Makefile should contain protoc command")
+	}
+}
+
+func TestGenerateProto(t *testing.T) {
+	dir := t.TempDir()
+
+	// 預先建立必要目錄
+	os.MkdirAll(filepath.Join(dir, "app", "proto"), 0755)
+	os.MkdirAll(filepath.Join(dir, "app", "rpc"), 0755)
+
+	if err := GenerateProto(dir, "order", "myapp"); err != nil {
+		t.Fatalf("GenerateProto failed: %v", err)
+	}
+
+	// 檢查 .proto
+	protoContent, err := os.ReadFile(filepath.Join(dir, "app", "proto", "orderpb", "order.proto"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(protoContent), "service OrderService") {
+		t.Error(".proto should define OrderService")
+	}
+
+	// 檢查 server
+	serverContent, err := os.ReadFile(filepath.Join(dir, "app", "rpc", "order_server.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(serverContent), "OrderServer") {
+		t.Error("server should define OrderServer")
+	}
+}
+
 func TestGenerateNoOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	if err := GenerateController(dir, "User", "myapp"); err != nil {
