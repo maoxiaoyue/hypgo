@@ -382,9 +382,11 @@ func (h *Hub) handleRegister(client *Client) {
 }
 
 // handleUnregister 處理客戶端註銷
+// 安全設計：即使同一 client 被多次 unregister（快速重連/斷線），也不會 panic
 func (h *Hub) handleUnregister(client *Client) {
 	h.mu.Lock()
-	if _, ok := h.clients[client.ID]; ok {
+	_, exists := h.clients[client.ID]
+	if exists {
 		delete(h.clients, client.ID)
 		h.stats.ActiveConnections--
 
@@ -405,11 +407,22 @@ func (h *Hub) handleUnregister(client *Client) {
 	}
 	h.mu.Unlock()
 
+	// 只有第一次 unregister 才執行 close 和 callback
+	// 防止重複 close(client.Send) 導致 panic
+	if !exists {
+		return
+	}
+
 	if h.onDisconnect != nil {
 		h.onDisconnect(client)
 	}
 
-	close(client.Send)
+	// 安全 close：使用 recover 防止極端 race condition 下的 double close
+	func() {
+		defer func() { recover() }()
+		close(client.Send)
+	}()
+
 	client.Release() // 返回池中
 	h.logger.Info("Client %s disconnected", client.ID)
 }

@@ -67,7 +67,7 @@ func CheckFile(filename string) (*CheckReport, error) {
 		Kind:      "package",
 		Line:      fset.Position(f.Package).Line,
 		HasDoc:    f.Doc != nil && f.Doc.Text() != "",
-		Suggested: fmt.Sprintf("// Package %s ...", f.Name.Name),
+		Suggested: fmt.Sprintf("// Package %s provides ...\n// @ai:owner ai-generated", f.Name.Name),
 	})
 
 	// 遍歷所有頂層宣告
@@ -109,11 +109,11 @@ func (r *CheckReport) checkGenDecl(fset *token.FileSet, d *ast.GenDecl) {
 				hasDoc = true
 			}
 			kind := "type"
-			suggested := fmt.Sprintf("// %s ...", s.Name.Name)
+			suggested := fmt.Sprintf("// %s ...\n// @ai:owner ai-generated", s.Name.Name)
 			if _, ok := s.Type.(*ast.InterfaceType); ok {
-				suggested = fmt.Sprintf("// %s defines ...", s.Name.Name)
+				suggested = fmt.Sprintf("// %s defines ...\n// @ai:owner ai-generated", s.Name.Name)
 			} else if _, ok := s.Type.(*ast.StructType); ok {
-				suggested = fmt.Sprintf("// %s represents ...", s.Name.Name)
+				suggested = fmt.Sprintf("// %s represents ...\n// @ai:owner ai-generated", s.Name.Name)
 			}
 			r.addResult(CheckResult{
 				Name:      kind + " " + s.Name.Name,
@@ -141,7 +141,7 @@ func (r *CheckReport) checkGenDecl(fset *token.FileSet, d *ast.GenDecl) {
 					Kind:      kind,
 					Line:      fset.Position(name.Pos()).Line,
 					HasDoc:    hasDoc,
-					Suggested: fmt.Sprintf("// %s ...", name.Name),
+					Suggested: fmt.Sprintf("// %s ...\n// @ai:owner ai-generated", name.Name),
 				})
 			}
 		}
@@ -162,12 +162,24 @@ func (r *CheckReport) checkFuncDecl(fset *token.FileSet, d *ast.FuncDecl) {
 		name = recvType + "." + name
 	}
 
+	suggested := fmt.Sprintf("// %s ...\n// @ai:owner ai-generated", d.Name.Name)
+
+	// 根據函式名稱推斷合適的 @ai: 標籤
+	funcName := strings.ToLower(d.Name.Name)
+	if strings.HasPrefix(funcName, "create") || strings.HasPrefix(funcName, "update") || strings.HasPrefix(funcName, "delete") {
+		suggested = fmt.Sprintf("// %s handles %s operations.\n// @ai:owner ai-generated\n// @ai:impact routes=/api/", d.Name.Name, funcName)
+	} else if strings.HasPrefix(funcName, "get") || strings.HasPrefix(funcName, "list") || strings.HasPrefix(funcName, "find") {
+		suggested = fmt.Sprintf("// %s retrieves data.\n// @ai:owner ai-generated", d.Name.Name)
+	} else if strings.Contains(funcName, "auth") || strings.Contains(funcName, "login") || strings.Contains(funcName, "token") {
+		suggested = fmt.Sprintf("// %s handles authentication.\n// @ai:owner ai-generated\n// @ai:security requires_auth", d.Name.Name)
+	}
+
 	r.addResult(CheckResult{
 		Name:      kind + " " + name,
 		Kind:      kind,
 		Line:      fset.Position(d.Pos()).Line,
 		HasDoc:    d.Doc != nil && d.Doc.Text() != "",
-		Suggested: fmt.Sprintf("// %s ...", d.Name.Name),
+		Suggested: suggested,
 	})
 }
 
@@ -229,9 +241,18 @@ func FixFile(filename string, results []CheckResult) error {
 				}
 			}
 
-			newLine := indent + ins.comment
-			// 在該行之前插入
-			lines = append(lines[:ins.line], append([]string{newLine}, lines[ins.line:]...)...)
+			// 處理多行註解（@ai: 標籤換行）
+			commentLines := strings.Split(ins.comment, "\n")
+			newLines := make([]string, len(commentLines))
+			for i, cl := range commentLines {
+				newLines[i] = indent + cl
+			}
+
+			// 在該行之前插入所有註解行
+			before := make([]string, len(lines[:ins.line]))
+			copy(before, lines[:ins.line])
+			after := lines[ins.line:]
+			lines = append(before, append(newLines, after...)...)
 		}
 	}
 
