@@ -53,7 +53,10 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no matching targets found for: %s", only)
 	}
 
-	results, err := airules.GenerateAll(dir, targets, m, dryRun)
+	opts := airules.Options{
+		DiffLogEnabled: IsDiffLogEnabled(),
+	}
+	results, err := airules.GenerateAll(dir, targets, m, opts, dryRun)
 	if err != nil {
 		return err
 	}

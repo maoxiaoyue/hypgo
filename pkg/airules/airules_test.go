@@ -20,6 +20,9 @@ func testManifest() *manifest.Manifest {
 	}
 }
 
+var defaultOpts = Options{}
+var diffLogOpts = Options{DiffLogEnabled: true}
+
 func TestAllTargets(t *testing.T) {
 	targets := AllTargets()
 	if len(targets) != 5 {
@@ -44,7 +47,7 @@ func TestFilterTargets(t *testing.T) {
 }
 
 func TestGenerateAgentsMD(t *testing.T) {
-	content := generateAgentsMD(testManifest())
+	content := generateAgentsMD(testManifest(), defaultOpts)
 	for _, want := range []string{autoGenMarker, "HypGo", "Schema-first", "/api/users", "Create user"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing %q", want)
@@ -53,7 +56,7 @@ func TestGenerateAgentsMD(t *testing.T) {
 }
 
 func TestGenerateCursorMDC(t *testing.T) {
-	content := generateCursorMDC(testManifest())
+	content := generateCursorMDC(testManifest(), defaultOpts)
 	for _, want := range []string{"---", "globs: \"**/*.go\"", "alwaysApply: true"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing %q", want)
@@ -62,14 +65,14 @@ func TestGenerateCursorMDC(t *testing.T) {
 }
 
 func TestGenerateWindsurfLimit(t *testing.T) {
-	content := generateWindsurfMD(testManifest())
+	content := generateWindsurfMD(testManifest(), defaultOpts)
 	if len(content) > 6000 {
 		t.Errorf("windsurf content exceeds 6000 chars: %d", len(content))
 	}
 }
 
 func TestGenerateNilManifest(t *testing.T) {
-	content := generateAgentsMD(nil)
+	content := generateAgentsMD(nil, defaultOpts)
 	if !strings.Contains(content, "HypGo") {
 		t.Error("nil manifest should still generate core content")
 	}
@@ -77,6 +80,24 @@ func TestGenerateNilManifest(t *testing.T) {
 		t.Error("nil manifest should not have routes")
 	}
 }
+
+// --- DiffLog 開關測試 ---
+
+func TestDiffLogEnabled(t *testing.T) {
+	content := generateAgentsMD(nil, diffLogOpts)
+	if !strings.Contains(content, "hyp diff-log") {
+		t.Error("diff-log ON: should include 'hyp diff-log' instruction")
+	}
+}
+
+func TestDiffLogDisabled(t *testing.T) {
+	content := generateAgentsMD(nil, defaultOpts)
+	if strings.Contains(content, "hyp diff-log") {
+		t.Error("diff-log OFF: should NOT include 'hyp diff-log' instruction")
+	}
+}
+
+// --- 共用測試 ---
 
 func TestCanOverwrite(t *testing.T) {
 	dir := t.TempDir()
@@ -97,7 +118,7 @@ func TestCanOverwrite(t *testing.T) {
 
 func TestGenerateAll(t *testing.T) {
 	dir := t.TempDir()
-	results, err := GenerateAll(dir, AllTargets(), testManifest(), false)
+	results, err := GenerateAll(dir, AllTargets(), testManifest(), defaultOpts, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +131,7 @@ func TestGenerateAll(t *testing.T) {
 
 func TestGenerateAllDryRun(t *testing.T) {
 	dir := t.TempDir()
-	results, _ := GenerateAll(dir, FilterTargets(AllTargets(), "agents"), testManifest(), true)
+	results, _ := GenerateAll(dir, FilterTargets(AllTargets(), "agents"), testManifest(), defaultOpts, true)
 	if results[0].Status != StatusDryRun || results[0].Content == "" {
 		t.Error("dry-run should return content without writing")
 	}
@@ -122,7 +143,7 @@ func TestGenerateAllDryRun(t *testing.T) {
 func TestGenerateAllSkipsManual(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# Custom"), 0644)
-	results, _ := GenerateAll(dir, FilterTargets(AllTargets(), "agents"), testManifest(), false)
+	results, _ := GenerateAll(dir, FilterTargets(AllTargets(), "agents"), testManifest(), defaultOpts, false)
 	if results[0].Status != StatusSkipped {
 		t.Error("should skip manual file")
 	}

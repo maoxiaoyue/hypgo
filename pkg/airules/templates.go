@@ -7,7 +7,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 )
 
-func coreContent(m *manifest.Manifest) string {
+func coreContent(m *manifest.Manifest, opts Options) string {
 	var sb strings.Builder
 
 	sb.WriteString(`## Framework
@@ -73,6 +73,11 @@ func coreContent(m *manifest.Manifest) string {
 - **All schema routes have Input/Output types** — use them for code generation
 `)
 
+	// 條件性加入 diff-log 指令（開啟時才寫入，關閉時省 token）
+	if opts.DiffLogEnabled {
+		sb.WriteString("- **After making changes**: Run " + "`hyp diff-log`" + " to log your changes to logs/ai.diff_YYYYMMDD.log\n")
+	}
+
 	if m != nil && len(m.Routes) > 0 {
 		sb.WriteString("\n## Current Routes\n\n")
 		sb.WriteString("| Method | Path | Summary |\n")
@@ -89,19 +94,19 @@ func coreContent(m *manifest.Manifest) string {
 	return sb.String()
 }
 
-func generateAgentsMD(m *manifest.Manifest) string {
-	return autoGenMarker + "\n# HypGo Framework Instructions\n\n" + coreContent(m)
+func generateAgentsMD(m *manifest.Manifest, opts Options) string {
+	return autoGenMarker + "\n# HypGo Framework Instructions\n\n" + coreContent(m, opts)
 }
 
-func generateGeminiMD(m *manifest.Manifest) string {
-	return autoGenMarker + "\n# HypGo Framework Instructions\n\n" + coreContent(m)
+func generateGeminiMD(m *manifest.Manifest, opts Options) string {
+	return autoGenMarker + "\n# HypGo Framework Instructions\n\n" + coreContent(m, opts)
 }
 
-func generateCopilotMD(m *manifest.Manifest) string {
-	return autoGenMarker + "\n# HypGo Framework Instructions\n\n" + coreContent(m)
+func generateCopilotMD(m *manifest.Manifest, opts Options) string {
+	return autoGenMarker + "\n# HypGo Framework Instructions\n\n" + coreContent(m, opts)
 }
 
-func generateCursorMDC(m *manifest.Manifest) string {
+func generateCursorMDC(m *manifest.Manifest, opts Options) string {
 	var sb strings.Builder
 	sb.WriteString(autoGenMarker + "\n")
 	sb.WriteString("---\n")
@@ -110,15 +115,15 @@ func generateCursorMDC(m *manifest.Manifest) string {
 	sb.WriteString("alwaysApply: true\n")
 	sb.WriteString("---\n\n")
 	sb.WriteString("# HypGo Framework Instructions\n\n")
-	sb.WriteString(coreContent(m))
+	sb.WriteString(coreContent(m, opts))
 	return sb.String()
 }
 
-func generateWindsurfMD(m *manifest.Manifest) string {
+func generateWindsurfMD(m *manifest.Manifest, opts Options) string {
 	var sb strings.Builder
 	sb.WriteString(autoGenMarker + "\n")
 	sb.WriteString("# HypGo Framework Instructions\n\n")
-	content := coreContent(m)
+	content := coreContent(m, opts)
 	if len(content) > 5800 {
 		if idx := strings.Index(content, "\n## Current Routes"); idx > 0 {
 			content = content[:idx]
