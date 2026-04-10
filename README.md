@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.8.1--alpha-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
 
-[English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md)
+[English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md) | [中文Wiki](https://github.com/maoxiaoyue/hypgo/wiki) | [English Wiki](https://github.com/maoxiaoyue/hypgo/wiki/Home_en)
 
 ---
 
