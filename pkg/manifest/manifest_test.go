@@ -127,8 +127,10 @@ func TestCollectorNonSchemaRoute(t *testing.T) {
 
 	for _, route := range m.Routes {
 		if route.Path == "/health" {
-			if route.Summary != "" {
-				t.Errorf("non-schema route should have empty summary, got %q", route.Summary)
+			// enricher 會從 handler 名自動推斷 summary，所以不再是空的
+			// 但不應有 schema 特有的欄位（InputType、OutputType）
+			if route.InputType != "" {
+				t.Errorf("non-schema route should have empty input_type, got %q", route.InputType)
 			}
 			if len(route.HandlerNames) == 0 {
 				t.Error("HandlerNames should not be empty")

@@ -33,23 +33,27 @@ it manually or in a different format.
 Flags:
   -o, --output   Output file path (default: stdout)
   -f, --format   Output format: yaml or json (default: yaml)
+  --llm          LLM config file path for smart enrichment
 
 Examples:
   hyp context                              Print YAML to stdout
   hyp context -f json                      Print JSON to stdout
   hyp context -o .hyp/manifest.yaml        Save YAML to file
-  hyp context -o manifest.json -f json     Save JSON to file`,
+  hyp context -o manifest.json -f json     Save JSON to file
+  hyp context --llm config/llm.yaml        Use LLM enrichment`,
 	RunE: runContext,
 }
 
 func init() {
 	contextCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	contextCmd.Flags().StringP("format", "f", "yaml", "Output format: yaml or json")
+	contextCmd.Flags().String("llm", "", "LLM config file path for smart enrichment (default: config/llm.yaml)")
 }
 
 func runContext(cmd *cobra.Command, args []string) error {
 	output, _ := cmd.Flags().GetString("output")
 	format, _ := cmd.Flags().GetString("format")
+	llmPath, _ := cmd.Flags().GetString("llm")
 
 	// 載入設定（若存在）
 	var cfg *config.Config
@@ -65,9 +69,32 @@ func runContext(cmd *cobra.Command, args []string) error {
 	// 建立 router（目前無法自動掃描使用者路由，輸出基礎結構）
 	r := router.New()
 
-	// 收集 manifest
-	c := manifest.NewCollector(r, cfg)
+	// 載入 LLM 配置（若指定）
+	if llmPath == "" {
+		// 嘗試預設路徑
+		for _, p := range []string{"config/llm.yaml", ".hyp/llm.yaml"} {
+			if _, err := os.Stat(p); err == nil {
+				llmPath = p
+				break
+			}
+		}
+	}
+
+	llmCfg, err := config.LoadLLMConfig(llmPath)
+	if err != nil {
+		return fmt.Errorf("failed to load LLM config: %w", err)
+	}
+
+	// 收集 manifest（帶 LLM 增強）
+	c, err := manifest.NewCollectorWithLLM(r, cfg, llmCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create collector: %w", err)
+	}
 	m := c.Collect()
+
+	if llmCfg.IsEnabled() {
+		fmt.Fprintf(os.Stderr, "LLM enrichment enabled (mode=%s)\n", llmCfg.Mode)
+	}
 
 	// 輸出
 	if output != "" {

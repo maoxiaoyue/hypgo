@@ -3,7 +3,11 @@
 // 讓 AI 能以最少 token 掌握專案全貌
 package manifest
 
-import "time"
+import (
+	"time"
+
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
+)
 
 // Manifest 描述整個 HypGo 應用程式的結構
 type Manifest struct {
@@ -23,17 +27,29 @@ type ServerInfo struct {
 	TLS      bool   `json:"tls" yaml:"tls"`
 }
 
-// RouteManifest 描述單一路由（含 schema metadata）
+// RouteManifest 描述單一路由（含 schema metadata，支援多協議）
 type RouteManifest struct {
-	Method       string         `json:"method" yaml:"method"`
-	Path         string         `json:"path" yaml:"path"`
-	HandlerNames []string       `json:"handler_names" yaml:"handler_names"`
+	// 多協議支援
+	Protocol     string         `json:"protocol,omitempty" yaml:"protocol,omitempty"`       // "rest", "grpc", "bot", "mcp", "websocket", "cli"
+	Command      string         `json:"command,omitempty" yaml:"command,omitempty"`          // 非 REST 命令標識
+	Platform     string         `json:"platform,omitempty" yaml:"platform,omitempty"`        // bot 專用平台
+
+	// REST 欄位
+	Method       string         `json:"method,omitempty" yaml:"method,omitempty"`
+	Path         string         `json:"path,omitempty" yaml:"path,omitempty"`
+	HandlerNames []string       `json:"handler_names,omitempty" yaml:"handler_names,omitempty"`
+
+	// 共用 metadata
 	Summary      string         `json:"summary,omitempty" yaml:"summary,omitempty"`
 	Description  string         `json:"description,omitempty" yaml:"description,omitempty"`
 	Tags         []string       `json:"tags,omitempty" yaml:"tags,omitempty"`
-	InputType    string         `json:"input_type,omitempty" yaml:"input_type,omitempty"`
-	OutputType   string         `json:"output_type,omitempty" yaml:"output_type,omitempty"`
-	Responses    map[int]string `json:"responses,omitempty" yaml:"responses,omitempty"`
+	InputType    string              `json:"input_type,omitempty" yaml:"input_type,omitempty"`
+	OutputType   string              `json:"output_type,omitempty" yaml:"output_type,omitempty"`
+	Responses    map[int]string      `json:"responses,omitempty" yaml:"responses,omitempty"`
+
+	// 推斷/增強的欄位（IncludeFields 開啟時填入）
+	InputFields  []schema.FieldInfo  `json:"input_fields,omitempty" yaml:"input_fields,omitempty"`
+	OutputFields []schema.FieldInfo  `json:"output_fields,omitempty" yaml:"output_fields,omitempty"`
 }
 
 // DatabaseInfo 描述資料庫配置

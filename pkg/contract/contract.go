@@ -126,7 +126,8 @@ func testInternal(t *testing.T, r *router.Router, tc TestCase) {
 }
 
 // TestAll 自動測試所有 schema-registered 路由
-// 為每個路由生成最小有效的測試案例並執行
+// REST 路由：發送 HTTP 請求並驗證 Input/Output
+// 非 REST 路由：驗證 schema 定義完整性（不發送請求）
 func TestAll(t *testing.T, r *router.Router) {
 	t.Helper()
 
@@ -136,13 +137,46 @@ func TestAll(t *testing.T, r *router.Router) {
 	}
 
 	for _, route := range routes {
-		name := route.Method + " " + route.Path
-		t.Run(name, func(t *testing.T) {
-			tc := generateTestCase(route)
-			// 使用原始 schema path 做 schema 查找
-			tc.schemaPath = route.Path
-			testInternal(t, r, tc)
-		})
+		route := route // capture
+
+		if route.IsREST() {
+			// REST 路由：完整的 HTTP 測試
+			name := route.Method + " " + route.Path
+			t.Run(name, func(t *testing.T) {
+				tc := generateTestCase(route)
+				tc.schemaPath = route.Path
+				testInternal(t, r, tc)
+			})
+		} else {
+			// 非 REST 路由：驗證 schema 定義完整性
+			name := route.Protocol + "|" + route.Command
+			t.Run(name, func(t *testing.T) {
+				testSchemaCompleteness(t, route)
+			})
+		}
+	}
+}
+
+// testSchemaCompleteness 驗證非 REST 路由的 schema 定義完整性
+// 不發送實際請求，只檢查 schema 本身的品質
+func testSchemaCompleteness(t *testing.T, route schema.Route) {
+	t.Helper()
+
+	label := route.Protocol + "|" + route.Command
+
+	if route.Command == "" {
+		t.Errorf("[%s] missing Command", label)
+	}
+	if route.Summary == "" {
+		t.Errorf("[%s] missing Summary", label)
+	}
+	// Input/Output 不強制要求（有些命令確實沒有 Input 或 Output）
+	// 但如果有，型別名稱應該已自動填入
+	if route.Input != nil && route.InputName == "" {
+		t.Errorf("[%s] has Input but missing InputName", label)
+	}
+	if route.Output != nil && route.OutputName == "" {
+		t.Errorf("[%s] has Output but missing OutputName", label)
 	}
 }
 
