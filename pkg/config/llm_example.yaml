@@ -1,0 +1,92 @@
+# HypGo LLM 智慧增強配置
+# 放置於 config/llm.yaml 或 .hyp/llm.yaml
+# 使用方式：hyp context --llm config/llm.yaml
+
+# ============================================================
+# mode: 控制 LLM 增強模式
+# ============================================================
+# "none"   — 不使用 LLM，只做純 Go 推斷（零成本，預設值）
+# "ollama" — 連接本地 Ollama 伺服器
+# "api"    — 連接遠端 API（OpenAI / Anthropic / Gemini）
+# "rag"    — RAG 模式（向量資料庫 + embedding + LLM 生成）
+
+mode: none
+
+# ============================================================
+# Mode 1: Ollama（本地模型，零費用，建議開發用）
+# ============================================================
+# 前置條件：安裝 Ollama (https://ollama.com) 並下載模型
+#   ollama pull llama3
+#   ollama pull codellama
+
+# mode: ollama
+# ollama:
+#   url: "http://localhost:11434"    # Ollama API 位址
+#   model: "llama3"                  # 模型名稱
+#   timeout: 30                      # 請求逾時（秒）
+#   max_tokens: 256                  # 最大回應 token 數
+
+# ============================================================
+# Mode 2: API（遠端模型，付費，建議正式環境用）
+# ============================================================
+# 支援 provider：openai, anthropic, gemini, custom
+# api_key 支援環境變數：${OPENAI_API_KEY}
+
+# --- OpenAI ---
+# mode: api
+# api:
+#   provider: "openai"
+#   model: "gpt-4o-mini"             # 建議用小模型，降低成本
+#   api_key: "${OPENAI_API_KEY}"     # 從環境變數讀取
+#   timeout: 30
+#   max_tokens: 256
+
+# --- Anthropic ---
+# mode: api
+# api:
+#   provider: "anthropic"
+#   model: "claude-haiku-4-5"
+#   api_key: "${ANTHROPIC_API_KEY}"
+#   timeout: 30
+#   max_tokens: 256
+
+# --- Gemini ---
+# mode: api
+# api:
+#   provider: "gemini"
+#   model: "gemini-2.0-flash"
+#   api_key: "${GEMINI_API_KEY}"
+#   timeout: 30
+#   max_tokens: 256
+
+# --- Custom（自建 OpenAI-compatible API）---
+# mode: api
+# api:
+#   provider: "custom"
+#   base_url: "http://localhost:8000/v1"   # 必填
+#   model: "my-model"
+#   api_key: "my-key"
+#   timeout: 30
+#   max_tokens: 256
+
+# ============================================================
+# Mode 3: RAG（檢索增強生成，最精確，需要向量資料庫）
+# ============================================================
+# 流程：程式碼 → embedding → 向量資料庫 → 檢索相關上下文 → LLM 生成描述
+# 適合大型專案，需先建立程式碼向量索引
+
+# mode: rag
+# rag:
+#   # Embedding 設定
+#   embedding_model: "nomic-embed-text"   # embedding 模型
+#   embedding_url: "http://localhost:11434" # 預設用本地 Ollama
+#
+#   # 向量資料庫設定（支援 chroma / qdrant / milvus / faiss）
+#   vector_store: "chroma"
+#   vector_store_url: "http://localhost:8000"
+#   collection: "hypgo_codebase"           # 集合名稱
+#   top_k: 5                               # 檢索結果數量
+#
+#   # 生成用 LLM
+#   generator_model: "llama3"              # 根據檢索結果生成描述
+#   generator_url: "http://localhost:11434" # 預設用本地 Ollama

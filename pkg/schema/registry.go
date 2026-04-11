@@ -6,10 +6,11 @@ import (
 
 // Registry 儲存所有 schema-registered 路由的全域註冊表
 // 執行緒安全，使用 sync.RWMutex 保護
+// 支援多協議：REST、gRPC、Bot、MCP、WebSocket、CLI
 type Registry struct {
 	mu      sync.RWMutex
 	schemas []Route
-	byKey   map[string]*Route // key = "METHOD /path"
+	byKey   map[string]*Route // key = RouteKey()
 }
 
 var globalRegistry = &Registry{
@@ -22,14 +23,13 @@ func Global() *Registry {
 	return globalRegistry
 }
 
-// Register 註冊一個路由 schema
+// Register 註冊一個路由 schema（支援所有協議）
 func (r *Registry) Register(route Route) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	key := route.Method + " " + route.Path
+	key := route.RouteKey()
 	if existing, ok := r.byKey[key]; ok {
-		// 更新已存在的 schema
 		*existing = route
 		return
 	}
@@ -38,14 +38,36 @@ func (r *Registry) Register(route Route) {
 	r.byKey[key] = &r.schemas[len(r.schemas)-1]
 }
 
-// Get 根據 method 和 path 查詢 schema
+// Get 根據 method 和 path 查詢 REST schema（向後相容）
 func (r *Registry) Get(method, path string) (*Route, bool) {
+	return r.GetByKey("rest|" + method + " " + path)
+}
+
+// GetByKey 根據完整 key 查詢 schema
+func (r *Registry) GetByKey(key string) (*Route, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	key := method + " " + path
 	route, ok := r.byKey[key]
 	return route, ok
+}
+
+// GetByProtocol 回傳指定協議的所有 schema
+func (r *Registry) GetByProtocol(protocol string) []Route {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var result []Route
+	for _, route := range r.schemas {
+		p := route.Protocol
+		if p == "" {
+			p = "rest"
+		}
+		if p == protocol {
+			result = append(result, route)
+		}
+	}
+	return result
 }
 
 // All 返回所有已註冊的路由 schema（副本）

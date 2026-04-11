@@ -11,19 +11,52 @@ import (
 
 // Collector 從框架各元件收集資訊，組裝成 Manifest
 type Collector struct {
-	router   *router.Router
-	config   *config.Config
-	registry *schema.Registry
+	router    *router.Router
+	config    *config.Config
+	registry  *schema.Registry
+	enrichCfg EnrichConfig
 }
 
-// NewCollector 建立新的 Collector
+// NewCollector 建立新的 Collector（使用預設推斷配置）
 // config 可為 nil（不含伺服器資訊）
 func NewCollector(r *router.Router, cfg *config.Config) *Collector {
 	return &Collector{
-		router:   r,
-		config:   cfg,
-		registry: schema.Global(),
+		router:    r,
+		config:    cfg,
+		registry:  schema.Global(),
+		enrichCfg: DefaultEnrichConfig(),
 	}
+}
+
+// NewCollectorWithEnrich 建立帶自訂推斷配置的 Collector
+func NewCollectorWithEnrich(r *router.Router, cfg *config.Config, enrichCfg EnrichConfig) *Collector {
+	return &Collector{
+		router:    r,
+		config:    cfg,
+		registry:  schema.Global(),
+		enrichCfg: enrichCfg,
+	}
+}
+
+// NewCollectorWithLLM 建立帶 LLM 增強的 Collector
+// llmCfg 為 nil 或 mode=none 時退回純推斷模式
+func NewCollectorWithLLM(r *router.Router, cfg *config.Config, llmCfg *config.LLMConfig) (*Collector, error) {
+	enrichCfg := DefaultEnrichConfig()
+
+	if llmCfg != nil && llmCfg.IsEnabled() {
+		enricher, err := NewLLMEnricherFromConfig(llmCfg)
+		if err != nil {
+			return nil, err
+		}
+		enrichCfg.LLMEnricher = enricher
+	}
+
+	return &Collector{
+		router:    r,
+		config:    cfg,
+		registry:  schema.Global(),
+		enrichCfg: enrichCfg,
+	}, nil
 }
 
 // Collect 組裝完整的 Manifest
@@ -52,43 +85,97 @@ func (c *Collector) collectServer() ServerInfo {
 	}
 }
 
-// collectRoutes 從 Router 收集路由，並用 Schema Registry 豐富 metadata
+// collectRoutes 從 Router 收集 REST 路由，並追加 Schema Registry 中的非 REST 路由
 func (c *Collector) collectRoutes() []RouteManifest {
-	routeInfos := c.router.Routes()
-	manifests := make([]RouteManifest, 0, len(routeInfos))
+	manifests := make([]RouteManifest, 0)
 
-	for _, ri := range routeInfos {
-		rm := RouteManifest{
-			Method:       ri.Method,
-			Path:         ri.Path,
-			HandlerNames: ri.HandlerNames,
-		}
+	// 1. 收集 HTTP REST 路由（從 Router 的 Radix Tree）
+	if c.router != nil {
+		routeInfos := c.router.Routes()
+		for _, ri := range routeInfos {
+			rm := RouteManifest{
+				Protocol:     "rest",
+				Method:       ri.Method,
+				Path:         ri.Path,
+				HandlerNames: ri.HandlerNames,
+			}
 
-		// 用 schema metadata 豐富路由資訊
-		if s, ok := c.registry.Get(ri.Method, ri.Path); ok {
-			rm.Summary = s.Summary
-			rm.Description = s.Description
-			rm.Tags = s.Tags
-			rm.InputType = s.InputName
-			rm.OutputType = s.OutputName
+			// 用 schema metadata 豐富路由資訊
+			var schemaRoute *schema.Route
+			if s, ok := c.registry.Get(ri.Method, ri.Path); ok {
+				schemaRoute = s
+				rm.Summary = s.Summary
+				rm.Description = s.Description
+				rm.Tags = s.Tags
+				rm.InputType = s.InputName
+				rm.OutputType = s.OutputName
 
-			if len(s.Responses) > 0 {
-				rm.Responses = make(map[int]string)
-				for code, resp := range s.Responses {
-					rm.Responses[code] = resp.Description
+				if len(s.Responses) > 0 {
+					rm.Responses = make(map[int]string)
+					for code, resp := range s.Responses {
+						rm.Responses[code] = resp.Description
+					}
 				}
 			}
+
+			// 智慧推斷回填空白欄位
+			enrichRoute(&rm, schemaRoute, c.enrichCfg)
+
+			manifests = append(manifests, rm)
 		}
+	}
+
+	// 2. 收集非 REST 路由（直接從 Schema Registry，不經過 Router）
+	for _, s := range c.registry.All() {
+		if s.IsREST() {
+			continue // REST 路由已在上面從 Router 收集
+		}
+
+		rm := RouteManifest{
+			Protocol:    s.Protocol,
+			Command:     s.Command,
+			Platform:    s.Platform,
+			Summary:     s.Summary,
+			Description: s.Description,
+			Tags:        s.Tags,
+			InputType:   s.InputName,
+			OutputType:  s.OutputName,
+		}
+
+		if len(s.Responses) > 0 {
+			rm.Responses = make(map[int]string)
+			for code, resp := range s.Responses {
+				rm.Responses[code] = resp.Description
+			}
+		}
+
+		// 智慧推斷回填空白欄位
+		sCopy := s
+		enrichRoute(&rm, &sCopy, c.enrichCfg)
 
 		manifests = append(manifests, rm)
 	}
 
-	// 按 Method + Path 排序
+	// 排序：REST 按 Path，非 REST 按 Protocol + Command
 	sort.Slice(manifests, func(i, j int) bool {
-		if manifests[i].Path != manifests[j].Path {
-			return manifests[i].Path < manifests[j].Path
+		pi, pj := manifests[i].Protocol, manifests[j].Protocol
+		if pi == "" {
+			pi = "rest"
 		}
-		return manifests[i].Method < manifests[j].Method
+		if pj == "" {
+			pj = "rest"
+		}
+		if pi != pj {
+			return pi < pj
+		}
+		// 同協議內排序
+		if pi == "rest" {
+			if manifests[i].Path != manifests[j].Path {
+				return manifests[i].Path < manifests[j].Path
+			}
+			return manifests[i].Method < manifests[j].Method
+		}
+		return manifests[i].Command < manifests[j].Command
 	})
 
 	return manifests
