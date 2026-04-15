@@ -35,6 +35,10 @@ func TestValidateName(t *testing.T) {
 }
 
 func TestGenerateController(t *testing.T) {
+	// 在無任何 config 的 tempdir 中執行 → 退回 "unknown"
+	origDir := chdir(t, t.TempDir())
+	defer chdir(t, origDir)
+
 	dir := t.TempDir()
 	if err := GenerateController(dir, "Product", "myapp"); err != nil {
 		t.Fatalf("GenerateController failed: %v", err)
@@ -55,14 +59,119 @@ func TestGenerateController(t *testing.T) {
 	if !strings.Contains(s, "ProductController") {
 		t.Error("should contain ProductController")
 	}
-	// Controller 不應有 Schema 路由（已移至 routers/）
 	if strings.Contains(s, "schema.Route") {
 		t.Error("controller should NOT contain schema.Route (moved to routers/)")
 	}
-	// 但應引用 models
 	if !strings.Contains(s, `"myapp/app/models"`) {
 		t.Error("should import models package")
 	}
+	// 無 config → @ai: madeby unknown
+	want := "// @ai: madeby unknown"
+	if !strings.Contains(s, want) {
+		t.Errorf("no config: should contain %q", want)
+	}
+	if count := strings.Count(s, want); count < 6 {
+		t.Errorf("expected at least 6 @ai annotations, got %d", count)
+	}
+}
+
+func TestGenerateControllerFromLLMConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		yaml     string
+		wantTag  string
+	}{
+		{
+			name:    "anthropic api",
+			yaml:    "mode: api\napi:\n  provider: anthropic\n  model: claude-haiku-4-5\n  api_key: test\n",
+			wantTag: "// @ai: madeby claude",
+		},
+		{
+			name:    "openai api",
+			yaml:    "mode: api\napi:\n  provider: openai\n  model: gpt-4o\n  api_key: test\n",
+			wantTag: "// @ai: madeby openai",
+		},
+		{
+			name:    "gemini api",
+			yaml:    "mode: api\napi:\n  provider: gemini\n  model: gemini-pro\n  api_key: test\n",
+			wantTag: "// @ai: madeby google",
+		},
+		{
+			name:    "ollama",
+			yaml:    "mode: ollama\nollama:\n  model: llama3\n",
+			wantTag: "// @ai: madeby ollama(llama3)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 建立含 config/llm.yaml 的工作目錄
+			wd := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(wd, "config"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(wd, "config", "llm.yaml"), []byte(tt.yaml), 0644); err != nil {
+				t.Fatal(err)
+			}
+			origDir := chdir(t, wd)
+			defer chdir(t, origDir)
+
+			dir := t.TempDir()
+			if err := GenerateController(dir, "Order", "myapp"); err != nil {
+				t.Fatalf("GenerateController failed: %v", err)
+			}
+			s, _ := os.ReadFile(filepath.Join(dir, "order_controller.go"))
+			if !strings.Contains(string(s), tt.wantTag) {
+				t.Errorf("want %q in output", tt.wantTag)
+			}
+		})
+	}
+}
+
+func TestGenerateControllerFromMarkdown(t *testing.T) {
+	tests := []struct {
+		name     string
+		mdText   string
+		wantTag  string
+	}{
+		{"claude md", "# Project\nModel: claude-sonnet-4-6", "// @ai: madeby claude"},
+		{"openai md", "# Project\nUsing openai gpt-4o", "// @ai: madeby openai"},
+		{"google md", "# Project\ngemini-pro integration", "// @ai: madeby google"},
+		{"ollama md", "# Project\nRunning ollama locally", "// @ai: madeby ollama"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wd := t.TempDir()
+			if err := os.WriteFile(filepath.Join(wd, "CLAUDE.md"), []byte(tt.mdText), 0644); err != nil {
+				t.Fatal(err)
+			}
+			origDir := chdir(t, wd)
+			defer chdir(t, origDir)
+
+			dir := t.TempDir()
+			if err := GenerateController(dir, "Item", "myapp"); err != nil {
+				t.Fatalf("GenerateController failed: %v", err)
+			}
+			s, _ := os.ReadFile(filepath.Join(dir, "item_controller.go"))
+			if !strings.Contains(string(s), tt.wantTag) {
+				t.Errorf("want %q in output", tt.wantTag)
+			}
+		})
+	}
+}
+
+// chdir 切換工作目錄，返回舊目錄路徑（用於 defer 還原）
+func chdir(t *testing.T, dir string) string {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	return orig
 }
 
 func TestGenerateRouter(t *testing.T) {
@@ -173,6 +282,9 @@ func TestGenerateModel(t *testing.T) {
 }
 
 func TestGenerateService(t *testing.T) {
+	origDir := chdir(t, t.TempDir())
+	defer chdir(t, origDir)
+
 	dir := t.TempDir()
 	if err := GenerateService(dir, "Payment"); err != nil {
 		t.Fatalf("GenerateService failed: %v", err)
@@ -189,6 +301,37 @@ func TestGenerateService(t *testing.T) {
 	}
 	if !strings.Contains(s, "PaymentService") {
 		t.Error("should contain PaymentService")
+	}
+	// 無 config → @ai: madeby unknown
+	want := "// @ai: madeby unknown"
+	if !strings.Contains(s, want) {
+		t.Errorf("no config: should contain %q", want)
+	}
+	if count := strings.Count(s, want); count < 7 {
+		t.Errorf("expected at least 7 @ai annotations, got %d", count)
+	}
+}
+
+func TestGenerateServiceFromLLMConfig(t *testing.T) {
+	wd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(wd, "config"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	llmYAML := "mode: api\napi:\n  provider: anthropic\n  model: claude-haiku-4-5\n  api_key: test\n"
+	if err := os.WriteFile(filepath.Join(wd, "config", "llm.yaml"), []byte(llmYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+	origDir := chdir(t, wd)
+	defer chdir(t, origDir)
+
+	dir := t.TempDir()
+	if err := GenerateService(dir, "Invoice"); err != nil {
+		t.Fatalf("GenerateService failed: %v", err)
+	}
+	s, _ := os.ReadFile(filepath.Join(dir, "invoice_service.go"))
+	want := "// @ai: madeby claude"
+	if !strings.Contains(string(s), want) {
+		t.Errorf("want %q in service output", want)
 	}
 }
 

@@ -438,7 +438,7 @@ func main() {
             "success": true,
             "message": "HypGo Framework",
             "data": map[string]interface{}{
-                "version":  "0.8.1-alpha",
+                "version":  "0.8.5",
                 "protocol": c.Request.Proto,
             },
         })
@@ -499,7 +499,7 @@ func (ctrl *HomeController) Info(c *hypcontext.Context) {
         "success": true,
         "message": "HypGo Framework",
         "data": map[string]interface{}{
-            "version":  "0.8.1-alpha",
+            "version":  "0.8.5",
             "protocol": c.Request.Proto,
         },
     })
@@ -795,7 +795,7 @@ func createGoMod(projectName string) error {
 	latestTag, err := getLatestGitTag("github.com/maoxiaoyue/hypgo")
 	if err != nil {
 		// 如果無法獲取標籤，使用目前版本
-		latestTag = "v0.8.1-alpha"
+		latestTag = "v0.8.5"
 		fmt.Fprintf(os.Stderr, "Warning: Failed to get latest tag, using %s: %v\n", latestTag, err)
 	}
 
