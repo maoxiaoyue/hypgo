@@ -8,6 +8,7 @@ import (
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
@@ -214,6 +215,220 @@ func TestWriteJSON(t *testing.T) {
 	}
 	if parsed.Framework != "HypGo" {
 		t.Errorf("Framework = %q, want %q", parsed.Framework, "HypGo")
+	}
+}
+
+// --- Model Manifest ---
+
+// 測試用 Model struct（使用 BaseModel 欄位名，與 bun ORM 慣例一致）
+type testUser struct {
+	BaseModel struct{} `bun:"table:users,alias:u"`
+	ID        int64    `bun:"id,pk,autoincrement"`
+	Name      string   `bun:"name,notnull"`
+	Email     string   `bun:"email,unique,notnull"`
+	Role      string   `bun:"role,default:user"`
+	DeletedAt string   `bun:"deleted_at"`
+}
+
+type testPost struct {
+	BaseModel struct{} `bun:"table:posts"`
+	ID        int64    `bun:"id,pk,autoincrement"`
+	Title     string   `bun:"title,notnull"`
+	Body      string   `bun:"body"`
+}
+
+func setupModelRegistry() *migrate.ModelRegistry {
+	r := migrate.NewRegistry()
+	r.Register((*testUser)(nil), (*testPost)(nil))
+	return r
+}
+
+func TestCollectorWithModels(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := setupModelRegistry()
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	if len(m.Models) != 2 {
+		t.Fatalf("got %d models, want 2", len(m.Models))
+	}
+
+	// 依表名排序：posts < users
+	if m.Models[0].Table != "posts" {
+		t.Errorf("Models[0].Table = %q, want %q", m.Models[0].Table, "posts")
+	}
+	if m.Models[1].Table != "users" {
+		t.Errorf("Models[1].Table = %q, want %q", m.Models[1].Table, "users")
+	}
+}
+
+func TestCollectorModelStructName(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := migrate.NewRegistry()
+	registry.Register((*testUser)(nil))
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	if len(m.Models) != 1 {
+		t.Fatalf("got %d models, want 1", len(m.Models))
+	}
+	if m.Models[0].Name != "testUser" {
+		t.Errorf("Model.Name = %q, want %q", m.Models[0].Name, "testUser")
+	}
+	if m.Models[0].Table != "users" {
+		t.Errorf("Model.Table = %q, want %q", m.Models[0].Table, "users")
+	}
+}
+
+func TestCollectorModelFields(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := migrate.NewRegistry()
+	registry.Register((*testUser)(nil))
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	fields := m.Models[0].Fields
+	if len(fields) == 0 {
+		t.Fatal("Fields should not be empty")
+	}
+
+	// 找 id 欄位
+	var idField *FieldManifest
+	for i := range fields {
+		if fields[i].Name == "id" {
+			idField = &fields[i]
+			break
+		}
+	}
+	if idField == nil {
+		t.Fatal("field 'id' not found")
+	}
+	if !idField.PrimaryKey {
+		t.Error("id.PrimaryKey should be true")
+	}
+	if !idField.AutoIncrement {
+		t.Error("id.AutoIncrement should be true")
+	}
+
+	// 找 email 欄位
+	var emailField *FieldManifest
+	for i := range fields {
+		if fields[i].Name == "email" {
+			emailField = &fields[i]
+			break
+		}
+	}
+	if emailField == nil {
+		t.Fatal("field 'email' not found")
+	}
+	if !emailField.Unique {
+		t.Error("email.Unique should be true")
+	}
+	if !emailField.NotNull {
+		t.Error("email.NotNull should be true")
+	}
+}
+
+func TestCollectorModelDefault(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := migrate.NewRegistry()
+	registry.Register((*testUser)(nil))
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	fields := m.Models[0].Fields
+	var roleField *FieldManifest
+	for i := range fields {
+		if fields[i].Name == "role" {
+			roleField = &fields[i]
+			break
+		}
+	}
+	if roleField == nil {
+		t.Fatal("field 'role' not found")
+	}
+	if roleField.Default != "user" {
+		t.Errorf("role.Default = %q, want %q", roleField.Default, "user")
+	}
+}
+
+func TestCollectorNilModelRegistry(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+
+	c := NewCollectorWithModels(r, nil, nil)
+	m := c.Collect()
+
+	if m.Models != nil {
+		t.Error("Models should be nil when registry is nil")
+	}
+}
+
+func TestCollectorEmptyModelRegistry(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := migrate.NewRegistry() // 空的 registry
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	if m.Models != nil {
+		t.Error("Models should be nil when registry is empty")
+	}
+}
+
+func TestManifestModelsInYAML(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := setupModelRegistry()
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	var buf bytes.Buffer
+	if err := WriteYAML(&buf, m); err != nil {
+		t.Fatalf("WriteYAML failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "models:") {
+		t.Error("YAML should contain models:")
+	}
+	if !strings.Contains(output, "table: users") {
+		t.Error("YAML should contain table: users")
+	}
+	if !strings.Contains(output, "table: posts") {
+		t.Error("YAML should contain table: posts")
+	}
+}
+
+func TestManifestModelsInJSON(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	registry := setupModelRegistry()
+
+	c := NewCollectorWithModels(r, nil, registry)
+	m := c.Collect()
+
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, m); err != nil {
+		t.Fatalf("WriteJSON failed: %v", err)
+	}
+
+	var parsed Manifest
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("JSON output is not valid: %v", err)
+	}
+	if len(parsed.Models) != 2 {
+		t.Errorf("got %d models in JSON, want 2", len(parsed.Models))
 	}
 }
 

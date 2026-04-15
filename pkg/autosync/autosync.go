@@ -9,6 +9,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 )
 
@@ -66,8 +67,8 @@ func (a *AutoSync) Sync() error {
 		return err
 	}
 
-	// 收集 manifest（使用已有的 Collector）
-	collector := manifest.NewCollector(a.router, a.appCfg)
+	// 收集 manifest（含 GlobalRegistry 中的 Model 描述）
+	collector := manifest.NewCollectorWithModels(a.router, a.appCfg, migrate.GlobalRegistry())
 	m := collector.Collect()
 
 	// 原子寫入：先寫 temp file，再 rename

@@ -9,6 +9,7 @@ import (
 	"{{.ModuleName}}/app/models"
 )
 
+// @ai: madeby {{.AIProvider}}
 // {{.Name}}Controller handles {{.LowerName}} CRUD operations
 type {{.Name}}Controller struct{}
 
@@ -18,6 +19,7 @@ var (
 	Err{{.Name}}Invalid  = errors.Define("E_{{.LowerName}}_002", 400, "Invalid {{.LowerName}} data", "{{.LowerName}}")
 )
 
+// @ai: madeby {{.AIProvider}}
 func (ctrl *{{.Name}}Controller) List(c *hypcontext.Context) {
 	// TODO: Fetch from database
 	c.JSON(200, models.{{.Name}}ListResp{
@@ -26,6 +28,7 @@ func (ctrl *{{.Name}}Controller) List(c *hypcontext.Context) {
 	})
 }
 
+// @ai: madeby {{.AIProvider}}
 func (ctrl *{{.Name}}Controller) Create(c *hypcontext.Context) {
 	var req models.Create{{.Name}}Req
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -40,6 +43,7 @@ func (ctrl *{{.Name}}Controller) Create(c *hypcontext.Context) {
 	})
 }
 
+// @ai: madeby {{.AIProvider}}
 func (ctrl *{{.Name}}Controller) Get(c *hypcontext.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -53,6 +57,7 @@ func (ctrl *{{.Name}}Controller) Get(c *hypcontext.Context) {
 	})
 }
 
+// @ai: madeby {{.AIProvider}}
 func (ctrl *{{.Name}}Controller) Update(c *hypcontext.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -72,6 +77,7 @@ func (ctrl *{{.Name}}Controller) Update(c *hypcontext.Context) {
 	})
 }
 
+// @ai: madeby {{.AIProvider}}
 func (ctrl *{{.Name}}Controller) Delete(c *hypcontext.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -266,6 +272,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 )
 
+// @ai: madeby {{.AIProvider}}
 // {{.Name}}Service 處理 {{.LowerName}} 業務邏輯
 type {{.Name}}Service struct {
 	db     *hidb.Database
@@ -278,34 +285,40 @@ var (
 	ErrSvc{{.Name}}Create   = errors.Define("E_svc_{{.LowerName}}_002", 500, "Failed to create {{.LowerName}}", "{{.LowerName}}")
 )
 
+// @ai: madeby {{.AIProvider}}
 func New{{.Name}}Service(db *hidb.Database, logger *logger.Logger) *{{.Name}}Service {
 	return &{{.Name}}Service{db: db, logger: logger}
 }
 
+// @ai: madeby {{.AIProvider}}
 func (s *{{.Name}}Service) Create(ctx context.Context, data map[string]interface{}) error {
 	s.logger.Info("Creating {{.LowerName}}")
 	// TODO: implement
 	return nil
 }
 
+// @ai: madeby {{.AIProvider}}
 func (s *{{.Name}}Service) GetByID(ctx context.Context, id string) (interface{}, error) {
 	s.logger.Info("Getting {{.LowerName}} by ID: %s", id)
 	// TODO: implement
 	return nil, ErrSvc{{.Name}}NotFound.With("id", id)
 }
 
+// @ai: madeby {{.AIProvider}}
 func (s *{{.Name}}Service) Update(ctx context.Context, id string, data map[string]interface{}) error {
 	s.logger.Info("Updating {{.LowerName}} ID: %s", id)
 	// TODO: implement
 	return nil
 }
 
+// @ai: madeby {{.AIProvider}}
 func (s *{{.Name}}Service) Delete(ctx context.Context, id string) error {
 	s.logger.Info("Deleting {{.LowerName}} ID: %s", id)
 	// TODO: implement
 	return nil
 }
 
+// @ai: madeby {{.AIProvider}}
 func (s *{{.Name}}Service) List(ctx context.Context) ([]interface{}, error) {
 	s.logger.Info("Listing {{.LowerName}}s")
 	// TODO: implement

@@ -1,20 +1,23 @@
 package manifest
 
 import (
+	"reflect"
 	"sort"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
 // Collector 從框架各元件收集資訊，組裝成 Manifest
 type Collector struct {
-	router    *router.Router
-	config    *config.Config
-	registry  *schema.Registry
-	enrichCfg EnrichConfig
+	router          *router.Router
+	config          *config.Config
+	registry        *schema.Registry
+	migrateRegistry *migrate.ModelRegistry
+	enrichCfg       EnrichConfig
 }
 
 // NewCollector 建立新的 Collector（使用預設推斷配置）
@@ -35,6 +38,18 @@ func NewCollectorWithEnrich(r *router.Router, cfg *config.Config, enrichCfg Enri
 		config:    cfg,
 		registry:  schema.Global(),
 		enrichCfg: enrichCfg,
+	}
+}
+
+// NewCollectorWithModels 建立帶 Model 描述的 Collector
+// registry 為 nil 時不收集 model 資訊
+func NewCollectorWithModels(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry) *Collector {
+	return &Collector{
+		router:          r,
+		config:          cfg,
+		registry:        schema.Global(),
+		migrateRegistry: registry,
+		enrichCfg:       DefaultEnrichConfig(),
 	}
 }
 
@@ -66,6 +81,7 @@ func (c *Collector) Collect() *Manifest {
 		Framework:   "HypGo",
 		GeneratedAt: time.Now(),
 		Routes:      c.collectRoutes(),
+		Models:      c.collectModels(),
 	}
 
 	if c.config != nil {
@@ -190,4 +206,57 @@ func (c *Collector) collectDatabase() *DatabaseInfo {
 		Driver:      c.config.Database.Driver,
 		HasReplicas: len(c.config.Database.Replicas) > 0,
 	}
+}
+
+// collectModels 從 migrate.ModelRegistry 收集 Model 描述
+// 直接掃描每個 model，同時取得 struct 名稱與 table schema
+func (c *Collector) collectModels() []ModelManifest {
+	if c.migrateRegistry == nil || c.migrateRegistry.Len() == 0 {
+		return nil
+	}
+
+	models := c.migrateRegistry.Models()
+	manifests := make([]ModelManifest, 0, len(models))
+
+	for _, model := range models {
+		table := migrate.ScanModel(model)
+		if table == nil {
+			continue
+		}
+
+		mm := ModelManifest{
+			Name:   structName(model), // 使用原始 struct 名稱，如 "User"
+			Table:  table.Name,        // bun tag 解析的表名，如 "users"
+			Fields: make([]FieldManifest, 0, len(table.Columns)),
+		}
+		for _, col := range table.Columns {
+			mm.Fields = append(mm.Fields, FieldManifest{
+				Name:          col.Name,
+				GoType:        col.GoType,
+				SQLType:       col.SQLType,
+				PrimaryKey:    col.PrimaryKey,
+				AutoIncrement: col.AutoIncrement,
+				NotNull:       col.NotNull,
+				Unique:        col.Unique,
+				Default:       col.Default,
+			})
+		}
+		manifests = append(manifests, mm)
+	}
+
+	// 依表名排序，確保輸出穩定
+	sort.Slice(manifests, func(i, j int) bool {
+		return manifests[i].Table < manifests[j].Table
+	})
+
+	return manifests
+}
+
+// structName 取得 model 的原始 struct 名稱（去除 pointer 層）
+func structName(model interface{}) string {
+	t := reflect.TypeOf(model)
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Name()
 }

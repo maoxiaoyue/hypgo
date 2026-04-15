@@ -15,9 +15,10 @@ type Manifest struct {
 	Framework   string          `json:"framework" yaml:"framework"`
 	GeneratedAt time.Time       `json:"generated_at" yaml:"generated_at"`
 	Server      ServerInfo      `json:"server" yaml:"server"`
-	Routes      []RouteManifest `json:"routes" yaml:"routes"`
-	Middleware  []string        `json:"middleware,omitempty" yaml:"middleware,omitempty"`
-	Database    *DatabaseInfo   `json:"database,omitempty" yaml:"database,omitempty"`
+	Routes      []RouteManifest  `json:"routes" yaml:"routes"`
+	Models      []ModelManifest  `json:"models,omitempty" yaml:"models,omitempty"`
+	Middleware  []string         `json:"middleware,omitempty" yaml:"middleware,omitempty"`
+	Database    *DatabaseInfo    `json:"database,omitempty" yaml:"database,omitempty"`
 }
 
 // ServerInfo 描述伺服器配置
@@ -56,4 +57,23 @@ type RouteManifest struct {
 type DatabaseInfo struct {
 	Driver      string `json:"driver" yaml:"driver"`
 	HasReplicas bool   `json:"has_replicas" yaml:"has_replicas"`
+}
+
+// ModelManifest 描述一個資料模型（對應資料庫資料表）
+type ModelManifest struct {
+	Name   string          `json:"name" yaml:"name"`
+	Table  string          `json:"table" yaml:"table"`
+	Fields []FieldManifest `json:"fields" yaml:"fields"`
+}
+
+// FieldManifest 描述一個資料欄位
+type FieldManifest struct {
+	Name          string `json:"name" yaml:"name"`
+	GoType        string `json:"go_type" yaml:"go_type"`
+	SQLType       string `json:"sql_type,omitempty" yaml:"sql_type,omitempty"`
+	PrimaryKey    bool   `json:"pk,omitempty" yaml:"pk,omitempty"`
+	AutoIncrement bool   `json:"auto_increment,omitempty" yaml:"auto_increment,omitempty"`
+	NotNull       bool   `json:"not_null,omitempty" yaml:"not_null,omitempty"`
+	Unique        bool   `json:"unique,omitempty" yaml:"unique,omitempty"`
+	Default       string `json:"default,omitempty" yaml:"default,omitempty"`
 }

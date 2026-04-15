@@ -9,12 +9,131 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+
+	"gopkg.in/yaml.v3"
 )
 
 // validName 只允許字母、數字、底線（防止目錄穿越和 code injection）
 var validName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 
+// DefaultAIProvider 是無法取得供應商資訊時的預設值。
+const DefaultAIProvider = "unknown"
+
+// llmYAMLConfig 是讀取 llm.yaml 所需的最小結構，
+// 避免直接引入 pkg/config 造成不必要的套件依賴。
+type llmYAMLConfig struct {
+	Mode   string `yaml:"mode"`
+	Ollama struct {
+		Model string `yaml:"model"`
+	} `yaml:"ollama"`
+	API struct {
+		Provider string `yaml:"provider"`
+	} `yaml:"api"`
+	RAG struct {
+		GeneratorModel string `yaml:"generator_model"`
+	} `yaml:"rag"`
+}
+
+// resolveAIProvider 在執行期決定 @ai 註解所記錄的供應商名稱。
+// 解析優先順序：
+//  1. config/llm.yaml 或 .hyp/llm.yaml（讀取配置的 LLM 供應商）
+//  2. 掃描專案根目錄的 *.md 檔案中的 AI 供應商關鍵字
+//  3. 退回 DefaultAIProvider（"unknown"）
+func resolveAIProvider() string {
+	if p := providerFromLLMConfig(); p != "" {
+		return p
+	}
+	if p := providerFromMarkdown(); p != "" {
+		return p
+	}
+	return DefaultAIProvider
+}
+
+// providerFromLLMConfig 從 config/llm.yaml 或 .hyp/llm.yaml 讀取供應商。
+func providerFromLLMConfig() string {
+	for _, path := range []string{"config/llm.yaml", ".hyp/llm.yaml"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cfg llmYAMLConfig
+		if err := yaml.Unmarshal(data, &cfg); err != nil || cfg.Mode == "" || cfg.Mode == "none" {
+			continue
+		}
+		switch cfg.Mode {
+		case "api":
+			return normalizeAPIProvider(cfg.API.Provider)
+		case "ollama":
+			if cfg.Ollama.Model != "" {
+				return "ollama(" + cfg.Ollama.Model + ")"
+			}
+			return "ollama"
+		case "rag":
+			if cfg.RAG.GeneratorModel != "" {
+				return "ollama(" + cfg.RAG.GeneratorModel + ")"
+			}
+			return "ollama"
+		}
+	}
+	return ""
+}
+
+// normalizeAPIProvider 將 llm.yaml 的 provider 值對應到標準名稱。
+func normalizeAPIProvider(provider string) string {
+	switch strings.ToLower(provider) {
+	case "anthropic":
+		return "claude"
+	case "openai":
+		return "openai"
+	case "gemini":
+		return "google"
+	default:
+		if provider != "" {
+			return provider
+		}
+		return ""
+	}
+}
+
+// providerFromMarkdown 掃描專案根目錄的 *.md 檔案，比對 AI 供應商關鍵字。
+// 優先順序依序：claude → openai → google/gemini → ollama/llama
+func providerFromMarkdown() string {
+	type hint struct {
+		keyword  string
+		provider string
+	}
+	hints := []hint{
+		{"claude", "claude"},
+		{"anthropic", "claude"},
+		{"openai", "openai"},
+		{"chatgpt", "openai"},
+		{"gpt-4", "openai"},
+		{"gpt-3", "openai"},
+		{"gemini", "google"},
+		{"ollama", "ollama"},
+		{"llama3", "ollama"},
+		{"llama2", "ollama"},
+		{"mistral", "ollama"},
+	}
+
+	files, _ := filepath.Glob("*.md")
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		lower := strings.ToLower(string(data))
+		for _, h := range hints {
+			if strings.Contains(lower, h.keyword) {
+				return h.provider
+			}
+		}
+	}
+	return ""
+}
+
 // GenerateController 生成 controller（只含 handler 邏輯，路由在 routers/ 中）
+// 產生的所有 struct 與 func 均強制加入 // @ai: madeby <provider> 註解，不可關閉。
 func GenerateController(dir, name, moduleName string) error {
 	if err := validateName(name); err != nil {
 		return err
@@ -24,6 +143,7 @@ func GenerateController(dir, name, moduleName string) error {
 	}
 	data := templateData(name)
 	data["ModuleName"] = moduleName
+	data["AIProvider"] = resolveAIProvider()
 	return generateFile(dir, strings.ToLower(name)+"_controller.go", controllerTemplate, data)
 }
 
@@ -260,11 +380,14 @@ func GenerateProto(baseDir, name, moduleName string) error {
 }
 
 // GenerateService 生成使用 Error Catalog 的 service
+// 產生的所有 struct 與 func 均強制加入 // @ai: madeby <provider> 註解，不可關閉。
 func GenerateService(dir, name string) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
-	return generateFile(dir, strings.ToLower(name)+"_service.go", serviceTemplate, templateData(name))
+	data := templateData(name)
+	data["AIProvider"] = resolveAIProvider()
+	return generateFile(dir, strings.ToLower(name)+"_service.go", serviceTemplate, data)
 }
 
 // validateName 驗證名稱安全性
