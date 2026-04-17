@@ -10,10 +10,49 @@ import (
 )
 
 func TestKeyspaceSimple(t *testing.T) {
-	got := (&CassandraDB{}).Keyspace("analytics").Simple(3).CreateCQL()
+	got := (&CassandraDB{}).Keyspace("analytics").Simple(3).NoDefaults().CreateCQL()
 	want := `CREATE KEYSPACE IF NOT EXISTS analytics WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 3}`
 	if got != want {
 		t.Fatalf("simple keyspace CQL mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestKeyspaceDefaultsApplied(t *testing.T) {
+	got := (&CassandraDB{}).Keyspace("ks").CreateCQL()
+	if !strings.Contains(got, "SimpleStrategy") {
+		t.Errorf("missing default replication: %s", got)
+	}
+	if !strings.Contains(got, "DURABLE_WRITES = true") {
+		t.Errorf("missing default durable_writes: %s", got)
+	}
+}
+
+func TestTableDefaultsApplied(t *testing.T) {
+	got := (&CassandraDB{}).Table("t").
+		Column("id", TypeUUID).
+		PartitionKey("id").
+		CreateCQL()
+	for _, c := range []string{
+		"'class': 'UnifiedCompactionStrategy'",
+		"'sstable_compression': 'LZ4Compressor'",
+		"'keys': 'ALL'",
+		"gc_grace_seconds = 864000",
+		"speculative_retry = '99p'",
+	} {
+		if !strings.Contains(got, c) {
+			t.Errorf("missing default %q in:\n%s", c, got)
+		}
+	}
+}
+
+func TestTableNoDefaults(t *testing.T) {
+	got := (&CassandraDB{}).Table("t").
+		Column("id", TypeUUID).
+		PartitionKey("id").
+		NoDefaults().
+		CreateCQL()
+	if strings.Contains(got, "WITH") {
+		t.Errorf("expected no WITH clause with NoDefaults:\n%s", got)
 	}
 }
 

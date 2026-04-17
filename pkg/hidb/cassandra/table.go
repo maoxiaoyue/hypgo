@@ -184,6 +184,15 @@ type TableBuilder struct {
 	orderBy    []Column // clustering order specs
 	options    TableOptions
 	ifNotExist bool
+	noDefaults bool
+}
+
+// NoDefaults disables automatic filling of DefaultCompaction / DefaultCompression /
+// DefaultCaching / DefaultGCGraceSeconds / DefaultBloomFilterFPChance /
+// DefaultSpeculativeRetry. Use when you want CQL to reflect only explicit settings.
+func (t *TableBuilder) NoDefaults() *TableBuilder {
+	t.noDefaults = true
+	return t
 }
 
 // Table returns a builder for the named table in the session keyspace.
@@ -292,7 +301,12 @@ func (t *TableBuilder) WithCDC(enabled bool) *TableBuilder {
 }
 
 // CreateCQL renders the CREATE TABLE statement.
+// Unless NoDefaults() was called, unset compaction/compression/caching and
+// related knobs are filled from the package-level Default* variables.
 func (t *TableBuilder) CreateCQL() string {
+	if !t.noDefaults {
+		applyTableDefaults(&t.options)
+	}
 	var sb strings.Builder
 	sb.WriteString("CREATE TABLE ")
 	if t.ifNotExist {

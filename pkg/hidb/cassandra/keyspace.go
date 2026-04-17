@@ -100,14 +100,22 @@ type KeyspaceOptions struct {
 
 // KeyspaceBuilder builds CREATE/ALTER/DROP KEYSPACE statements.
 type KeyspaceBuilder struct {
-	db      *CassandraDB
-	name    string
-	options KeyspaceOptions
+	db         *CassandraDB
+	name       string
+	options    KeyspaceOptions
+	noDefaults bool
 }
 
 // Keyspace returns a builder for the given keyspace name.
 func (c *CassandraDB) Keyspace(name string) *KeyspaceBuilder {
 	return &KeyspaceBuilder{db: c, name: name, options: KeyspaceOptions{IfNotExists: true}}
+}
+
+// NoDefaults disables automatic filling of DefaultKeyspaceReplication / DefaultDurableWrites.
+// Use when you want CQL to reflect only exactly what you set.
+func (k *KeyspaceBuilder) NoDefaults() *KeyspaceBuilder {
+	k.noDefaults = true
+	return k
 }
 
 // IfNotExists toggles the IF NOT EXISTS clause (default true).
@@ -141,21 +149,26 @@ func (k *KeyspaceBuilder) DurableWrites(v bool) *KeyspaceBuilder {
 }
 
 // CreateCQL renders the CREATE KEYSPACE statement.
+// Unless NoDefaults() was called, unset replication falls back to
+// DefaultKeyspaceReplication and unset DurableWrites falls back to DefaultDurableWrites.
 func (k *KeyspaceBuilder) CreateCQL() string {
+	opts := k.options
+	if !k.noDefaults {
+		applyKeyspaceDefaults(&opts)
+	} else if opts.Replication.Class == "" && opts.Replication.Factor == 0 && len(opts.Replication.DataCenters) == 0 {
+		// preserve prior minimal fallback to avoid invalid CQL
+		opts.Replication = NewSimpleReplication(1)
+	}
 	var sb strings.Builder
 	sb.WriteString("CREATE KEYSPACE ")
-	if k.options.IfNotExists {
+	if opts.IfNotExists {
 		sb.WriteString("IF NOT EXISTS ")
 	}
 	sb.WriteString(quoteIdent(k.name))
 	sb.WriteString(" WITH REPLICATION = ")
-	rep := k.options.Replication
-	if rep.Class == "" && rep.Factor == 0 && len(rep.DataCenters) == 0 {
-		rep = NewSimpleReplication(1)
-	}
-	sb.WriteString(rep.ToCQL())
-	if k.options.DurableWrites != nil {
-		fmt.Fprintf(&sb, " AND DURABLE_WRITES = %t", *k.options.DurableWrites)
+	sb.WriteString(opts.Replication.ToCQL())
+	if opts.DurableWrites != nil {
+		fmt.Fprintf(&sb, " AND DURABLE_WRITES = %t", *opts.DurableWrites)
 	}
 	return sb.String()
 }
