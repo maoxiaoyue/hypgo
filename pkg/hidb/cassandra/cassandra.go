@@ -221,14 +221,84 @@ func (c *CassandraDB) QueryContext(ctx context.Context, stmt string, values ...i
 	return c.session.Query(stmt, values...).WithContext(ctx)
 }
 
-// Batch 創建批次操作
+// Exec executes a single CQL statement (DDL or DML) without returning rows.
+// The statement may be terminated with a trailing ';', which is stripped
+// before dispatch. For multi-statement scripts or parameterised CQL, use
+// ExecScript or QueryContext respectively.
+func (c *CassandraDB) Exec(ctx context.Context, stmt string) error {
+	if c.session == nil {
+		return fmt.Errorf("cassandra: session not connected")
+	}
+	stmt = strings.TrimSpace(stmt)
+	stmt = strings.TrimRight(stmt, ";")
+	stmt = strings.TrimRight(stmt, " \t\r\n")
+	if stmt == "" {
+		return nil
+	}
+	return c.session.Query(stmt).WithContext(ctx).Exec()
+}
+
+// ExecScript executes a multi-statement CQL script, ignoring empty segments.
+// Bind args are not supported; use separate Exec calls for parameterised CQL.
+func (c *CassandraDB) ExecScript(ctx context.Context, script string) error {
+	for i, p := range splitStatements(script) {
+		if err := c.session.Query(p).WithContext(ctx).Exec(); err != nil {
+			return fmt.Errorf("cassandra: stmt %d failed: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+// splitStatements splits a CQL script on top-level semicolons (ignoring those
+// inside single-quoted literals and $$-delimited function bodies).
+func splitStatements(src string) []string {
+	var out []string
+	var cur strings.Builder
+	inSingle := false
+	inDollar := false
+	for i := 0; i < len(src); i++ {
+		ch := src[i]
+		switch {
+		case !inSingle && !inDollar && ch == '\'':
+			inSingle = true
+			cur.WriteByte(ch)
+		case inSingle && ch == '\'':
+			inSingle = false
+			cur.WriteByte(ch)
+		case !inSingle && ch == '$' && i+1 < len(src) && src[i+1] == '$':
+			inDollar = !inDollar
+			cur.WriteByte(ch)
+			cur.WriteByte(src[i+1])
+			i++
+		case !inSingle && !inDollar && ch == ';':
+			s := strings.TrimSpace(cur.String())
+			if s != "" {
+				out = append(out, s)
+			}
+			cur.Reset()
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+// Batch 創建批次操作（gocql 原生介面）
 func (c *CassandraDB) Batch(batchType gocql.BatchType) *gocql.Batch {
 	return c.session.NewBatch(batchType)
 }
 
-// ExecuteBatch 執行批次操作
+// ExecuteBatch 執行批次操作（gocql 原生介面）
 func (c *CassandraDB) ExecuteBatch(batch *gocql.Batch) error {
 	return c.session.ExecuteBatch(batch)
+}
+
+// KeyspaceName returns the current session keyspace (from config).
+func (c *CassandraDB) KeyspaceName() string {
+	return c.config.Keyspace
 }
 
 // parseConsistency 將字串轉換為 gocql.Consistency
