@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -847,5 +848,153 @@ func TestColumnSchemaSortOrder(t *testing.T) {
 func TestIntrospectNilSession(t *testing.T) {
 	if _, err := (&CassandraDB{}).Introspect(context.Background(), IntrospectOptions{}); err == nil {
 		t.Fatal("expected error on nil session")
+	}
+}
+
+func TestMemTracerCollectsSessionIDs(t *testing.T) {
+	tr := NewMemTracer()
+	if _, ok := tr.Last(); ok {
+		t.Fatal("expected no sessions initially")
+	}
+	id := gocql.TimeUUID()
+	tr.Trace(id[:])
+	got, ok := tr.Last()
+	if !ok || got != id {
+		t.Fatalf("expected last=%s, got %s ok=%v", id, got, ok)
+	}
+	if s := tr.Sessions(); len(s) != 1 || s[0] != id {
+		t.Fatalf("unexpected sessions: %v", s)
+	}
+	tr.Reset()
+	if _, ok := tr.Last(); ok {
+		t.Fatal("expected empty after Reset")
+	}
+}
+
+func TestMemTracerIgnoresInvalidID(t *testing.T) {
+	tr := NewMemTracer()
+	tr.Trace([]byte{1, 2, 3})
+	if _, ok := tr.Last(); ok {
+		t.Fatal("expected invalid id to be ignored")
+	}
+}
+
+func TestGetTraceNilSession(t *testing.T) {
+	if _, err := (&CassandraDB{}).GetTrace(context.Background(), gocql.TimeUUID()); err == nil {
+		t.Fatal("expected error on nil session")
+	}
+}
+
+func TestTraceFormatContainsHeader(t *testing.T) {
+	id := gocql.TimeUUID()
+	tr := Trace{
+		Session: TraceSession{
+			SessionID:      id,
+			Command:        "QUERY",
+			Coordinator:    "10.0.0.1",
+			DurationMicros: 1500,
+		},
+		Events: []TraceEvent{
+			{Source: "10.0.0.1", SourceElapsed: 500, Activity: "Parsing", Thread: "Native-1"},
+			{Source: "10.0.0.1", SourceElapsed: 1400, Activity: "Done", Thread: "Native-1"},
+		},
+	}
+	out := tr.Format()
+	if !strings.Contains(out, id.String()) || !strings.Contains(out, "Parsing") || !strings.Contains(out, "Done") {
+		t.Fatalf("unexpected format output: %s", out)
+	}
+	if tr.Duration() != 1500*time.Microsecond {
+		t.Fatalf("duration mismatch: %s", tr.Duration())
+	}
+	if tr.TotalElapsed() != 1400*time.Microsecond {
+		t.Fatalf("total elapsed mismatch: %s", tr.TotalElapsed())
+	}
+}
+
+func TestNB5ScenarioArgsDeterministic(t *testing.T) {
+	nb := &NB5Exec{Binary: "nb5", Host: "10.0.0.1", LocalDC: "dc1", Driver: "cqld4"}
+	s := nb.Scenario("cql-iot").
+		Phase(PhaseMain).
+		Cycles("1M").
+		Threads(32).
+		CycleRate("10000").
+		Param("rampup-cycles", "100k").
+		Param("keycount", "1000000").
+		Errors("count").
+		Extra("--report-summary-to", "stdout:60s")
+
+	args := s.Args()
+	// activity first
+	if args[0] != "cql-iot" {
+		t.Fatalf("activity must be first arg, got %v", args)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"driver=cqld4", "host=10.0.0.1", "localdc=dc1",
+		"tags=block:main", "cycles=1M", "cyclerate=10000",
+		"threads=32", "errors=count",
+		"keycount=1000000", "rampup-cycles=100k",
+		"--report-summary-to", "stdout:60s",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestNB5RunActivityRequiresName(t *testing.T) {
+	nb := &NB5Exec{Binary: "nb5"}
+	if _, err := nb.RunActivity(context.Background(), "", nil); err == nil {
+		t.Fatal("expected error on empty activity")
+	}
+}
+
+func TestNB5RunPhaseValidates(t *testing.T) {
+	nb := &NB5Exec{Binary: "nb5"}
+	if _, err := nb.RunPhase(context.Background(), "", PhaseMain, "", 0, nil); err == nil {
+		t.Fatal("expected workload-required error")
+	}
+	if _, err := nb.RunPhase(context.Background(), "cql-iot", "", "", 0, nil); err == nil {
+		t.Fatal("expected phase-required error")
+	}
+}
+
+func TestNB5ParseSummary(t *testing.T) {
+	out := `
+Setting up scenario...
+Running activity...
+Scenario finished: cycles=1000000 errors=0 rate=48231.5 ops/s duration=20.7s
+`
+	s := ParseSummary(out)
+	if s.TotalCycles != 1000000 {
+		t.Errorf("cycles: got %d", s.TotalCycles)
+	}
+	if s.Errors != 0 {
+		t.Errorf("errors: got %d", s.Errors)
+	}
+	if s.OpsPerSec < 48000 || s.OpsPerSec > 49000 {
+		t.Errorf("rate: got %v", s.OpsPerSec)
+	}
+	if s.Duration != 20700*time.Millisecond {
+		t.Errorf("duration: got %s", s.Duration)
+	}
+}
+
+func TestNB5WriteInlineWorkload(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/workload.yaml"
+	abs, err := WriteInlineWorkload(path, "app", "kv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	for _, want := range []string{"scenarios:", "blocks:", "app.kv", "schema:", "rampup:", "main:"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("workload missing %q", want)
+		}
 	}
 }

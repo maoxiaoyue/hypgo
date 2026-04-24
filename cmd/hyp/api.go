@@ -8,8 +8,13 @@ import (
 	"text/template"
 	//	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
 )
+
+// llmYamlContent 為 hyp api 生成 config/llm.yaml 時採用的預設內容。
+// 直接複用 scaffold 套件的共用模板，確保所有專案模式內容一致。
+var llmYamlContent = scaffold.LLMYamlTemplate
 
 var apiCmd = &cobra.Command{
 	Use:   "api [project-name]",
@@ -54,6 +59,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		// 主要檔案
 		{Path: "main.go", Content: mainGoContent},
 		{Path: "config/config.yaml", Content: configYamlContent},
+		{Path: "config/llm.yaml", Content: llmYamlContent},
 		{Path: ".env.example", Content: envExampleContent},
 
 		// 初始化檔案
