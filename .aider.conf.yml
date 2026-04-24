@@ -1,0 +1,14 @@
+# HypGo — Aider 設定
+# 完整規範：config/AI_CODING_RULES.md
+#
+# Aider 需要明確指定 read 檔案才會讀取規範，
+# 此設定讓規範檔在每次對話自動載入。
+
+read:
+  - config/AI_CODING_RULES.md
+
+# 提醒 Aider 遵守規範
+# （Aider 不支援 system prompt 覆寫，但 read 檔案會隨對話送出）
+
+auto-commits: false
+dirty-commits: false

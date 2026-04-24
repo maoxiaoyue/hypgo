@@ -275,6 +275,11 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// 創建 LLM 配置文件
+	if err := createLLMConfigFile(filepath.Join(projectName, "config")); err != nil {
+		return err
+	}
+
 	// 創建主程序文件
 	if err := createMainFile(projectName); err != nil {
 		return err
@@ -364,14 +369,17 @@ logger:
     max_age: 7d
     max_backups: 10
     compress: true
-
-# 插件配置將存放在獨立的文件中
-# 使用 'hyp install <plugin-name>' 來添加插件
-# 支援的插件：rabbitmq, kafka, cassandra, scylladb, mongodb, elasticsearch
 `
 
 	filename := filepath.Join(projectName, "config", "config.yaml")
 	return os.WriteFile(filename, []byte(configContent), 0644)
+}
+
+// createLLMConfigFile 寫入 llm.yaml 到指定目錄。
+// 內容來自 scaffold.LLMYamlTemplate，預設 mode=none（不啟用 LLM）。
+func createLLMConfigFile(configDir string) error {
+	filename := filepath.Join(configDir, "llm.yaml")
+	return os.WriteFile(filename, []byte(scaffold.LLMYamlTemplate), 0644)
 }
 
 func createMainFile(projectName string) error {
