@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -421,7 +422,8 @@ func TestParseConsistency(t *testing.T) {
 		"quorum":       gocql.Quorum,
 		"all":          gocql.All,
 		"local_quorum": gocql.LocalQuorum,
-		"":             gocql.Quorum,
+		// 空字串現在 fallback 為 LocalOne（修正 Critical-1：舊行為悄悄變 Quorum 害單節點 dev 卡死）
+		"": gocql.LocalOne,
 	}
 	for in, want := range cases {
 		if got := parseConsistency(in); got != want {
@@ -996,5 +998,205 @@ func TestNB5WriteInlineWorkload(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("workload missing %q", want)
 		}
+	}
+}
+
+func TestParseConsistencyStrict(t *testing.T) {
+	for _, in := range []string{"any", "ONE", "Local-One", "local_one", "LOCAL_QUORUM"} {
+		if _, err := parseConsistencyStrict(in); err != nil {
+			t.Errorf("expected %q to parse, got %v", in, err)
+		}
+	}
+	if cl, _ := parseConsistencyStrict(""); cl != gocql.LocalOne {
+		t.Errorf("empty string should default to LocalOne, got %v", cl)
+	}
+	if _, err := parseConsistencyStrict("typo_one"); err == nil {
+		t.Error("expected error on typo_one")
+	}
+}
+
+func TestParseConsistencyFallbackLocalOne(t *testing.T) {
+	// 舊 API：拼錯不再回 Quorum，改回 LocalOne
+	if got := parseConsistency("typo"); got != gocql.LocalOne {
+		t.Errorf("expected LocalOne fallback, got %v", got)
+	}
+}
+
+func TestInitStrictConsistencyError(t *testing.T) {
+	c := &CassandraDB{config: Config{
+		Hosts:             []string{"127.0.0.1"},
+		Consistency:       "typo_consistency",
+		StrictConsistency: true,
+	}}
+	if err := c.init(); err == nil {
+		t.Fatal("expected init() to error on unknown consistency under strict mode")
+	}
+}
+
+func TestInitAppliesRetryAndReconnectDefaults(t *testing.T) {
+	c := &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}}}
+	if err := c.init(); err != nil {
+		t.Fatal(err)
+	}
+	if c.cluster.RetryPolicy == nil {
+		t.Error("RetryPolicy not set")
+	}
+	if c.cluster.ReconnectionPolicy == nil {
+		t.Error("ReconnectionPolicy not set")
+	}
+	rp, ok := c.cluster.RetryPolicy.(*gocql.ExponentialBackoffRetryPolicy)
+	if !ok || rp.NumRetries != 3 {
+		t.Errorf("expected default NumRetries=3, got %#v", c.cluster.RetryPolicy)
+	}
+}
+
+func TestInitDisableRetryAndReconnect(t *testing.T) {
+	c := &CassandraDB{config: Config{
+		Hosts:        []string{"127.0.0.1"},
+		NumRetries:   -1,
+		ReconnectMax: -1,
+	}}
+	if err := c.init(); err != nil {
+		t.Fatal(err)
+	}
+	if c.cluster.RetryPolicy != nil {
+		t.Error("RetryPolicy should be disabled when NumRetries=-1")
+	}
+	if c.cluster.ReconnectionPolicy != nil {
+		t.Error("ReconnectionPolicy should be disabled when ReconnectMax=-1")
+	}
+}
+
+func TestInitTLSEnabled(t *testing.T) {
+	c := &CassandraDB{config: Config{
+		Hosts: []string{"127.0.0.1"},
+		TLS: TLSConfig{
+			Enabled:    true,
+			CertFile:   "/tmp/c.pem",
+			KeyFile:    "/tmp/c.key",
+			CaFile:     "/tmp/ca.pem",
+			ServerName: "cass.local",
+		},
+	}}
+	if err := c.init(); err != nil {
+		t.Fatal(err)
+	}
+	if c.cluster.SslOpts == nil {
+		t.Fatal("SslOpts should be set when TLS.Enabled=true")
+	}
+	if c.cluster.SslOpts.CertPath != "/tmp/c.pem" {
+		t.Errorf("CertPath mismatch: %s", c.cluster.SslOpts.CertPath)
+	}
+}
+
+func TestInitTLSCertWithoutKeyError(t *testing.T) {
+	c := &CassandraDB{config: Config{
+		Hosts: []string{"127.0.0.1"},
+		TLS:   TLSConfig{Enabled: true, CertFile: "/tmp/c.pem"},
+	}}
+	if err := c.init(); err == nil {
+		t.Fatal("expected error: cert without key")
+	}
+}
+
+func TestCloseIdempotent(t *testing.T) {
+	c := &CassandraDB{}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("second Close should be no-op, got %v", err)
+	}
+	if !c.closed {
+		t.Error("closed flag should be true")
+	}
+}
+
+func TestCloseConcurrent(t *testing.T) {
+	c := &CassandraDB{}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = c.Close() }()
+	}
+	wg.Wait()
+}
+
+func TestConnectAfterCloseRejected(t *testing.T) {
+	c := &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}}}
+	_ = c.init()
+	_ = c.Close()
+	if err := c.Connect(); err == nil {
+		t.Fatal("Connect() after Close() should error")
+	}
+}
+
+func TestInitMapHostsInterfaceSlice(t *testing.T) {
+	c := &CassandraDB{}
+	err := c.Init(map[string]interface{}{
+		"hosts":              []interface{}{"1.1.1.1", "2.2.2.2"},
+		"keyspace":           "ks",
+		"consistency":        "local_quorum",
+		"connect_timeout":    "3s",
+		"timeout":            int64(5_000_000_000), // 5s
+		"num_retries":        2,
+		"reconnect_interval": "500ms",
+		"strict_consistency": false,
+		"tls": map[string]interface{}{
+			"enabled":              true,
+			"cert_file":            "/c.pem",
+			"key_file":             "/c.key",
+			"insecure_skip_verify": true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.config.Hosts) != 2 || c.config.Hosts[0] != "1.1.1.1" {
+		t.Errorf("hosts not parsed: %v", c.config.Hosts)
+	}
+	if c.config.ConnectTimeout != 3*time.Second {
+		t.Errorf("connect_timeout: %v", c.config.ConnectTimeout)
+	}
+	if c.config.Timeout != 5*time.Second {
+		t.Errorf("timeout: %v", c.config.Timeout)
+	}
+	if c.config.NumRetries != 2 {
+		t.Errorf("num_retries: %d", c.config.NumRetries)
+	}
+	if !c.config.TLS.Enabled || c.config.TLS.CertFile != "/c.pem" {
+		t.Errorf("tls block: %+v", c.config.TLS)
+	}
+}
+
+func TestVectorMarshalRoundTrip(t *testing.T) {
+	v := []float32{0.1, -0.5, 1.5, 0, 3.14159}
+	blob, err := MarshalVectorFloat32(v, len(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blob) != 4*len(v) {
+		t.Fatalf("blob len: got %d want %d", len(blob), 4*len(v))
+	}
+	got, err := UnmarshalVectorFloat32(blob, len(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range v {
+		if got[i] != v[i] {
+			t.Errorf("idx %d: got %v want %v", i, got[i], v[i])
+		}
+	}
+}
+
+func TestVectorDimMismatch(t *testing.T) {
+	if _, err := MarshalVectorFloat32([]float32{1, 2, 3}, 4); err == nil {
+		t.Error("expected length mismatch error")
+	}
+	if _, err := UnmarshalVectorFloat32(make([]byte, 4), 2); err == nil {
+		t.Error("expected blob length mismatch error")
+	}
+	if _, err := MarshalVectorFloat32(nil, 0); err == nil {
+		t.Error("expected dim<=0 error")
 	}
 }
