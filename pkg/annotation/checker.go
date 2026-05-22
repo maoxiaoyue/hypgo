@@ -1,6 +1,7 @@
 package annotation
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -513,4 +514,47 @@ func percent(a, b int) int {
 		return 0
 	}
 	return a * 100 / b
+}
+
+// FixFileWithSuggester 為缺少註解的區塊呼叫 Suggester 取得 doc 與 @ai 標註，
+// 再委派給 FixFile 寫入檔案（仍會建立 .go.bak 備份）。
+//
+// 任一 Suggest 呼叫失敗時，該區塊退回使用既有的 r.Suggested / r.SuggestedTags。
+func FixFileWithSuggester(ctx context.Context, filename string, results []CheckResult, s Suggester) error {
+	if s == nil {
+		return FixFile(filename, results)
+	}
+	enriched := make([]CheckResult, len(results))
+	copy(enriched, results)
+
+	for i := range enriched {
+		r := &enriched[i]
+		if r.HasDoc && r.HasRequired {
+			continue
+		}
+		req := SuggestRequest{
+			Kind: r.Kind,
+			Name: strings.TrimPrefix(r.Name, r.Kind+" "),
+			File: filename,
+		}
+		out, err := s.Suggest(ctx, req)
+		if err != nil {
+			continue
+		}
+		if !r.HasDoc && out.Doc != "" {
+			r.Suggested = "// " + out.Doc
+		}
+		if len(out.Annotations) > 0 {
+			if r.SuggestedTags == nil {
+				r.SuggestedTags = make(map[AnnotationType]string)
+			}
+			for _, a := range out.Annotations {
+				if _, exists := r.SuggestedTags[a.Type]; !exists {
+					r.SuggestedTags[a.Type] = a.Value
+				}
+			}
+		}
+	}
+
+	return FixFile(filename, enriched)
 }

@@ -1,0 +1,323 @@
+package annotation
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/maoxiaoyue/hypgo/pkg/config"
+)
+
+const (
+	systemPrompt = `你是 Go 程式碼註解助手。為使用者給出的宣告產出：
+1) 一行 godoc 風格說明（不超過 80 字元，不要加 // 前綴）
+2) 0~3 個 @ai 標註，type 只能是：constraint / deprecated / security / impact / owner
+
+請只以 JSON 物件回覆，格式為：
+{"doc":"...", "annotations":[{"type":"security","value":"requires_auth"}]}
+不要附加任何其他文字。`
+	maxDocRunes   = 200
+	maxValueRunes = 120
+	maxAnnotations = 3
+)
+
+// LLMSuggester 呼叫 LLM 取得建議的 doc 與標註
+type LLMSuggester struct {
+	cfg    *config.LLMConfig
+	client *http.Client
+}
+
+// NewLLMSuggester 建立 LLM 實作
+func NewLLMSuggester(cfg *config.LLMConfig) (*LLMSuggester, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("llm config is nil")
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	timeout := 30 * time.Second
+	switch cfg.Mode {
+	case config.LLMModeOllama:
+		if cfg.Ollama.Timeout > 0 {
+			timeout = time.Duration(cfg.Ollama.Timeout) * time.Second
+		}
+	case config.LLMModeAPI:
+		if cfg.API.Timeout > 0 {
+			timeout = time.Duration(cfg.API.Timeout) * time.Second
+		}
+	default:
+		return nil, fmt.Errorf("LLMSuggester does not support mode %q", cfg.Mode)
+	}
+	return &LLMSuggester{cfg: cfg, client: &http.Client{Timeout: timeout}}, nil
+}
+
+func (l *LLMSuggester) Suggest(ctx context.Context, req SuggestRequest) (Suggestion, error) {
+	prompt := buildPrompt(req)
+	var raw string
+	var err error
+	switch l.cfg.Mode {
+	case config.LLMModeOllama:
+		raw, err = l.callOllama(ctx, prompt)
+	case config.LLMModeAPI:
+		raw, err = l.callAPI(ctx, prompt)
+	default:
+		return Suggestion{}, fmt.Errorf("unsupported mode %q", l.cfg.Mode)
+	}
+	if err != nil {
+		return Suggestion{}, err
+	}
+	return parseSuggestion(raw), nil
+}
+
+func buildPrompt(req SuggestRequest) string {
+	var sb strings.Builder
+	sb.WriteString(systemPrompt)
+	sb.WriteString("\n\n宣告資訊：\n")
+	fmt.Fprintf(&sb, "Kind=%s\n", req.Kind)
+	fmt.Fprintf(&sb, "Name=%s\n", req.Name)
+	if req.Receiver != "" {
+		fmt.Fprintf(&sb, "Receiver=%s\n", req.Receiver)
+	}
+	if req.PkgName != "" {
+		fmt.Fprintf(&sb, "Package=%s\n", req.PkgName)
+	}
+	if len(req.Params) > 0 {
+		fmt.Fprintf(&sb, "Params=[%s]\n", strings.Join(req.Params, ","))
+	}
+	return sb.String()
+}
+
+// ---------- Ollama ----------
+
+type ollamaRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	Stream bool   `json:"stream"`
+}
+
+type ollamaResponse struct {
+	Response string `json:"response"`
+}
+
+func (l *LLMSuggester) callOllama(ctx context.Context, prompt string) (string, error) {
+	body, _ := json.Marshal(ollamaRequest{
+		Model:  l.cfg.Ollama.Model,
+		Prompt: prompt,
+		Stream: false,
+	})
+	url := strings.TrimRight(l.cfg.Ollama.URL, "/") + "/api/generate"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := l.client.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama: status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var out ollamaResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "", err
+	}
+	return out.Response, nil
+}
+
+// ---------- 雲端 API（OpenAI / Anthropic） ----------
+
+func (l *LLMSuggester) callAPI(ctx context.Context, prompt string) (string, error) {
+	switch strings.ToLower(l.cfg.API.Provider) {
+	case "openai":
+		return l.callOpenAI(ctx, prompt)
+	case "anthropic":
+		return l.callAnthropic(ctx, prompt)
+	default:
+		return "", fmt.Errorf("unsupported provider %q", l.cfg.API.Provider)
+	}
+}
+
+type openAIRequest struct {
+	Model    string          `json:"model"`
+	Messages []openAIMessage `json:"messages"`
+}
+
+type openAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type openAIResponse struct {
+	Choices []struct {
+		Message openAIMessage `json:"message"`
+	} `json:"choices"`
+}
+
+func (l *LLMSuggester) callOpenAI(ctx context.Context, prompt string) (string, error) {
+	body, _ := json.Marshal(openAIRequest{
+		Model:    l.cfg.API.Model,
+		Messages: []openAIMessage{{Role: "user", Content: prompt}},
+	})
+	base := l.cfg.API.BaseURL
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
+	url := strings.TrimRight(base, "/") + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+l.cfg.API.APIKey)
+
+	resp, err := l.client.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("openai: status %d", resp.StatusCode)
+	}
+	var out openAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if len(out.Choices) == 0 {
+		return "", fmt.Errorf("openai: empty choices")
+	}
+	return out.Choices[0].Message.Content, nil
+}
+
+type anthropicRequest struct {
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	Messages  []anthropicMessage `json:"messages"`
+}
+
+type anthropicMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type anthropicResponse struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+func (l *LLMSuggester) callAnthropic(ctx context.Context, prompt string) (string, error) {
+	body, _ := json.Marshal(anthropicRequest{
+		Model:     l.cfg.API.Model,
+		MaxTokens: 512,
+		Messages:  []anthropicMessage{{Role: "user", Content: prompt}},
+	})
+	base := l.cfg.API.BaseURL
+	if base == "" {
+		base = "https://api.anthropic.com/v1"
+	}
+	url := strings.TrimRight(base, "/") + "/messages"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", l.cfg.API.APIKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := l.client.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("anthropic: status %d", resp.StatusCode)
+	}
+	var out anthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	for _, c := range out.Content {
+		if c.Type == "text" {
+			return c.Text, nil
+		}
+	}
+	return "", fmt.Errorf("anthropic: no text content")
+}
+
+// ---------- 共用 parse & sanitize ----------
+
+var jsonObjectRE = regexp.MustCompile(`(?s)\{.*\}`)
+var htmlTagRE = regexp.MustCompile(`<[^>]+>`)
+
+type llmPayload struct {
+	Doc         string `json:"doc"`
+	Annotations []struct {
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	} `json:"annotations"`
+}
+
+// parseSuggestion 從 LLM 回應提取 JSON 並做白名單過濾
+func parseSuggestion(raw string) Suggestion {
+	jsonText := jsonObjectRE.FindString(raw)
+	if jsonText == "" {
+		return Suggestion{}
+	}
+	var p llmPayload
+	if err := json.Unmarshal([]byte(jsonText), &p); err != nil {
+		return Suggestion{}
+	}
+
+	doc := sanitize(p.Doc, maxDocRunes)
+
+	var anns []Annotation
+	for _, a := range p.Annotations {
+		t := AnnotationType(strings.ToLower(strings.TrimSpace(a.Type)))
+		if !isValidType(t) {
+			continue
+		}
+		anns = append(anns, Annotation{
+			Type:  t,
+			Value: sanitize(a.Value, maxValueRunes),
+		})
+		if len(anns) >= maxAnnotations {
+			break
+		}
+	}
+	return Suggestion{Doc: doc, Annotations: anns}
+}
+
+func isValidType(t AnnotationType) bool {
+	for _, v := range ValidAnnotationTypes() {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitize(s string, maxRunes int) string {
+	s = htmlTagRE.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) > maxRunes {
+		s = string(r[:maxRunes])
+	}
+	return s
+}
