@@ -248,6 +248,10 @@ func runNewGRPC(projectName string) error {
 	return nil
 }
 
+func init() {
+	rootCmd.AddCommand(newCmd)
+}
+
 func runNew(cmd *cobra.Command, args []string) error {
 	projectName := args[0]
 
