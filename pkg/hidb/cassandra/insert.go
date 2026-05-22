@@ -30,6 +30,11 @@ func (c *CassandraDB) Insert(table string) *InsertBuilder {
 }
 
 // Value appends a single column/value pair.
+//
+// IMPORTANT for vector<float, N> columns: do NOT pass a []float32 directly —
+// gocql v1.7.0 will encode it as list<float> and the server will reject the
+// write. Call MarshalVectorFloat32(vec, dim) first and pass the []byte blob.
+// See pkg/hidb/cassandra/vector.go.
 func (i *InsertBuilder) Value(col string, val interface{}) *InsertBuilder {
 	i.columns = append(i.columns, col)
 	i.values = append(i.values, val)

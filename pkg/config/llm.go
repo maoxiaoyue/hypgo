@@ -6,6 +6,14 @@ import (
 	"strings"
 )
 
+// LLMMode 列出支援的 LLM 模式
+const (
+	LLMModeNone   = "none"
+	LLMModeOllama = "ollama"
+	LLMModeAPI    = "api"
+	LLMModeRAG    = "rag"
+)
+
 // LLMConfig 控制 Manifest 智慧增強的 LLM 層
 type LLMConfig struct {
 	// Mode 控制 LLM 增強模式

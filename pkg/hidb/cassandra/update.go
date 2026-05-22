@@ -35,6 +35,11 @@ func (c *CassandraDB) Update(table string) *UpdateBuilder {
 }
 
 // Set assigns col = value.
+//
+// IMPORTANT for vector<float, N> columns: do NOT pass a []float32 directly —
+// gocql v1.7.0 will encode it as list<float> and the server will reject the
+// write. Call MarshalVectorFloat32(vec, dim) first and pass the []byte blob.
+// See pkg/hidb/cassandra/vector.go.
 func (u *UpdateBuilder) Set(col string, v interface{}) *UpdateBuilder {
 	u.assignments = append(u.assignments, assignment{expr: quoteIdent(col) + " = ?", args: []interface{}{v}})
 	return u

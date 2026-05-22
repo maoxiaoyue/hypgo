@@ -178,6 +178,7 @@ func GenerateMiddleware(dir string) error {
 	return generateFile(dir, "middleware.go", middlewareTemplate, nil)
 }
 
+
 // GenerateModel 生成使用 bun ORM 的 model（含 Request/Response struct）
 func GenerateModel(dir, name string) error {
 	if err := validateName(name); err != nil {
