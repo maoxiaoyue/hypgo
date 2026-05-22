@@ -8,20 +8,25 @@ import (
 
 // Cassandra 5.0 vector codec helpers
 // ----------------------------------------------------------------------
+// REQUIRED for any INSERT/UPDATE against a `vector<float, N>` column.
+//
 // gocql v1.7.0 does not natively recognise the Cassandra 5.0
 // `vector<float, N>` type — it is delivered as a CUSTOM type at the
-// wire level. These helpers let callers explicitly marshal / unmarshal
-// a []float32 against the Cassandra 5.0 vector wire format
-// (an N-element packed array of big-endian IEEE-754 binary32 values),
-// independent of driver version.
+// wire level. Binding []float32 directly through Value(..., []float32)
+// or session.Query(..., []float32{...}) causes the driver to encode it
+// as list<float>, and the server rejects the write with
+//   "type mismatch: list<float> vs vector<float, N>"
+// — the first write fails. There is no silent fallback.
 //
-// Use them when:
-//   - You hit a "marshal: not enough/too many bytes to marshal" or
-//     a "type mismatch: list<float> vs vector<float, N>" error from gocql.
-//   - You want to insert/select via raw []byte bind values to bypass
-//     the driver's type negotiation entirely.
+// Usage rule:
+//   - Insert / Update: call MarshalVectorFloat32 and bind the []byte
+//     blob. See wiki/hidb.cassandra.md "Vector serialization" section.
+//   - Select: read the column as []byte, then UnmarshalVectorFloat32.
+//   - ANN OF queries: SelectBuilder.ANNOf renders the vector as a CQL
+//     literal, bypassing parameter binding — []float32 is fine there.
 //
-// Once gocql adds first-class vector support these helpers can be retired.
+// Once gocql adds first-class vector support, these helpers can be
+// retired and direct []float32 binding will start working.
 
 // MarshalVectorFloat32 packs a []float32 into Cassandra 5.0 wire format.
 //
