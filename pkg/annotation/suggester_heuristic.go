@@ -21,6 +21,11 @@ func (h *HeuristicSuggester) Suggest(_ context.Context, req SuggestRequest) (Sug
 	}, nil
 }
 
+// ProviderName 回傳 "heuristic"，標示本地規則而非 LLM
+func (h *HeuristicSuggester) ProviderName() string {
+	return "heuristic"
+}
+
 func heuristicDoc(req SuggestRequest) string {
 	switch req.Kind {
 	case "package":
