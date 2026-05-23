@@ -1,0 +1,260 @@
+package main
+
+// @ai purpose: hyp eval-report CLI 命令 — 讀取 .hyp/eval_history.jsonl，以趨勢表格呈現各路由的測試品質演進
+// @ai input: 可選的 --path（自訂 history 檔案路徑）、--n（最近 N 筆的平均視窗）
+// @ai output: 終端趨勢報告（route | last N avg | trend | flaky detection）
+// @ai sideeffect: 讀取 .hyp/eval_history.jsonl
+// date: 2026-05-23
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"sort"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/maoxiaoyue/hypgo/pkg/eval"
+	"github.com/spf13/cobra"
+)
+
+var evalReportCmd = &cobra.Command{
+	Use:   "eval-report",
+	Short: "Show contract test quality trend from eval history",
+	Long: `Read .hyp/eval_history.jsonl and display a quality trend report for each route.
+
+The report shows:
+  - Route path (METHOD /path)
+  - Average contract score over the last N runs (default: 5)
+  - Trend vs. the previous N runs (↑ improving / ↓ degrading / → stable)
+  - Flaky detection: routes that alternate between pass and fail
+  - Warning ⚠ for routes where score dropped more than 0.1
+
+History is generated automatically when using:
+  contract.TestAll(t, router, contract.RunConfig{RecordHistory: true})
+
+Examples:
+  hyp eval-report                       # read .hyp/eval_history.jsonl
+  hyp eval-report --path my/history.jsonl
+  hyp eval-report --n 10                # average over last 10 runs`,
+	RunE: runEvalReport,
+}
+
+var (
+	evalReportPath string
+	evalReportN    int
+)
+
+func init() {
+	evalReportCmd.Flags().StringVar(&evalReportPath, "path", eval.DefaultHistoryPath(),
+		"Path to the eval history JSONL file")
+	evalReportCmd.Flags().IntVar(&evalReportN, "n", 5,
+		"Number of recent runs to average for the trend window")
+}
+
+// runEvalReport 執行 eval-report 命令：讀取 history 並輸出趨勢表格
+func runEvalReport(cmd *cobra.Command, args []string) error {
+	if evalReportN < 1 {
+		return fmt.Errorf("--n must be >= 1, got %d", evalReportN)
+	}
+
+	records, err := eval.LoadHistory(evalReportPath)
+	if err != nil {
+		return fmt.Errorf("讀取 eval history 失敗: %w", err)
+	}
+
+	if len(records) == 0 {
+		fmt.Println("📋 尚無 eval 記錄。")
+		fmt.Println()
+		fmt.Println("啟用歷史記錄：")
+		fmt.Println(`  contract.TestAll(t, r, contract.RunConfig{RecordHistory: true})`)
+		fmt.Println()
+		fmt.Printf("記錄儲存位置：%s\n", evalReportPath)
+		return nil
+	}
+
+	// 按路由分組
+	byRoute := groupByRoute(records)
+
+	// 取得所有路由並排序（固定輸出順序）
+	routes := make([]string, 0, len(byRoute))
+	for r := range byRoute {
+		routes = append(routes, r)
+	}
+	sort.Strings(routes)
+
+	// 輸出報告頭
+	fmt.Printf("📊 Eval Report — %s\n", evalReportPath)
+	fmt.Printf("   Total records: %d  |  Routes: %d  |  Window: last %d\n\n",
+		len(records), len(routes), evalReportN)
+
+	// 使用 tabwriter 對齊欄位
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "Route\tLast N avg\tPrev N avg\tTrend\tFlaky\tRuns")
+	fmt.Fprintln(w, "─────\t──────────\t──────────\t─────\t─────\t────")
+
+	var hasWarning bool
+	for _, route := range routes {
+		recs := byRoute[route]
+
+		n := evalReportN
+		lastAvg := windowAvg(recs, 0, n)
+		prevAvg := windowAvg(recs, n, 2*n)
+		flaky := isFlaky(recs, n)
+		trend := trendArrow(lastAvg, prevAvg)
+		warn := ""
+		if prevAvg >= 0 && lastAvg < prevAvg-0.1 {
+			warn = " ⚠"
+			hasWarning = true
+		}
+
+		lastStr := formatScore(lastAvg)
+		prevStr := formatScore(prevAvg)
+
+		flakyStr := ""
+		if flaky {
+			flakyStr = "⚡"
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s%s\t%s\t%d\n",
+			route, lastStr, prevStr, trend, warn, flakyStr, len(recs))
+	}
+	w.Flush()
+
+	if hasWarning {
+		fmt.Println()
+		fmt.Println("⚠ = score dropped more than 0.1 vs previous window")
+	}
+
+	// 最後記錄的 git commit
+	if len(records) > 0 {
+		last := records[len(records)-1]
+		if last.GitCommit != "" {
+			fmt.Printf("\nLast recorded commit: %s\n", last.GitCommit)
+		}
+	}
+
+	return nil
+}
+
+// groupByRoute 將 []EvalRecord 按 Route 欄位分組，組內保持時間先後順序
+func groupByRoute(records []eval.EvalRecord) map[string][]eval.EvalRecord {
+	result := make(map[string][]eval.EvalRecord)
+	for _, r := range records {
+		result[r.Route] = append(result[r.Route], r)
+	}
+	return result
+}
+
+// windowAvg 計算 records 中倒數第 (skip+n) 到倒數第 skip 筆的平均 contract score
+// skip=0,n=5 → last 5；skip=5,n=5 → previous 5
+// 若無足夠記錄回傳 -1（表示 N/A）
+func windowAvg(records []eval.EvalRecord, skip, end int) float64 {
+	total := len(records)
+	// 計算實際的倒數範圍
+	from := total - end
+	to := total - skip
+	if from < 0 {
+		from = 0
+	}
+	if to <= from {
+		return -1
+	}
+
+	window := records[from:to]
+	if len(window) == 0 {
+		return -1
+	}
+
+	var sum float64
+	var count int
+	for _, r := range window {
+		if score, ok := r.Scores["contract"]; ok {
+			sum += score
+			count++
+		} else {
+			// 無 scores 欄位：由 status 推斷
+			if r.Status == "pass" {
+				sum++
+			}
+			count++
+		}
+	}
+	if count == 0 {
+		return -1
+	}
+	return sum / float64(count)
+}
+
+// isFlaky 偵測最近 N 筆記錄中是否有「通過/失敗交替」模式（flaky test）
+// 若同一路由在最近 N 筆中同時有 pass 和 fail，視為 flaky
+func isFlaky(records []eval.EvalRecord, n int) bool {
+	from := len(records) - n
+	if from < 0 {
+		from = 0
+	}
+	window := records[from:]
+	if len(window) < 2 {
+		return false
+	}
+
+	hasPass, hasFail := false, false
+	for _, r := range window {
+		if r.Status == "pass" {
+			hasPass = true
+		} else {
+			hasFail = true
+		}
+		if hasPass && hasFail {
+			return true
+		}
+	}
+	return false
+}
+
+// trendArrow 依據最近與前期平均分數，回傳趨勢符號
+func trendArrow(last, prev float64) string {
+	if prev < 0 {
+		// 前期無資料
+		return "→ new"
+	}
+	diff := last - prev
+	switch {
+	case math.Abs(diff) < 0.02:
+		return fmt.Sprintf("→ stable")
+	case diff > 0:
+		return fmt.Sprintf("↑ +%.2f", diff)
+	default:
+		return fmt.Sprintf("↓ %.2f", diff)
+	}
+}
+
+// formatScore 將 -1（N/A）或 0–1 的分數格式化為字串
+func formatScore(score float64) string {
+	if score < 0 {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f", score)
+}
+
+// truncateRoute 截短過長的路由字串，讓表格不會過寬
+func truncateRoute(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
+}
+
+// filterByRoute 過濾只保留特定路由的記錄（供未來 --filter flag 使用）
+func filterByRoute(records []eval.EvalRecord, filter string) []eval.EvalRecord {
+	if filter == "" {
+		return records
+	}
+	var result []eval.EvalRecord
+	for _, r := range records {
+		if strings.Contains(strings.ToLower(r.Route), strings.ToLower(filter)) {
+			result = append(result, r)
+		}
+	}
+	return result
+}

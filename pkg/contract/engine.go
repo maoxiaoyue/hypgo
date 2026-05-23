@@ -1,0 +1,74 @@
+package contract
+
+// @ai purpose: RunConfig 執行引擎設定 — 集中管理 TestAll / ObserveAll / Observe 的並行、重試、速率限制與 FailFast 策略
+// @ai input: 無（僅定義型別與工具函式，由 TestAll / runObserve 呼叫）
+// @ai output: RunConfig 型別、mergeRunConfig() 正規化函式
+// @ai sideeffect: 無
+// date: 2026-05-23
+
+import (
+	"runtime"
+	"time"
+)
+
+// RunConfig 控制 TestAll / ObserveAll / Observe 的執行策略
+//
+// 零值等同於原有行為（循序、不重試、不限速、不 FailFast），保持向後相容。
+//
+// 使用範例：
+//
+//	contract.TestAll(t, r, contract.RunConfig{
+//	    Parallel:   true,
+//	    MaxWorkers: 4,
+//	    RetryCount: 2,
+//	    RetryDelay: 500 * time.Millisecond,
+//	    RateLimit:  10,
+//	    FailFast:   false,
+//	})
+type RunConfig struct {
+	// Parallel 啟用並行執行
+	// TestAll 使用 t.Parallel()，ObserveAll/Observe 使用 goroutine pool
+	Parallel bool
+
+	// MaxWorkers 限制並行 goroutine 數量
+	// 0 或負值 → 自動設為 runtime.GOMAXPROCS(0)
+	MaxWorkers int
+
+	// RetryCount 失敗後的額外重試次數（0 = 不重試）
+	// 例如 RetryCount=2 表示最多執行 3 次（1 次初始 + 2 次重試）
+	RetryCount int
+
+	// RetryDelay 每次重試前的等待時間（0 = 立即重試）
+	RetryDelay time.Duration
+
+	// RateLimit 每秒最大執行數（0 = 不限制）
+	// 使用 time.Ticker 實作，多個 goroutine 競爭接收，天然 goroutine-safe
+	RateLimit int
+
+	// FailFast 第一個失敗後立即停止後續測試
+	// 並行模式下：已啟動的 goroutine 會繼續完成，新的不再啟動
+	FailFast bool
+
+	// RecordHistory 將每次測試結果 append 到 .hyp/eval_history.jsonl
+	// true 時自動記錄（含路由、狀態、延遲、git commit、輸入 hash）
+	// false 時不記錄（零值，向後相容）
+	RecordHistory bool
+}
+
+// mergeRunConfig 取第一個 RunConfig 或回傳零值，並正規化 MaxWorkers
+//
+// @ai purpose: 讓 TestAll(t, r) 零引數呼叫繼續向後相容，並確保 MaxWorkers 非零
+// @ai input: []RunConfig（可為空或 nil）
+// @ai output: 單一正規化的 RunConfig
+// @ai sideeffect: 無
+// date: 2026-05-23
+func mergeRunConfig(cfgs []RunConfig) RunConfig {
+	var cfg RunConfig
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
+	if cfg.MaxWorkers <= 0 {
+		cfg.MaxWorkers = runtime.GOMAXPROCS(0)
+	}
+	return cfg
+}

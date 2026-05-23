@@ -1,7 +1,7 @@
 package contract
 
 // @ai purpose: Test Observe — 以完整 HTTP 捕捉模式執行 contract 測試，並生成結構化 HTML 報告
-// @ai input: *testing.T, *router.Router, 可選的函式名稱過濾字串與 ObserveOptions
+// @ai input: *testing.T, *router.Router, 可選的函式名稱過濾字串與 ObserveOptions（含 RunConfig）
 // @ai output: []ObserveResult（每條路由一筆完整記錄），並將 HTML 報告寫入 .hyp/observe_*.html
 // @ai sideeffect: 建立 .hyp/ 目錄、寫入 HTML 報告檔案、可選擇自動開啟瀏覽器
 // date: 2026-05-23
@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +36,10 @@ type ObserveOptions struct {
 
 	// Silent 抑制 t.Logf 的報告路徑輸出
 	Silent bool
+
+	// Run 配置執行引擎（並行、重試、速率限制、FailFast）
+	// 零值等同原有行為（循序、不重試、不限速、不 FailFast）
+	Run RunConfig
 }
 
 // CapturedRequest 記錄實際發出的 HTTP 請求完整內容
@@ -82,6 +88,18 @@ type ObserveResult struct {
 //	func TestObserveWithBrowser(t *testing.T) {
 //	    contract.ObserveAll(t, setupRouter(), contract.ObserveOptions{OpenBrowser: true})
 //	}
+//
+//	func TestObserveParallel(t *testing.T) {
+//	    contract.ObserveAll(t, setupRouter(), contract.ObserveOptions{
+//	        Run: contract.RunConfig{Parallel: true, MaxWorkers: 4, RetryCount: 2},
+//	    })
+//	}
+//
+// @ai purpose: 觀察所有 schema-registered REST 路由，捕捉完整 HTTP 交換並生成 HTML 報告
+// @ai input: *testing.T（可為 nil）、*hypRouter.Router、可選的 ObserveOptions
+// @ai output: []ObserveResult（每條路由一筆完整記錄）
+// @ai sideeffect: 建立 .hyp/ 目錄、寫入 HTML 報告、可開啟瀏覽器
+// date: 2026-05-23
 func ObserveAll(t *testing.T, r *hypRouter.Router, opts ...ObserveOptions) []ObserveResult {
 	if t != nil {
 		t.Helper()
@@ -103,6 +121,12 @@ func ObserveAll(t *testing.T, r *hypRouter.Router, opts ...ObserveOptions) []Obs
 //	func TestObserveOrders(t *testing.T) {
 //	    contract.Observe(t, setupRouter(), "orders")
 //	}
+//
+// @ai purpose: 依過濾條件觀察特定路由，支援 HandlerNames / Path / Summary / Tags 比對
+// @ai input: *testing.T（可為 nil）、*hypRouter.Router、funcName string（過濾條件）、可選的 ObserveOptions
+// @ai output: []ObserveResult（符合過濾條件的路由記錄）
+// @ai sideeffect: 建立 .hyp/ 目錄、寫入 HTML 報告、可開啟瀏覽器
+// date: 2026-05-23
 func Observe(t *testing.T, r *hypRouter.Router, funcName string, opts ...ObserveOptions) []ObserveResult {
 	if t != nil {
 		t.Helper()
@@ -111,6 +135,13 @@ func Observe(t *testing.T, r *hypRouter.Router, funcName string, opts ...Observe
 }
 
 // runObserve 為 ObserveAll 和 Observe 的共用內部實作
+// 支援循序與並行兩種執行路徑，均透過 writeObserveReport 輸出 HTML 報告
+//
+// @ai purpose: 整合路由過濾、執行引擎（RunConfig）、結果收集、HTML 報告寫入
+// @ai input: *testing.T、*hypRouter.Router、filter string、ObserveOptions
+// @ai output: []ObserveResult
+// @ai sideeffect: 可能建立 .hyp/ 目錄並寫入 HTML 檔案
+// date: 2026-05-23
 func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOptions) []ObserveResult {
 	routes := schema.Global().All()
 	if len(routes) == 0 {
@@ -120,7 +151,8 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		return nil
 	}
 
-	var results []ObserveResult
+	// 過濾出符合條件的 REST 路由
+	var targets []schema.Route
 	for _, route := range routes {
 		if !route.IsREST() {
 			continue
@@ -128,17 +160,137 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		if filter != "" && !observeRouteMatchesFilter(route, filter) {
 			continue
 		}
-		results = append(results, captureRouteExchange(r, route))
+		targets = append(targets, route)
 	}
 
-	if len(results) == 0 {
+	if len(targets) == 0 {
 		if t != nil {
 			t.Logf("[observe] no routes matched filter %q", filter)
 		}
+		return nil
+	}
+
+	cfg := opt.Run
+	// 防禦性檢查：MaxWorkers 在 mergeObserveOpts 不做正規化，在此補齊
+	if cfg.MaxWorkers <= 0 {
+		cfg.MaxWorkers = runtime.GOMAXPROCS(0)
+	}
+
+	// ── 並行路徑 ──────────────────────────────────────────────────────────
+	if cfg.Parallel && len(targets) > 1 {
+		sem := make(chan struct{}, cfg.MaxWorkers)
+		var (
+			mu      sync.Mutex
+			wg      sync.WaitGroup
+			aborted atomic.Bool
+			results []ObserveResult
+		)
+
+		// 速率限制器
+		var limiterCh <-chan time.Time
+		if cfg.RateLimit > 0 {
+			ticker := time.NewTicker(time.Second / time.Duration(cfg.RateLimit))
+			limiterCh = ticker.C
+			defer ticker.Stop()
+		}
+
+		for _, route := range targets {
+			if aborted.Load() {
+				break
+			}
+			route := route // capture
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				// 獲取 semaphore slot（控制最大並行數）
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				// 再次檢查：獲取 slot 後可能已有其他 goroutine 設定 FailFast
+				if aborted.Load() {
+					return
+				}
+
+				// 速率限制
+				if cfg.RateLimit > 0 {
+					<-limiterCh
+				}
+
+				result := captureWithRetry(r, route, cfg)
+
+				mu.Lock()
+				results = append(results, result)
+				mu.Unlock()
+
+				if !result.Pass && cfg.FailFast {
+					aborted.Store(true)
+				}
+			}()
+		}
+		wg.Wait()
+
+		return writeObserveReport(t, results, filter, opt)
+	}
+
+	// ── 循序路徑（預設）──────────────────────────────────────────────────
+	var results []ObserveResult
+	var seqAborted bool
+
+	for _, route := range targets {
+		if cfg.FailFast && seqAborted {
+			break
+		}
+		// 循序速率限制：兩次執行間 sleep
+		if cfg.RateLimit > 0 {
+			time.Sleep(time.Second / time.Duration(cfg.RateLimit))
+		}
+		result := captureWithRetry(r, route, cfg)
+		results = append(results, result)
+		if !result.Pass && cfg.FailFast {
+			seqAborted = true
+		}
+	}
+
+	return writeObserveReport(t, results, filter, opt)
+}
+
+// captureWithRetry 執行帶重試機制的 captureRouteExchange
+// 失敗時最多重試 cfg.RetryCount 次，回傳最後一次的完整記錄
+//
+// @ai purpose: 讓 Observe 模式也能受益於 RunConfig 的重試設定
+// @ai input: *hypRouter.Router、schema.Route、RunConfig（重試設定）
+// @ai output: ObserveResult（最後一次執行的完整記錄）
+// @ai sideeffect: 無（不接觸 *testing.T）
+// date: 2026-05-23
+func captureWithRetry(r *hypRouter.Router, route schema.Route, cfg RunConfig) ObserveResult {
+	var result ObserveResult
+	for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
+		if attempt > 0 && cfg.RetryDelay > 0 {
+			time.Sleep(cfg.RetryDelay)
+		}
+		result = captureRouteExchange(r, route)
+		if result.Pass {
+			break
+		}
+	}
+	return result
+}
+
+// writeObserveReport 將結果列表寫入 HTML 報告並回傳結果
+// 提取為獨立函式以消除循序/並行兩條路徑的重複邏輯
+//
+// @ai purpose: 統一處理 HTML 報告生成、檔案寫入、瀏覽器開啟
+// @ai input: *testing.T（可為 nil）、[]ObserveResult、filter string、ObserveOptions
+// @ai output: []ObserveResult（原樣回傳，供呼叫端程式化斷言）
+// @ai sideeffect: 建立 .hyp/ 目錄、寫入 HTML 檔案、可開啟瀏覽器
+// date: 2026-05-23
+func writeObserveReport(t *testing.T, results []ObserveResult, filter string, opt ObserveOptions) []ObserveResult {
+	if len(results) == 0 {
 		return results
 	}
 
-	// 寫入 HTML 報告
 	outPath := opt.OutputPath
 	if outPath == "" {
 		if err := os.MkdirAll(".hyp", 0o755); err == nil {
@@ -147,8 +299,8 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		}
 	}
 	if outPath != "" {
-		html := GenerateObserveHTML(results, filter)
-		if err := os.WriteFile(outPath, []byte(html), 0o644); err == nil {
+		htmlContent := GenerateObserveHTML(results, filter)
+		if err := os.WriteFile(outPath, []byte(htmlContent), 0o644); err == nil {
 			if t != nil && !opt.Silent {
 				t.Logf("[observe] report → %s", outPath)
 			}
@@ -162,6 +314,12 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 }
 
 // captureRouteExchange 執行一條路由的測試並捕捉完整的 HTTP 交換記錄
+//
+// @ai purpose: 捕捉單一路由的完整 HTTP 請求/回應，並執行四步驗證
+// @ai input: *hypRouter.Router、schema.Route
+// @ai output: ObserveResult（含完整 HTTP 交換記錄與驗證步驟）
+// @ai sideeffect: 無（httptest 模式，不開真實 port）
+// date: 2026-05-23
 func captureRouteExchange(r *hypRouter.Router, route schema.Route) ObserveResult {
 	tc := generateTestCase(route)
 	tc.schemaPath = route.Path
@@ -230,6 +388,12 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route) ObserveResult
 }
 
 // runObserveValidation 逐步執行驗證並記錄每個步驟的結果
+//
+// @ai purpose: 四步驗證（狀態碼、回應 body 非空、Input schema、Output schema）
+// @ai input: schema.Route、TestCase（自動生成）、實際 HTTP 狀態碼、回應 body
+// @ai output: []ValidationStep、pass bool、reason string
+// @ai sideeffect: 無
+// date: 2026-05-23
 func runObserveValidation(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
 	pass = true
 
@@ -303,6 +467,12 @@ func runObserveValidation(route schema.Route, tc TestCase, code int, body []byte
 
 // observeRouteMatchesFilter 判斷路由是否符合過濾字串
 // 對 HandlerNames、Path、Summary、Tags 做大小寫不敏感的子字串比對
+//
+// @ai purpose: 讓 Observe(t, r, "funcName") 可以依多個維度過濾路由
+// @ai input: schema.Route、filter string
+// @ai output: bool（是否符合）
+// @ai sideeffect: 無
+// date: 2026-05-23
 func observeRouteMatchesFilter(route schema.Route, filter string) bool {
 	f := strings.ToLower(filter)
 	for _, h := range route.HandlerNames {
@@ -325,6 +495,12 @@ func observeRouteMatchesFilter(route schema.Route, filter string) bool {
 }
 
 // mergeObserveOpts 取第一個 ObserveOptions 或回傳預設值
+//
+// @ai purpose: 讓 ObserveAll(t, r) 零引數呼叫繼續向後相容
+// @ai input: []ObserveOptions
+// @ai output: ObserveOptions（第一個或零值）
+// @ai sideeffect: 無
+// date: 2026-05-23
 func mergeObserveOpts(opts []ObserveOptions) ObserveOptions {
 	if len(opts) > 0 {
 		return opts[0]
@@ -333,6 +509,12 @@ func mergeObserveOpts(opts []ObserveOptions) ObserveOptions {
 }
 
 // observeIfElse 為內部使用的三元表達式替代
+//
+// @ai purpose: 消除 if/else 的樣板程式碼
+// @ai input: cond bool、t string（true 時回傳）、f string（false 時回傳）
+// @ai output: string
+// @ai sideeffect: 無
+// date: 2026-05-23
 func observeIfElse(cond bool, t, f string) string {
 	if cond {
 		return t
@@ -341,6 +523,12 @@ func observeIfElse(cond bool, t, f string) string {
 }
 
 // openObserveBrowser 在預設瀏覽器中開啟指定路徑的 HTML 報告
+//
+// @ai purpose: 跨平台開啟瀏覽器（macOS / Linux / Windows）
+// @ai input: path string（HTML 報告的相對或絕對路徑）
+// @ai output: 無
+// @ai sideeffect: 啟動系統瀏覽器程序
+// date: 2026-05-23
 func openObserveBrowser(path string) {
 	abs, err := filepath.Abs(path)
 	if err != nil {

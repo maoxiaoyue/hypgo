@@ -1,0 +1,198 @@
+package eval
+
+// @ai purpose: Evaluation History 持久化 — 將 contract 測試結果以 JSONL 格式 append 到 .hyp/eval_history.jsonl
+// @ai input: EvalRecord（測試結果結構）、可選的自訂路徑
+// @ai output: 錯誤（nil 表示成功）
+// @ai sideeffect: 建立 .hyp/ 目錄、讀寫 .hyp/eval_history.jsonl（原子替換：寫 .tmp → rename）
+// date: 2026-05-23
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// EvalRecord 記錄單一測試案例的完整執行結果
+// 對應 .hyp/eval_history.jsonl 中的每一行 JSON
+//
+// @ai purpose: 標準化測試結果的持久化格式，供後續趨勢分析與品質追蹤使用
+// @ai input: none（純資料結構）
+// @ai output: none（純資料結構）
+// @ai sideeffect: none
+// date: 2026-05-23
+type EvalRecord struct {
+	// Timestamp 為測試執行時間（UTC）
+	Timestamp time.Time `json:"ts"`
+
+	// GitCommit 為當前 git 短 hash（如 "a3f8b21"），無法取得時為空字串
+	GitCommit string `json:"git_commit,omitempty"`
+
+	// Route 為 "METHOD /path" 格式，例如 "POST /api/summarize"
+	Route string `json:"route"`
+
+	// Status 為 "pass" 或 "fail"
+	Status string `json:"status"`
+
+	// Scores 為各評判器的評分（0.0–1.0），目前只有 "contract" 分數
+	// 未來 Item A（Probabilistic Evaluation）加入後將包含 "llm_judge"、"similarity" 等
+	Scores map[string]float64 `json:"scores,omitempty"`
+
+	// LatencyMs 為完整執行時間（含重試），單位毫秒
+	LatencyMs int64 `json:"latency_ms"`
+
+	// InputHash 為請求 body 的 sha256 前綴（格式 "sha256:abcdef01"）
+	// 只存 hash，不存實際輸入，避免敏感資料洩漏
+	InputHash string `json:"input_hash,omitempty"`
+
+	// FailReason 為失敗原因字串，pass 時為空
+	FailReason string `json:"fail_reason,omitempty"`
+}
+
+// historyMu 保護同一進程內對 history 檔案的並行寫入
+var historyMu sync.Mutex
+
+// DefaultHistoryPath 回傳預設的 history 檔案路徑
+//
+// @ai purpose: 集中管理 history 檔案路徑，讓呼叫者不需硬編碼路徑字串
+// @ai input: none
+// @ai output: .hyp/eval_history.jsonl 的相對路徑字串
+// @ai sideeffect: none
+// date: 2026-05-23
+func DefaultHistoryPath() string {
+	return filepath.Join(".hyp", "eval_history.jsonl")
+}
+
+// HashInput 計算請求 body 的 sha256 前綴摘要
+// 格式：「sha256:」+ 前 8 bytes 的 hex（16 字元）
+// 空字串輸入回傳空字串（不記錄）
+//
+// @ai purpose: 在不儲存實際輸入內容的前提下，唯一識別相同的 test input，供重複性分析使用
+// @ai input: 請求 body 字串（可為空）
+// @ai output: "sha256:前8bytes的hex" 或空字串
+// @ai sideeffect: none
+// date: 2026-05-23
+func HashInput(input string) string {
+	if input == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(input))
+	return fmt.Sprintf("sha256:%x", h[:8])
+}
+
+// GitShortCommit 取得目前 git 倉庫的短 commit hash（7 字元）
+// 若 git 不可用或不在 git 倉庫中，回傳空字串（不中止程式）
+//
+// @ai purpose: 將測試結果與 git 版本關聯，讓趨勢報告可追蹤品質與程式碼版本的對應關係
+// @ai input: none（從當前工作目錄執行 git 命令）
+// @ai output: 7 字元短 commit hash 或空字串（git 不可用時）
+// @ai sideeffect: 呼叫 git rev-parse --short HEAD 子程序
+// date: 2026-05-23
+func GitShortCommit() string {
+	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// AppendHistory 將一筆 EvalRecord append 到預設 history 檔案（DefaultHistoryPath()）
+// 採原子替換（讀取現有內容 → 寫入暫存 .tmp → rename），不會在寫入中途損壞檔案
+// 若 .hyp/ 目錄不存在則自動建立
+//
+// @ai purpose: 讓 TestAll 可以在不修改原始碼的情況下持久化測試結果，支援未來的趨勢分析
+// @ai input: EvalRecord（單一測試結果）
+// @ai output: 錯誤（nil 表示成功）
+// @ai sideeffect: 讀寫 .hyp/eval_history.jsonl 與暫存 .tmp 檔案
+// date: 2026-05-23
+func AppendHistory(record EvalRecord) error {
+	return AppendHistoryTo(DefaultHistoryPath(), record)
+}
+
+// AppendHistoryTo 將一筆 EvalRecord append 到指定路徑
+// 功能與 AppendHistory 相同，但接受自訂路徑，方便測試使用暫存目錄
+//
+// @ai purpose: 提供可測試版本的 AppendHistory，讓測試可指定路徑而不影響真實 .hyp/ 目錄
+// @ai input: path string（目標 JSONL 路徑）、EvalRecord（資料）
+// @ai output: 錯誤（nil 表示成功）
+// @ai sideeffect: 讀寫指定路徑與暫存 .tmp 檔案
+// date: 2026-05-23
+func AppendHistoryTo(path string, record EvalRecord) error {
+	historyMu.Lock()
+	defer historyMu.Unlock()
+
+	// 確保目錄存在
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("eval: mkdir %s: %w", dir, err)
+	}
+
+	// 序列化新紀錄為一行 JSON
+	line, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("eval: marshal record: %w", err)
+	}
+	line = append(line, '\n')
+
+	// 讀取現有內容（若檔案不存在則視為空）
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("eval: read history: %w", err)
+	}
+
+	// 合併現有內容 + 新紀錄
+	combined := make([]byte, 0, len(existing)+len(line))
+	combined = append(combined, existing...)
+	combined = append(combined, line...)
+
+	// 原子寫入：先寫暫存檔，成功後 rename
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, combined, 0o644); err != nil {
+		return fmt.Errorf("eval: write temp %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp) // 清理暫存檔，忽略錯誤
+		return fmt.Errorf("eval: rename to %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// LoadHistory 從 JSONL 檔案讀取所有 EvalRecord
+// 若檔案不存在，回傳 nil slice（非錯誤）
+// 跳過格式錯誤的行，不中止整個讀取
+//
+// @ai purpose: 讓 hyp eval-report 與未來的趨勢分析工具讀取歷史測試結果
+// @ai input: path string（JSONL 檔案路徑，通常為 DefaultHistoryPath()）
+// @ai output: []EvalRecord（若檔案不存在為 nil）、錯誤
+// @ai sideeffect: 讀取指定檔案
+// date: 2026-05-23
+func LoadHistory(path string) ([]EvalRecord, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("eval: read history %s: %w", path, err)
+	}
+
+	var records []EvalRecord
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var r EvalRecord
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			// 跳過格式錯誤的行（可能由截斷寫入產生）
+			continue
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
