@@ -296,6 +296,7 @@ hyp health                       # Health check
 
 ---
 
+[The Harnesss Paradigm and HypGo](https://raw.githubusercontent.com/maoxiaoyue/hypgo/refs/heads/main/Harness_HypGo.svg)
 ## License
 
 MIT License. Made from Maoxiaoyue❤️ Taiwan.
