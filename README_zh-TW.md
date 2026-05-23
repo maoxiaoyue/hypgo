@@ -296,6 +296,8 @@ hyp health                       # 健康檢查
 
 ---
 
+[The Harnesss Paradigm and HypGo](https://raw.githubusercontent.com/maoxiaoyue/hypgo/refs/heads/main/Harness_HypGo.svg)
+
 ## 授權
 
 MIT 授權。由台灣卯小月製作。
