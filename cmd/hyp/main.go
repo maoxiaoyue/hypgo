@@ -21,6 +21,7 @@ AI Collaboration:
 
 Testing:
   observe        List or open contract observe HTML reports
+  eval-report    Show contract test quality trend from .hyp/eval_history.jsonl
 
 Project Management:
   new / api      Create full-stack or API-only project
@@ -105,6 +106,7 @@ Examples:
 	rootCmd.AddCommand(chkcommentCmd)
 	rootCmd.AddCommand(impactCmd)
 	rootCmd.AddCommand(observeCmd)
+	rootCmd.AddCommand(evalReportCmd)
 }
 
 // Execute 允許其他包執行根命令
