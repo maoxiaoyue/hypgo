@@ -65,6 +65,10 @@ type Route struct {
 	Params    []ParamSchema          `json:"params,omitempty" yaml:"params,omitempty"`
 	Headers   []HeaderSchema         `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Responses map[int]ResponseSchema `json:"responses,omitempty" yaml:"responses,omitempty"`
+
+	// HandlerNames 記錄處理此路由的函式名稱（由 RegisterSchema 自動填入）
+	// 供 contract.Observe() 依函式名稱過濾使用
+	HandlerNames []string `json:"handler_names,omitempty" yaml:"handler_names,omitempty"`
 }
 
 // RouteKey 回傳 Registry 的查詢 key

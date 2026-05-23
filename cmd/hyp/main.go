@@ -19,6 +19,9 @@ AI Collaboration:
   chkcomment     Check annotation completeness in Go source files
   impact         Analyze change impact before modifying shared packages
 
+Testing:
+  observe        List or open contract observe HTML reports
+
 Project Management:
   new / api      Create full-stack or API-only project
   run            Start with hot reload + AutoSync (.hyp/context.yaml)
@@ -101,6 +104,7 @@ Examples:
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)
 	rootCmd.AddCommand(impactCmd)
+	rootCmd.AddCommand(observeCmd)
 }
 
 // Execute 允許其他包執行根命令
