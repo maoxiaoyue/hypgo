@@ -1,0 +1,707 @@
+package contract
+
+// @ai purpose: GenerateObserveHTML — 將 []ObserveResult 轉換為自包含的深色主題 HTML 觀察報告
+// @ai input: []ObserveResult（captureRouteExchange 的輸出結果列表）、filter 字串（用於報告標題顯示）
+// @ai output: string（完整的自包含 HTML 文件，可直接寫入 .html 檔案）
+// @ai sideeffect: 無（純轉換函式）
+// date: 2026-05-23
+
+import (
+	"fmt"
+	"html"
+	"strings"
+	"time"
+)
+
+// GenerateObserveHTML 將觀察結果列表轉換為完整的自包含 HTML 報告
+// 使用 HypGo 標準深色主題（--bg: #0f1419, --primary: #6ee7b7）
+// 報告包含：摘要統計、每條路由的完整 HTTP 交換記錄與逐步驗證結果
+func GenerateObserveHTML(results []ObserveResult, filter string) string {
+	pass, fail := 0, 0
+	for _, r := range results {
+		if r.Pass {
+			pass++
+		} else {
+			fail++
+		}
+	}
+
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	filterDisplay := "（全部路由）"
+	if filter != "" {
+		filterDisplay = fmt.Sprintf("「%s」", filter)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(reportHTMLHeader(ts, filter, len(results), pass, fail, filterDisplay))
+
+	for i, r := range results {
+		sb.WriteString(renderRouteCard(i, r))
+	}
+
+	sb.WriteString(reportHTMLFooter())
+	return sb.String()
+}
+
+// reportHTMLHeader 生成 HTML 文件頭部，包含完整 CSS、頁首與摘要列
+func reportHTMLHeader(ts, filter string, total, pass, fail int, filterDisplay string) string {
+	passRate := 0
+	if total > 0 {
+		passRate = pass * 100 / total
+	}
+	filterAttr := html.EscapeString(filter)
+	_ = filterAttr // used via filterDisplay
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HypGo Observe Report — %s</title>
+<style>
+:root {
+  --bg:      #0f1419;
+  --surface: #161b22;
+  --card:    #1c2128;
+  --border:  #30363d;
+  --primary: #6ee7b7;
+  --accent:  #3ddba0;
+  --text:    #c9d1d9;
+  --dim:     #8b949e;
+  --pass:    #3fb950;
+  --fail:    #f85149;
+  --warn:    #d29922;
+  --info:    #388bfd;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', 'PingFang TC', 'Microsoft JhengHei', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+a { color: var(--primary); text-decoration: none; }
+code, pre {
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-size: 13px;
+}
+
+/* ── Header ── */
+.header {
+  background: linear-gradient(135deg, #0d1117 0%%, #161b22 100%%);
+  border-bottom: 1px solid var(--border);
+  padding: 24px 32px 20px;
+}
+.header-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.logo {
+  width: 32px; height: 32px;
+  background: var(--primary);
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 900; font-size: 16px; color: #0f1419;
+}
+.header h1 { font-size: 22px; font-weight: 700; color: var(--primary); }
+.header-meta { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
+/* ── Summary Bar ── */
+.summary {
+  display: flex;
+  gap: 16px;
+  padding: 16px 32px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 20px;
+  background: var(--card);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  min-width: 90px;
+}
+.stat-value { font-size: 24px; font-weight: 700; line-height: 1.2; }
+.stat-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+.stat.total  .stat-value { color: var(--text); }
+.stat.passed .stat-value { color: var(--pass); }
+.stat.failed .stat-value { color: var(--fail); }
+.stat.rate   .stat-value { color: var(--primary); }
+.filter-badge {
+  margin-left: auto;
+  padding: 6px 14px;
+  background: rgba(110,231,183,.1);
+  border: 1px solid rgba(110,231,183,.3);
+  border-radius: 20px;
+  font-size: 12px;
+  color: var(--primary);
+}
+
+/* ── Main Layout ── */
+.main { padding: 24px 32px; max-width: 1200px; margin: 0 auto; }
+
+/* ── Route Card ── */
+.route-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 20px;
+  overflow: hidden;
+  transition: border-color .15s;
+}
+.route-card:hover { border-color: var(--primary); }
+.route-card.pass { border-left: 3px solid var(--pass); }
+.route-card.fail { border-left: 3px solid var(--fail); }
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--surface);
+}
+.card-header:hover { background: #1c2230; }
+
+.method-badge {
+  padding: 3px 10px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.method-GET     { background: #0d4429; color: #3fb950; border: 1px solid #238636; }
+.method-POST    { background: #0c1d3e; color: #58a6ff; border: 1px solid #1f6feb; }
+.method-PUT     { background: #2d1500; color: #ffa657; border: 1px solid #bd561d; }
+.method-DELETE  { background: #300d0d; color: #f85149; border: 1px solid #8b1a1a; }
+.method-PATCH   { background: #261700; color: #e3b341; border: 1px solid #9e6a03; }
+.method-OPTIONS { background: #1c1040; color: #a371f7; border: 1px solid #6e40c9; }
+.method-HEAD    { background: #1c2a30; color: #76e3ea; border: 1px solid #1b6f7a; }
+
+.route-path { font-size: 15px; font-weight: 600; color: var(--text); flex: 1; min-width: 0; }
+.route-path .param { color: var(--warn); }
+.route-summary { font-size: 12px; color: var(--dim); }
+.status-icon { font-size: 18px; margin-left: auto; flex-shrink: 0; }
+.duration-badge {
+  font-size: 11px;
+  color: var(--dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.chevron {
+  color: var(--dim);
+  font-size: 12px;
+  transition: transform .2s;
+  flex-shrink: 0;
+}
+.card-header.open .chevron { transform: rotate(90deg); }
+
+/* ── Card Body ── */
+.card-body { display: none; }
+.card-body.open { display: block; }
+
+.card-section {
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+}
+.section-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--dim);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.section-title::before {
+  content: '';
+  display: inline-block;
+  width: 3px; height: 12px;
+  background: var(--primary);
+  border-radius: 2px;
+}
+
+/* ── Route Meta Grid ── */
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+}
+.meta-item { display: flex; flex-direction: column; gap: 2px; }
+.meta-key { font-size: 11px; color: var(--dim); }
+.meta-val { font-size: 13px; color: var(--text); font-family: monospace; }
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  background: rgba(110,231,183,.1);
+  border: 1px solid rgba(110,231,183,.25);
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--primary);
+  margin: 1px;
+}
+.handler-name {
+  display: inline-block;
+  padding: 1px 7px;
+  background: rgba(56,139,253,.1);
+  border: 1px solid rgba(56,139,253,.25);
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--info);
+  margin: 1px;
+}
+
+/* ── HTTP Panel ── */
+.http-panel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 768px) { .http-panel { grid-template-columns: 1fr; } }
+.http-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.http-block-title {
+  padding: 7px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border-bottom: 1px solid var(--border);
+}
+.http-block.request .http-block-title { color: var(--info); background: rgba(56,139,253,.06); }
+.http-block.response .http-block-title { color: var(--primary); background: rgba(110,231,183,.06); }
+.http-first-line {
+  padding: 8px 12px;
+  font-family: monospace;
+  font-size: 13px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,.02);
+}
+.http-headers {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  max-height: 120px;
+  overflow-y: auto;
+}
+.http-header-row { display: flex; gap: 8px; margin-bottom: 2px; }
+.header-key { color: var(--info); min-width: 140px; font-family: monospace; font-size: 12px; }
+.header-val { color: var(--dim); font-family: monospace; font-size: 12px; word-break: break-all; }
+.http-body {
+  padding: 10px 12px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.http-body pre {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+.http-body .empty { color: var(--dim); font-style: italic; font-size: 12px; }
+.status-code {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 13px;
+  margin-left: 6px;
+}
+.status-2xx { background: rgba(63,185,80,.15); color: var(--pass); }
+.status-3xx { background: rgba(56,139,253,.15); color: var(--info); }
+.status-4xx { background: rgba(248,81,73,.15); color: var(--fail); }
+.status-5xx { background: rgba(248,81,73,.2);  color: var(--fail); }
+
+/* ── Validation Steps ── */
+.steps { display: flex; flex-direction: column; gap: 8px; }
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 7px;
+  border: 1px solid;
+}
+.step.pass { background: rgba(63,185,80,.06);  border-color: rgba(63,185,80,.2); }
+.step.fail { background: rgba(248,81,73,.06);  border-color: rgba(248,81,73,.2); }
+.step-icon { font-size: 16px; flex-shrink: 0; line-height: 1.4; }
+.step-content { flex: 1; }
+.step-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.step-detail { font-size: 12px; color: var(--dim); margin-top: 2px; font-family: monospace; }
+
+/* ── Fail Reason Banner ── */
+.fail-banner {
+  margin: 0 18px 12px;
+  padding: 10px 14px;
+  background: rgba(248,81,73,.08);
+  border: 1px solid rgba(248,81,73,.3);
+  border-radius: 7px;
+  color: var(--fail);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── Footer ── */
+.footer {
+  text-align: center;
+  padding: 28px;
+  color: var(--dim);
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+}
+.footer strong { color: var(--primary); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-title">
+    <div class="logo">H</div>
+    <h1>HypGo Observe Report</h1>
+  </div>
+  <div class="header-meta">%s &nbsp;·&nbsp; 觀察過濾 %s</div>
+</div>
+
+<div class="summary">
+  <div class="stat total">
+    <span class="stat-value">%d</span>
+    <span class="stat-label">總路由</span>
+  </div>
+  <div class="stat passed">
+    <span class="stat-value">%d</span>
+    <span class="stat-label">通過</span>
+  </div>
+  <div class="stat failed">
+    <span class="stat-value">%d</span>
+    <span class="stat-label">失敗</span>
+  </div>
+  <div class="stat rate">
+    <span class="stat-value">%d%%</span>
+    <span class="stat-label">通過率</span>
+  </div>
+  <div class="filter-badge">🔍 %s</div>
+</div>
+
+<div class="main">
+`, filterDisplay, ts, filterDisplay, total, pass, fail, passRate, filterDisplay)
+}
+
+// renderRouteCard 渲染單條路由的完整觀察卡片
+func renderRouteCard(idx int, r ObserveResult) string {
+	cardClass := "pass"
+	statusIcon := "✅"
+	if !r.Pass {
+		cardClass = "fail"
+		statusIcon = "❌"
+	}
+
+	method := r.Route.Method
+	if method == "" {
+		parts := strings.SplitN(r.Request.Method, " ", 2)
+		method = parts[0]
+	}
+
+	// 為路徑中的 :param 加上樣式（僅用於顯示）
+	displayPath := highlightPathParams(r.Route.Path)
+
+	// Duration
+	dur := fmt.Sprintf("%.1fms", float64(r.Duration.Microseconds())/1000.0)
+
+	var sb strings.Builder
+	cardID := fmt.Sprintf("card-%d", idx)
+
+	// Card wrapper
+	fmt.Fprintf(&sb, `<div class="route-card %s">`, cardClass)
+
+	// Card header (clickable toggle)
+	fmt.Fprintf(&sb, `
+  <div class="card-header" onclick="toggleCard('%s')" id="%s-hdr">
+    <span class="method-badge method-%s">%s</span>
+    <span class="route-path">%s</span>`,
+		cardID, cardID, method, method, displayPath)
+
+	if r.Route.Summary != "" {
+		fmt.Fprintf(&sb, `<span class="route-summary">%s</span>`, html.EscapeString(r.Route.Summary))
+	}
+
+	fmt.Fprintf(&sb, `
+    <span class="duration-badge">%s</span>
+    <span class="status-icon">%s</span>
+    <span class="chevron">▶</span>
+  </div>`, dur, statusIcon)
+
+	// Card body
+	fmt.Fprintf(&sb, `<div class="card-body" id="%s">`, cardID)
+
+	// Fail reason banner
+	if !r.Pass && r.FailReason != "" {
+		fmt.Fprintf(&sb, `
+  <div class="fail-banner">⚠ %s</div>`, html.EscapeString(r.FailReason))
+	}
+
+	// Section: Route Metadata
+	sb.WriteString(`
+  <div class="card-section">
+    <div class="section-title">路由資訊</div>
+    <div class="meta-grid">`)
+
+	fmt.Fprintf(&sb, `
+      <div class="meta-item">
+        <span class="meta-key">路徑</span>
+        <span class="meta-val">%s</span>
+      </div>`, html.EscapeString(r.Route.Path))
+
+	if r.Route.InputName != "" {
+		fmt.Fprintf(&sb, `
+      <div class="meta-item">
+        <span class="meta-key">Input Schema</span>
+        <span class="meta-val">%s</span>
+      </div>`, html.EscapeString(r.Route.InputName))
+	}
+	if r.Route.OutputName != "" {
+		fmt.Fprintf(&sb, `
+      <div class="meta-item">
+        <span class="meta-key">Output Schema</span>
+        <span class="meta-val">%s</span>
+      </div>`, html.EscapeString(r.Route.OutputName))
+	}
+
+	// Tags
+	if len(r.Route.Tags) > 0 {
+		sb.WriteString(`
+      <div class="meta-item">
+        <span class="meta-key">Tags</span>
+        <span class="meta-val">`)
+		for _, tag := range r.Route.Tags {
+			fmt.Fprintf(&sb, `<span class="tag">%s</span>`, html.EscapeString(tag))
+		}
+		sb.WriteString(`</span></div>`)
+	}
+
+	// HandlerNames
+	if len(r.Route.HandlerNames) > 0 {
+		sb.WriteString(`
+      <div class="meta-item">
+        <span class="meta-key">Handler</span>
+        <span class="meta-val">`)
+		for _, name := range r.Route.HandlerNames {
+			fmt.Fprintf(&sb, `<span class="handler-name">%s</span>`, html.EscapeString(name))
+		}
+		sb.WriteString(`</span></div>`)
+	}
+
+	sb.WriteString(`
+    </div>
+  </div>`)
+
+	// Section: HTTP Exchange
+	sb.WriteString(`
+  <div class="card-section">
+    <div class="section-title">HTTP 交換記錄</div>
+    <div class="http-panel">`)
+
+	// Request block
+	reqBody := r.Request.Body
+	if reqBody == "" {
+		reqBody = ""
+	}
+	sb.WriteString(`
+      <div class="http-block request">
+        <div class="http-block-title">▲ 請求 Request</div>`)
+	fmt.Fprintf(&sb, `
+        <div class="http-first-line">%s %s</div>`,
+		html.EscapeString(r.Request.Method),
+		html.EscapeString(r.Request.Path))
+
+	sb.WriteString(`
+        <div class="http-headers">`)
+	for k, v := range r.Request.Headers {
+		fmt.Fprintf(&sb, `
+          <div class="http-header-row">
+            <span class="header-key">%s</span>
+            <span class="header-val">%s</span>
+          </div>`, html.EscapeString(k), html.EscapeString(v))
+	}
+	sb.WriteString(`</div>`)
+
+	sb.WriteString(`
+        <div class="http-body">`)
+	if reqBody != "" {
+		fmt.Fprintf(&sb, `<pre>%s</pre>`, html.EscapeString(formatJSONCompact(reqBody)))
+	} else {
+		sb.WriteString(`<span class="empty">（無 body）</span>`)
+	}
+	sb.WriteString(`</div>
+      </div>`)
+
+	// Response block
+	statusClass := statusCodeClass(r.Response.StatusCode)
+	sb.WriteString(`
+      <div class="http-block response">
+        <div class="http-block-title">▼ 回應 Response</div>`)
+	fmt.Fprintf(&sb, `
+        <div class="http-first-line">HTTP/1.1 <span class="status-code %s">%d</span></div>`,
+		statusClass, r.Response.StatusCode)
+
+	sb.WriteString(`
+        <div class="http-headers">`)
+	for k, v := range r.Response.Headers {
+		fmt.Fprintf(&sb, `
+          <div class="http-header-row">
+            <span class="header-key">%s</span>
+            <span class="header-val">%s</span>
+          </div>`, html.EscapeString(k), html.EscapeString(v))
+	}
+	sb.WriteString(`</div>`)
+
+	sb.WriteString(`
+        <div class="http-body">`)
+	if r.Response.Body != "" {
+		fmt.Fprintf(&sb, `<pre>%s</pre>`, html.EscapeString(formatJSONCompact(r.Response.Body)))
+	} else {
+		sb.WriteString(`<span class="empty">（無 body）</span>`)
+	}
+	sb.WriteString(`</div>
+      </div>
+    </div>
+  </div>`)
+
+	// Section: Validation Steps
+	if len(r.Steps) > 0 {
+		sb.WriteString(`
+  <div class="card-section">
+    <div class="section-title">驗證步驟</div>
+    <div class="steps">`)
+
+		for _, step := range r.Steps {
+			stepClass := "pass"
+			icon := "✅"
+			if !step.Pass {
+				stepClass = "fail"
+				icon = "❌"
+			}
+			fmt.Fprintf(&sb, `
+      <div class="step %s">
+        <span class="step-icon">%s</span>
+        <div class="step-content">
+          <div class="step-name">%s</div>
+          <div class="step-detail">%s</div>
+        </div>
+      </div>`,
+				stepClass, icon,
+				html.EscapeString(step.Name),
+				html.EscapeString(step.Detail))
+		}
+
+		sb.WriteString(`
+    </div>
+  </div>`)
+	}
+
+	sb.WriteString(`
+</div>
+</div>
+`)
+	return sb.String()
+}
+
+// reportHTMLFooter 生成 HTML 文件尾部，包含 JavaScript 互動邏輯
+func reportHTMLFooter() string {
+	return `</div><!-- .main -->
+
+<div class="footer">
+  Generated by <strong>HypGo</strong> Contract Observe &nbsp;·&nbsp; <a href="https://github.com/maoxiaoyue/hypgo">github.com/maoxiaoyue/hypgo</a>
+</div>
+
+<script>
+function toggleCard(id) {
+  var body = document.getElementById(id);
+  var hdr  = document.getElementById(id + '-hdr');
+  if (!body) return;
+  var isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  hdr.classList.toggle('open', !isOpen);
+}
+
+// 自動展開失敗的卡片
+document.addEventListener('DOMContentLoaded', function() {
+  var failCards = document.querySelectorAll('.route-card.fail .card-body');
+  failCards.forEach(function(b) {
+    b.classList.add('open');
+    var hdr = document.getElementById(b.id + '-hdr');
+    if (hdr) hdr.classList.add('open');
+  });
+});
+</script>
+</body>
+</html>
+`
+}
+
+// highlightPathParams 將路徑中 :param 標記為 HTML span（供顯示用）
+func highlightPathParams(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if strings.HasPrefix(p, ":") {
+			parts[i] = `<span class="param">` + html.EscapeString(p) + `</span>`
+		} else if strings.HasPrefix(p, "*") {
+			parts[i] = `<span class="param">` + html.EscapeString(p) + `</span>`
+		} else {
+			parts[i] = html.EscapeString(p)
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// statusCodeClass 依 HTTP 狀態碼回傳對應的 CSS class
+func statusCodeClass(code int) string {
+	switch {
+	case code >= 200 && code < 300:
+		return "status-2xx"
+	case code >= 300 && code < 400:
+		return "status-3xx"
+	case code >= 400 && code < 500:
+		return "status-4xx"
+	default:
+		return "status-5xx"
+	}
+}
+
+// formatJSONCompact 對已知的 JSON 字串進行基本整理（原樣回傳，不重新 marshal）
+// 保留原始格式，只截斷過長的內容
+func formatJSONCompact(s string) string {
+	const maxLen = 2000
+	s = strings.TrimSpace(s)
+	if len(s) > maxLen {
+		return s[:maxLen] + "\n… (truncated)"
+	}
+	return s
+}

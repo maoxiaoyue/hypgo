@@ -406,9 +406,17 @@ func (r *Router) Schema(route schema.Route) *schema.SchemaRoute {
 	return schema.NewSchemaRoute(route, r)
 }
 
-// registerSchema 實作 schema.SchemaRegistrar 介面
+// RegisterSchema 實作 schema.SchemaRegistrar 介面
+// 同時將 handler 函式名稱寫入 route.HandlerNames，供 contract.Observe() 過濾使用
 func (r *Router) RegisterSchema(route schema.Route, handlers ...hypcontext.HandlerFunc) {
 	r.Group.handle(route.Method, route.Path, handlers)
+	if len(route.HandlerNames) == 0 && len(handlers) > 0 {
+		names := make([]string, len(handlers))
+		for i, h := range handlers {
+			names[i] = nameOfFunction(h)
+		}
+		route.HandlerNames = names
+	}
 	schema.Global().Register(route)
 }
 
