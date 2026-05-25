@@ -48,7 +48,7 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 
 	fmt.Print(annotation.FormatReport(report))
 
-	if !fix || report.Passed >= report.Total {
+	if !fix {
 		return nil
 	}
 
@@ -75,6 +75,21 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// Git headline enrichment：只在 LLM 模式下執行（heuristic 不需要 git 脈絡）
+	if llmCfg.Mode != "" && llmCfg.Mode != config.LLMModeNone {
+		enriched, enrichErr := annotation.EnrichMissingHeadlines(ctx, filename, report.Results, suggester)
+		if enrichErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: headline enrichment failed: %v\n", enrichErr)
+		} else if enriched > 0 {
+			fmt.Fprintf(os.Stdout, "Enriched %d placeholder headline(s) using git history.\n", enriched)
+		}
+	}
+
+	// 補齊缺少的 @ai: 欄位（若全部已通過則跳過）
+	if report.Passed >= report.Total {
+		return nil
+	}
 
 	if err := annotation.FixFileWithSuggester(ctx, filename, report.Results, suggester); err != nil {
 		return fmt.Errorf("fix failed: %w", err)
