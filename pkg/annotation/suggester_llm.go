@@ -117,6 +117,24 @@ func buildPrompt(req SuggestRequest) string {
 	if len(req.Params) > 0 {
 		fmt.Fprintf(&sb, "Params=[%s]\n", strings.Join(req.Params, ","))
 	}
+	if req.GitContext != nil && !req.GitContext.IsEmpty() {
+		sb.WriteString("\nGit 歷史（供理解此宣告的演變脈絡）：\n")
+		commits := req.GitContext.DeclCommits
+		if len(commits) == 0 {
+			commits = req.GitContext.FileCommits
+		}
+		max := 5
+		if len(commits) < max {
+			max = len(commits)
+		}
+		for _, c := range commits[:max] {
+			hash := c.Hash
+			if len(hash) > 7 {
+				hash = hash[:7]
+			}
+			fmt.Fprintf(&sb, "[%s] %s - %s\n", hash, c.Date, c.Subject)
+		}
+	}
 	return sb.String()
 }
 

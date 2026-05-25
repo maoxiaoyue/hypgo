@@ -9,12 +9,13 @@ import (
 
 // SuggestRequest 描述一個待補註解的 Go 宣告，供 Suggester 產生 doc 與 @ai 標註
 type SuggestRequest struct {
-	Kind     string   // "package", "type", "func", "method", "const", "var"
-	Name     string   // "Create" 或 "UserController.Delete"
-	Receiver string   // method receiver type；func 為空
-	Params   []string // 參數名稱列表
-	PkgName  string   // 所屬 package 名稱
-	File     string   // 檔案路徑
+	Kind       string     // "package", "type", "func", "method", "const", "var"
+	Name       string     // "Create" 或 "UserController.Delete"
+	Receiver   string     // method receiver type；func 為空
+	Params     []string   // 參數名稱列表
+	PkgName    string     // 所屬 package 名稱
+	File       string     // 檔案路徑
+	GitContext *GitContext // git 歷史脈絡（nil = 無 git 資訊）
 }
 
 // Suggestion 為 Suggester 的回傳值
