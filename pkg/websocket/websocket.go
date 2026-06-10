@@ -378,7 +378,7 @@ func (h *Hub) handleRegister(client *Client) {
 		h.onConnect(client)
 	}
 
-	h.logger.Info("Client %s connected", client.ID)
+	h.logger.Infof("Client %s connected", client.ID)
 }
 
 // handleUnregister 處理客戶端註銷
@@ -424,7 +424,7 @@ func (h *Hub) handleUnregister(client *Client) {
 	}()
 
 	client.Release() // 返回池中
-	h.logger.Info("Client %s disconnected", client.ID)
+	h.logger.Infof("Client %s disconnected", client.ID)
 }
 
 // handleBroadcast 處理廣播（支持跨協議序列化 + 安全管線）
@@ -469,7 +469,7 @@ func (h *Hub) cleanupInactiveClients() {
 	h.mu.RUnlock()
 
 	for _, client := range inactiveClients {
-		h.logger.Debug("Cleaning up inactive client: %s", client.ID)
+		h.logger.Debugf("Cleaning up inactive client: %s", client.ID)
 		h.unregister <- client
 	}
 }
@@ -478,7 +478,7 @@ func (h *Hub) cleanupInactiveClients() {
 func (h *Hub) ServeHTTP(c *hypcontext.Context) {
 	conn, err := h.upgrader.upgrader.Upgrade(c.Response, c.Request, nil)
 	if err != nil {
-		h.logger.Warning("WebSocket upgrade failed: %v", err)
+		h.logger.Warningf("WebSocket upgrade failed: %v", err)
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
@@ -537,7 +537,7 @@ func (c *Client) readPump(config Config) {
 		_, data, err := c.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				c.Hub.logger.Warning("WebSocket error for client %s: %v", c.ID, err)
+				c.Hub.logger.Warningf("WebSocket error for client %s: %v", c.ID, err)
 			}
 			break
 		}
@@ -551,7 +551,7 @@ func (c *Client) readPump(config Config) {
 			var secErr error
 			data, secErr = applySecurityIn(data, c, c.Hub.security)
 			if secErr != nil {
-				c.Hub.logger.Warning("Security verification failed for client %s: %v", c.ID, secErr)
+				c.Hub.logger.Warningf("Security verification failed for client %s: %v", c.ID, secErr)
 				continue
 			}
 		}
@@ -560,7 +560,7 @@ func (c *Client) readPump(config Config) {
 		msg := AcquireMessage()
 
 		if err := c.codec.Unmarshal(data, msg); err != nil {
-			c.Hub.logger.Warning("Invalid message format from client %s: %v", c.ID, err)
+			c.Hub.logger.Warningf("Invalid message format from client %s: %v", c.ID, err)
 			msg.Release()
 			continue
 		}
@@ -696,7 +696,7 @@ func (c *Client) Subscribe(channel string) {
 	c.Hub.channels[channel][c] = true
 	c.Hub.mu.Unlock()
 
-	c.Hub.logger.Debug("Client %s subscribed to channel %s", c.ID, channel)
+	c.Hub.logger.Debugf("Client %s subscribed to channel %s", c.ID, channel)
 }
 
 // Unsubscribe 取消訂閱頻道
@@ -714,7 +714,7 @@ func (c *Client) Unsubscribe(channel string) {
 	}
 	c.Hub.mu.Unlock()
 
-	c.Hub.logger.Debug("Client %s unsubscribed from channel %s", c.ID, channel)
+	c.Hub.logger.Debugf("Client %s unsubscribed from channel %s", c.ID, channel)
 }
 
 // ===== Room 管理 =====
@@ -820,7 +820,7 @@ func (c *Client) JoinRoom(roomID string) {
 	c.Hub.mu.Unlock()
 
 	room.AddClient(c)
-	c.Hub.logger.Debug("Client %s joined room %s", c.ID, roomID)
+	c.Hub.logger.Debugf("Client %s joined room %s", c.ID, roomID)
 }
 
 // LeaveRoom 離開房間
@@ -831,7 +831,7 @@ func (c *Client) LeaveRoom(roomID string) {
 
 	if exists {
 		room.RemoveClient(c)
-		c.Hub.logger.Debug("Client %s left room %s", c.ID, roomID)
+		c.Hub.logger.Debugf("Client %s left room %s", c.ID, roomID)
 
 		// 如果房間為空，刪除房間
 		if len(room.Clients) == 0 {

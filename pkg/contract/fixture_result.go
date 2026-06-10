@@ -1,4 +1,5 @@
-package fixture
+// fixture_result.go — 測試回應封裝（合併自原 pkg/fixture，v0.8.6）。
+package contract
 
 import (
 	"encoding/json"

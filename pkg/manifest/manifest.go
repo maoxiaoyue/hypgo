@@ -15,10 +15,27 @@ type Manifest struct {
 	Framework   string          `json:"framework" yaml:"framework"`
 	GeneratedAt time.Time       `json:"generated_at" yaml:"generated_at"`
 	Server      ServerInfo      `json:"server" yaml:"server"`
-	Routes      []RouteManifest  `json:"routes" yaml:"routes"`
-	Models      []ModelManifest  `json:"models,omitempty" yaml:"models,omitempty"`
-	Middleware  []string         `json:"middleware,omitempty" yaml:"middleware,omitempty"`
-	Database    *DatabaseInfo    `json:"database,omitempty" yaml:"database,omitempty"`
+	Routes      []RouteManifest `json:"routes" yaml:"routes"`
+	Models      []ModelManifest `json:"models,omitempty" yaml:"models,omitempty"`
+	Middleware  []string        `json:"middleware,omitempty" yaml:"middleware,omitempty"`
+	Database    *DatabaseInfo   `json:"database,omitempty" yaml:"database,omitempty"`
+	Lint        *LintReport     `json:"lint,omitempty" yaml:"lint,omitempty"`
+}
+
+// LintReport 描述 Schema 完整度檢查結果
+// 供 AI 讀 manifest 時直接看到缺口（把警告變成可自動補完的工單）
+type LintReport struct {
+	Coverage   string        `json:"coverage" yaml:"coverage"` // "8/13"
+	Total      int           `json:"total" yaml:"total"`       // 可檢查的 REST 路由總數
+	WithSchema int           `json:"with_schema" yaml:"with_schema"`
+	Warnings   []LintWarning `json:"warnings,omitempty" yaml:"warnings,omitempty"`
+}
+
+// LintWarning 單一缺漏項目
+type LintWarning struct {
+	Route   string `json:"route" yaml:"route"` // "POST /api/orders"
+	Kind    string `json:"kind" yaml:"kind"`   // no_schema | missing_input | missing_output | missing_summary
+	Message string `json:"message" yaml:"message"`
 }
 
 // ServerInfo 描述伺服器配置
@@ -31,26 +48,26 @@ type ServerInfo struct {
 // RouteManifest 描述單一路由（含 schema metadata，支援多協議）
 type RouteManifest struct {
 	// 多協議支援
-	Protocol     string         `json:"protocol,omitempty" yaml:"protocol,omitempty"`       // "rest", "grpc", "bot", "mcp", "websocket", "cli"
-	Command      string         `json:"command,omitempty" yaml:"command,omitempty"`          // 非 REST 命令標識
-	Platform     string         `json:"platform,omitempty" yaml:"platform,omitempty"`        // bot 專用平台
+	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest", "grpc", "bot", "mcp", "websocket", "cli"
+	Command  string `json:"command,omitempty" yaml:"command,omitempty"`   // 非 REST 命令標識
+	Platform string `json:"platform,omitempty" yaml:"platform,omitempty"` // bot 專用平台
 
 	// REST 欄位
-	Method       string         `json:"method,omitempty" yaml:"method,omitempty"`
-	Path         string         `json:"path,omitempty" yaml:"path,omitempty"`
-	HandlerNames []string       `json:"handler_names,omitempty" yaml:"handler_names,omitempty"`
+	Method       string   `json:"method,omitempty" yaml:"method,omitempty"`
+	Path         string   `json:"path,omitempty" yaml:"path,omitempty"`
+	HandlerNames []string `json:"handler_names,omitempty" yaml:"handler_names,omitempty"`
 
 	// 共用 metadata
-	Summary      string         `json:"summary,omitempty" yaml:"summary,omitempty"`
-	Description  string         `json:"description,omitempty" yaml:"description,omitempty"`
-	Tags         []string       `json:"tags,omitempty" yaml:"tags,omitempty"`
-	InputType    string              `json:"input_type,omitempty" yaml:"input_type,omitempty"`
-	OutputType   string              `json:"output_type,omitempty" yaml:"output_type,omitempty"`
-	Responses    map[int]string      `json:"responses,omitempty" yaml:"responses,omitempty"`
+	Summary     string         `json:"summary,omitempty" yaml:"summary,omitempty"`
+	Description string         `json:"description,omitempty" yaml:"description,omitempty"`
+	Tags        []string       `json:"tags,omitempty" yaml:"tags,omitempty"`
+	InputType   string         `json:"input_type,omitempty" yaml:"input_type,omitempty"`
+	OutputType  string         `json:"output_type,omitempty" yaml:"output_type,omitempty"`
+	Responses   map[int]string `json:"responses,omitempty" yaml:"responses,omitempty"`
 
 	// 推斷/增強的欄位（IncludeFields 開啟時填入）
-	InputFields  []schema.FieldInfo  `json:"input_fields,omitempty" yaml:"input_fields,omitempty"`
-	OutputFields []schema.FieldInfo  `json:"output_fields,omitempty" yaml:"output_fields,omitempty"`
+	InputFields  []schema.FieldInfo `json:"input_fields,omitempty" yaml:"input_fields,omitempty"`
+	OutputFields []schema.FieldInfo `json:"output_fields,omitempty" yaml:"output_fields,omitempty"`
 }
 
 // DatabaseInfo 描述資料庫配置

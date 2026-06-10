@@ -408,8 +408,11 @@ func (r *Router) Schema(route schema.Route) *schema.SchemaRoute {
 
 // RegisterSchema 實作 schema.SchemaRegistrar 介面
 // 同時將 handler 函式名稱寫入 route.HandlerNames，供 contract.Observe() 過濾使用
+//
+// 若路由宣告了 Input 型別，會在 handler 鏈前置一個標記，於每次請求將該型別寫入
+// Context，供 c.BindInput() 在執行期對齊「實作綁定型別」與「Schema 宣告型別」。
 func (r *Router) RegisterSchema(route schema.Route, handlers ...hypcontext.HandlerFunc) {
-	r.Group.handle(route.Method, route.Path, handlers)
+	// 先以原始 handlers 計算 HandlerNames（不含後續注入的標記）
 	if len(route.HandlerNames) == 0 && len(handlers) > 0 {
 		names := make([]string, len(handlers))
 		for i, h := range handlers {
@@ -417,6 +420,19 @@ func (r *Router) RegisterSchema(route schema.Route, handlers ...hypcontext.Handl
 		}
 		route.HandlerNames = names
 	}
+
+	// 前置 schema-input 標記，供 BindInput 對齊型別
+	finalHandlers := handlers
+	if route.Input != nil {
+		key := route.RouteKey()
+		input := route.Input
+		marker := func(c *hypcontext.Context) {
+			c.SetSchemaInput(key, input)
+		}
+		finalHandlers = append([]hypcontext.HandlerFunc{marker}, handlers...)
+	}
+
+	r.Group.handle(route.Method, route.Path, finalHandlers)
 	schema.Global().Register(route)
 }
 

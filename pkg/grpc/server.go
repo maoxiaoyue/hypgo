@@ -72,7 +72,7 @@ func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 	if cfg.TLS != nil && cfg.TLS.CertFile != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 		if err != nil {
-			log.Error("Failed to load TLS certificate: %v", err)
+			log.Errorf("Failed to load TLS certificate: %v", err)
 		} else {
 			tlsConfig := &tls.Config{
 				Certificates: []tls.Certificate{cert},
@@ -134,7 +134,7 @@ func (s *Server) Start() error {
 		if s.config.TLS != nil {
 			protocol = "TLS"
 		}
-		s.logger.Info("gRPC server listening on %s (%s)", s.config.Addr, protocol)
+		s.logger.Infof("gRPC server listening on %s (%s)", s.config.Addr, protocol)
 	}
 
 	// 標記所有服務為 SERVING

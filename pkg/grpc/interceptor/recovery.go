@@ -18,7 +18,7 @@ func Recovery(log *logger.Logger) grpc.UnaryServerInterceptor {
 			if r := recover(); r != nil {
 				stack := string(debug.Stack())
 				if log != nil {
-					log.Error("gRPC panic recovered: %v\n%s", r, stack)
+					log.Errorf("gRPC panic recovered: %v\n%s", r, stack)
 				}
 				err = status.Errorf(codes.Internal, "internal error")
 			}

@@ -83,6 +83,12 @@ type Context struct {
 
 	// SameSite cookie 設置
 	sameSite http.SameSite
+
+	// Schema-first 綁定支援（由 router 在 RegisterSchema 時設定）
+	// 供 BindInput 在執行期比對 handler 綁定型別是否與 Schema 宣告一致
+	schemaInput     interface{} // 該路由宣告的 Input 零值實例（nil 表示無 schema）
+	schemaRouteKey  string      // schema RouteKey，用於型別不符回報
+	bindInputCalled bool        // 本請求是否呼叫過 BindInput（供啟動 lint runtime 偵測）
 }
 
 // QuicConnection 封裝 QUIC 連接資訊
@@ -192,6 +198,9 @@ func (c *Context) Reset(w http.ResponseWriter, r *http.Request) {
 	c.formCache = nil
 	c.rawData = nil
 	c.fullPath = ""
+	c.schemaInput = nil
+	c.schemaRouteKey = ""
+	c.bindInputCalled = false
 	c.startTime = time.Now()
 	c.metrics = &RequestMetrics{}
 	if r != nil {

@@ -18,6 +18,7 @@ AI Collaboration:
   ai-rules       Generate config files for Codex, Gemini, Cursor, Copilot, Windsurf
   chkcomment     Check annotation completeness in Go source files
   impact         Analyze change impact before modifying shared packages
+  lint           Check Schema completeness from the manifest (CI gate)
 
 Testing:
   observe        List or open contract observe HTML reports
@@ -105,6 +106,7 @@ Examples:
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)
 	rootCmd.AddCommand(impactCmd)
+	rootCmd.AddCommand(lintCmd)
 	rootCmd.AddCommand(observeCmd)
 	rootCmd.AddCommand(evalReportCmd)
 }

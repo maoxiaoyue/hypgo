@@ -1,4 +1,4 @@
-package fixture
+package contract
 
 import (
 	"testing"
@@ -7,7 +7,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 )
 
-func setupRouter() *router.Router {
+func setupFixtureRouter() *router.Router {
 	r := router.New()
 	r.GET("/health", func(c *hypcontext.Context) {
 		c.JSON(200, map[string]string{"status": "ok"})
@@ -31,7 +31,7 @@ func setupRouter() *router.Router {
 }
 
 func TestRequestGET(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).GET("/health").Expect(200).Run(t)
 
 	if result.Status != 200 {
@@ -48,7 +48,7 @@ func TestRequestGET(t *testing.T) {
 }
 
 func TestRequestPOSTWithJSON(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).
 		POST("/api/users").
 		WithJSON(map[string]string{"name": "alice"}).
@@ -65,7 +65,7 @@ func TestRequestPOSTWithJSON(t *testing.T) {
 }
 
 func TestRequestWithHeader(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).
 		GET("/health").
 		WithHeader("X-Custom", "test").
@@ -97,7 +97,7 @@ func TestRequestWithQuery(t *testing.T) {
 }
 
 func TestRequestDELETE(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).DELETE("/api/users/1").Expect(204).Run(t)
 	if result.Status != 204 {
 		t.Errorf("status = %d, want 204", result.Status)
@@ -105,7 +105,7 @@ func TestRequestDELETE(t *testing.T) {
 }
 
 func TestRequest404(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).GET("/nonexistent").Expect(404).Run(t)
 	if result.Status != 404 {
 		t.Errorf("status = %d, want 404", result.Status)
@@ -162,7 +162,7 @@ func TestRequestWithBody(t *testing.T) {
 // --- TestResult methods ---
 
 func TestResultBodyString(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).GET("/health").Run(t)
 	body := result.BodyString()
 	if body == "" {
@@ -171,7 +171,7 @@ func TestResultBodyString(t *testing.T) {
 }
 
 func TestResultHasHeader(t *testing.T) {
-	r := setupRouter()
+	r := setupFixtureRouter()
 	result := Request(r).GET("/health").Run(t)
 	if !result.HasHeader("Content-Type") {
 		t.Error("should have Content-Type header")

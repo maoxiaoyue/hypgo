@@ -82,6 +82,7 @@ func (c *Collector) Collect() *Manifest {
 		GeneratedAt: time.Now(),
 		Routes:      c.collectRoutes(),
 		Models:      c.collectModels(),
+		Lint:        lintRoutes(c.router, c.registry),
 	}
 
 	if c.config != nil {
@@ -125,6 +126,12 @@ func (c *Collector) collectRoutes() []RouteManifest {
 				rm.Tags = s.Tags
 				rm.InputType = s.InputName
 				rm.OutputType = s.OutputName
+
+				// 優先採用 registry 中的乾淨 handler 名稱
+				// （router.Routes() 會含 RegisterSchema 注入的 BindInput marker）
+				if len(s.HandlerNames) > 0 {
+					rm.HandlerNames = s.HandlerNames
+				}
 
 				if len(s.Responses) > 0 {
 					rm.Responses = make(map[int]string)

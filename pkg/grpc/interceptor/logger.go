@@ -21,9 +21,9 @@ func Logger(log *logger.Logger) grpc.UnaryServerInterceptor {
 
 		if log != nil {
 			if err != nil {
-				log.Warning("gRPC %s [%s] %v (%s)", info.FullMethod, st.Code(), err, duration)
+				log.Warningf("gRPC %s [%s] %v (%s)", info.FullMethod, st.Code(), err, duration)
 			} else {
-				log.Info("gRPC %s [%s] (%s)", info.FullMethod, st.Code(), duration)
+				log.Infof("gRPC %s [%s] (%s)", info.FullMethod, st.Code(), duration)
 			}
 		}
 
