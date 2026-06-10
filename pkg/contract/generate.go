@@ -3,10 +3,69 @@ package contract
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
+
+// sampleMu 保護 sampleValues 的並行存取
+var sampleMu sync.RWMutex
+
+// sampleValues 將「格式類 validate tag」對應到能通過該規則的範例值
+// 內建常見的非參數化格式；app 可透過 RegisterSampleValue 為自訂 validator 註冊範例值，
+// 讓自動生成的測試資料也能滿足自訂規則 —— 與 pkg/validate 的共用驗證 registry 形成生成↔驗證閉環
+var sampleValues = map[string]interface{}{
+	"email":       "test@example.com",
+	"url":         "https://example.com",
+	"uri":         "https://example.com",
+	"http_url":    "https://example.com",
+	"uuid":        "00000000-0000-0000-0000-000000000000",
+	"uuid4":       "00000000-0000-4000-8000-000000000000",
+	"e164":        "+15555550123",
+	"ip":          "127.0.0.1",
+	"ipv4":        "127.0.0.1",
+	"hostname":    "example.com",
+	"alpha":       "abc",
+	"alphanum":    "abc123",
+	"number":      "123",
+	"numeric":     "123",
+	"hexadecimal": "deadbeef",
+}
+
+// RegisterSampleValue 教導測試資料生成器：帶有指定 validate tag 的欄位
+// 應生成什麼範例值才能通過驗證（含 app 透過 pkg/validate 註冊的自訂 validator）
+//
+// @ai purpose: 補上自訂 validator 的生成端對應，與共用驗證 registry 形成生成↔驗證閉環
+// @ai input: validate tag 名稱（如 "e164" 或自訂 tag）、滿足該規則的範例值
+// @ai output: none
+// @ai sideeffect: 修改套件層級的 sampleValues 表（並行安全）
+// date: 2026-06-10
+func RegisterSampleValue(tag string, value interface{}) {
+	sampleMu.Lock()
+	defer sampleMu.Unlock()
+	sampleValues[tag] = value
+}
+
+// sampleForTag 檢查 validate tag 是否含有已註冊範例值的 token（取第一個命中者）
+func sampleForTag(tag string) (interface{}, bool) {
+	if tag == "" || tag == "-" {
+		return nil, false
+	}
+	sampleMu.RLock()
+	defer sampleMu.RUnlock()
+	for _, tok := range strings.Split(tag, ",") {
+		key := tok
+		if eq := strings.IndexByte(tok, '='); eq >= 0 {
+			key = tok[:eq]
+		}
+		if v, ok := sampleValues[strings.TrimSpace(key)]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
 
 // generateTestCase 根據 Route schema 自動生成測試案例
 func generateTestCase(route schema.Route) TestCase {
@@ -26,8 +85,9 @@ func generateTestCase(route schema.Route) TestCase {
 	return tc
 }
 
-// generateMinimalJSON 根據 struct 型別生成最小有效 JSON
-// 為必填欄位填入合理的預設值
+// generateMinimalJSON 根據 struct 型別生成最小且「有效」的 JSON
+// 不只填型別零值，而是同時滿足 validate: tag 的約束（oneof / min / max / email / len 等），
+// 並依欄位名稱語意填入合理值，讓自動生成的請求能通過 handler 的驗證而非被擋下
 func generateMinimalJSON(typ interface{}) string {
 	if typ == nil {
 		return "{}"
@@ -42,6 +102,17 @@ func generateMinimalJSON(typ interface{}) string {
 		return "{}"
 	}
 
+	fields := structFields(t)
+
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// structFields 將 struct 的每個 exported 欄位生成 JSON 名稱 → 測試值的 map
+func structFields(t reflect.Type) map[string]interface{} {
 	fields := make(map[string]interface{})
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
@@ -56,20 +127,411 @@ func generateMinimalJSON(typ interface{}) string {
 
 		jsonName := f.Name
 		if jsonTag != "" {
-			parts := strings.Split(jsonTag, ",")
-			if parts[0] != "" {
-				jsonName = parts[0]
+			if first := strings.Split(jsonTag, ",")[0]; first != "" {
+				jsonName = first
 			}
 		}
 
-		fields[jsonName] = zeroValueForType(f.Type)
+		fields[jsonName] = generateFieldValue(f, jsonName)
+	}
+	return fields
+}
+
+// generateFieldValue 為單一 struct 欄位生成合理的測試值
+// 優先順序：validate: 的 oneof 約束 → 型別 + 其餘約束 + 欄位名稱語意
+func generateFieldValue(f reflect.StructField, jsonName string) interface{} {
+	tag := f.Tag.Get("validate")
+
+	// 格式類 / 自訂規則：若某個 validate token 有註冊範例值，優先採用
+	if v, ok := sampleForTag(tag); ok {
+		return v
 	}
 
-	data, err := json.Marshal(fields)
-	if err != nil {
-		return "{}"
+	rules := parseValidateTag(tag)
+
+	// oneof：直接採用第一個合法選項（轉成欄位實際型別）
+	if len(rules.oneOf) > 0 {
+		return coerceString(rules.oneOf[0], f.Type)
 	}
-	return string(data)
+
+	return valueForType(f.Type, rules, strings.ToLower(jsonName))
+}
+
+// validateRules 為解析後的 validate: tag 約束集合（contract 生成/驗證所需子集）
+type validateRules struct {
+	required bool
+	oneOf    []string
+	min      *float64
+	max      *float64
+	gte      *float64
+	lte      *float64
+	gt       *float64
+	lt       *float64
+	length   *int
+}
+
+// parseValidateTag 解析 go-playground/validator 風格的 validate: tag
+// 與 pkg/json 使用的驗證詞彙一致（required / email / oneof / min / max / len ...）
+func parseValidateTag(tag string) validateRules {
+	var r validateRules
+	if tag == "" || tag == "-" {
+		return r
+	}
+
+	for _, tok := range strings.Split(tag, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+
+		key, val := tok, ""
+		if eq := strings.IndexByte(tok, '='); eq >= 0 {
+			key, val = tok[:eq], tok[eq+1:]
+		}
+
+		switch key {
+		case "required":
+			r.required = true
+		case "oneof":
+			if val != "" {
+				r.oneOf = strings.Fields(val)
+			}
+		case "len":
+			if n, err := strconv.Atoi(val); err == nil {
+				r.length = &n
+			}
+		case "min":
+			r.min = parseFloatPtr(val)
+		case "max":
+			r.max = parseFloatPtr(val)
+		case "gte":
+			r.gte = parseFloatPtr(val)
+		case "lte":
+			r.lte = parseFloatPtr(val)
+		case "gt":
+			r.gt = parseFloatPtr(val)
+		case "lt":
+			r.lt = parseFloatPtr(val)
+		}
+	}
+	return r
+}
+
+// parseFloatPtr 解析數值字串為 *float64，失敗回傳 nil
+func parseFloatPtr(s string) *float64 {
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return &f
+	}
+	return nil
+}
+
+// valueForType 依 Go 型別、validate 約束與欄位名稱語意生成測試值
+func valueForType(t reflect.Type, rules validateRules, name string) interface{} {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	switch t.Kind() {
+	case reflect.String:
+		return stringValue(rules, name)
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return numericValue(rules, name)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		v := numericValue(rules, name)
+		if v < 0 {
+			v = 0
+		}
+		return uint64(v)
+
+	case reflect.Float32, reflect.Float64:
+		return floatValue(rules, name)
+
+	case reflect.Bool:
+		// required 的 bool 必須為 true 才能通過 validator 的 required 檢查
+		return rules.required
+
+	case reflect.Slice, reflect.Array:
+		n := 0
+		if rules.length != nil {
+			n = *rules.length
+		} else if rules.min != nil && *rules.min > 0 {
+			n = int(*rules.min)
+		}
+		if n == 0 && rules.required {
+			n = 1
+		}
+		arr := make([]interface{}, 0, n)
+		for i := 0; i < n; i++ {
+			arr = append(arr, valueForType(t.Elem(), validateRules{}, name))
+		}
+		return arr
+
+	case reflect.Map:
+		m := map[string]interface{}{}
+		if rules.required {
+			m["key"] = valueForType(t.Elem(), validateRules{}, name)
+		}
+		return m
+
+	case reflect.Struct:
+		// time.Time 以 RFC3339 字串表示，其餘 struct 遞迴生成
+		if t.PkgPath() == "time" && t.Name() == "Time" {
+			return "2026-06-10T00:00:00Z"
+		}
+		return structFields(t)
+
+	default:
+		return nil
+	}
+}
+
+// stringValue 依約束與欄位名稱生成字串
+func stringValue(rules validateRules, name string) string {
+	if v, ok := stringByName(name); ok {
+		return clampString(v, rules)
+	}
+
+	if rules.length != nil {
+		return strings.Repeat("x", *rules.length)
+	}
+	return clampString("test", rules)
+}
+
+// clampString 依 len / min / max 約束調整字串長度
+func clampString(s string, rules validateRules) string {
+	if rules.length != nil {
+		return fitLength(s, *rules.length)
+	}
+	if rules.min != nil && len(s) < int(*rules.min) {
+		s += strings.Repeat("x", int(*rules.min)-len(s))
+	}
+	if rules.max != nil && len(s) > int(*rules.max) {
+		s = s[:int(*rules.max)]
+	}
+	return s
+}
+
+// fitLength 將字串補齊或截斷至指定長度
+func fitLength(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if len(s) == n {
+		return s
+	}
+	if len(s) > n {
+		return s[:n]
+	}
+	return s + strings.Repeat("x", n-len(s))
+}
+
+// stringByName 依欄位名稱語意回傳合理字串值
+func stringByName(name string) (string, bool) {
+	switch {
+	case strings.Contains(name, "email"):
+		return "test@example.com", true
+	case strings.Contains(name, "url"), strings.Contains(name, "uri"), strings.Contains(name, "link"):
+		return "https://example.com", true
+	case strings.Contains(name, "phone"), strings.Contains(name, "mobile"), strings.Contains(name, "tel"):
+		return "+15555550123", true
+	case strings.Contains(name, "password"), strings.Contains(name, "passwd"), strings.Contains(name, "pwd"):
+		return "Passw0rd!", true
+	case strings.Contains(name, "slug"):
+		return "test-slug", true
+	case strings.Contains(name, "uuid"), strings.Contains(name, "guid"):
+		return "00000000-0000-0000-0000-000000000000", true
+	case strings.Contains(name, "time"), strings.Contains(name, "_at"):
+		return "2026-06-10T00:00:00Z", true
+	case strings.Contains(name, "date"):
+		return "2026-06-10", true
+	case strings.Contains(name, "status"), strings.Contains(name, "state"):
+		return "active", true
+	case strings.Contains(name, "color"), strings.Contains(name, "colour"):
+		return "#000000", true
+	case strings.Contains(name, "title"):
+		return "Test Title", true
+	case strings.Contains(name, "desc"), strings.Contains(name, "content"),
+		strings.Contains(name, "body"), strings.Contains(name, "message"), strings.Contains(name, "note"):
+		return "test content", true
+	case strings.Contains(name, "code"):
+		return "TEST", true
+	case strings.Contains(name, "name"):
+		return "test", true
+	}
+	return "", false
+}
+
+// numericValue 依約束與欄位名稱計算合理整數值
+func numericValue(rules validateRules, name string) int64 {
+	lo, hasLo := numericLowerBound(rules)
+	hi, hasHi := numericUpperBound(rules)
+
+	suggested, hasSug := intByName(name)
+	if !hasSug && rules.required {
+		// required 的數值不可為 0，否則被 validator 視為未填
+		suggested, hasSug = 1, true
+	}
+
+	var v int64
+	switch {
+	case hasSug:
+		v = suggested
+	case hasLo:
+		v = lo
+	}
+
+	if hasLo && v < lo {
+		v = lo
+	}
+	if hasHi && v > hi {
+		v = hi
+	}
+	return v
+}
+
+// numericLowerBound 由 gte / min / gt 推導整數下界
+func numericLowerBound(rules validateRules) (int64, bool) {
+	switch {
+	case rules.gte != nil:
+		return int64(*rules.gte), true
+	case rules.min != nil:
+		return int64(*rules.min), true
+	case rules.gt != nil:
+		return int64(*rules.gt) + 1, true
+	}
+	return 0, false
+}
+
+// numericUpperBound 由 lte / max / lt 推導整數上界
+func numericUpperBound(rules validateRules) (int64, bool) {
+	switch {
+	case rules.lte != nil:
+		return int64(*rules.lte), true
+	case rules.max != nil:
+		return int64(*rules.max), true
+	case rules.lt != nil:
+		return int64(*rules.lt) - 1, true
+	}
+	return 0, false
+}
+
+// intByName 依欄位名稱語意回傳合理整數值
+func intByName(name string) (int64, bool) {
+	switch {
+	case strings.Contains(name, "age"):
+		return 25, true
+	case strings.Contains(name, "year"):
+		return 2026, true
+	case strings.Contains(name, "port"):
+		return 8080, true
+	case strings.Contains(name, "count"), strings.Contains(name, "qty"),
+		strings.Contains(name, "quantity"), strings.Contains(name, "num"),
+		strings.Contains(name, "page"), strings.Contains(name, "amount"):
+		return 1, true
+	case strings.Contains(name, "id"):
+		return 1, true
+	}
+	return 0, false
+}
+
+// floatValue 依約束與欄位名稱計算合理浮點數值
+func floatValue(rules validateRules, name string) float64 {
+	lo, hasLo := floatLowerBound(rules)
+	hi, hasHi := floatUpperBound(rules)
+
+	suggested, hasSug := floatByName(name)
+	if !hasSug && rules.required {
+		suggested, hasSug = 1, true
+	}
+
+	var v float64
+	switch {
+	case hasSug:
+		v = suggested
+	case hasLo:
+		v = lo
+	}
+
+	if hasLo && v < lo {
+		v = lo
+	}
+	if hasHi && v > hi {
+		v = hi
+	}
+	return v
+}
+
+// floatLowerBound 由 gte / min / gt 推導浮點下界（gt 取邊界 +1 以維持嚴格大於）
+func floatLowerBound(rules validateRules) (float64, bool) {
+	switch {
+	case rules.gte != nil:
+		return *rules.gte, true
+	case rules.min != nil:
+		return *rules.min, true
+	case rules.gt != nil:
+		return *rules.gt + 1, true
+	}
+	return 0, false
+}
+
+// floatUpperBound 由 lte / max / lt 推導浮點上界（lt 取邊界 -1 以維持嚴格小於）
+func floatUpperBound(rules validateRules) (float64, bool) {
+	switch {
+	case rules.lte != nil:
+		return *rules.lte, true
+	case rules.max != nil:
+		return *rules.max, true
+	case rules.lt != nil:
+		return *rules.lt - 1, true
+	}
+	return 0, false
+}
+
+// floatByName 依欄位名稱語意回傳合理浮點數值
+func floatByName(name string) (float64, bool) {
+	switch {
+	case strings.Contains(name, "price"), strings.Contains(name, "amount"),
+		strings.Contains(name, "cost"), strings.Contains(name, "total"),
+		strings.Contains(name, "fee"), strings.Contains(name, "balance"),
+		strings.Contains(name, "salary"):
+		return 9.99, true
+	case strings.Contains(name, "rate"), strings.Contains(name, "ratio"),
+		strings.Contains(name, "percent"):
+		return 0.5, true
+	case strings.Contains(name, "lat"):
+		return 25.0, true
+	case strings.Contains(name, "lng"), strings.Contains(name, "lon"):
+		return 121.0, true
+	}
+	return 0, false
+}
+
+// coerceString 將 oneof 的字串選項轉為欄位實際型別
+func coerceString(s string, t reflect.Type) interface{} {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return n
+		}
+		return int64(0)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return n
+		}
+		return uint64(0)
+	case reflect.Float32, reflect.Float64:
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+		return 0.0
+	default:
+		return s
+	}
 }
 
 // resolvePath 將路徑中的參數替換為測試值
@@ -87,14 +549,22 @@ func resolvePath(path string) string {
 	return strings.Join(parts, "/")
 }
 
-// guessParamValue 根據參數名猜測合理值
+// guessParamValue 依參數名稱語意猜測合理值（保留既有 id / slug 行為）
 func guessParamValue(name string) string {
 	lower := strings.ToLower(name)
-	if strings.Contains(lower, "id") {
+	switch {
+	case strings.Contains(lower, "id"):
 		return "1"
-	}
-	if strings.Contains(lower, "slug") {
+	case strings.Contains(lower, "slug"):
 		return "test-slug"
+	case strings.Contains(lower, "uuid"), strings.Contains(lower, "guid"):
+		return "00000000-0000-0000-0000-000000000000"
+	case strings.Contains(lower, "date"):
+		return "2026-06-10"
+	case strings.Contains(lower, "year"):
+		return "2026"
+	case strings.Contains(lower, "page"):
+		return "1"
 	}
 	return "test"
 }
@@ -129,30 +599,5 @@ func needsBody(method string) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-// zeroValueForType 為 Go 型別生成合理的測試值
-func zeroValueForType(t reflect.Type) interface{} {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	switch t.Kind() {
-	case reflect.String:
-		return "test"
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return 0
-	case reflect.Float32, reflect.Float64:
-		return 0.0
-	case reflect.Bool:
-		return false
-	case reflect.Slice, reflect.Array:
-		return []interface{}{}
-	case reflect.Map:
-		return map[string]interface{}{}
-	default:
-		return nil
 	}
 }

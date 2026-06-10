@@ -8,25 +8,17 @@ import (
 	"strings"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
 type Validator struct {
 	validator *validator.Validate
 }
 
+// NewValidator 回傳包裝共用 validator registry 的 Validator
+// 透過 pkg/validate 的單例，自訂規則與 pkg/contract 的合約驗證共用同一份規則表
 func NewValidator() *Validator {
-	v := validator.New()
-
-	// 註冊自定義標籤
-	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
-		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
-		if name == "-" {
-			return ""
-		}
-		return name
-	})
-
-	return &Validator{validator: v}
+	return &Validator{validator: validate.Default()}
 }
 
 // ValidatedUnmarshal 解析並驗證 JSON

@@ -33,6 +33,7 @@ logs/
 *.log
 hypgo.pid
 .env
+.html
 .env.local
 *.tmp.*
 
