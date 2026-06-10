@@ -2,12 +2,17 @@ package contract
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+
+	"github.com/go-playground/validator/v10"
+	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
 // validateResponse 驗證回應 body 是否符合 Output schema
+// 三層檢查：可反序列化 → 必填欄位存在 → validate: 約束（格式 / 範圍 / 列舉）
 func validateResponse(body []byte, outputType interface{}) error {
 	if outputType == nil {
 		return nil
@@ -28,10 +33,16 @@ func validateResponse(body []byte, outputType interface{}) error {
 	}
 
 	// 驗證必填欄位
-	return validateRequiredFields(body, t)
+	if err := validateRequiredFields(body, t); err != nil {
+		return err
+	}
+
+	// 驗證 validate: 約束
+	return validateConstraints(instance)
 }
 
 // validateRequest 驗證請求 body 是否符合 Input schema
+// 與 validateResponse 對稱：反序列化 → 必填欄位 → validate: 約束
 func validateRequest(body []byte, inputType interface{}) error {
 	if inputType == nil {
 		return nil
@@ -50,10 +61,16 @@ func validateRequest(body []byte, inputType interface{}) error {
 		return fmt.Errorf("request does not match Input schema %s: %w", t.Name(), err)
 	}
 
-	return validateRequiredFields(body, t)
+	if err := validateRequiredFields(body, t); err != nil {
+		return err
+	}
+
+	return validateConstraints(instance)
 }
 
 // validateRequiredFields 檢查必填欄位是否存在於 JSON 中
+// 「必填」的判定不依賴 validate: tag：非 omitempty 且非 pointer 的欄位即視為必填
+// 這是不需任何標註即可運作的結構性基準檢查
 func validateRequiredFields(body []byte, t reflect.Type) error {
 	if t.Kind() != reflect.Struct {
 		return nil
@@ -102,4 +119,68 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// validateConstraints 以 go-playground/validator 執行 validate: tag 的語意/格式約束檢查
+// 無 validate: tag 的 struct 會直接通過（向後相容）；非 struct 型別不檢查
+func validateConstraints(instance interface{}) error {
+	rv := reflect.ValueOf(instance)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return nil
+	}
+
+	// 使用 pkg/validate 的共用 registry，讓 app 註冊的自訂規則同樣生效
+	err := hypvalidate.Default().Struct(instance)
+	if err == nil {
+		return nil
+	}
+
+	var verrs validator.ValidationErrors
+	if errors.As(err, &verrs) {
+		msgs := make([]string, 0, len(verrs))
+		for _, fe := range verrs {
+			msgs = append(msgs, formatConstraintError(fe))
+		}
+		return fmt.Errorf("constraint validation failed: %s", strings.Join(msgs, "; "))
+	}
+	return fmt.Errorf("constraint validation failed: %w", err)
+}
+
+// formatConstraintError 將單一欄位的驗證錯誤轉為可讀訊息
+func formatConstraintError(fe validator.FieldError) string {
+	field := fe.Field()
+	switch fe.Tag() {
+	case "required":
+		return field + " is required"
+	case "email":
+		return field + " must be a valid email"
+	case "url", "uri", "http_url":
+		return field + " must be a valid URL"
+	case "uuid", "uuid4":
+		return field + " must be a valid UUID"
+	case "oneof":
+		return field + " must be one of [" + fe.Param() + "]"
+	case "min":
+		return field + " must be >= " + fe.Param()
+	case "max":
+		return field + " must be <= " + fe.Param()
+	case "len":
+		return field + " must have length " + fe.Param()
+	case "gte":
+		return field + " must be >= " + fe.Param()
+	case "lte":
+		return field + " must be <= " + fe.Param()
+	case "gt":
+		return field + " must be > " + fe.Param()
+	case "lt":
+		return field + " must be < " + fe.Param()
+	default:
+		return field + " failed " + fe.Tag() + " validation"
+	}
 }

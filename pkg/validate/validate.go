@@ -1,0 +1,83 @@
+// Package validate 提供全框架共用的 validator 單例
+// app 在此註冊的自訂驗證規則，會同時被 pkg/json 的請求驗證
+// 與 pkg/contract 的合約驗證看見，避免兩處各自持有獨立的規則表
+package validate
+
+import (
+	"reflect"
+	"strings"
+	"sync"
+
+	"github.com/go-playground/validator/v10"
+)
+
+var (
+	once     sync.Once
+	instance *validator.Validate
+)
+
+// Default 回傳全框架共用的 *validator.Validate 單例
+//
+// @ai purpose: 提供唯一的 validator 註冊表，讓自訂驗證規則跨 pkg/json 與 pkg/contract 共用
+// @ai input: none
+// @ai output: 已設定以 json 欄位名稱回報錯誤的共用 *validator.Validate
+// @ai sideeffect: 首次呼叫時初始化單例（sync.Once）
+// date: 2026-06-10
+func Default() *validator.Validate {
+	once.Do(func() {
+		v := validator.New()
+		v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+			name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+			if name == "-" {
+				return ""
+			}
+			return name
+		})
+		instance = v
+	})
+	return instance
+}
+
+// RegisterValidation 在共用實例上註冊自訂驗證規則
+//
+// @ai purpose: 讓 app 註冊自訂 validate tag（如 e164 變體、商業規則），供全框架共用
+// @ai input: tag 名稱、validator.Func、可選的 callValidationEvenIfNull
+// @ai output: error（註冊失敗時）
+// @ai sideeffect: 修改共用 validator 的規則表；非並行安全，須於程式啟動階段呼叫
+// date: 2026-06-10
+func RegisterValidation(tag string, fn validator.Func, callValidationEvenIfNull ...bool) error {
+	return Default().RegisterValidation(tag, fn, callValidationEvenIfNull...)
+}
+
+// RegisterAlias 在共用實例上為一組規則註冊別名
+//
+// @ai purpose: 讓 app 為常用的規則組合建立簡短別名
+// @ai input: alias 名稱、對應的 tags 字串
+// @ai output: none
+// @ai sideeffect: 修改共用 validator 的別名表；須於程式啟動階段呼叫
+// date: 2026-06-10
+func RegisterAlias(alias, tags string) {
+	Default().RegisterAlias(alias, tags)
+}
+
+// Struct 以共用規則表驗證 struct
+//
+// @ai purpose: 對外提供以共用 registry 驗證 struct 的捷徑
+// @ai input: 任意 struct 或其 pointer
+// @ai output: error（驗證失敗時為 validator.ValidationErrors）
+// @ai sideeffect: none
+// date: 2026-06-10
+func Struct(s interface{}) error {
+	return Default().Struct(s)
+}
+
+// Var 以共用規則表驗證單一變數
+//
+// @ai purpose: 對外提供以共用 registry 驗證單一值的捷徑
+// @ai input: 欲驗證的值、validate tag 字串
+// @ai output: error（驗證失敗時）
+// @ai sideeffect: none
+// date: 2026-06-10
+func Var(field interface{}, tag string) error {
+	return Default().Var(field, tag)
+}

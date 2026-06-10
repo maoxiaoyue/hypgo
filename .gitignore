@@ -33,6 +33,7 @@ logs/
 *.log
 hypgo.pid
 .env
+.html
 .env.local
 *.tmp.*
 
@@ -41,3 +42,4 @@ hypgo.pid
 Dockerfile.tmp.*
 /.claude/
 /md
+.html
