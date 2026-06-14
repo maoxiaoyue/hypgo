@@ -42,4 +42,6 @@ hypgo.pid
 Dockerfile.tmp.*
 /.claude/
 /md
-.html
+*.html
+hypgo.go
+hypgo_test.go

@@ -1,4 +1,4 @@
-package autosync
+package manifest
 
 import (
 	"os"
@@ -11,7 +11,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
-func setupTestRouter() *router.Router {
+func setupAutoSyncRouter() *router.Router {
 	schema.Global().Reset()
 	r := router.New()
 	r.GET("/health", func(c *hypcontext.Context) {})
@@ -23,12 +23,12 @@ func setupTestRouter() *router.Router {
 	return r
 }
 
-func TestSyncCreatesFile(t *testing.T) {
+func TestAutoSyncCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".hyp", "context.yaml")
 
-	r := setupTestRouter()
-	a := New(Config{Enabled: true, Path: path}, r, nil, nil)
+	r := setupAutoSyncRouter()
+	a := NewAutoSync(AutoSyncConfig{Enabled: true, Path: path}, r, nil, nil)
 
 	if err := a.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
@@ -39,18 +39,17 @@ func TestSyncCreatesFile(t *testing.T) {
 	}
 
 	content, _ := os.ReadFile(path)
-	s := string(content)
-	if len(s) == 0 {
+	if len(content) == 0 {
 		t.Fatal("file should not be empty")
 	}
 }
 
-func TestSyncDisabled(t *testing.T) {
+func TestAutoSyncDisabled(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "context.yaml")
 
 	r := router.New()
-	a := New(Config{Enabled: false, Path: path}, r, nil, nil)
+	a := NewAutoSync(AutoSyncConfig{Enabled: false, Path: path}, r, nil, nil)
 
 	if err := a.Sync(); err != nil {
 		t.Fatal(err)
@@ -61,62 +60,60 @@ func TestSyncDisabled(t *testing.T) {
 	}
 }
 
-func TestSyncWithConfig(t *testing.T) {
+func TestAutoSyncWithConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "context.yaml")
 
-	r := setupTestRouter()
+	r := setupAutoSyncRouter()
 	cfg := &config.Config{}
 	cfg.Server.Addr = ":8080"
 	cfg.Server.Protocol = "http2"
 
-	a := New(Config{Enabled: true, Path: path}, r, cfg, nil)
+	a := NewAutoSync(AutoSyncConfig{Enabled: true, Path: path}, r, cfg, nil)
 	if err := a.Sync(); err != nil {
 		t.Fatal(err)
 	}
 
 	content, _ := os.ReadFile(path)
-	s := string(content)
-	if len(s) == 0 {
+	if len(content) == 0 {
 		t.Error("should have content")
 	}
 }
 
-func TestSyncJSON(t *testing.T) {
+func TestAutoSyncJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "context.json")
 
-	r := setupTestRouter()
-	a := New(Config{Enabled: true, Path: path, Format: "json"}, r, nil, nil)
+	r := setupAutoSyncRouter()
+	a := NewAutoSync(AutoSyncConfig{Enabled: true, Path: path, Format: "json"}, r, nil, nil)
 
 	if err := a.Sync(); err != nil {
 		t.Fatal(err)
 	}
 
 	content, _ := os.ReadFile(path)
-	s := string(content)
-	if s[0] != '{' {
+	if len(content) == 0 || content[0] != '{' {
 		t.Error("JSON output should start with {")
 	}
 }
 
-func TestSyncSafe(t *testing.T) {
+func TestAutoSyncSafe(t *testing.T) {
 	r := router.New()
 	schema.Global().Reset()
 	// 使用不可寫的路徑，不應 panic
-	a := New(Config{Enabled: true, Path: "/nonexistent/deep/path/ctx.yaml"}, r, nil, nil)
+	a := NewAutoSync(AutoSyncConfig{Enabled: true, Path: "/nonexistent/deep/path/ctx.yaml"}, r, nil, nil)
 	a.SyncSafe() // 不應 panic
 }
 
-func TestDefaultPath(t *testing.T) {
-	a := New(Config{Enabled: true}, router.New(), nil, nil)
-	if a.config.Path != DefaultPath {
-		t.Errorf("default path = %q, want %q", a.config.Path, DefaultPath)
+func TestAutoSyncDefaultPath(t *testing.T) {
+	a := NewAutoSync(AutoSyncConfig{Enabled: true}, router.New(), nil, nil)
+	if a.config.Path != DefaultContextPath {
+		t.Errorf("default path = %q, want %q", a.config.Path, DefaultContextPath)
 	}
 }
 
-func TestDefaultFormat(t *testing.T) {
-	a := New(Config{Enabled: true}, router.New(), nil, nil)
+func TestAutoSyncDefaultFormat(t *testing.T) {
+	a := NewAutoSync(AutoSyncConfig{Enabled: true}, router.New(), nil, nil)
 	if a.config.Format != "yaml" {
 		t.Errorf("default format = %q, want yaml", a.config.Format)
 	}

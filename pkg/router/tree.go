@@ -1,3 +1,4 @@
+// @chris
 package router
 
 import (
@@ -87,7 +88,7 @@ walk:
 						p = make([]Param, 0, 4)
 					}
 					p = append(p, Param{
-						Key:   n.path[1:],   // 去掉前導 '*'
+						Key:   n.path[1:], // 去掉前導 '*'
 						Value: "/" + path, // 補回被父節點消費的前導 '/'
 					})
 					return n.handlers, p

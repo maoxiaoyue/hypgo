@@ -175,38 +175,75 @@ func TestParseLevel(t *testing.T) {
 	}
 }
 
-// TestFormatMessagePrintfStyle Bug5 修復驗證：%s/%v/%d 格式動詞必須展開
-func TestFormatMessagePrintfStyle(t *testing.T) {
-	l, _ := New("debug", "stdout", &bytes.Buffer{}, false)
+// TestPrintfMethods 驗證 printf-style 方法（Infof/Errorf/...）會展開格式動詞
+func TestPrintfMethods(t *testing.T) {
+	var buf bytes.Buffer
+	l, _ := New("debug", "stdout", &buf, false)
 
 	// %s 展開
-	msg := l.formatMessage(INFO, "hello %s", "world")
-	if !strings.Contains(msg, "hello world") {
-		t.Errorf("expected 'hello world', got: %s", msg)
+	buf.Reset()
+	l.Infof("hello %s", "world")
+	if !strings.Contains(buf.String(), "hello world") {
+		t.Errorf("expected 'hello world', got: %s", buf.String())
 	}
 
 	// %v 展開
-	msg = l.formatMessage(ERROR, "error: %v", "something failed")
-	if !strings.Contains(msg, "error: something failed") {
-		t.Errorf("expected 'error: something failed', got: %s", msg)
-	}
-
-	// %d 展開
-	msg = l.formatMessage(INFO, "port: %d", 8080)
-	if !strings.Contains(msg, "port: 8080") {
-		t.Errorf("expected 'port: 8080', got: %s", msg)
+	buf.Reset()
+	l.Errorf("error: %v", "something failed")
+	if !strings.Contains(buf.String(), "error: something failed") {
+		t.Errorf("expected 'error: something failed', got: %s", buf.String())
 	}
 
 	// 多參數
-	msg = l.formatMessage(INFO, "server %s on :%d", "started", 9090)
-	if !strings.Contains(msg, "server started on :9090") {
-		t.Errorf("expected 'server started on :9090', got: %s", msg)
+	buf.Reset()
+	l.Infof("server %s on :%d", "started", 9090)
+	if !strings.Contains(buf.String(), "server started on :9090") {
+		t.Errorf("expected 'server started on :9090', got: %s", buf.String())
+	}
+}
+
+// TestInfoDoesNotInterpretPercent 驗證拆分後的正確性修復：
+// KV 模式（Info）不再把訊息中字面的 % 當成格式動詞（修正啟發式偵測地雷）
+func TestInfoDoesNotInterpretPercent(t *testing.T) {
+	var buf bytes.Buffer
+	l, _ := New("debug", "stdout", &buf, false)
+
+	// 含字面百分比的訊息 + KV：% 必須原樣輸出，不可被吃掉或變亂碼
+	l.Info("upload progress 50% done", "file", "video.mp4")
+	out := buf.String()
+	if !strings.Contains(out, "upload progress 50% done") {
+		t.Errorf("literal %% must be preserved in KV mode, got: %s", out)
+	}
+	if !strings.Contains(out, "file=video.mp4") {
+		t.Errorf("expected KV pair file=video.mp4, got: %s", out)
+	}
+	if strings.Contains(out, "%!") || strings.Contains(out, "(MISSING)") {
+		t.Errorf("KV mode must not run Sprintf on the message, got: %s", out)
 	}
 
-	// 不含 % 的結構化 KV 模式仍應正常運作
-	msg = l.formatMessage(INFO, "request completed", "status", 200, "latency", "5ms")
-	if !strings.Contains(msg, "status=200") || !strings.Contains(msg, "latency=5ms") {
-		t.Errorf("expected KV pairs, got: %s", msg)
+	// 結構化 KV 模式正常運作
+	buf.Reset()
+	l.Info("request completed", "status", 200, "latency", "5ms")
+	out = buf.String()
+	if !strings.Contains(out, "status=200") || !strings.Contains(out, "latency=5ms") {
+		t.Errorf("expected KV pairs, got: %s", out)
+	}
+}
+
+// TestJSONFormat 驗證 slog JSON 後端輸出標準結構化日誌
+func TestJSONFormat(t *testing.T) {
+	var buf bytes.Buffer
+	l, _ := New("debug", "stdout", &buf, false)
+	l.SetFormat("json")
+
+	l.Info("user login", "user_id", 42, "ip", "1.2.3.4")
+	out := buf.String()
+
+	// slog JSONHandler 應輸出標準欄位
+	for _, want := range []string{`"level"`, `"msg":"user login"`, `"user_id":42`, `"ip":"1.2.3.4"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected JSON output to contain %s, got: %s", want, out)
+		}
 	}
 }
 

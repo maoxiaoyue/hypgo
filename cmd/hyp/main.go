@@ -1,3 +1,4 @@
+// @chris
 package main
 
 import (
@@ -7,7 +8,7 @@ import (
 )
 
 var (
-	version = "0.8.5"
+	version = "0.8.6"
 	rootCmd = &cobra.Command{
 		Use:   "hyp",
 		Short: "HypGo CLI - AI-Human Collaborative Go Web Framework",
@@ -18,6 +19,7 @@ AI Collaboration:
   ai-rules       Generate config files for Codex, Gemini, Cursor, Copilot, Windsurf
   chkcomment     Check annotation completeness in Go source files
   impact         Analyze change impact before modifying shared packages
+  lint           Check Schema completeness from the manifest (CI gate)
 
 Testing:
   observe        List or open contract observe HTML reports
@@ -105,6 +107,7 @@ Examples:
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)
 	rootCmd.AddCommand(impactCmd)
+	rootCmd.AddCommand(lintCmd)
 	rootCmd.AddCommand(observeCmd)
 	rootCmd.AddCommand(evalReportCmd)
 }

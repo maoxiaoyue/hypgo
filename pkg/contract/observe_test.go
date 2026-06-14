@@ -12,6 +12,7 @@ import (
 	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/resource"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
@@ -243,7 +244,7 @@ func TestCaptureRouteExchange_CapturesRequest(t *testing.T) {
 		t.Fatal("未找到 POST /orders 路由")
 	}
 
-	res := captureRouteExchange(r, postRoute)
+	res := captureRouteExchange(r, postRoute, true)
 
 	if res.Request.Method != "POST" {
 		t.Errorf("Method 預期 POST，得到 %s", res.Request.Method)
@@ -256,6 +257,84 @@ func TestCaptureRouteExchange_CapturesRequest(t *testing.T) {
 	}
 	if res.Response.Body == "" {
 		t.Error("Response.Body 不應為空")
+	}
+
+	// 量測欄位（measure=true 時應有資料）
+	if !res.Measured {
+		t.Error("Measured 應為 true（循序量測）")
+	}
+	if res.AllocBytes == 0 {
+		t.Error("AllocBytes 應 > 0（handler 必有配置）")
+	}
+	if res.Duration < 0 {
+		t.Error("Duration 不應為負數")
+	}
+}
+
+func TestCaptureRouteExchange_ParallelSkipsMeasurement(t *testing.T) {
+	r := setupObserveRouter()
+	routes := schema.Global().All()
+	var postRoute schema.Route
+	for _, rt := range routes {
+		if rt.Method == "POST" && rt.Path == "/orders" {
+			postRoute = rt
+			break
+		}
+	}
+	if postRoute.Path == "" {
+		t.Fatal("未找到 POST /orders 路由")
+	}
+
+	// measure=false 模擬並行模式：不量測資源/效能，但功能仍正常
+	res := captureRouteExchange(r, postRoute, false)
+	if res.Measured {
+		t.Error("Measured 應為 false（並行模式不量測）")
+	}
+	if res.AllocBytes != 0 || res.CPUTime != 0 || res.Resources.Any() {
+		t.Error("並行模式量測欄位應為零值")
+	}
+	if res.Response.StatusCode != 201 {
+		t.Errorf("StatusCode 預期 201，得到 %d", res.Response.StatusCode)
+	}
+}
+
+func TestCaptureRouteExchange_RecordsResourceUsage(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	r.Schema(schema.Route{
+		Method:    "POST",
+		Path:      "/db-op",
+		Summary:   "touches DB and Redis",
+		Input:     createReq{},
+		Output:    userResp{},
+		Responses: map[int]schema.ResponseSchema{201: {Description: "ok"}},
+	}).Handle(func(c *hypcontext.Context) {
+		// 模擬 handler 觸及資料庫與 Redis（Redis 操作觸及 2 個 key）
+		resource.MarkDB()
+		resource.MarkRedis(2)
+		c.JSON(201, userResp{ID: 1, Name: "x", Email: "x@x.com"})
+	})
+
+	var route schema.Route
+	for _, rt := range schema.Global().All() {
+		if rt.Path == "/db-op" {
+			route = rt
+			break
+		}
+	}
+
+	res := captureRouteExchange(r, route, true)
+	if res.Resources.DB < 1 {
+		t.Errorf("Resources.DB 應 >= 1，得到 %d", res.Resources.DB)
+	}
+	if res.Resources.Redis < 1 {
+		t.Errorf("Resources.Redis 應 >= 1，得到 %d", res.Resources.Redis)
+	}
+	if res.Resources.RedisKeys < 2 {
+		t.Errorf("Resources.RedisKeys 應 >= 2，得到 %d", res.Resources.RedisKeys)
+	}
+	if !res.Resources.UsesStorage() {
+		t.Error("UsesStorage() 應為 true（handler 觸及 DB/Redis）")
 	}
 }
 
@@ -340,12 +419,12 @@ func TestGenerateObserveHTML_NotEmpty(t *testing.T) {
 func TestGenerateObserveHTML_ShowsPassFail(t *testing.T) {
 	results := []ObserveResult{
 		{
-			Route:      schema.Route{Method: "GET", Path: "/ok"},
-			Request:    CapturedRequest{Method: "GET", Path: "/ok"},
-			Response:   CapturedResponse{StatusCode: 200},
-			Pass:       true,
-			Duration:   1 * time.Millisecond,
-			Timestamp:  time.Now(),
+			Route:     schema.Route{Method: "GET", Path: "/ok"},
+			Request:   CapturedRequest{Method: "GET", Path: "/ok"},
+			Response:  CapturedResponse{StatusCode: 200},
+			Pass:      true,
+			Duration:  1 * time.Millisecond,
+			Timestamp: time.Now(),
 		},
 		{
 			Route:      schema.Route{Method: "POST", Path: "/fail"},

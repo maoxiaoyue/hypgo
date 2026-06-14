@@ -1,3 +1,4 @@
+// @chris
 package main
 
 import (
@@ -458,9 +459,9 @@ func main() {
 
     // 啟動服務器
     go func() {
-        appLog.Info("Starting HypGo server on %s", cfg.Server.Addr)
+        appLog.Infof("Starting HypGo server on %s", cfg.Server.Addr)
         if err := srv.Start(); err != nil {
-            appLog.Error("Server error: %v", err)
+            appLog.Errorf("Server error: %v", err)
             os.Exit(1)
         }
     }()
@@ -475,7 +476,7 @@ func main() {
     defer cancel()
 
     if err := srv.Shutdown(ctx); err != nil {
-        appLog.Error("Server forced to shutdown: %v", err)
+        appLog.Errorf("Server forced to shutdown: %v", err)
     }
     appLog.Info("Server exited")
 }

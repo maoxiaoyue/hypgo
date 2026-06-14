@@ -1,4 +1,6 @@
 // Package server 提供 HTTP/1.1/2/3 統一伺服器實現
+//
+// @chris
 package server
 
 import (
@@ -16,7 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/maoxiaoyue/hypgo/pkg/autosync"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
@@ -196,12 +197,17 @@ func (s *Server) Use(middlewares ...hypcontext.HandlerFunc) {
 func (s *Server) Start() error {
 	// 保存 PID 檔案
 	if err := s.savePIDFile(); err != nil {
-		s.logger.Warning("Failed to save PID file: %v", err)
+		s.logger.Warningf("Failed to save PID file: %v", err)
 	}
 
+	// 將 BindInput 型別不符回報接到 logger（context 對 logger 零依賴，故以 hook 注入）
+	hypcontext.SetBindInputReporter(func(routeKey, declared, bound string) {
+		s.logger.Warningf("BindInput 型別不符 [%s]：handler 綁定 %s，但 Schema 宣告 %s", routeKey, bound, declared)
+	})
+
 	// AutoSync：啟動時自動同步 .hyp/context.yaml
-	sync := autosync.New(
-		autosync.Config{Enabled: true},
+	sync := manifest.NewAutoSync(
+		manifest.AutoSyncConfig{Enabled: true},
 		s.router, s.config, s.logger,
 	)
 	sync.SyncSafe()
@@ -228,13 +234,13 @@ func (s *Server) Start() error {
 
 // startAutoProtocol 自動協議選擇（同時支援 HTTP/1.1/2/3）
 func (s *Server) startAutoProtocol() error {
-	s.logger.Info("Starting server with auto protocol detection on %s", s.config.Server.Addr)
+	s.logger.Infof("Starting server with auto protocol detection on %s", s.config.Server.Addr)
 
 	// 啟動 HTTP/3 伺服器（UDP）
 	if s.config.Server.TLS.Enabled {
 		go func() {
 			if err := s.startHTTP3(); err != nil {
-				s.logger.Warning("HTTP/3 server failed: %v", err)
+				s.logger.Warningf("HTTP/3 server failed: %v", err)
 			}
 		}()
 	}
@@ -286,7 +292,7 @@ func (s *Server) loadCertificate() (tls.Certificate, error) {
 
 // startHTTP3 啟動 HTTP/3 伺服器
 func (s *Server) startHTTP3() error {
-	s.logger.Info("Starting HTTP/3 server on %s", s.config.Server.Addr)
+	s.logger.Infof("Starting HTTP/3 server on %s", s.config.Server.Addr)
 
 	if !s.config.Server.TLS.Enabled {
 		return fmt.Errorf("HTTP/3 requires TLS to be enabled")
@@ -321,7 +327,7 @@ func (s *Server) startHTTP3() error {
 
 // startHTTP2WithFallback 啟動 HTTP/2 伺服器（支援 HTTP/1.1 降級）
 func (s *Server) startHTTP2WithFallback() error {
-	s.logger.Info("Starting HTTP/2 server with HTTP/1.1 fallback on %s", s.config.Server.Addr)
+	s.logger.Infof("Starting HTTP/2 server with HTTP/1.1 fallback on %s", s.config.Server.Addr)
 
 	// 驗證並修正 HTTP/2 設定
 	maxReadFrameSize := s.config.Server.MaxReadFrameSize
@@ -390,7 +396,7 @@ func (s *Server) startHTTP2() error {
 
 // startHTTP1 啟動 HTTP/1.1 伺服器
 func (s *Server) startHTTP1() error {
-	s.logger.Info("Starting HTTP/1.1 server on %s", s.config.Server.Addr)
+	s.logger.Infof("Starting HTTP/1.1 server on %s", s.config.Server.Addr)
 	s.protocol = HTTP1
 
 	listener, err := s.getListener()
@@ -469,7 +475,7 @@ func (s *Server) getInheritedListener() net.Listener {
 	listener, err := net.FileListener(file)
 	file.Close() // 無論成功與否，關閉 file descriptor 複本
 	if err != nil {
-		s.logger.Warning("Failed to inherit listener: %v", err)
+		s.logger.Warningf("Failed to inherit listener: %v", err)
 		return nil
 	}
 
@@ -537,7 +543,7 @@ func (s *Server) handleGracefulRestart() {
 
 			// Fork 新進程
 			if err := s.forkNewProcess(); err != nil {
-				s.logger.Emergency("Failed to fork new process: %v", err)
+				s.logger.Emergencyf("Failed to fork new process: %v", err)
 				continue
 			}
 
@@ -549,7 +555,7 @@ func (s *Server) handleGracefulRestart() {
 			// 優雅關閉
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := s.Shutdown(ctx); err != nil {
-				s.logger.Emergency("Failed to shutdown gracefully: %v", err)
+				s.logger.Emergencyf("Failed to shutdown gracefully: %v", err)
 			}
 			cancel()
 
@@ -592,7 +598,7 @@ func (s *Server) forkNewProcess() error {
 		return fmt.Errorf("failed to start new process: %w", err)
 	}
 
-	s.logger.Info("Started new process with PID: %d", process.Pid)
+	s.logger.Infof("Started new process with PID: %d", process.Pid)
 	return nil
 }
 

@@ -1,3 +1,4 @@
+// @chris
 package context
 
 import (
@@ -140,6 +141,11 @@ func (c *Context) reset() {
 	c.index = -1
 	c.protocol = 0
 	c.startTime = time.Time{}
+
+	// Schema-first 綁定狀態
+	c.schemaInput = nil
+	c.schemaRouteKey = ""
+	c.bindInputCalled = false
 }
 
 // ===== ResponseWriter 池操作 =====

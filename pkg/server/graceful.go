@@ -1,3 +1,4 @@
+// @chris
 package server
 
 import (
@@ -35,7 +36,7 @@ func (s *Server) ListenAndServeWithGracefulShutdown() error {
 		defer cancel()
 
 		if err := s.Shutdown(ctx); err != nil {
-			s.logger.Emergency("Server forced to shutdown: %v", err)
+			s.logger.Emergencyf("Server forced to shutdown: %v", err)
 			return err
 		}
 

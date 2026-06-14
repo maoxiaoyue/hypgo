@@ -1,3 +1,4 @@
+// @chris
 package main
 
 import (
@@ -235,14 +236,14 @@ func main() {
 	// 初始化數據庫
 	db, err := database.Init(cfg.Database)
 	if err != nil {
-		log.Emergency("Failed to initialize database: %v", err)
+		log.Emergencyf("Failed to initialize database: %v", err)
 		os.Exit(1)
 	}
 	defer database.Close()
 
 	// 初始化 Redis
 	if err := cache.Init(cfg.Redis); err != nil {
-		log.Warning("Failed to initialize Redis: %v", err)
+		log.Warningf("Failed to initialize Redis: %v", err)
 		// Redis 是可選的，不退出
 	}
 	defer cache.Close()
@@ -251,7 +252,7 @@ func main() {
 	if cfg.Database.AutoMigrate {
 		log.Info("Running database migrations...")
 		if err := models.AutoMigrate(db); err != nil {
-			log.Error("Failed to migrate database: %v", err)
+			log.Errorf("Failed to migrate database: %v", err)
 		}
 	}
 
@@ -264,7 +265,7 @@ func main() {
 	// 啟動服務器
 	serverErrors := make(chan error, 1)
 	go func() {
-		log.Info("Server starting on %s with protocol %s", 
+		log.Infof("Server starting on %s with protocol %s", 
 			cfg.Server.Addr, 
 			cfg.Server.Protocol)
 		
@@ -301,16 +302,16 @@ func main() {
 
 	select {
 	case err := <-serverErrors:
-		log.Emergency("Server error: %v", err)
+		log.Emergencyf("Server error: %v", err)
 		os.Exit(1)
 	case sig := <-shutdown:
-		log.Info("Shutdown signal received: %v", sig)
+		log.Infof("Shutdown signal received: %v", sig)
 		
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		
 		if err := srv.Shutdown(ctx); err != nil {
-			log.Error("Server forced to shutdown: %v", err)
+			log.Errorf("Server forced to shutdown: %v", err)
 			os.Exit(1)
 		}
 		
@@ -1005,7 +1006,7 @@ func GetUsers(ctx *context.Context) {
 	userService := services.NewUserService(database.GetDB())
 	users, total, err := userService.GetUsers(page, pageSize)
 	if err != nil {
-		logger.Error("Failed to get users: %v", err)
+		logger.Errorf("Failed to get users: %v", err)
 		ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
 			"error": "Failed to retrieve users",
 		})
@@ -1044,7 +1045,7 @@ func GetUser(ctx *context.Context) {
 				"error": "User not found",
 			})
 		} else {
-			logger.Error("Failed to get user: %v", err)
+			logger.Errorf("Failed to get user: %v", err)
 			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
 				"error": "Failed to retrieve user",
 			})
@@ -1078,7 +1079,7 @@ func CreateUser(ctx *context.Context) {
 				"error": "User already exists",
 			})
 		} else {
-			logger.Error("Failed to create user: %v", err)
+			logger.Errorf("Failed to create user: %v", err)
 			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
 				"error": "Failed to create user",
 			})
@@ -1128,7 +1129,7 @@ func UpdateUser(ctx *context.Context) {
 				"error": "User not found",
 			})
 		} else {
-			logger.Error("Failed to update user: %v", err)
+			logger.Errorf("Failed to update user: %v", err)
 			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
 				"error": "Failed to update user",
 			})
@@ -1160,7 +1161,7 @@ func DeleteUser(ctx *context.Context) {
 				"error": "User not found",
 			})
 		} else {
-			logger.Error("Failed to delete user: %v", err)
+			logger.Errorf("Failed to delete user: %v", err)
 			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
 				"error": "Failed to delete user",
 			})

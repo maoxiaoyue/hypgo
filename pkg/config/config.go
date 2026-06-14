@@ -1,3 +1,4 @@
+// @chris
 package config
 
 import (
@@ -177,6 +178,18 @@ func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
 	}
 
 	return nil
+}
+
+// LoadConfig 讀取設定檔，套用預設值並驗證後回傳 *Config（便捷函式）。
+// 檔案不存在、格式錯誤或驗證失敗時回傳 error；成功時預設值已套用。
+//
+//	cfg, err := config.LoadConfig("config.yaml")
+func LoadConfig(path string) (*Config, error) {
+	cfg := &Config{}
+	if err := NewConfigLoader(path).Load(path, cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // ApplyDefaults 應用預設值
