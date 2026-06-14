@@ -1,3 +1,4 @@
+// @chris
 package middleware
 
 import (
@@ -470,8 +471,8 @@ func (g *Group) Handle(handler hypcontext.HandlerFunc) hypcontext.HandlerFunc {
 
 // BodyLimitConfig 請求 body 大小限制配置
 type BodyLimitConfig struct {
-	MaxBytes    int64  // 最大 body 大小（bytes），預設 1MB
-	ErrorMsg    string // 自訂錯誤訊息
+	MaxBytes int64  // 最大 body 大小（bytes），預設 1MB
+	ErrorMsg string // 自訂錯誤訊息
 }
 
 // BodyLimit 限制請求 body 大小，防止大 payload 攻擊

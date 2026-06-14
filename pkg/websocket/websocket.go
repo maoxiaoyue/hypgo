@@ -1,4 +1,6 @@
 // Package websocket 提供優化的 WebSocket 實現，整合 HypGo Context
+//
+// @chris
 package websocket
 
 import (

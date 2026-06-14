@@ -976,4 +976,3 @@ mode: none
 #   generator_model: "llama3"              # 根據檢索結果生成描述
 #   generator_url: "http://localhost:11434" # 預設用本地 Ollama
 `
-

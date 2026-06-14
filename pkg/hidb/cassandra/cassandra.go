@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
+	"github.com/maoxiaoyue/hypgo/pkg/resource"
 )
 
 // TLSConfig holds optional TLS settings for the CQL connection.
@@ -293,6 +294,7 @@ func (c *CassandraDB) Connect() error {
 
 // Session 獲取 gocql.Session（用戶直接操作 CQL）
 func (c *CassandraDB) Session() *gocql.Session {
+	resource.MarkCassandra()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.session

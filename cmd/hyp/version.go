@@ -1,3 +1,4 @@
+// @chris
 package main
 
 import (
@@ -8,8 +9,8 @@ import (
 )
 
 var (
-	Version   = "0.8.5"
-	BuildTime = "2026/04/15"
+	Version   = "0.8.6"
+	BuildTime = "2026/06/11"
 	GitCommit = "unknown"
 )
 
