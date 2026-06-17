@@ -36,6 +36,7 @@ func init() {
 	chkcommentCmd.Flags().Bool("fix", false, "Automatically add suggested comments to the file")
 	chkcommentCmd.Flags().String("llm", "", "Path to LLM config YAML (default: auto-detect config/llm.yaml or .hyp/llm.yaml)")
 	chkcommentCmd.Flags().Bool("unintent", false, "Check AI-generated funcs for missing //@ai:think and write report to .hyp/lostintent.md (warning only)")
+	chkcommentCmd.Flags().Bool("fixintent", false, "Auto-insert //@ai:think into AI-generated funcs using LLM or heuristics (creates .bak backup)")
 }
 
 func runChkComment(cmd *cobra.Command, args []string) error {
@@ -43,6 +44,7 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 	fix, _ := cmd.Flags().GetBool("fix")
 	llmPath, _ := cmd.Flags().GetString("llm")
 	unintent, _ := cmd.Flags().GetBool("unintent")
+	fixintent, _ := cmd.Flags().GetBool("fixintent")
 
 	report, err := annotation.CheckFile(filename)
 	if err != nil {
@@ -51,12 +53,21 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 
 	fmt.Print(annotation.FormatReport(report))
 
-	if unintent {
+	if unintent || fixintent {
 		thinkReport, thinkErr := annotation.CheckThink(filename)
 		if thinkErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: @ai:think check failed: %v\n", thinkErr)
 		} else {
 			fmt.Print(annotation.FormatThinkReport(thinkReport))
+
+			if fixintent && len(thinkReport.Missing) > 0 {
+				if fixErr := runFixIntent(cmd, filename, llmPath, thinkReport); fixErr != nil {
+					return fixErr
+				}
+				// 修復後重新檢查，寫入乾淨的報告
+				thinkReport, _ = annotation.CheckThink(filename)
+			}
+
 			if writeErr := annotation.WriteLostIntentReport(".hyp", thinkReport); writeErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: cannot write .hyp/lostintent.md: %v\n", writeErr)
 			} else {
@@ -112,6 +123,43 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("fix failed: %w", err)
 	}
 	fmt.Fprintf(os.Stdout, "Fixed: comments added to %s (backup: %s.bak)\n", filename, filename)
+	return nil
+}
+
+// runFixIntent 使用 LLM 為缺少 @ai:think 的函式插入意圖註解；無 LLM 設定時僅警告
+func runFixIntent(_ *cobra.Command, filename, llmPath string, thinkReport *annotation.ThinkReport) error {
+	resolvedPath := resolveLLMConfigPath(llmPath)
+	llmCfg, err := config.LoadLLMConfig(resolvedPath)
+	if err != nil {
+		return fmt.Errorf("load llm config: %w", err)
+	}
+
+	if llmCfg == nil || llmCfg.Mode == "" || llmCfg.Mode == config.LLMModeNone {
+		fmt.Fprintf(os.Stderr, "\n[fixintent] Warning: no LLM configured (mode=none). "+
+			"--fixintent requires model support to auto-insert @ai:think.\n"+
+			"  → Please provide a valid LLM config via --llm or place one at config/llm.yaml\n"+
+			"  → See: hyp chkcomment --unintent %s  (to list missing funcs only)\n", filename)
+		return nil
+	}
+
+	thinkSuggester, err := annotation.NewThinkSuggester(llmCfg)
+	if err != nil {
+		return fmt.Errorf("init think suggester: %w", err)
+	}
+
+	modelName := thinkSuggester.ModelName()
+	fmt.Fprintf(os.Stdout, "\n[fixintent] Using LLM config: %s (mode=%s, model=%s)\n",
+		resolvedPath, string(llmCfg.Mode), modelName)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	fixed, fixErr := annotation.FixThinkFile(ctx, filename, thinkReport, thinkSuggester)
+	if fixErr != nil {
+		return fmt.Errorf("fixintent failed: %w", fixErr)
+	}
+	fmt.Fprintf(os.Stdout, "[fixintent] Inserted @ai:think into %d func(s) in %s (backup: %s.bak, model=%s)\n",
+		fixed, filename, filename, modelName)
 	return nil
 }
 
