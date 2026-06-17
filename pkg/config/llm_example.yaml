@@ -1,6 +1,6 @@
 # HypGo LLM 智慧增強配置
 # 放置於 config/llm.yaml 或 .hyp/llm.yaml
-# 使用方式：hyp context --llm config/llm.yaml
+# 使用方式：hyp chkcomment --llm config/llm.yaml
 
 # ============================================================
 # mode: 控制 LLM 增強模式

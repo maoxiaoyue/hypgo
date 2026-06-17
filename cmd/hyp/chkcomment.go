@@ -35,12 +35,14 @@ Examples:
 func init() {
 	chkcommentCmd.Flags().Bool("fix", false, "Automatically add suggested comments to the file")
 	chkcommentCmd.Flags().String("llm", "", "Path to LLM config YAML (default: auto-detect config/llm.yaml or .hyp/llm.yaml)")
+	chkcommentCmd.Flags().Bool("unintent", false, "Check AI-generated funcs for missing //@ai:think and write report to .hyp/lostintent.md (warning only)")
 }
 
 func runChkComment(cmd *cobra.Command, args []string) error {
 	filename := args[0]
 	fix, _ := cmd.Flags().GetBool("fix")
 	llmPath, _ := cmd.Flags().GetString("llm")
+	unintent, _ := cmd.Flags().GetBool("unintent")
 
 	report, err := annotation.CheckFile(filename)
 	if err != nil {
@@ -48,6 +50,20 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Print(annotation.FormatReport(report))
+
+	if unintent {
+		thinkReport, thinkErr := annotation.CheckThink(filename)
+		if thinkErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: @ai:think check failed: %v\n", thinkErr)
+		} else {
+			fmt.Print(annotation.FormatThinkReport(thinkReport))
+			if writeErr := annotation.WriteLostIntentReport(".hyp", thinkReport); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: cannot write .hyp/lostintent.md: %v\n", writeErr)
+			} else {
+				fmt.Fprintf(os.Stdout, "Report written to .hyp/lostintent.md\n")
+			}
+		}
+	}
 
 	if !fix {
 		return nil
