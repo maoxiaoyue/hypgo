@@ -212,6 +212,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
 		filepath.Join(baseDir, "app", "config"),
+		filepath.Join(baseDir, "tools", "genctx"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -226,6 +227,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		{baseDir, "main.go", cliMainTemplate},
 		{filepath.Join(baseDir, "app", "commands"), "root.go", cliRootTemplate},
 		{filepath.Join(baseDir, "app", "commands"), "schema.go", cliSchemaTemplate},
+		{filepath.Join(baseDir, "tools", "genctx"), "main.go", cliGenctxTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", cliConfigTemplate},
 		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
 		{baseDir, "go.mod", cliGoModTemplate},
@@ -270,6 +272,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
 		filepath.Join(baseDir, "app", "config"),
+		filepath.Join(baseDir, "tools", "genctx"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -284,6 +287,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		{baseDir, "main.go", desktopMainTemplate},
 		{filepath.Join(baseDir, "app", "views"), "main_view.go", desktopViewTemplate},
 		{filepath.Join(baseDir, "app", "views"), "schema.go", desktopSchemaTemplate},
+		{filepath.Join(baseDir, "tools", "genctx"), "main.go", desktopGenctxTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", desktopConfigTemplate},
 		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
 		{baseDir, "go.mod", desktopGoModTemplate},

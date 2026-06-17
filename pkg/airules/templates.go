@@ -69,7 +69,19 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("   }\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("5. **@ai annotations** (MANDATORY): every exported func/struct MUST carry a full `@ai` block (generated / purpose / input / output / sideeffect). Dates use `YYYY-MM-DD`; model names use official ids (e.g. `claude-opus-4-8`). Verify with `hyp chkcomment <file>`.\n")
+	sb.WriteString("5. **@ai annotations** (MANDATORY): every exported func/struct MUST carry a full `@ai` block (generated / purpose / input / output / sideeffect). Dates use `YYYY-MM-DD`; model names use official ids (e.g. `claude-opus-4-8`). Verify with `hyp chkcomment <file>`.\n\n")
+
+	sb.WriteString("6. **@ai:think** (MANDATORY): every func body MUST begin with a `//@ai:think` comment explaining:\n")
+	sb.WriteString("   - **Intent**: why AI wrote this func / what problem it solves\n")
+	sb.WriteString("   - **Special notes**: non-obvious design choices, edge-case handling, or workarounds inside the func\n")
+	sb.WriteString("   ```go\n")
+	sb.WriteString("   func CreateUser(ctx context.Context, req CreateUserReq) (*UserResp, error) {\n")
+	sb.WriteString("       //@ai:think intent=處理使用者建立流程，先驗證 email 唯一性再寫入\n")
+	sb.WriteString("       //@ai:think special=用 upsert 而非 insert 避免併發建立時的 unique 衝突；密碼用 bcrypt cost=12 而非預設 10 因安全政策要求\n")
+	sb.WriteString("       // ... implementation\n")
+	sb.WriteString("   }\n")
+	sb.WriteString("   ```\n")
+	sb.WriteString("   This applies to ALL funcs (exported and unexported). Omitting `@ai:think` is a lint violation.\n")
 
 	sb.WriteString("\n## Database access (pkg/hidb)\n\n")
 	sb.WriteString("- Reads → `hidb.ReadHypDB()` (replica)\n")

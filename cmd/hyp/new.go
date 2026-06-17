@@ -172,6 +172,8 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("   │   ├── services/\n")
 	fmt.Printf("   │   └── config/\n")
 	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   ├── tools/\n")
+	fmt.Printf("   │   └── genctx/          # 產生 .hyp/context.yaml（go run ./tools/genctx）\n")
 	fmt.Printf("   ├── main.go\n")
 	fmt.Printf("   └── go.mod\n")
 	fmt.Printf("\n🚀 Get started:\n")
@@ -181,6 +183,8 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("\n📝 Add subcommands:\n")
 	fmt.Printf("   hyp generate command process\n")
 	fmt.Printf("   hyp generate command export\n")
+	fmt.Printf("\n🧩 Generate schema manifest (.hyp/context.yaml):\n")
+	fmt.Printf("   go run ./tools/genctx\n")
 
 	return nil
 }
@@ -202,6 +206,8 @@ func runNewDesktop(projectName string) error {
 	fmt.Printf("   │   ├── services/\n")
 	fmt.Printf("   │   └── config/\n")
 	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   ├── tools/\n")
+	fmt.Printf("   │   └── genctx/          # 產生 .hyp/context.yaml（go run ./tools/genctx）\n")
 	fmt.Printf("   ├── main.go\n")
 	fmt.Printf("   └── go.mod\n")
 	fmt.Printf("\n🚀 Get started:\n")
@@ -211,6 +217,8 @@ func runNewDesktop(projectName string) error {
 	fmt.Printf("\n📝 Add views:\n")
 	fmt.Printf("   hyp generate view settings\n")
 	fmt.Printf("   hyp generate view dashboard\n")
+	fmt.Printf("\n🧩 Generate schema manifest (.hyp/context.yaml):\n")
+	fmt.Printf("   go run ./tools/genctx\n")
 	fmt.Printf("\n⚠️  Requires: C compiler (gcc) for CGO (Fyne dependency)\n")
 
 	return nil
@@ -243,7 +251,7 @@ func runNewGRPC(projectName string) error {
 	fmt.Printf("   cd %s\n", projectName)
 	fmt.Printf("   go mod tidy\n")
 	fmt.Printf("   make proto              # compile .proto → Go code\n")
-	fmt.Printf("   go run .\n")
+	fmt.Printf("   go run .                # 啟動時自動寫 .hyp/context.yaml（gRPC schema manifest）\n")
 	fmt.Printf("\n📝 Add more services:\n")
 	fmt.Printf("   hyp generate proto order\n")
 	fmt.Printf("\n⚠️  Requires: protoc + protoc-gen-go + protoc-gen-go-grpc\n")
