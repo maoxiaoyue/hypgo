@@ -50,7 +50,7 @@ type ResponseSchema struct {
 //	schema.RegisterMCP("search_repos", "Search repos", Input{}, Output{})
 type Route struct {
 	// 通用欄位（所有協議共用）
-	Protocol    string      `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest"(default), "grpc", "bot", "mcp", "websocket", "cli"
+	Protocol    string      `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest"(default), "grpc", "bot", "mcp", "websocket", "cli", "desktop"
 	Command     string      `json:"command,omitempty" yaml:"command,omitempty"`   // 非 REST 的命令標識
 	Platform    string      `json:"platform,omitempty" yaml:"platform,omitempty"` // bot 專用平台："telegram", "line", "discord", "whatsapp"
 	Summary     string      `json:"summary,omitempty" yaml:"summary,omitempty"`
