@@ -225,6 +225,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 	}{
 		{baseDir, "main.go", cliMainTemplate},
 		{filepath.Join(baseDir, "app", "commands"), "root.go", cliRootTemplate},
+		{filepath.Join(baseDir, "app", "commands"), "schema.go", cliSchemaTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", cliConfigTemplate},
 		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
 		{baseDir, "go.mod", cliGoModTemplate},
@@ -282,6 +283,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 	}{
 		{baseDir, "main.go", desktopMainTemplate},
 		{filepath.Join(baseDir, "app", "views"), "main_view.go", desktopViewTemplate},
+		{filepath.Join(baseDir, "app", "views"), "schema.go", desktopSchemaTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", desktopConfigTemplate},
 		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
 		{baseDir, "go.mod", desktopGoModTemplate},
@@ -343,6 +345,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		{baseDir, "main.go", grpcMainTemplate},
 		{filepath.Join(baseDir, "app", "proto", lowerName+"pb"), lowerName + ".proto", grpcProtoTemplate},
 		{filepath.Join(baseDir, "app", "rpc"), lowerName + "_server.go", grpcServerTemplate},
+		{filepath.Join(baseDir, "app", "rpc"), "schema.go", grpcSchemaTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", grpcConfigTemplate},
 		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
 		{baseDir, "go.mod", grpcGoModTemplate},

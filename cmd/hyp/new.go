@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
@@ -165,7 +166,8 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("   %s/\n", projectName)
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── commands/\n")
-	fmt.Printf("   │   │   └── root.go\n")
+	fmt.Printf("   │   │   ├── root.go\n")
+	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol cli）\n")
 	fmt.Printf("   │   ├── models/\n")
 	fmt.Printf("   │   ├── services/\n")
 	fmt.Printf("   │   └── config/\n")
@@ -194,7 +196,8 @@ func runNewDesktop(projectName string) error {
 	fmt.Printf("   %s/\n", projectName)
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── views/\n")
-	fmt.Printf("   │   │   └── main_view.go\n")
+	fmt.Printf("   │   │   ├── main_view.go\n")
+	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol desktop）\n")
 	fmt.Printf("   │   ├── models/\n")
 	fmt.Printf("   │   ├── services/\n")
 	fmt.Printf("   │   └── config/\n")
@@ -227,7 +230,8 @@ func runNewGRPC(projectName string) error {
 	fmt.Printf("   │   ├── proto/%spb/\n", lowerName)
 	fmt.Printf("   │   │   └── %s.proto\n", lowerName)
 	fmt.Printf("   │   ├── rpc/\n")
-	fmt.Printf("   │   │   └── %s_server.go\n", lowerName)
+	fmt.Printf("   │   │   ├── %s_server.go\n", lowerName)
+	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol grpc）\n")
 	fmt.Printf("   │   ├── models/\n")
 	fmt.Printf("   │   ├── services/\n")
 	fmt.Printf("   │   └── config/\n")
@@ -261,6 +265,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 		filepath.Join(projectName, "app", "controllers"),
 		filepath.Join(projectName, "app", "models"),
 		filepath.Join(projectName, "app", "services"),
+		filepath.Join(projectName, "app", "routers"),
 		filepath.Join(projectName, "config"),
 		filepath.Join(projectName, "logs"),
 		filepath.Join(projectName, "static", "css"),
@@ -285,13 +290,26 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 創建主程序文件
-	if err := createMainFile(projectName); err != nil {
+	// @ai:generated 標記所用日期（YYYY-MM-DD）
+	today := time.Now().Format("2006-01-02")
+
+	// 創建示例 Model（Schema Input/Output DTO）
+	if err := createHomeModel(projectName, today); err != nil {
 		return err
 	}
 
-	// 創建示例控制器
-	if err := createFullStackController(projectName); err != nil {
+	// 創建示例 Controller（薄控制器，引用 model）
+	if err := createFullStackController(projectName, today); err != nil {
+		return err
+	}
+
+	// 創建 Router 入口（app/routers/router.go，引入 router + schema，串接 controller + model）
+	if err := createRouterSetup(projectName, today); err != nil {
+		return err
+	}
+
+	// 創建主程序文件（呼叫 routers.Setup）
+	if err := createMainFile(projectName); err != nil {
 		return err
 	}
 
@@ -314,8 +332,9 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Printf("📁 Project structure:\n")
 	fmt.Printf("   %s/\n", projectName)
 	fmt.Printf("   ├── app/\n")
-	fmt.Printf("   │   ├── controllers/\n")
-	fmt.Printf("   │   ├── models/\n")
+	fmt.Printf("   │   ├── controllers/    # home.go（薄控制器）\n")
+	fmt.Printf("   │   ├── models/         # home.go（Schema Input/Output DTO）\n")
+	fmt.Printf("   │   ├── routers/        # router.go（Setup：router + schema 串接）\n")
 	fmt.Printf("   │   └── services/\n")
 	fmt.Printf("   ├── config/\n")
 	fmt.Printf("   │   └── config.yaml\n")
@@ -388,136 +407,167 @@ func createLLMConfigFile(configDir string) error {
 }
 
 func createMainFile(projectName string) error {
-	mainContent := `package main
-
-import (
-    "context"
-    "log"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
-
-    "github.com/maoxiaoyue/hypgo/pkg/config"
-    hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
-    "github.com/maoxiaoyue/hypgo/pkg/logger"
-    "github.com/maoxiaoyue/hypgo/pkg/schema"
-    "github.com/maoxiaoyue/hypgo/pkg/server"
-)
-
-func main() {
-    // 載入配置
-    cfg := &config.Config{}
-    loader := config.NewConfigLoader("config/config.yaml")
-    if err := loader.Load("config/config.yaml", cfg); err != nil {
-        log.Fatal("Failed to load config:", err)
-    }
-    cfg.ApplyDefaults()
-
-    // 初始化日誌
-    appLog := logger.NewLogger()
-    defer appLog.Close()
-
-    // 創建服務器
-    srv := server.New(cfg, appLog)
-    r := srv.Router()
-
-    // 靜態檔案
-    r.Static("/static", "./static")
-
-    // 首頁
-    r.GET("/", func(c *hypcontext.Context) {
-        c.File("templates/welcome.html")
-    })
-
-    // API 路由（Schema-first）
-    r.Schema(schema.Route{
-        Method:  "GET",
-        Path:    "/api/health",
-        Summary: "Health check",
-    }).Handle(func(c *hypcontext.Context) {
-        c.JSON(200, map[string]interface{}{
-            "success": true,
-            "message": "Server is healthy",
-        })
-    })
-
-    r.Schema(schema.Route{
-        Method:  "GET",
-        Path:    "/api/info",
-        Summary: "Server info",
-    }).Handle(func(c *hypcontext.Context) {
-        c.JSON(200, map[string]interface{}{
-            "success": true,
-            "message": "HypGo Framework",
-            "data": map[string]interface{}{
-                "version":  "0.8.5",
-                "protocol": c.Request.Proto,
-            },
-        })
-    })
-
-    // 啟動服務器
-    go func() {
-        appLog.Infof("Starting HypGo server on %s", cfg.Server.Addr)
-        if err := srv.Start(); err != nil {
-            appLog.Errorf("Server error: %v", err)
-            os.Exit(1)
-        }
-    }()
-
-    // 優雅關閉
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    <-quit
-
-    appLog.Info("Shutting down server...")
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-
-    if err := srv.Shutdown(ctx); err != nil {
-        appLog.Errorf("Server forced to shutdown: %v", err)
-    }
-    appLog.Info("Server exited")
-}
-`
+	mainContent := "package main\n\n" +
+		"import (\n" +
+		"\t\"context\"\n" +
+		"\t\"log\"\n" +
+		"\t\"os\"\n" +
+		"\t\"os/signal\"\n" +
+		"\t\"syscall\"\n" +
+		"\t\"time\"\n\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/config\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/server\"\n\n" +
+		"\t\"" + projectName + "/app/routers\"\n" +
+		")\n\n" +
+		"func main() {\n" +
+		"\t// 載入配置\n" +
+		"\tcfg := &config.Config{}\n" +
+		"\tloader := config.NewConfigLoader(\"config/config.yaml\")\n" +
+		"\tif err := loader.Load(\"config/config.yaml\", cfg); err != nil {\n" +
+		"\t\tlog.Fatal(\"Failed to load config:\", err)\n" +
+		"\t}\n" +
+		"\tcfg.ApplyDefaults()\n\n" +
+		"\t// 初始化日誌\n" +
+		"\tappLog := logger.NewLogger()\n" +
+		"\tdefer appLog.Close()\n\n" +
+		"\t// 創建服務器\n" +
+		"\tsrv := server.New(cfg, appLog)\n\n" +
+		"\t// 設定所有路由與中間件（定義於 app/routers/router.go）\n" +
+		"\trouters.Setup(srv.Router())\n\n" +
+		"\t// 啟動服務器\n" +
+		"\tgo func() {\n" +
+		"\t\tappLog.Infof(\"Starting HypGo server on %s\", cfg.Server.Addr)\n" +
+		"\t\tif err := srv.Start(); err != nil {\n" +
+		"\t\t\tappLog.Errorf(\"Server error: %v\", err)\n" +
+		"\t\t\tos.Exit(1)\n" +
+		"\t\t}\n" +
+		"\t}()\n\n" +
+		"\t// 優雅關閉\n" +
+		"\tquit := make(chan os.Signal, 1)\n" +
+		"\tsignal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)\n" +
+		"\t<-quit\n\n" +
+		"\tappLog.Info(\"Shutting down server...\")\n" +
+		"\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n" +
+		"\tdefer cancel()\n\n" +
+		"\tif err := srv.Shutdown(ctx); err != nil {\n" +
+		"\t\tappLog.Errorf(\"Server forced to shutdown: %v\", err)\n" +
+		"\t}\n" +
+		"\tappLog.Info(\"Server exited\")\n" +
+		"}\n"
 
 	filename := filepath.Join(projectName, "main.go")
 	return os.WriteFile(filename, []byte(mainContent), 0644)
 }
 
-func createFullStackController(projectName string) error {
-	controllerContent := `package controllers
+// createHomeModel 生成 app/models/home.go，定義 Schema Input/Output 用的 DTO。
+func createHomeModel(projectName, today string) error {
+	content := "// Package models 定義資料模型與 Schema 的 Request/Response DTO。\n" +
+		"//\n" +
+		"// @ai:generated by=hypgo date=" + today + "\n" +
+		"package models\n\n" +
+		"// HealthResp 健康檢查回應（Schema Output）。\n" +
+		"type HealthResp struct {\n" +
+		"\tSuccess bool   `json:\"success\"`\n" +
+		"\tMessage string `json:\"message\"`\n" +
+		"}\n\n" +
+		"// InfoResp 伺服器資訊回應（Schema Output）。\n" +
+		"type InfoResp struct {\n" +
+		"\tSuccess bool       `json:\"success\"`\n" +
+		"\tMessage string     `json:\"message\"`\n" +
+		"\tData    InfoDetail `json:\"data\"`\n" +
+		"}\n\n" +
+		"// InfoDetail 伺服器資訊明細。\n" +
+		"type InfoDetail struct {\n" +
+		"\tVersion  string `json:\"version\"`\n" +
+		"\tProtocol string `json:\"protocol\"`\n" +
+		"}\n"
 
-import (
-    hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
-)
-
-// HomeController 處理首頁相關路由
-type HomeController struct{}
-
-func (ctrl *HomeController) Home(c *hypcontext.Context) {
-    c.File("templates/welcome.html")
+	filename := filepath.Join(projectName, "app", "models", "home.go")
+	return os.WriteFile(filename, []byte(content), 0644)
 }
 
-func (ctrl *HomeController) Health(c *hypcontext.Context) {
-    c.JSON(200, map[string]interface{}{
-        "success": true,
-        "message": "Server is healthy",
-    })
+// createRouterSetup 生成 app/routers/router.go：引入 router + schema，
+// 以 Schema-first 串接 controller 與 model，作為專案路由的唯一入口。
+func createRouterSetup(projectName, today string) error {
+	content := "// Package routers 集中定義路由與中間件（Schema-first MVC 的 Router 層）。\n" +
+		"//\n" +
+		"// @ai:generated by=hypgo date=" + today + "\n" +
+		"package routers\n\n" +
+		"import (\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/middleware\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/router\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/schema\"\n\n" +
+		"\t\"" + projectName + "/app/controllers\"\n" +
+		"\t\"" + projectName + "/app/models\"\n" +
+		")\n\n" +
+		"// Setup 註冊所有路由與中間件。\n" +
+		"// 在 main.go 呼叫：routers.Setup(srv.Router())。\n" +
+		"func Setup(r *router.Router) {\n" +
+		"\t// 全域中間件\n" +
+		"\tr.Use(middleware.DefaultMiddleware()...)\n\n" +
+		"\t// 靜態資源\n" +
+		"\tr.Static(\"/static\", \"./static\")\n\n" +
+		"\t// Controller 實例（薄控制器；業務邏輯置於 app/services）\n" +
+		"\thome := &controllers.HomeController{}\n\n" +
+		"\t// 首頁\n" +
+		"\tr.GET(\"/\", home.Home)\n\n" +
+		"\t// API（Schema-first：宣告 Input/Output 型別，供 c.BindInput 與 contract 測試對齊）\n" +
+		"\tr.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"GET\",\n" +
+		"\t\tPath:    \"/api/health\",\n" +
+		"\t\tSummary: \"Health check\",\n" +
+		"\t\tTags:    []string{\"system\"},\n" +
+		"\t\tOutput:  models.HealthResp{},\n" +
+		"\t}).Handle(home.Health)\n\n" +
+		"\tr.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"GET\",\n" +
+		"\t\tPath:    \"/api/info\",\n" +
+		"\t\tSummary: \"Server info\",\n" +
+		"\t\tTags:    []string{\"system\"},\n" +
+		"\t\tOutput:  models.InfoResp{},\n" +
+		"\t}).Handle(home.Info)\n\n" +
+		"\t// 在此註冊更多資源路由，例如由 `hyp generate controller user` 產生的：\n" +
+		"\t// RegisterUserRoutes(r)\n" +
+		"}\n"
+
+	filename := filepath.Join(projectName, "app", "routers", "router.go")
+	return os.WriteFile(filename, []byte(content), 0644)
 }
 
-func (ctrl *HomeController) Info(c *hypcontext.Context) {
-    c.JSON(200, map[string]interface{}{
-        "success": true,
-        "message": "HypGo Framework",
-        "data": map[string]interface{}{
-            "version":  "0.8.5",
-            "protocol": c.Request.Proto,
-        },
-    })
-}
-`
+func createFullStackController(projectName, today string) error {
+	controllerContent := "// Package controllers 承載 HTTP handler（薄控制器：解析輸入 → 呼叫 service → 寫回應）。\n" +
+		"//\n" +
+		"// @ai:generated by=hypgo date=" + today + "\n" +
+		"package controllers\n\n" +
+		"import (\n" +
+		"\thypcontext \"github.com/maoxiaoyue/hypgo/pkg/context\"\n\n" +
+		"\t\"" + projectName + "/app/models\"\n" +
+		")\n\n" +
+		"// HomeController 處理首頁與系統狀態相關路由。\n" +
+		"type HomeController struct{}\n\n" +
+		"// Home 回傳歡迎頁面。\n" +
+		"func (ctrl *HomeController) Home(c *hypcontext.Context) {\n" +
+		"\tc.File(\"templates/welcome.html\")\n" +
+		"}\n\n" +
+		"// Health 回傳服務健康狀態。\n" +
+		"func (ctrl *HomeController) Health(c *hypcontext.Context) {\n" +
+		"\tc.JSON(200, models.HealthResp{\n" +
+		"\t\tSuccess: true,\n" +
+		"\t\tMessage: \"Server is healthy\",\n" +
+		"\t})\n" +
+		"}\n\n" +
+		"// Info 回傳伺服器資訊。\n" +
+		"func (ctrl *HomeController) Info(c *hypcontext.Context) {\n" +
+		"\tc.JSON(200, models.InfoResp{\n" +
+		"\t\tSuccess: true,\n" +
+		"\t\tMessage: \"HypGo Framework\",\n" +
+		"\t\tData: models.InfoDetail{\n" +
+		"\t\t\tVersion:  \"0.8.6\",\n" +
+		"\t\t\tProtocol: c.Request.Proto,\n" +
+		"\t\t},\n" +
+		"\t})\n" +
+		"}\n"
 
 	filename := filepath.Join(projectName, "app", "controllers", "home.go")
 	return os.WriteFile(filename, []byte(controllerContent), 0644)
