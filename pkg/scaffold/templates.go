@@ -1033,11 +1033,11 @@ build:
 `
 
 // LLMYamlTemplate 是 Manifest LLM 智慧增強功能的預設配置檔。
-// 由 hyp new / hyp api 在建立專案時複製為 config/llm.yaml。
+// 由 hyp new / hyp api 在建立專案時複製為 .hyp/llm.yaml。
 // 內容與 pkg/config/llm_example.yaml 同步。
 const LLMYamlTemplate = `# HypGo LLM 智慧增強配置
-# 放置於 config/llm.yaml 或 .hyp/llm.yaml
-# 使用方式：hyp chkcomment --llm config/llm.yaml
+# 放置於 .hyp/llm.yaml
+# 使用方式：hyp chkcomment --llm .hyp/llm.yaml
 
 # ============================================================
 # mode: 控制 LLM 增強模式
@@ -1127,4 +1127,27 @@ mode: none
 #   # 生成用 LLM
 #   generator_model: "llama3"              # 根據檢索結果生成描述
 #   generator_url: "http://localhost:11434" # 預設用本地 Ollama
+`
+
+// CommentYamlTemplate 是 .hyp/comment.yaml 的預設內容。
+// 由 hyp new / hyp api 在建立專案時複製為 .hyp/comment.yaml。
+// 內容與 pkg/config.DefaultCommentYAML 同步。
+const CommentYamlTemplate = `# HypGo 註釋開關設定
+# 放置於 .hyp/comment.yaml
+#
+# 這三個開關控制 hyp ai-rules 生成的規則檔（AGENTS.md/CLAUDE.md/CURSOR…）
+# 會要求 AI 寫哪些類型的註釋。打開 = 規則檔包含該規範；關閉 = 該規範不出現。
+#
+# 預設只啟用「普通註釋」，符合最低噪音原則；
+# 想開啟完整 AI 協作鏈時把另外兩個改為 true，再重新 hyp ai-rules 即可。
+
+# 普通註釋（godoc、函式說明）。預設 true。
+normal_comment: true
+
+# @ai 系列註釋（@ai:generated / @ai:purpose / @ai:input / @ai:output / @ai:sideeffect）
+# 不含 @ai:think。預設 false。
+ai_comment: false
+
+# @ai:think 函式體內意圖註釋（intent / special / model）。預設 false。
+think_comment: false
 `

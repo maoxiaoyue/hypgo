@@ -1,6 +1,6 @@
 # HypGo — Gemini Code Assist Rules
 
-完整規範：`config/AI_CODING_RULES.md`
+完整規範：`.hyp/AI_CODING_RULES.md`
 
 ## 核心規則
 
@@ -40,4 +40,4 @@ func FuncName(...) {}
 - ❌ `math/rand` 產生 token（用 `crypto/rand`）
 - ❌ 硬編碼 DSN / API key
 
-完整規則請讀取 `config/AI_CODING_RULES.md`。
+完整規則請讀取 `.hyp/AI_CODING_RULES.md`。

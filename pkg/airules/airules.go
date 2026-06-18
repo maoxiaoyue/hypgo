@@ -32,6 +32,22 @@ var defaultTargetNames = []string{
 type Options struct {
 	// DiffLogEnabled 是否在配置檔中包含 diff-log 指令
 	DiffLogEnabled bool
+
+	// Comment 控制要寫入哪些註釋規範（讀自 .hyp/comment.yaml）
+	// 空值 = 預設（只開普通註釋）
+	Comment CommentToggles
+}
+
+// CommentToggles 鏡像 pkg/config.CommentConfig，避免 airules 直接依賴 pkg/config
+type CommentToggles struct {
+	NormalComment bool
+	AIComment     bool
+	ThinkComment  bool
+}
+
+// DefaultCommentToggles 回傳預設值（與 config.DefaultCommentConfig 一致）
+func DefaultCommentToggles() CommentToggles {
+	return CommentToggles{NormalComment: true, AIComment: false, ThinkComment: false}
 }
 
 // Target 描述一個 AI 工具配置檔目標
