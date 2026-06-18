@@ -12,9 +12,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// llmYamlContent 為 hyp api 生成 config/llm.yaml 時採用的預設內容。
+// llmYamlContent 為 hyp api 生成 .hyp/llm.yaml 時採用的預設內容。
 // 直接複用 scaffold 套件的共用模板，確保所有專案模式內容一致。
 var llmYamlContent = scaffold.LLMYamlTemplate
+
+// commentYamlContent 為 hyp api 生成 .hyp/comment.yaml 時採用的預設內容。
+var commentYamlContent = scaffold.CommentYamlTemplate
 
 var apiCmd = &cobra.Command{
 	Use:   "api [project-name]",
@@ -39,6 +42,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		filepath.Join(projectName, "app", "middleware"),
 		filepath.Join(projectName, "app", "validators"),
 		filepath.Join(projectName, "config"),
+		filepath.Join(projectName, ".hyp"),
 		filepath.Join(projectName, "internal", "database"),
 		filepath.Join(projectName, "internal", "logger"),
 		filepath.Join(projectName, "internal", "cache"),
@@ -60,7 +64,8 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		// 主要檔案
 		{Path: "main.go", Content: mainGoContent},
 		{Path: "config/config.yaml", Content: configYamlContent},
-		{Path: "config/llm.yaml", Content: llmYamlContent},
+		{Path: ".hyp/llm.yaml", Content: llmYamlContent},
+		{Path: ".hyp/comment.yaml", Content: commentYamlContent},
 		{Path: ".env.example", Content: envExampleContent},
 
 		// 初始化檔案

@@ -1,6 +1,6 @@
 # HypGo 專案 — Windsurf 指示
 
-本專案的完整 AI 協作規範定義於 `config/AI_CODING_RULES.md`。
+本專案的完整 AI 協作規範定義於 `.hyp/AI_CODING_RULES.md`。
 
 在生成或修改任何 Go 程式碼前，請先讀取該檔案並嚴格遵守其中所有規則。
 
@@ -23,4 +23,4 @@
 func FuncName(...) {}
 ```
 
-完整規則參閱 `config/AI_CODING_RULES.md`。
+完整規則參閱 `.hyp/AI_CODING_RULES.md`。

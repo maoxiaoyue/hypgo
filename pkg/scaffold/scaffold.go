@@ -37,7 +37,7 @@ type llmYAMLConfig struct {
 
 // resolveAIProvider 在執行期決定 @ai 註解所記錄的供應商名稱。
 // 解析優先順序：
-//  1. config/llm.yaml 或 .hyp/llm.yaml（讀取配置的 LLM 供應商）
+//  1. .hyp/llm.yaml（讀取配置的 LLM 供應商）
 //  2. 掃描專案根目錄的 *.md 檔案中的 AI 供應商關鍵字
 //  3. 退回 DefaultAIProvider（"unknown"）
 func resolveAIProvider() string {
@@ -50,9 +50,9 @@ func resolveAIProvider() string {
 	return DefaultAIProvider
 }
 
-// providerFromLLMConfig 從 config/llm.yaml 或 .hyp/llm.yaml 讀取供應商。
+// providerFromLLMConfig 從 .hyp/llm.yaml 讀取供應商。
 func providerFromLLMConfig() string {
-	for _, path := range []string{"config/llm.yaml", ".hyp/llm.yaml"} {
+	for _, path := range []string{".hyp/llm.yaml"} {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -79,7 +79,7 @@ func providerFromLLMConfig() string {
 	return ""
 }
 
-// normalizeAPIProvider 將 llm.yaml 的 provider 值對應到標準名稱。
+// normalizeAPIProvider 將 .hyp/llm.yaml 的 provider 值對應到標準名稱。
 func normalizeAPIProvider(provider string) string {
 	switch strings.ToLower(provider) {
 	case "anthropic":
@@ -213,6 +213,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "services"),
 		filepath.Join(baseDir, "app", "config"),
 		filepath.Join(baseDir, "tools", "genctx"),
+		filepath.Join(baseDir, ".hyp"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -229,7 +230,8 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "commands"), "schema.go", cliSchemaTemplate},
 		{filepath.Join(baseDir, "tools", "genctx"), "main.go", cliGenctxTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", cliConfigTemplate},
-		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
 		{baseDir, "go.mod", cliGoModTemplate},
 	}
 
@@ -273,6 +275,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "services"),
 		filepath.Join(baseDir, "app", "config"),
 		filepath.Join(baseDir, "tools", "genctx"),
+		filepath.Join(baseDir, ".hyp"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -289,7 +292,8 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "views"), "schema.go", desktopSchemaTemplate},
 		{filepath.Join(baseDir, "tools", "genctx"), "main.go", desktopGenctxTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", desktopConfigTemplate},
-		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
 		{baseDir, "go.mod", desktopGoModTemplate},
 	}
 
@@ -333,6 +337,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
 		filepath.Join(baseDir, "app", "config"),
+		filepath.Join(baseDir, ".hyp"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -351,7 +356,8 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "rpc"), lowerName + "_server.go", grpcServerTemplate},
 		{filepath.Join(baseDir, "app", "rpc"), "schema.go", grpcSchemaTemplate},
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", grpcConfigTemplate},
-		{filepath.Join(baseDir, "app", "config"), "llm.yaml", LLMYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
 		{baseDir, "go.mod", grpcGoModTemplate},
 		{baseDir, "Makefile", grpcMakefileTemplate},
 	}
@@ -427,7 +433,7 @@ func validateName(name string) error {
 // @ai:purpose 統一所有 scaffold 模板可用的資料欄位，避免模板引用未設定變數
 // @ai:input name 資源名稱字串
 // @ai:output 已填妥共用欄位的 map
-// @ai:sideeffect 讀取 config/llm.yaml 或 *.md 以偵測 AI 供應商
+// @ai:sideeffect 讀取 .hyp/llm.yaml 或 *.md 以偵測 AI 供應商
 func templateData(name string) map[string]string {
 	return map[string]string{
 		"Name":       capitalize(name),

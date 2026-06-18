@@ -111,12 +111,12 @@ func TestGenerateControllerFromLLMConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 建立含 config/llm.yaml 的工作目錄
+			// 建立含 .hyp/llm.yaml 的工作目錄
 			wd := t.TempDir()
-			if err := os.MkdirAll(filepath.Join(wd, "config"), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Join(wd, ".hyp"), 0755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(wd, "config", "llm.yaml"), []byte(tt.yaml), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(wd, ".hyp", "llm.yaml"), []byte(tt.yaml), 0644); err != nil {
 				t.Fatal(err)
 			}
 			origDir := chdir(t, wd)
@@ -326,11 +326,11 @@ func TestGenerateService(t *testing.T) {
 
 func TestGenerateServiceFromLLMConfig(t *testing.T) {
 	wd := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(wd, "config"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(wd, ".hyp"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	llmYAML := "mode: api\napi:\n  provider: anthropic\n  model: claude-haiku-4-5\n  api_key: test\n"
-	if err := os.WriteFile(filepath.Join(wd, "config", "llm.yaml"), []byte(llmYAML), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(wd, ".hyp", "llm.yaml"), []byte(llmYAML), 0644); err != nil {
 		t.Fatal(err)
 	}
 	origDir := chdir(t, wd)

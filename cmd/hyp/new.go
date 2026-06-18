@@ -275,6 +275,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 		filepath.Join(projectName, "app", "services"),
 		filepath.Join(projectName, "app", "routers"),
 		filepath.Join(projectName, "config"),
+		filepath.Join(projectName, ".hyp"),
 		filepath.Join(projectName, "logs"),
 		filepath.Join(projectName, "static", "css"),
 		filepath.Join(projectName, "static", "js"),
@@ -293,8 +294,11 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 創建 LLM 配置文件
-	if err := createLLMConfigFile(filepath.Join(projectName, "config")); err != nil {
+	// 創建 LLM 配置文件（.hyp/llm.yaml）+ 註釋開關（.hyp/comment.yaml）
+	if err := createLLMConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
+		return err
+	}
+	if err := createCommentConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
 		return err
 	}
 
@@ -407,11 +411,18 @@ logger:
 	return os.WriteFile(filename, []byte(configContent), 0644)
 }
 
-// createLLMConfigFile 寫入 llm.yaml 到指定目錄。
+// createLLMConfigFile 寫入 llm.yaml 到指定目錄（預期為 .hyp/）。
 // 內容來自 scaffold.LLMYamlTemplate，預設 mode=none（不啟用 LLM）。
 func createLLMConfigFile(configDir string) error {
 	filename := filepath.Join(configDir, "llm.yaml")
 	return os.WriteFile(filename, []byte(scaffold.LLMYamlTemplate), 0644)
+}
+
+// createCommentConfigFile 寫入 comment.yaml 到指定目錄（預期為 .hyp/）。
+// 內容來自 scaffold.CommentYamlTemplate，預設只開啟 normal_comment。
+func createCommentConfigFile(configDir string) error {
+	filename := filepath.Join(configDir, "comment.yaml")
+	return os.WriteFile(filename, []byte(scaffold.CommentYamlTemplate), 0644)
 }
 
 func createMainFile(projectName string) error {

@@ -10,8 +10,19 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 )
 
+// effectiveComment 回傳 opts.Comment 或預設值
+func effectiveComment(opts Options) CommentToggles {
+	c := opts.Comment
+	// 全部關閉時視為「未設定」→ 回退預設（避免全空時生成出意義不明的規則檔）
+	if !c.NormalComment && !c.AIComment && !c.ThinkComment {
+		return DefaultCommentToggles()
+	}
+	return c
+}
+
 func coreContent(m *manifest.Manifest, opts Options) string {
 	var sb strings.Builder
+	cm := effectiveComment(opts)
 
 	sb.WriteString(`## Framework
 
@@ -69,19 +80,45 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("   }\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("5. **@ai annotations** (MANDATORY): every exported func/struct MUST carry a full `@ai` block (generated / purpose / input / output / sideeffect). Dates use `YYYY-MM-DD`; model names use official ids (e.g. `claude-opus-4-8`). Verify with `hyp chkcomment <file>`.\n\n")
+	// 規範編號連續：依 toggles 動態決定是否寫入 §5（普通註釋）、§6（@ai）、§7（@ai:think）
+	ruleNum := 5
 
-	sb.WriteString("6. **@ai:think** (MANDATORY): every func body MUST begin with a `//@ai:think` comment explaining:\n")
-	sb.WriteString("   - **Intent**: why AI wrote this func / what problem it solves\n")
-	sb.WriteString("   - **Special notes**: non-obvious design choices, edge-case handling, or workarounds inside the func\n")
-	sb.WriteString("   ```go\n")
-	sb.WriteString("   func CreateUser(ctx context.Context, req CreateUserReq) (*UserResp, error) {\n")
-	sb.WriteString("       //@ai:think intent=處理使用者建立流程，先驗證 email 唯一性再寫入\n")
-	sb.WriteString("       //@ai:think special=用 upsert 而非 insert 避免併發建立時的 unique 衝突；密碼用 bcrypt cost=12 而非預設 10 因安全政策要求\n")
-	sb.WriteString("       // ... implementation\n")
-	sb.WriteString("   }\n")
-	sb.WriteString("   ```\n")
-	sb.WriteString("   This applies to ALL funcs (exported and unexported). Omitting `@ai:think` is a lint violation.\n")
+	if cm.NormalComment {
+		sb.WriteString(fmt.Sprintf("%d. **Comments** (REQUIRED): every exported func, type, and package MUST have a Go doc comment. Comments explain **why**, not **what** (the name covers what). Keep them concise; prefer one tight sentence over a paragraph. Verify with `go vet ./...` (missing exported-name docs surface in `golint`-style checks).\n\n", ruleNum))
+		ruleNum++
+	}
+
+	if cm.AIComment {
+		sb.WriteString(fmt.Sprintf("%d. **@ai annotations** (MANDATORY): every exported func/struct MUST carry a full `@ai` block (generated / purpose / input / output / sideeffect). Dates use `YYYY-MM-DD`; model names use official ids (e.g. `claude-opus-4-8`). Verify with `hyp chkcomment <file>`.\n\n", ruleNum))
+		ruleNum++
+	}
+
+	if cm.ThinkComment {
+		sb.WriteString(fmt.Sprintf("%d. **@ai:think** (MANDATORY): every func body MUST begin with a `//@ai:think` comment explaining:\n", ruleNum))
+		sb.WriteString("   - **Intent**: why AI wrote this func / what problem it solves\n")
+		sb.WriteString("   - **Special notes**: non-obvious design choices, edge-case handling, or workarounds inside the func\n")
+		sb.WriteString("   ```go\n")
+		sb.WriteString("   func CreateUser(ctx context.Context, req CreateUserReq) (*UserResp, error) {\n")
+		sb.WriteString("       //@ai:think intent=處理使用者建立流程，先驗證 email 唯一性再寫入 model=claude-opus-4-8\n")
+		sb.WriteString("       //@ai:think special=用 upsert 而非 insert 避免併發建立時的 unique 衝突；密碼用 bcrypt cost=12 而非預設 10 因安全政策要求 model=claude-opus-4-8\n")
+		sb.WriteString("       // ... implementation\n")
+		sb.WriteString("   }\n")
+		sb.WriteString("   ```\n")
+		sb.WriteString("   This applies to ALL funcs (exported and unexported). Omitting `@ai:think` is a lint violation. Auto-fix with `hyp chkcomment --fixintent --llm .hyp/llm.yaml <file>`.\n")
+		_ = ruleNum // 最後一條規範不再需要編號
+	}
+
+	// 註釋開關來源（always emitted）— 即使某些規範因 toggle 關閉而沒寫進此文件，
+	// AI 在每次生成程式碼前仍應重讀 .hyp/comment.yaml 確認當下設定。
+	sb.WriteString("\n### Comment Generation Toggle (source of truth: `.hyp/comment.yaml`)\n\n")
+	sb.WriteString("Before generating ANY code, read `.hyp/comment.yaml` to confirm which comment types to write. Only emit a comment type whose toggle is `true`. If the file is missing or unreadable, fall back to defaults:\n\n")
+	sb.WriteString("| Toggle | Default | What it controls |\n")
+	sb.WriteString("|--------|---------|------------------|\n")
+	sb.WriteString("| `normal_comment` | **true** | Standard Go doc comments on exported funcs/types/packages |\n")
+	sb.WriteString("| `ai_comment` | **false** | `@ai:generated` / `@ai:purpose` / `@ai:input` / `@ai:output` / `@ai:sideeffect` |\n")
+	sb.WriteString("| `think_comment` | **false** | `//@ai:think intent=… / special=… / model=…` inside func bodies |\n\n")
+	sb.WriteString("Rules above marked MANDATORY/REQUIRED apply ONLY when their toggle is on. The toggle file overrides any rule shown here — re-read it on every session start; do NOT cache.\n")
+	sb.WriteString("Fallback behaviour (missing/unreadable file): write `normal_comment` only — do NOT add `@ai` or `@ai:think` lines.\n")
 
 	sb.WriteString("\n## Database access (pkg/hidb)\n\n")
 	sb.WriteString("- Reads → `hidb.ReadHypDB()` (replica)\n")
@@ -109,7 +146,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 ## AI Collaboration
 
 - **Start here**: Read ` + "`.hyp/context.yaml`" + ` — all routes, types, config in ~500 tokens
-- **Authoritative rules**: ` + "`config/AI_CODING_RULES.md`" + ` is the single source of truth — read it before generating code
+- **Authoritative rules**: ` + "`.hyp/AI_CODING_RULES.md`" + ` is the single source of truth — read it before generating code
 - **Before modifying shared packages**: Run ` + "`hyp impact <file>`" + `
 - **After writing code**: Run ` + "`hyp chkcomment <file>`" + ` then ` + "`hyp lint`" + ` (CI gate; non-zero exit blocks merge)
 - **Generate manifest**: ` + "`hyp context -o .hyp/manifest.yaml`" + `

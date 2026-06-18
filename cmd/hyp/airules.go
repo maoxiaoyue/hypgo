@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/maoxiaoyue/hypgo/pkg/airules"
+	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -97,6 +98,7 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 
 	opts := airules.Options{
 		DiffLogEnabled: IsDiffLogEnabled(),
+		Comment:        loadCommentToggles(dir),
 	}
 	results, err := airules.GenerateAll(dir, targets, m, opts, dryRun)
 	if err != nil {
@@ -186,6 +188,22 @@ func runAIRulesClean(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println(".")
 	return nil
+}
+
+// loadCommentToggles 讀取 .hyp/comment.yaml，回傳註釋開關設定。
+// 檔案不存在時用預設值（只開普通註釋）；解析失敗時警告並退回預設。
+func loadCommentToggles(dir string) airules.CommentToggles {
+	path := filepath.Join(dir, ".hyp", "comment.yaml")
+	cfg, err := config.LoadCommentConfig(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to load %s: %v — using defaults\n", path, err)
+		cfg = config.DefaultCommentConfig()
+	}
+	return airules.CommentToggles{
+		NormalComment: cfg.NormalComment,
+		AIComment:     cfg.AIComment,
+		ThinkComment:  cfg.ThinkComment,
+	}
 }
 
 func loadManifestIfExists(dir string) *manifest.Manifest {

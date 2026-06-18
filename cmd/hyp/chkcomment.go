@@ -20,21 +20,21 @@ const, var) and check whether each has a standardized documentation comment.
 
 Missing comments will be reported with suggested text. Use --fix to
 automatically add the suggested comments to the file. When an LLM config
-is supplied (or auto-detected at config/llm.yaml / .hyp/llm.yaml), --fix
-will additionally insert structured @ai: annotations produced by the LLM
-(or by built-in heuristics when mode=none).
+is supplied (or auto-detected at .hyp/llm.yaml), --fix will additionally
+insert structured @ai: annotations produced by the LLM (or by built-in
+heuristics when mode=none).
 
 Examples:
   hyp chkcomment controllers/user.go
   hyp chkcomment --fix models/order.go
-  hyp chkcomment --fix --llm config/llm.yaml controllers/user.go`,
+  hyp chkcomment --fix --llm .hyp/llm.yaml controllers/user.go`,
 	Args: cobra.ExactArgs(1),
 	RunE: runChkComment,
 }
 
 func init() {
 	chkcommentCmd.Flags().Bool("fix", false, "Automatically add suggested comments to the file")
-	chkcommentCmd.Flags().String("llm", "", "Path to LLM config YAML (default: auto-detect config/llm.yaml or .hyp/llm.yaml)")
+	chkcommentCmd.Flags().String("llm", "", "Path to LLM config YAML (default: auto-detect .hyp/llm.yaml)")
 	chkcommentCmd.Flags().Bool("unintent", false, "Check AI-generated funcs for missing //@ai:think and write report to .hyp/lostintent.md (warning only)")
 	chkcommentCmd.Flags().Bool("fixintent", false, "Auto-insert //@ai:think into AI-generated funcs using LLM or heuristics (creates .bak backup)")
 }
@@ -137,7 +137,7 @@ func runFixIntent(_ *cobra.Command, filename, llmPath string, thinkReport *annot
 	if llmCfg == nil || llmCfg.Mode == "" || llmCfg.Mode == config.LLMModeNone {
 		fmt.Fprintf(os.Stderr, "\n[fixintent] Warning: no LLM configured (mode=none). "+
 			"--fixintent requires model support to auto-insert @ai:think.\n"+
-			"  → Please provide a valid LLM config via --llm or place one at config/llm.yaml\n"+
+			"  → Please provide a valid LLM config via --llm or place one at .hyp/llm.yaml\n"+
 			"  → See: hyp chkcomment --unintent %s  (to list missing funcs only)\n", filename)
 		return nil
 	}
@@ -168,7 +168,7 @@ func resolveLLMConfigPath(explicit string) string {
 	if explicit != "" {
 		return explicit
 	}
-	for _, candidate := range []string{"config/llm.yaml", ".hyp/llm.yaml"} {
+	for _, candidate := range []string{".hyp/llm.yaml"} {
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}

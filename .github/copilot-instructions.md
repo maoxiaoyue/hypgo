@@ -1,6 +1,6 @@
 # HypGo — GitHub Copilot Instructions
 
-Full rules: `config/AI_CODING_RULES.md`
+Full rules: `.hyp/AI_CODING_RULES.md`
 
 ## Critical rules (must follow)
 
@@ -30,4 +30,4 @@ func FuncName(...) {}
 - `math/rand` for tokens (use `crypto/rand`)
 - Hardcoded DSN / API key / secrets
 
-Read `config/AI_CODING_RULES.md` for full specification.
+Read `.hyp/AI_CODING_RULES.md` for full specification.
