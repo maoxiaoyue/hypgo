@@ -9,12 +9,17 @@ package manifest
 import (
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 )
+
+// maxEnricherErrorsReported AutoSync 在每次 Sync 中最多回報幾條 enricher 錯誤
+// 超出後僅累積計數，最終一次 summary。避免大型專案 enricher 全部失敗時刷屏。
+const maxEnricherErrorsReported = 5
 
 // DefaultContextPath 預設的 context 檔案路徑
 const DefaultContextPath = ".hyp/context.yaml"
@@ -87,18 +92,39 @@ func (a *AutoSync) Sync() error {
 	// 決定使用的 LLMConfig：明確指定 > 自動探測同目錄的 llm.yaml > nil
 	llmCfg := a.resolveLLMConfig(dir)
 
-	// 收集 manifest（含 GlobalRegistry 中的 Model 描述；可選 LLM 增強）
-	collector, err := NewCollectorWithModelsAndLLM(a.router, a.appCfg, migrate.GlobalRegistry(), llmCfg)
-	if err != nil {
-		// LLM enricher 建構失敗（如 API key 錯誤）時記錄並降級為純推斷
-		if a.logger != nil {
-			a.logger.Warningf("AutoSync: LLM enricher init failed (%v); using pure Go inference", err)
+	// 構建 collector：若 llmCfg 啟用，建立 enricher 並掛上錯誤回報 callback
+	enrichCfg := DefaultEnrichConfig()
+	var errCount int64
+
+	if llmCfg != nil && llmCfg.IsEnabled() {
+		reporter := a.buildErrorReporter(&errCount)
+		enricher, err := NewLLMEnricherFromConfigWithReporter(llmCfg, reporter)
+		if err != nil {
+			if a.logger != nil {
+				a.logger.Warningf("AutoSync: LLM enricher init failed (%v); using pure Go inference", err)
+			}
+		} else if enricher != nil {
+			enrichCfg.LLMEnricher = enricher
+			if a.logger != nil {
+				detail := string(llmCfg.Mode)
+				if llmCfg.Mode == config.LLMModeAPI {
+					detail = "api/" + llmCfg.API.Provider + "/" + llmCfg.API.Model
+				} else if llmCfg.Mode == config.LLMModeOllama {
+					detail = "ollama/" + llmCfg.Ollama.Model
+				}
+				a.logger.Infof("AutoSync: LLM enrichment enabled (%s)", detail)
+			}
 		}
-		collector = NewCollectorWithModels(a.router, a.appCfg, migrate.GlobalRegistry())
-	} else if llmCfg != nil && llmCfg.IsEnabled() && a.logger != nil {
-		a.logger.Infof("AutoSync: LLM enrichment enabled (mode=%s)", llmCfg.Mode)
 	}
+
+	collector := NewCollectorWithModelsAndEnrich(a.router, a.appCfg, migrate.GlobalRegistry(), enrichCfg)
 	m := collector.Collect()
+
+	// 若 LLM 期間累積了錯誤，給一條 summary（避免使用者誤以為 LLM 有生效）
+	if total := atomic.LoadInt64(&errCount); total > maxEnricherErrorsReported && a.logger != nil {
+		a.logger.Warningf("AutoSync: %d enricher errors total (%d shown); manifest fell back to pure inference for those routes",
+			total, int64(maxEnricherErrorsReported))
+	}
 
 	// Schema 完整度檢查：有缺漏時於啟動輸出建議（缺漏同時寫入 manifest 供 AI 補完）
 	if a.logger != nil && m.Lint != nil && len(m.Lint.Warnings) > 0 {
@@ -130,6 +156,18 @@ func (a *AutoSync) SyncSafe() {
 		if a.logger != nil {
 			a.logger.Warningf("AutoSync failed: %v", err)
 		}
+	}
+}
+
+// buildErrorReporter 回傳一個錯誤回報 callback：
+// 前 N 條把錯誤完整寫進 logger.Warning；超出後僅累加 errCount，Sync 結束時統一報告數量。
+func (a *AutoSync) buildErrorReporter(errCount *int64) EnricherErrorReporter {
+	return func(routeKey string, err error) bool {
+		n := atomic.AddInt64(errCount, 1)
+		if a.logger != nil && n <= maxEnricherErrorsReported {
+			a.logger.Warningf("AutoSync: LLM enrich %s: %v", routeKey, err)
+		}
+		return true // 繼續處理後續路由
 	}
 }
 

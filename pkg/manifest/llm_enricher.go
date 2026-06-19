@@ -13,23 +13,55 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 )
 
+// EnricherErrorReporter 在 enricher 內部錯誤發生時被呼叫
+// （HTTP 失敗、回應 JSON 解析失敗、API 回傳 4xx/5xx 等）
+// 為 nil 時錯誤靜默丟棄（向後相容）。
+// 回傳 false 時表示「不要再回報後續錯誤」（用於限制日誌量）。
+type EnricherErrorReporter func(routeKey string, err error) bool
+
 // NewLLMEnricherFromConfig 根據 LLMConfig 建立對應的 LLMEnricher 實作
-// mode=none 時回傳 nil（不使用 LLM）
+// mode=none 時回傳 nil（不使用 LLM）。錯誤訊息會被靜默丟棄；要看錯誤請用
+// NewLLMEnricherFromConfigWithReporter。
 func NewLLMEnricherFromConfig(cfg *config.LLMConfig) (LLMEnricher, error) {
+	return NewLLMEnricherFromConfigWithReporter(cfg, nil)
+}
+
+// NewLLMEnricherFromConfigWithReporter 根據 LLMConfig 建立 enricher 並接受錯誤回報 callback
+// （v0.8.6+）。AutoSync 透過 callback 把錯誤接到 logger，讓使用者看得到「LLM 為什麼沒生效」。
+func NewLLMEnricherFromConfigWithReporter(cfg *config.LLMConfig, reporter EnricherErrorReporter) (LLMEnricher, error) {
 	if cfg == nil || !cfg.IsEnabled() {
 		return nil, nil
 	}
 
 	switch cfg.Mode {
 	case "ollama":
-		return newOllamaEnricher(&cfg.Ollama)
+		return newOllamaEnricher(&cfg.Ollama, reporter)
 	case "api":
-		return newAPIEnricher(&cfg.API)
+		return newAPIEnricher(&cfg.API, reporter)
 	case "rag":
-		return newRAGEnricher(&cfg.RAG)
+		return newRAGEnricher(&cfg.RAG, reporter)
 	default:
 		return nil, fmt.Errorf("unsupported LLM mode: %s", cfg.Mode)
 	}
+}
+
+// reportErr 是給各 enricher 用的內部 helper：回報錯誤並依 reporter 回傳決定是否繼續
+// （仍會回傳原 route，呼叫端要照樣 return route）
+func reportErr(reporter EnricherErrorReporter, route RouteManifest, err error) {
+	if reporter == nil || err == nil {
+		return
+	}
+	reporter(routeKey(route), err)
+}
+
+func routeKey(r RouteManifest) string {
+	if r.Method != "" && r.Path != "" {
+		return r.Method + " " + r.Path
+	}
+	if r.Command != "" {
+		return r.Protocol + ":" + r.Command
+	}
+	return r.Protocol
 }
 
 // --- Prompt Builder ---
@@ -143,9 +175,10 @@ type OllamaEnricher struct {
 	timeout   time.Duration
 	maxTokens int
 	client    *http.Client
+	reporter  EnricherErrorReporter
 }
 
-func newOllamaEnricher(cfg *config.OllamaConfig) (*OllamaEnricher, error) {
+func newOllamaEnricher(cfg *config.OllamaConfig, reporter EnricherErrorReporter) (*OllamaEnricher, error) {
 	if cfg.Model == "" {
 		return nil, fmt.Errorf("ollama model is required")
 	}
@@ -159,6 +192,7 @@ func newOllamaEnricher(cfg *config.OllamaConfig) (*OllamaEnricher, error) {
 		timeout:   timeout,
 		maxTokens: cfg.MaxTokens,
 		client:    &http.Client{Timeout: timeout},
+		reporter:  reporter,
 	}, nil
 }
 
@@ -189,26 +223,32 @@ func (e *OllamaEnricher) EnrichRoute(route RouteManifest) RouteManifest {
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("ollama: marshal request: %w", err))
 		return route
 	}
 
 	resp, err := e.client.Post(e.url+"/api/generate", "application/json", bytes.NewReader(body))
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("ollama POST %s/api/generate: %w", e.url, err))
 		return route
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		reportErr(e.reporter, route, fmt.Errorf("ollama returned %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet))))
 		return route
 	}
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("ollama read response: %w", err))
 		return route
 	}
 
 	var ollamaResp ollamaResponse
 	if err := json.Unmarshal(respBody, &ollamaResp); err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("ollama parse JSON: %w", err))
 		return route
 	}
 
@@ -227,9 +267,10 @@ type APIEnricher struct {
 	timeout   time.Duration
 	maxTokens int
 	client    *http.Client
+	reporter  EnricherErrorReporter
 }
 
-func newAPIEnricher(cfg *config.APIConfig) (*APIEnricher, error) {
+func newAPIEnricher(cfg *config.APIConfig, reporter EnricherErrorReporter) (*APIEnricher, error) {
 	if cfg.Model == "" {
 		return nil, fmt.Errorf("api model is required")
 	}
@@ -249,6 +290,7 @@ func newAPIEnricher(cfg *config.APIConfig) (*APIEnricher, error) {
 		timeout:   timeout,
 		maxTokens: cfg.MaxTokens,
 		client:    &http.Client{Timeout: timeout},
+		reporter:  reporter,
 	}, nil
 }
 
@@ -297,12 +339,14 @@ func (e *APIEnricher) enrichOpenAI(prompt string, route RouteManifest) RouteMani
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: marshal request: %w", err))
 		return route
 	}
 
 	url := e.baseURL + "/chat/completions"
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: build request: %w", err))
 		return route
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -310,25 +354,31 @@ func (e *APIEnricher) enrichOpenAI(prompt string, route RouteManifest) RouteMani
 
 	resp, err := e.client.Do(req)
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible POST %s: %w", url, err))
 		return route
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(snippet))))
 		return route
 	}
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: read response: %w", err))
 		return route
 	}
 
 	var chatResp openAIChatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: parse JSON: %w (body: %.200s)", err, string(respBody)))
 		return route
 	}
 
 	if len(chatResp.Choices) == 0 {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: response has no choices (body: %.200s)", string(respBody)))
 		return route
 	}
 
@@ -364,12 +414,14 @@ func (e *APIEnricher) enrichAnthropic(prompt string, route RouteManifest) RouteM
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: marshal request: %w", err))
 		return route
 	}
 
 	url := e.baseURL + "/messages"
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: build request: %w", err))
 		return route
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -378,25 +430,31 @@ func (e *APIEnricher) enrichAnthropic(prompt string, route RouteManifest) RouteM
 
 	resp, err := e.client.Do(req)
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic POST %s: %w", url, err))
 		return route
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		reportErr(e.reporter, route, fmt.Errorf("anthropic %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(snippet))))
 		return route
 	}
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: read response: %w", err))
 		return route
 	}
 
 	var anthropicResp anthropicResponse
 	if err := json.Unmarshal(respBody, &anthropicResp); err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: parse JSON: %w", err))
 		return route
 	}
 
 	if len(anthropicResp.Content) == 0 {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: response has no content"))
 		return route
 	}
 
@@ -417,9 +475,10 @@ type RAGEnricher struct {
 	generatorModel string
 	generatorURL   string
 	client         *http.Client
+	reporter       EnricherErrorReporter
 }
 
-func newRAGEnricher(cfg *config.RAGConfig) (*RAGEnricher, error) {
+func newRAGEnricher(cfg *config.RAGConfig, reporter EnricherErrorReporter) (*RAGEnricher, error) {
 	if cfg.EmbeddingModel == "" {
 		return nil, fmt.Errorf("rag embedding_model is required")
 	}
@@ -436,6 +495,7 @@ func newRAGEnricher(cfg *config.RAGConfig) (*RAGEnricher, error) {
 		generatorModel: cfg.GeneratorModel,
 		generatorURL:   cfg.GeneratorURL,
 		client:         &http.Client{Timeout: 60 * time.Second},
+		reporter:       reporter,
 	}, nil
 }
 

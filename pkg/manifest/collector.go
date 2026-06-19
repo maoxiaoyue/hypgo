@@ -75,6 +75,18 @@ func NewCollectorWithLLM(r *router.Router, cfg *config.Config, llmCfg *config.LL
 	}, nil
 }
 
+// NewCollectorWithModelsAndEnrich 建立同時帶 Model 描述與自訂 EnrichConfig 的 Collector
+// 給 AutoSync 等需要組合 Model 註冊器 + LLM Enricher（含 reporter）的場景使用
+func NewCollectorWithModelsAndEnrich(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry, enrichCfg EnrichConfig) *Collector {
+	return &Collector{
+		router:          r,
+		config:          cfg,
+		registry:        schema.Global(),
+		migrateRegistry: registry,
+		enrichCfg:       enrichCfg,
+	}
+}
+
 // NewCollectorWithModelsAndLLM 建立同時帶 Model 描述與 LLM 增強的 Collector
 // registry 為 nil 時不收集 model 資訊；llmCfg 為 nil 或 mode=none 時退回純推斷
 func NewCollectorWithModelsAndLLM(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry, llmCfg *config.LLMConfig) (*Collector, error) {
