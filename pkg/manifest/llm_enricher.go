@@ -27,7 +27,7 @@ func NewLLMEnricherFromConfig(cfg *config.LLMConfig) (LLMEnricher, error) {
 }
 
 // NewLLMEnricherFromConfigWithReporter 根據 LLMConfig 建立 enricher 並接受錯誤回報 callback
-// （v0.8.6+）。AutoSync 透過 callback 把錯誤接到 logger，讓使用者看得到「LLM 為什麼沒生效」。
+// （v0.8.9+）。AutoSync 透過 callback 把錯誤接到 logger，讓使用者看得到「LLM 為什麼沒生效」。
 func NewLLMEnricherFromConfigWithReporter(cfg *config.LLMConfig, reporter EnricherErrorReporter) (LLMEnricher, error) {
 	if cfg == nil || !cfg.IsEnabled() {
 		return nil, nil

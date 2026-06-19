@@ -3,7 +3,7 @@
 package manifest
 
 // autosync.go — .hyp/context.yaml 自動同步。
-// 自 v0.8.6 由原 pkg/autosync 合併進 pkg/manifest，以收斂套件數量。
+// 自 v0.8.9 由原 pkg/autosync 合併進 pkg/manifest，以收斂套件數量。
 // 在 Server 啟動時自動生成專案 manifest，永遠與程式碼同步。
 
 import (
