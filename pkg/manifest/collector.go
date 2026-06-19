@@ -75,6 +75,28 @@ func NewCollectorWithLLM(r *router.Router, cfg *config.Config, llmCfg *config.LL
 	}, nil
 }
 
+// NewCollectorWithModelsAndLLM 建立同時帶 Model 描述與 LLM 增強的 Collector
+// registry 為 nil 時不收集 model 資訊；llmCfg 為 nil 或 mode=none 時退回純推斷
+func NewCollectorWithModelsAndLLM(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry, llmCfg *config.LLMConfig) (*Collector, error) {
+	enrichCfg := DefaultEnrichConfig()
+
+	if llmCfg != nil && llmCfg.IsEnabled() {
+		enricher, err := NewLLMEnricherFromConfig(llmCfg)
+		if err != nil {
+			return nil, err
+		}
+		enrichCfg.LLMEnricher = enricher
+	}
+
+	return &Collector{
+		router:          r,
+		config:          cfg,
+		registry:        schema.Global(),
+		migrateRegistry: registry,
+		enrichCfg:       enrichCfg,
+	}, nil
+}
+
 // Collect 組裝完整的 Manifest
 func (c *Collector) Collect() *Manifest {
 	m := &Manifest{
