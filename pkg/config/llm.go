@@ -132,13 +132,10 @@ func (c *LLMConfig) Validate() error {
 		if c.API.Provider == "" {
 			return fmt.Errorf("llm.api.provider is required when mode=api")
 		}
-		switch c.API.Provider {
-		case "openai", "anthropic", "gemini", "custom":
-		default:
-			return fmt.Errorf("llm.api.provider must be one of: openai, anthropic, gemini, custom; got %q", c.API.Provider)
-		}
-		if c.API.Provider == "custom" && c.API.BaseURL == "" {
-			return fmt.Errorf("llm.api.base_url is required when provider=custom")
+		// 不限制 provider 名稱：openai / anthropic / gemini 有內建預設 BaseURL；
+		// 其他名稱（含 custom、本地推論伺服器、第三方相容端點）一律需提供 base_url。
+		if !hasBuiltinBaseURL(c.API.Provider) && c.API.BaseURL == "" {
+			return fmt.Errorf("llm.api.base_url is required when provider=%q (only openai/anthropic/gemini have built-in defaults)", c.API.Provider)
 		}
 		if c.API.Model == "" {
 			return fmt.Errorf("llm.api.model is required when mode=api")
@@ -173,6 +170,15 @@ func (c *LLMConfig) Validate() error {
 	}
 
 	return nil
+}
+
+// hasBuiltinBaseURL 回傳 provider 是否有內建預設 BaseURL（ApplyDefaults 會自動填）
+func hasBuiltinBaseURL(provider string) bool {
+	switch provider {
+	case "openai", "anthropic", "gemini":
+		return true
+	}
+	return false
 }
 
 // ResolvedAPIKey 展開 API key 中的環境變數引用
