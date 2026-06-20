@@ -232,6 +232,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", cliConfigTemplate},
 		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
 		{baseDir, "go.mod", cliGoModTemplate},
 	}
 
@@ -294,6 +295,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", desktopConfigTemplate},
 		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
 		{baseDir, "go.mod", desktopGoModTemplate},
 	}
 
@@ -358,6 +360,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "config"), "config.yaml", grpcConfigTemplate},
 		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
+		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
 		{baseDir, "go.mod", grpcGoModTemplate},
 		{baseDir, "Makefile", grpcMakefileTemplate},
 	}

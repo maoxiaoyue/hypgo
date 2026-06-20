@@ -19,6 +19,9 @@ var llmYamlContent = scaffold.LLMYamlTemplate
 // commentYamlContent 為 hyp api 生成 .hyp/comment.yaml 時採用的預設內容。
 var commentYamlContent = scaffold.CommentYamlTemplate
 
+// hypConfigYamlContent 為 hyp api 生成 .hyp/config.yaml 時採用的預設內容。
+var hypConfigYamlContent = scaffold.HypConfigYamlTemplate
+
 var apiCmd = &cobra.Command{
 	Use:   "api [project-name]",
 	Short: "Create a new HypGo API-only project with HTTP/3 support",
@@ -66,6 +69,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		{Path: "config/config.yaml", Content: configYamlContent},
 		{Path: ".hyp/llm.yaml", Content: llmYamlContent},
 		{Path: ".hyp/comment.yaml", Content: commentYamlContent},
+		{Path: ".hyp/config.yaml", Content: hypConfigYamlContent},
 		{Path: ".env.example", Content: envExampleContent},
 
 		// 初始化檔案
@@ -119,6 +123,9 @@ func runAPI(cmd *cobra.Command, args []string) error {
 	if err := createAPIRouterSetup(projectName, time.Now().Format("2006-01-02")); err != nil {
 		return fmt.Errorf("failed to create app/routers/router.go: %w", err)
 	}
+
+	// 把生成專案的 hypgo 依賴升到 @latest（如果可以）
+	postScaffoldUpgrade(projectName)
 
 	// 打印成功信息
 	printSuccessMessage(projectName)
@@ -1999,7 +2006,7 @@ const goModContent = `module {{.ProjectName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.8.5
+	github.com/maoxiaoyue/hypgo v0.8.11
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/lib/pq v1.10.9

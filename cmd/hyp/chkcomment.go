@@ -37,6 +37,7 @@ func init() {
 	chkcommentCmd.Flags().String("llm", "", "Path to LLM config YAML (default: auto-detect .hyp/llm.yaml)")
 	chkcommentCmd.Flags().Bool("unintent", false, "Check AI-generated funcs for missing //@ai:think and write report to .hyp/lostintent.md (warning only)")
 	chkcommentCmd.Flags().Bool("fixintent", false, "Auto-insert //@ai:think into AI-generated funcs using LLM or heuristics (creates .bak backup)")
+	chkcommentCmd.Flags().Bool("all", false, "(with --unintent/--fixintent) Apply to ALL funcs, not just those with @ai:generated. --fixintent --all emits @ai:think lines tagged retroactive=true (post-hoc analysis, not design intent)")
 }
 
 func runChkComment(cmd *cobra.Command, args []string) error {
@@ -45,6 +46,7 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 	llmPath, _ := cmd.Flags().GetString("llm")
 	unintent, _ := cmd.Flags().GetBool("unintent")
 	fixintent, _ := cmd.Flags().GetBool("fixintent")
+	all, _ := cmd.Flags().GetBool("all")
 
 	report, err := annotation.CheckFile(filename)
 	if err != nil {
@@ -54,18 +56,22 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 	fmt.Print(annotation.FormatReport(report))
 
 	if unintent || fixintent {
-		thinkReport, thinkErr := annotation.CheckThink(filename)
+		thinkOpts := annotation.CheckThinkOpts{IncludeAll: all}
+		thinkReport, thinkErr := annotation.CheckThinkWithOpts(filename, thinkOpts)
 		if thinkErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: @ai:think check failed: %v\n", thinkErr)
 		} else {
 			fmt.Print(annotation.FormatThinkReport(thinkReport))
+			if all {
+				fmt.Fprintf(os.Stdout, "[--all] Scanning ALL funcs (not just @ai:generated). Retroactive mode is active.\n")
+			}
 
 			if fixintent && len(thinkReport.Missing) > 0 {
-				if fixErr := runFixIntent(cmd, filename, llmPath, thinkReport); fixErr != nil {
+				if fixErr := runFixIntent(cmd, filename, llmPath, thinkReport, all); fixErr != nil {
 					return fixErr
 				}
 				// 修復後重新檢查，寫入乾淨的報告
-				thinkReport, _ = annotation.CheckThink(filename)
+				thinkReport, _ = annotation.CheckThinkWithOpts(filename, thinkOpts)
 			}
 
 			if writeErr := annotation.WriteLostIntentReport(".hyp", thinkReport); writeErr != nil {
@@ -127,7 +133,8 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 }
 
 // runFixIntent 使用 LLM 為缺少 @ai:think 的函式插入意圖註解；無 LLM 設定時僅警告
-func runFixIntent(_ *cobra.Command, filename, llmPath string, thinkReport *annotation.ThinkReport) error {
+// retroactive=true 時切換 LLM 為事後反推模式並在每行 @ai:think 加上 retroactive=true 標籤
+func runFixIntent(_ *cobra.Command, filename, llmPath string, thinkReport *annotation.ThinkReport, retroactive bool) error {
 	resolvedPath := resolveLLMConfigPath(llmPath)
 	llmCfg, err := config.LoadLLMConfig(resolvedPath)
 	if err != nil {
@@ -148,13 +155,18 @@ func runFixIntent(_ *cobra.Command, filename, llmPath string, thinkReport *annot
 	}
 
 	modelName := thinkSuggester.ModelName()
-	fmt.Fprintf(os.Stdout, "\n[fixintent] Using LLM config: %s (mode=%s, model=%s)\n",
-		resolvedPath, string(llmCfg.Mode), modelName)
+	mode := "design-intent"
+	if retroactive {
+		mode = "retroactive"
+	}
+	fmt.Fprintf(os.Stdout, "\n[fixintent] Using LLM config: %s (mode=%s, model=%s, prompt=%s)\n",
+		resolvedPath, string(llmCfg.Mode), modelName, mode)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	fixed, fixErr := annotation.FixThinkFile(ctx, filename, thinkReport, thinkSuggester)
+	fixed, fixErr := annotation.FixThinkFileWithOpts(ctx, filename, thinkReport, thinkSuggester,
+		annotation.FixThinkOpts{Retroactive: retroactive})
 	if fixErr != nil {
 		return fmt.Errorf("fixintent failed: %w", fixErr)
 	}

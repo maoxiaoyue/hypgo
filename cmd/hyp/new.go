@@ -161,6 +161,8 @@ func runNewCLI(projectName string) error {
 		return fmt.Errorf("failed to create CLI project: %w", err)
 	}
 
+	postScaffoldUpgrade(projectName)
+
 	fmt.Printf("\n✨ Successfully created CLI project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
 	fmt.Printf("   %s/\n", projectName)
@@ -194,6 +196,8 @@ func runNewDesktop(projectName string) error {
 	if err := scaffold.GenerateDesktopProject(projectName, projectName, projectName); err != nil {
 		return fmt.Errorf("failed to create desktop project: %w", err)
 	}
+
+	postScaffoldUpgrade(projectName)
 
 	fmt.Printf("\n✨ Successfully created Desktop project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
@@ -229,6 +233,8 @@ func runNewGRPC(projectName string) error {
 	if err := scaffold.GenerateGRPCProject(projectName, projectName, projectName); err != nil {
 		return fmt.Errorf("failed to create gRPC project: %w", err)
 	}
+
+	postScaffoldUpgrade(projectName)
 
 	lowerName := strings.ToLower(projectName)
 	fmt.Printf("\n✨ Successfully created gRPC project: %s\n", projectName)
@@ -294,11 +300,14 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 創建 LLM 配置文件（.hyp/llm.yaml）+ 註釋開關（.hyp/comment.yaml）
+	// 創建設計時設定檔（.hyp/llm.yaml + comment.yaml + config.yaml）
 	if err := createLLMConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
 		return err
 	}
 	if err := createCommentConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
+		return err
+	}
+	if err := createHypConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
 		return err
 	}
 
@@ -339,6 +348,8 @@ func runNew(cmd *cobra.Command, args []string) error {
 	if err := createGoMod(projectName); err != nil {
 		return err
 	}
+
+	postScaffoldUpgrade(projectName)
 
 	fmt.Printf("✨ Successfully created full-stack project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
@@ -423,6 +434,13 @@ func createLLMConfigFile(configDir string) error {
 func createCommentConfigFile(configDir string) error {
 	filename := filepath.Join(configDir, "comment.yaml")
 	return os.WriteFile(filename, []byte(scaffold.CommentYamlTemplate), 0644)
+}
+
+// createHypConfigFile 寫入 .hyp/config.yaml 到指定目錄（預期為 .hyp/）。
+// 內容來自 scaffold.HypConfigYamlTemplate，預設 language=en / debug_level=debug / environment=local。
+func createHypConfigFile(configDir string) error {
+	filename := filepath.Join(configDir, "config.yaml")
+	return os.WriteFile(filename, []byte(scaffold.HypConfigYamlTemplate), 0644)
 }
 
 func createMainFile(projectName string) error {

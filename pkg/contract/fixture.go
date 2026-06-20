@@ -1,5 +1,5 @@
 // fixture.go — 框架層級的測試工廠（fluent test request builder）。
-// 自 v0.8.9 由原 pkg/fixture 合併進 pkg/contract，以收斂套件數量。
+// 自 v0.8.11 由原 pkg/fixture 合併進 pkg/contract，以收斂套件數量。
 //
 // 讓 AI 和人都能用 fluent API 建立完整的測試請求：
 //

@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	version = "0.8.9"
+	version = "0.8.11"
 	rootCmd = &cobra.Command{
 		Use:   "hyp",
 		Short: "HypGo CLI - AI-Human Collaborative Go Web Framework",
@@ -52,7 +52,7 @@ func main() {
 
 func init() {
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
-AI-Human Collaborative Go Web Framework (HTTP/1.1 + HTTP/2 + HTTP/3)
+AI-Human Collaborative Go Framework — Web (HTTP/1.1 + HTTP/2 + HTTP/3) / CLI / Desktop / gRPC
 `)
 	registerCommands()
 }
