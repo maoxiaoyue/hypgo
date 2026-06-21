@@ -148,35 +148,9 @@ type RequestMetrics struct {
 
 // New 創建新的 Context（使用物件池）
 func New(w http.ResponseWriter, r *http.Request) *Context {
-	// 優先使用物件池
-	if contextPool != nil {
-		return AcquireContext(w, r)
-	}
-
-	c := &Context{
-		Request:   r,
-		Response:  newResponseWriter(w),
-		Params:    make(Params, 0, 8),
-		handlers:  make([]HandlerFunc, 0, 8),
-		index:     -1,
-		Keys:      make(map[string]interface{}),
-		startTime: time.Now(),
-		metrics:   &RequestMetrics{},
-		sameSite:  http.SameSiteDefaultMode,
-	}
-
-	// Writer 是 Response 的別名（Gin 兼容）
-	c.Writer = c.Response
-
-	// 檢測並設置協議
-	c.detectProtocol()
-
-	// 如果是 HTTP/3，初始化 QUIC 相關資訊
-	if c.protocol == HTTP3 {
-		c.initQuicConnection()
-	}
-
-	return c
+	// contextPool 為 package 級單例、恆非 nil，故一律走物件池
+	// （原本的非池 fallback 分支永不可達，已移除）
+	return AcquireContext(w, r)
 }
 
 // Reset 重置 Context 到初始狀態（用於物件池）

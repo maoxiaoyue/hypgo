@@ -129,8 +129,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 
 	sb.WriteString("\n## Forbidden\n\n")
 	sb.WriteString("- No `panic()` in request handlers (init phase only)\n")
-	sb.WriteString("- No `fmt.Println` for logging — use `pkg/logger`; configure ONLY via `.hyp/config.yaml`\n")
-	sb.WriteString("- No swallowed errors — log every `err != nil` via `pkg/logger` before returning/aborting\n")
+	sb.WriteString("- No `fmt.Println` for logging — use `pkg/logger` (`log.Info` KV / `log.Infof` printf)\n")
 	sb.WriteString("- No `math/rand` for tokens / session ids — use `crypto/rand`\n")
 	sb.WriteString("- No `time.Sleep` inside handlers\n")
 	sb.WriteString("- No hardcoded DSN / API key / secret — read from config (pkg/config)\n")

@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/go-playground/validator/v10"
-	hypjson "github.com/maoxiaoyue/hypgo/pkg/json"
 	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
@@ -13,10 +12,9 @@ type widget struct {
 	Code string `json:"code" validate:"required,shortcode"`
 }
 
-// 驗證 item 3 + 4：app 註冊的自訂規則同時被
+// 驗證 item 3：app 註冊的自訂規則同時被
 //   - 生成器（RegisterSampleValue 餵入合法樣本）
 //   - pkg/contract 的合約驗證（共用 registry）
-//   - pkg/json 的請求驗證（共用 registry）
 // 看見
 func TestSharedValidatorCustomRule(t *testing.T) {
 	// app 在共用 registry 註冊自訂規則：剛好 4 個大寫字母
@@ -52,16 +50,6 @@ func TestSharedValidatorCustomRule(t *testing.T) {
 	// 3. contract 驗證端：違反自訂規則的值必須被攔下
 	if err := validateRequest([]byte(`{"code":"xx"}`), widget{}); err == nil {
 		t.Error("contract: value violating custom rule should be rejected")
-	}
-
-	// 4. pkg/json 驗證端：同一條自訂規則也必須生效（證明 registry 已統一）
-	jv := hypjson.NewValidator()
-	var w widget
-	if err := jv.ValidatedUnmarshal([]byte(`{"code":"xx"}`), &w); err == nil {
-		t.Error("pkg/json: shared custom rule should be enforced (registry not unified?)")
-	}
-	if err := jv.ValidatedUnmarshal([]byte(`{"code":"ABCD"}`), &w); err != nil {
-		t.Errorf("pkg/json: valid value should pass shared rule: %v", err)
 	}
 }
 

@@ -30,9 +30,6 @@ type llmYAMLConfig struct {
 	API struct {
 		Provider string `yaml:"provider"`
 	} `yaml:"api"`
-	RAG struct {
-		GeneratorModel string `yaml:"generator_model"`
-	} `yaml:"rag"`
 }
 
 // resolveAIProvider 在執行期決定 @ai 註解所記錄的供應商名稱。
@@ -67,11 +64,6 @@ func providerFromLLMConfig() string {
 		case "ollama":
 			if cfg.Ollama.Model != "" {
 				return "ollama(" + cfg.Ollama.Model + ")"
-			}
-			return "ollama"
-		case "rag":
-			if cfg.RAG.GeneratorModel != "" {
-				return "ollama(" + cfg.RAG.GeneratorModel + ")"
 			}
 			return "ollama"
 		}

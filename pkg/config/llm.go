@@ -12,43 +12,21 @@ const (
 	LLMModeNone   = "none"
 	LLMModeOllama = "ollama"
 	LLMModeAPI    = "api"
-	LLMModeRAG    = "rag"
 )
 
 // LLMConfig 控制 Manifest 智慧增強的 LLM 層
 type LLMConfig struct {
 	// Mode 控制 LLM 增強模式
 	// "none"（預設）：不使用 LLM，只做純 Go 推斷（零成本）
-	// "rag"：使用 RAG（向量資料庫 + embedding + LLM 生成）
 	// "ollama"：直接連接本地 Ollama 伺服器
 	// "api"：連接遠端 API（OpenAI、Anthropic、Gemini 等）
 	Mode string `mapstructure:"mode" yaml:"mode"`
-
-	// RAG 模式配置（mode=rag 時使用）
-	RAG RAGConfig `mapstructure:"rag" yaml:"rag"`
 
 	// Ollama 模式配置（mode=ollama 時使用）
 	Ollama OllamaConfig `mapstructure:"ollama" yaml:"ollama"`
 
 	// API 模式配置（mode=api 時使用）
 	API APIConfig `mapstructure:"api" yaml:"api"`
-}
-
-// RAGConfig RAG（Retrieval-Augmented Generation）模式配置
-type RAGConfig struct {
-	// Embedding 設定
-	EmbeddingModel string `mapstructure:"embedding_model" yaml:"embedding_model"` // embedding 模型名 e.g. "nomic-embed-text"
-	EmbeddingURL   string `mapstructure:"embedding_url" yaml:"embedding_url"`     // embedding API 端點（預設用 Ollama）
-
-	// 向量資料庫設定
-	VectorStore    string `mapstructure:"vector_store" yaml:"vector_store"`         // "chroma", "qdrant", "milvus", "faiss"
-	VectorStoreURL string `mapstructure:"vector_store_url" yaml:"vector_store_url"` // 向量資料庫連線 URL
-	Collection     string `mapstructure:"collection" yaml:"collection"`             // 集合名稱
-	TopK           int    `mapstructure:"top_k" yaml:"top_k"`                       // 檢索結果數量（預設 5）
-
-	// 生成用 LLM（可選，用於根據檢索結果生成回答）
-	GeneratorModel string `mapstructure:"generator_model" yaml:"generator_model"` // 生成模型 e.g. "llama3"
-	GeneratorURL   string `mapstructure:"generator_url" yaml:"generator_url"`     // 生成 API 端點（預設 Ollama localhost）
 }
 
 // OllamaConfig 本地 Ollama 模式配置
@@ -73,17 +51,6 @@ type APIConfig struct {
 func (c *LLMConfig) ApplyDefaults() {
 	if c.Mode == "" {
 		c.Mode = "none"
-	}
-
-	// RAG 預設值
-	if c.RAG.TopK == 0 {
-		c.RAG.TopK = 5
-	}
-	if c.RAG.EmbeddingURL == "" {
-		c.RAG.EmbeddingURL = "http://localhost:11434"
-	}
-	if c.RAG.GeneratorURL == "" {
-		c.RAG.GeneratorURL = "http://localhost:11434"
 	}
 
 	// Ollama 預設值
@@ -146,27 +113,8 @@ func (c *LLMConfig) Validate() error {
 			return fmt.Errorf("llm.api.api_key is required when mode=api (supports ${ENV_VAR} syntax)")
 		}
 
-	case "rag":
-		if c.RAG.EmbeddingModel == "" {
-			return fmt.Errorf("llm.rag.embedding_model is required when mode=rag")
-		}
-		if c.RAG.VectorStore == "" {
-			return fmt.Errorf("llm.rag.vector_store is required when mode=rag")
-		}
-		switch c.RAG.VectorStore {
-		case "chroma", "qdrant", "milvus", "faiss":
-		default:
-			return fmt.Errorf("llm.rag.vector_store must be one of: chroma, qdrant, milvus, faiss; got %q", c.RAG.VectorStore)
-		}
-		if c.RAG.VectorStoreURL == "" {
-			return fmt.Errorf("llm.rag.vector_store_url is required when mode=rag")
-		}
-		if c.RAG.GeneratorModel == "" {
-			return fmt.Errorf("llm.rag.generator_model is required when mode=rag")
-		}
-
 	default:
-		return fmt.Errorf("llm.mode must be one of: none, rag, ollama, api; got %q", c.Mode)
+		return fmt.Errorf("llm.mode must be one of: none, ollama, api; got %q", c.Mode)
 	}
 
 	return nil

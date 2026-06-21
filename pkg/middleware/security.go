@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 
@@ -328,15 +329,14 @@ func IPWhitelist(config IPWhitelistConfig) hypcontext.HandlerFunc {
 
 		// 檢查是否在白名單中
 		if !allowedIPs[clientIP] {
-			// 檢查 CIDR
+			// 檢查 CIDR（stdlib net.ParseCIDR + IPNet.Contains）
 			allowed := false
+			ip := net.ParseIP(clientIP)
 			for _, cidr := range config.AllowedCIDRs {
-				// 這裡需要實際的 CIDR 匹配邏輯
-				_ = cidr
-				// if matchCIDR(clientIP, cidr) {
-				//     allowed = true
-				//     break
-				// }
+				if _, ipNet, err := net.ParseCIDR(cidr); err == nil && ip != nil && ipNet.Contains(ip) {
+					allowed = true
+					break
+				}
 			}
 
 			if !allowed {
@@ -353,72 +353,3 @@ func IPWhitelist(config IPWhitelistConfig) hypcontext.HandlerFunc {
 	}
 }
 
-// ===== Session 中間件 =====
-
-// SessionConfig Session 配置
-type SessionConfig struct {
-	Store      SessionStore
-	CookieName string
-	MaxAge     int
-	Path       string
-	Domain     string
-	Secure     bool
-	HTTPOnly   bool
-	SameSite   http.SameSite
-}
-
-// SessionStore Session 存儲介面
-type SessionStore interface {
-	Get(sessionID string) (map[string]interface{}, error)
-	Set(sessionID string, data map[string]interface{}, ttl int) error
-	Delete(sessionID string) error
-	Generate() string
-}
-
-// Session 創建 Session 中間件
-func Session(config SessionConfig) hypcontext.HandlerFunc {
-	if config.CookieName == "" {
-		config.CookieName = "session_id"
-	}
-
-	if config.Path == "" {
-		config.Path = "/"
-	}
-
-	return func(c *hypcontext.Context) {
-		// 獲取或創建 session ID
-		sessionID, err := c.Cookie(config.CookieName)
-		if err != nil || sessionID == "" {
-			sessionID = config.Store.Generate()
-			c.SetCookie(
-				config.CookieName,
-				sessionID,
-				config.MaxAge,
-				config.Path,
-				config.Domain,
-				config.Secure,
-				config.HTTPOnly,
-			)
-		}
-
-		// 載入 session 資料
-		sessionData, err := config.Store.Get(sessionID)
-		if err != nil {
-			sessionData = make(map[string]interface{})
-		}
-
-		// 設置到上下文
-		c.Set("session_id", sessionID)
-		c.Set("session", sessionData)
-
-		// 處理請求
-		c.Next()
-
-		// 保存 session 資料
-		if data, exists := c.Get("session"); exists {
-			if sessionMap, ok := data.(map[string]interface{}); ok {
-				config.Store.Set(sessionID, sessionMap, config.MaxAge)
-			}
-		}
-	}
-}

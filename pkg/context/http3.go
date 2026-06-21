@@ -254,40 +254,7 @@ func (c *Context) Stream(step func(w io.Writer) bool) bool {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-
-		// HTTP/3 優化：調整流控制
-		if c.protocol == HTTP3 && c.quicConn != nil {
-			c.adaptiveStreamControl()
-		}
-	}
-}
-
-// adaptiveStreamControl HTTP/3 自適應流控制
-func (c *Context) adaptiveStreamControl() {
-	if c.quicConn == nil {
-		return
-	}
-
-	// 根據 RTT 動態調整發送速率
-	rtt := c.quicConn.rtt
-	switch {
-	case rtt > 200*time.Millisecond:
-		// 高延遲：降低發送頻率
-		time.Sleep(20 * time.Millisecond)
-	case rtt > 100*time.Millisecond:
-		// 中等延遲：適度調整
-		time.Sleep(10 * time.Millisecond)
-	case rtt > 50*time.Millisecond:
-		// 低延遲：小幅調整
-		time.Sleep(5 * time.Millisecond)
-	default:
-		// 極低延遲：無需調整
-	}
-
-	// 根據擁塞窗口調整
-	if c.quicConn.congWin > 0 && c.quicConn.bytesRead > uint64(c.quicConn.congWin)*3/4 {
-		// 接近擁塞窗口限制，降速
-		time.Sleep(10 * time.Millisecond)
+		// ponytail: 移除 adaptiveStreamControl —— 它只在熱路徑迴圈裡 time.Sleep，是 footgun
 	}
 }
 

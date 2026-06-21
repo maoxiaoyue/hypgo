@@ -38,13 +38,6 @@ type LLMEnricher interface {
 	EnrichRoute(route RouteManifest) RouteManifest
 }
 
-// FieldInfo 描述 struct 中的單一欄位（用於 manifest 輸出）
-type FieldInfo struct {
-	Name     string `json:"name" yaml:"name"`
-	Type     string `json:"type" yaml:"type"`
-	Required bool   `json:"required" yaml:"required"`
-}
-
 // enrichRoute 用智慧推斷填補 RouteManifest 的空白欄位
 func enrichRoute(rm *RouteManifest, schemaRoute *schema.Route, cfg EnrichConfig) {
 	// 推斷 Summary

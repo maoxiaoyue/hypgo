@@ -1072,7 +1072,6 @@ const LLMYamlTemplate = `# HypGo LLM 智慧增強配置
 # "none"   — 不使用 LLM，只做純 Go 推斷（零成本，預設值）
 # "ollama" — 連接本地 Ollama 伺服器
 # "api"    — 連接遠端 API（OpenAI / Anthropic / Gemini）
-# "rag"    — RAG 模式（向量資料庫 + embedding + LLM 生成）
 
 mode: none
 
@@ -1133,27 +1132,6 @@ mode: none
 #   timeout: 30
 #   max_tokens: 256
 
-# ============================================================
-# Mode 3: RAG（檢索增強生成，最精確，需要向量資料庫）
-# ============================================================
-# 流程：程式碼 → embedding → 向量資料庫 → 檢索相關上下文 → LLM 生成描述
-# 適合大型專案，需先建立程式碼向量索引
-
-# mode: rag
-# rag:
-#   # Embedding 設定
-#   embedding_model: "nomic-embed-text"   # embedding 模型
-#   embedding_url: "http://localhost:11434" # 預設用本地 Ollama
-#
-#   # 向量資料庫設定（支援 chroma / qdrant / milvus / faiss）
-#   vector_store: "chroma"
-#   vector_store_url: "http://localhost:8000"
-#   collection: "hypgo_codebase"           # 集合名稱
-#   top_k: 5                               # 檢索結果數量
-#
-#   # 生成用 LLM
-#   generator_model: "llama3"              # 根據檢索結果生成描述
-#   generator_url: "http://localhost:11434" # 預設用本地 Ollama
 `
 
 // CommentYamlTemplate 是 .hyp/comment.yaml 的預設內容。

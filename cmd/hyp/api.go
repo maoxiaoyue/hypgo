@@ -515,18 +515,9 @@ func Init(cfg Config) (Logger, error) {
 		writer = os.Stdout
 	}
 
-	// 創建 logger 實例
-	log, err := logger.New(
-		cfg.Level,
-		writer,
-		&logger.RotationConfig{
-			MaxSize:    cfg.MaxSize,
-			MaxAge:     cfg.MaxAge,
-			MaxBackups: cfg.MaxBackups,
-			Compress:   cfg.Compress,
-		},
-		cfg.Colors,
-	)
+	// 創建 logger 實例（rotation 由上面的 lumberjack writer 處理；
+	// logger.New 簽名為 (level, output, writer, colorEnabled)，writer 非 nil 時 output 被忽略）
+	log, err := logger.New(cfg.Level, "", writer, cfg.Colors)
 	
 	if err != nil {
 		return nil, fmt.Errorf("failed to create logger: %w", err)
