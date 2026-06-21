@@ -26,8 +26,23 @@ type ThinkReport struct {
 	Scanned  int
 }
 
+// CheckThinkOpts 控制 CheckThinkWithOpts 的篩選行為（v0.8.11+）
+type CheckThinkOpts struct {
+	// IncludeAll 為 true 時，忽略 @ai:generated 篩選，把**所有**函式都納入掃描
+	// （給「事後反推設計」場景使用 — `hyp chkcomment --fixintent --all`）。
+	// 預設為 false：只掃描有 @ai:generated 的 AI 生成函式。
+	IncludeAll bool
+}
+
 // CheckThink 掃描 Go 檔案，找出有 @ai:generated 但函式體內缺少 //@ai:think 的 func。
+// 等同 CheckThinkWithOpts(filename, CheckThinkOpts{})。
 func CheckThink(filename string) (*ThinkReport, error) {
+	return CheckThinkWithOpts(filename, CheckThinkOpts{})
+}
+
+// CheckThinkWithOpts 同 CheckThink 但接受 opts 控制篩選行為。
+// opts.IncludeAll=true 時繞過 @ai:generated 篩選，回報所有缺少 //@ai:think 的函式。
+func CheckThinkWithOpts(filename string, opts CheckThinkOpts) (*ThinkReport, error) {
 	if filepath.Ext(filename) != ".go" {
 		return nil, fmt.Errorf("only .go files are supported: %s", filename)
 	}
@@ -54,7 +69,8 @@ func CheckThink(filename string) (*ThinkReport, error) {
 			continue
 		}
 
-		if !docHasGenerated(fd.Doc) {
+		// --all 模式下不要求 @ai:generated（事後反推所有 func 的設計）
+		if !opts.IncludeAll && !docHasGenerated(fd.Doc) {
 			continue
 		}
 

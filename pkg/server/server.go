@@ -676,7 +676,7 @@ func (s *Server) removePIDFile() {
 	os.Remove("hypgo.pid")
 }
 
-// isGracefulRestartEnabled 檢查是否啟用優雅重啟
+// isGracefulRestartEnabled 檢查是否啟用優雅重啟（讀 config.Server.EnableGracefulRestart）
 func (s *Server) isGracefulRestartEnabled() bool {
-	return true
+	return s.config.Server.EnableGracefulRestart
 }

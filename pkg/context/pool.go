@@ -316,8 +316,7 @@ func ReleaseBuffer(buf *bytes.Buffer) {
 // AcquireURLValues 從池中獲取 URL Values
 // GC 優化：重建 map 替代逐一 delete
 func AcquireURLValues() url.Values {
-	// 舊 map 由 GC 整體回收，比逐一 delete 更高效
-	_ = urlValuesPool.Get()
+	// ponytail: 直接配置即可；先前的 urlValuesPool.Get() 取出後丟棄，是無效操作
 	return make(url.Values, 8)
 }
 

@@ -210,27 +210,6 @@ func (w *responseWriter) StreamID() uint64 {
 	return w.streamID
 }
 
-// ===== 物件池支援 =====
-/*
-var contextPool = &sync.Pool{
-	New: func() interface{} {
-		return &Context{}
-	},
-}
-
-// AcquireContext 從物件池獲取 Context
-func AcquireContext(w http.ResponseWriter, r *http.Request) *Context {
-	c := contextPool.Get().(*Context)
-	c.Reset(w, r)
-	return c
-}
-
-// ReleaseContext 釋放 Context 回物件池
-func ReleaseContext(c *Context) {
-	c.Reset(nil, nil)
-	contextPool.Put(c)
-}
-*/
 // ===== 輔助函數 =====
 
 // bodyAllowedForStatus 檢查狀態碼是否允許有 body

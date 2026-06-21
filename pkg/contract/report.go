@@ -50,9 +50,6 @@ func reportHTMLHeader(ts, filter string, total, pass, fail int, filterDisplay st
 	if total > 0 {
 		passRate = pass * 100 / total
 	}
-	filterAttr := html.EscapeString(filter)
-	_ = filterAttr // used via filterDisplay
-
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -616,9 +613,6 @@ func renderRouteCard(idx int, r ObserveResult) string {
 
 	// Request block
 	reqBody := r.Request.Body
-	if reqBody == "" {
-		reqBody = ""
-	}
 	sb.WriteString(`
       <div class="http-block request">
         <div class="http-block-title">▲ 請求 Request</div>`)

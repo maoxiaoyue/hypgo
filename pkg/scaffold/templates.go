@@ -578,7 +578,7 @@ const cliGoModTemplate = `module {{.ModuleName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.8.1-alpha
+	github.com/maoxiaoyue/hypgo v0.8.11
 	github.com/spf13/cobra v1.9.1
 )
 `
@@ -753,7 +753,7 @@ go 1.24
 
 require (
 	fyne.io/fyne/v2 v2.5.4
-	github.com/maoxiaoyue/hypgo v0.8.1-alpha
+	github.com/maoxiaoyue/hypgo v0.8.11
 )
 `
 
@@ -1024,7 +1024,7 @@ const grpcGoModTemplate = `module {{.ModuleName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.8.1-alpha
+	github.com/maoxiaoyue/hypgo v0.8.11
 	google.golang.org/grpc v1.72.0
 	google.golang.org/protobuf v1.36.8
 )
@@ -1060,6 +1060,11 @@ build:
 const LLMYamlTemplate = `# HypGo LLM 智慧增強配置
 # 放置於 .hyp/llm.yaml
 # 使用方式：hyp chkcomment --llm .hyp/llm.yaml
+#
+# 注意 timeout 設定（秒）：
+#   - 雲端 API（GPT/Claude/Gemini）：30 通常足夠
+#   - 本地大模型（llama.cpp + 30B+）：建議 120-180，避免 hyp chkcomment --fixintent 退回 heuristic
+#   - 若每次都退回 heuristic，先試 HYP_DEBUG_LLM=1 hyp chkcomment --fixintent ... 看是不是 timeout
 
 # ============================================================
 # mode: 控制 LLM 增強模式
@@ -1067,7 +1072,6 @@ const LLMYamlTemplate = `# HypGo LLM 智慧增強配置
 # "none"   — 不使用 LLM，只做純 Go 推斷（零成本，預設值）
 # "ollama" — 連接本地 Ollama 伺服器
 # "api"    — 連接遠端 API（OpenAI / Anthropic / Gemini）
-# "rag"    — RAG 模式（向量資料庫 + embedding + LLM 生成）
 
 mode: none
 
@@ -1128,27 +1132,6 @@ mode: none
 #   timeout: 30
 #   max_tokens: 256
 
-# ============================================================
-# Mode 3: RAG（檢索增強生成，最精確，需要向量資料庫）
-# ============================================================
-# 流程：程式碼 → embedding → 向量資料庫 → 檢索相關上下文 → LLM 生成描述
-# 適合大型專案，需先建立程式碼向量索引
-
-# mode: rag
-# rag:
-#   # Embedding 設定
-#   embedding_model: "nomic-embed-text"   # embedding 模型
-#   embedding_url: "http://localhost:11434" # 預設用本地 Ollama
-#
-#   # 向量資料庫設定（支援 chroma / qdrant / milvus / faiss）
-#   vector_store: "chroma"
-#   vector_store_url: "http://localhost:8000"
-#   collection: "hypgo_codebase"           # 集合名稱
-#   top_k: 5                               # 檢索結果數量
-#
-#   # 生成用 LLM
-#   generator_model: "llama3"              # 根據檢索結果生成描述
-#   generator_url: "http://localhost:11434" # 預設用本地 Ollama
 `
 
 // CommentYamlTemplate 是 .hyp/comment.yaml 的預設內容。
@@ -1172,4 +1155,32 @@ ai_comment: false
 
 # @ai:think 函式體內意圖註釋（intent / special / model）。預設 false。
 think_comment: false
+`
+
+// HypConfigYamlTemplate 是 .hyp/config.yaml 的預設內容。
+// 由 hyp new / hyp api 在建立專案時複製為 .hyp/config.yaml。
+// 內容與 pkg/config.DefaultHypConfigYAML 同步。
+const HypConfigYamlTemplate = `# HypGo 設計時通用設定
+# 放置於 .hyp/config.yaml
+#
+# 這份檔案存放「開發時」hyp CLI 與工具會用到的通用設定。
+# 與 config/config.yaml（伺服器/資料庫等 runtime 設定）分離。
+
+# 語言：影響 hyp CLI 訊息、scaffold 模板與 LLM prompt 的語言偏好。
+# 支援 zh-cn（簡中）、zh-tw（繁中）、en（英文）。預設 en。
+language: en
+
+# debug 等級：控制 hyp 工具的輸出量。
+# none    — 完全不輸出（連 error 也不印；CI 用）
+# debug   — 全部都印（預設，開發中用）
+# info    — info 以上
+# warning — warning 以上
+# error   — 只印 error
+debug_level: debug
+
+# 環境：標示此專案目前的執行環境，影響 ai-rules / AutoSync 的口吻與嚴格度。
+# local — 本機開發（預設）
+# dev   — 開發/測試環境
+# prod  — 正式環境
+environment: local
 `

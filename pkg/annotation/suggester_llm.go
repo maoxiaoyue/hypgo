@@ -182,17 +182,15 @@ func (l *LLMSuggester) callOllama(ctx context.Context, prompt string) (string, e
 	return out.Response, nil
 }
 
-// ---------- 雲端 API（OpenAI / Anthropic） ----------
+// ---------- 雲端 API（OpenAI / Anthropic / OpenAI-compatible） ----------
 
 func (l *LLMSuggester) callAPI(ctx context.Context, prompt string) (string, error) {
-	switch strings.ToLower(l.cfg.API.Provider) {
-	case "openai":
-		return l.callOpenAI(ctx, prompt)
-	case "anthropic":
+	// 對齊 pkg/manifest/llm_enricher.go：只把 anthropic 視為特殊形狀，
+	// 其餘（openai / gemini / custom / 自家命名的本地推論伺服器）一律走 OpenAI-compatible 介面
+	if strings.ToLower(l.cfg.API.Provider) == "anthropic" {
 		return l.callAnthropic(ctx, prompt)
-	default:
-		return "", fmt.Errorf("unsupported provider %q", l.cfg.API.Provider)
 	}
+	return l.callOpenAI(ctx, prompt)
 }
 
 type openAIRequest struct {

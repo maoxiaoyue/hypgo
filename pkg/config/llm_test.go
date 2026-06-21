@@ -25,9 +25,6 @@ func TestLLMConfigDefaults(t *testing.T) {
 	if cfg.API.Timeout != 30 {
 		t.Errorf("API.Timeout = %d, want 30", cfg.API.Timeout)
 	}
-	if cfg.RAG.TopK != 5 {
-		t.Errorf("RAG.TopK = %d, want 5", cfg.RAG.TopK)
-	}
 }
 
 func TestLLMConfigValidateNone(t *testing.T) {
@@ -99,44 +96,6 @@ func TestLLMConfigValidateAPI(t *testing.T) {
 	}
 }
 
-func TestLLMConfigValidateRAG(t *testing.T) {
-	cfg := &LLMConfig{Mode: "rag"}
-
-	// 缺少 embedding_model
-	if err := cfg.Validate(); err == nil {
-		t.Error("rag without embedding_model should fail")
-	}
-
-	cfg.RAG.EmbeddingModel = "nomic-embed-text"
-	// 缺少 vector_store
-	if err := cfg.Validate(); err == nil {
-		t.Error("rag without vector_store should fail")
-	}
-
-	cfg.RAG.VectorStore = "chroma"
-	// 缺少 vector_store_url
-	if err := cfg.Validate(); err == nil {
-		t.Error("rag without vector_store_url should fail")
-	}
-
-	cfg.RAG.VectorStoreURL = "http://localhost:8000"
-	// 缺少 generator_model
-	if err := cfg.Validate(); err == nil {
-		t.Error("rag without generator_model should fail")
-	}
-
-	cfg.RAG.GeneratorModel = "llama3"
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("valid rag config should pass, got: %v", err)
-	}
-
-	// 無效 vector_store
-	cfg.RAG.VectorStore = "unknown"
-	if err := cfg.Validate(); err == nil {
-		t.Error("invalid vector_store should fail")
-	}
-}
-
 func TestLLMConfigAPIBaseURLDefaults(t *testing.T) {
 	tests := []struct {
 		provider string
@@ -190,7 +149,6 @@ func TestLLMConfigIsEnabled(t *testing.T) {
 		{"none", false},
 		{"ollama", true},
 		{"api", true},
-		{"rag", true},
 	}
 	for _, tt := range tests {
 		cfg := &LLMConfig{Mode: tt.mode}

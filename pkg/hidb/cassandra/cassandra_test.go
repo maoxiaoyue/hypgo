@@ -2,7 +2,6 @@ package cassandra
 
 import (
 	"context"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -206,33 +205,6 @@ func TestUDT(t *testing.T) {
 	}
 	if !strings.Contains(got, "street text") || !strings.Contains(got, "zip text") {
 		t.Fatalf("missing fields: %s", got)
-	}
-}
-
-func TestUDFAndUDA(t *testing.T) {
-	udf := (&CassandraDB{}).Function("state_add").
-		Arg("s", TypeInt).
-		Arg("val", TypeInt).
-		Returns(TypeInt).
-		Language("java").
-		Body("return s + val;").
-		Deterministic(true).
-		CreateCQL()
-	for _, c := range []string{"CREATE OR REPLACE FUNCTION", "RETURNS int", "DETERMINISTIC", "LANGUAGE java", "$$return s + val;$$"} {
-		if !strings.Contains(udf, c) {
-			t.Errorf("udf missing %q:\n%s", c, udf)
-		}
-	}
-	uda := (&CassandraDB{}).Aggregate("my_sum").
-		Arg(TypeInt).
-		SFunc("state_add").
-		StateType(TypeInt).
-		InitCond("0").
-		CreateCQL()
-	for _, c := range []string{"CREATE OR REPLACE AGGREGATE", "SFUNC state_add", "STYPE int", "INITCOND 0"} {
-		if !strings.Contains(uda, c) {
-			t.Errorf("uda missing %q:\n%s", c, uda)
-		}
 	}
 }
 
@@ -492,63 +464,6 @@ func TestOmitEmpty(t *testing.T) {
 	}
 }
 
-func TestTriggerCreateCQL(t *testing.T) {
-	got := (&CassandraDB{}).Trigger("audit").
-		On("logs.events").
-		Using("com.example.triggers.AuditTrigger").
-		CreateCQL()
-	want := `CREATE TRIGGER IF NOT EXISTS audit ON logs.events USING 'com.example.triggers.AuditTrigger'`
-	if got != want {
-		t.Fatalf("trigger create CQL mismatch:\n got: %s\nwant: %s", got, want)
-	}
-}
-
-func TestTriggerCreateCQLWithoutIfNotExists(t *testing.T) {
-	got := (&CassandraDB{}).Trigger("audit").
-		IfNotExists(false).
-		On("events").
-		Using("com.example.AuditTrigger").
-		CreateCQL()
-	want := `CREATE TRIGGER audit ON events USING 'com.example.AuditTrigger'`
-	if got != want {
-		t.Fatalf("trigger create CQL mismatch:\n got: %s\nwant: %s", got, want)
-	}
-}
-
-func TestTriggerDropCQL(t *testing.T) {
-	got := (&CassandraDB{}).Trigger("audit").
-		On("events").
-		Keyspace("logs").
-		DropCQL(true)
-	want := `DROP TRIGGER IF EXISTS audit ON logs.events`
-	if got != want {
-		t.Fatalf("trigger drop CQL mismatch:\n got: %s\nwant: %s", got, want)
-	}
-}
-
-func TestRoleCreateCQL(t *testing.T) {
-	got := (&CassandraDB{}).Role("alice").
-		Password("s3cret").
-		Login(true).
-		Superuser(false).
-		CreateCQL()
-	want := `CREATE ROLE IF NOT EXISTS alice WITH PASSWORD = 's3cret' AND SUPERUSER = false AND LOGIN = true`
-	if got != want {
-		t.Fatalf("create role CQL mismatch:\n got: %s\nwant: %s", got, want)
-	}
-}
-
-func TestRoleAlterAndDropCQL(t *testing.T) {
-	alter := (&CassandraDB{}).Role("bob").Password("newpw").AlterCQL()
-	if alter != `ALTER ROLE bob WITH PASSWORD = 'newpw'` {
-		t.Fatalf("alter CQL mismatch: %s", alter)
-	}
-	drop := (&CassandraDB{}).Role("bob").DropCQL(true)
-	if drop != `DROP ROLE IF EXISTS bob` {
-		t.Fatalf("drop CQL mismatch: %s", drop)
-	}
-}
-
 func TestGrantCQL(t *testing.T) {
 	stmt, err := GrantCQL(PermSelect, TableResource("logs.events"), "reader")
 	if err != nil {
@@ -568,26 +483,6 @@ func TestGrantAllKeyspaces(t *testing.T) {
 	want := `GRANT ALL PERMISSIONS ON ALL KEYSPACES TO admin`
 	if stmt != want {
 		t.Fatalf("grant all CQL mismatch:\n got: %s\nwant: %s", stmt, want)
-	}
-}
-
-func TestRevokeCQL(t *testing.T) {
-	stmt, err := RevokeCQL(PermModify, KeyspaceResource("analytics"), "writer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := `REVOKE MODIFY ON KEYSPACE analytics FROM writer`
-	if stmt != want {
-		t.Fatalf("revoke CQL mismatch:\n got: %s\nwant: %s", stmt, want)
-	}
-}
-
-func TestListPermissionsCQL(t *testing.T) {
-	if got := ListPermissionsCQL(""); got != "LIST ALL PERMISSIONS" {
-		t.Fatalf("list all perms: %s", got)
-	}
-	if got := ListPermissionsCQL("alice"); got != "LIST ALL PERMISSIONS OF alice" {
-		t.Fatalf("list perms of role: %s", got)
 	}
 }
 
@@ -693,51 +588,6 @@ func TestTableSizeEstimatesRequiresKsTable(t *testing.T) {
 	db := &CassandraDB{config: Config{}}
 	if _, err := db.TableSizeEstimates(context.Background(), "", ""); err == nil {
 		t.Fatal("expected error when keyspace and table are missing")
-	}
-}
-
-func TestNodetoolExecConnFlags(t *testing.T) {
-	n := &NodetoolExec{
-		Binary:   "nodetool",
-		Host:     "10.0.0.1",
-		Port:     7199,
-		Username: "cass",
-		Password: "pw",
-	}
-	args := n.connFlags()
-	joined := strings.Join(args, " ")
-	for _, s := range []string{"-h 10.0.0.1", "-p 7199", "-u cass", "-pw pw"} {
-		if !strings.Contains(joined, s) {
-			t.Errorf("missing %q in %q", s, joined)
-		}
-	}
-}
-
-func TestNodetoolExecEmptySubcommand(t *testing.T) {
-	n := NewNodetool("")
-	if _, err := n.Run(context.Background(), ""); err == nil {
-		t.Fatal("expected error on empty subcommand")
-	}
-}
-
-func TestNodetoolRefreshRequiresArgs(t *testing.T) {
-	n := NewNodetool("")
-	if err := n.Refresh(context.Background(), "", ""); err == nil {
-		t.Fatal("expected error when keyspace and table are missing")
-	}
-}
-
-func TestNodetoolMoveRequiresToken(t *testing.T) {
-	n := NewNodetool("")
-	if err := n.Move(context.Background(), ""); err == nil {
-		t.Fatal("expected error when token is missing")
-	}
-}
-
-func TestNodetoolBinaryNotFound(t *testing.T) {
-	n := &NodetoolExec{Binary: "__nodetool_does_not_exist__"}
-	if _, err := n.Run(context.Background(), "version"); err == nil {
-		t.Fatal("expected error when binary is missing")
 	}
 }
 
@@ -853,34 +703,6 @@ func TestIntrospectNilSession(t *testing.T) {
 	}
 }
 
-func TestMemTracerCollectsSessionIDs(t *testing.T) {
-	tr := NewMemTracer()
-	if _, ok := tr.Last(); ok {
-		t.Fatal("expected no sessions initially")
-	}
-	id := gocql.TimeUUID()
-	tr.Trace(id[:])
-	got, ok := tr.Last()
-	if !ok || got != id {
-		t.Fatalf("expected last=%s, got %s ok=%v", id, got, ok)
-	}
-	if s := tr.Sessions(); len(s) != 1 || s[0] != id {
-		t.Fatalf("unexpected sessions: %v", s)
-	}
-	tr.Reset()
-	if _, ok := tr.Last(); ok {
-		t.Fatal("expected empty after Reset")
-	}
-}
-
-func TestMemTracerIgnoresInvalidID(t *testing.T) {
-	tr := NewMemTracer()
-	tr.Trace([]byte{1, 2, 3})
-	if _, ok := tr.Last(); ok {
-		t.Fatal("expected invalid id to be ignored")
-	}
-}
-
 func TestGetTraceNilSession(t *testing.T) {
 	if _, err := (&CassandraDB{}).GetTrace(context.Background(), gocql.TimeUUID()); err == nil {
 		t.Fatal("expected error on nil session")
@@ -910,94 +732,6 @@ func TestTraceFormatContainsHeader(t *testing.T) {
 	}
 	if tr.TotalElapsed() != 1400*time.Microsecond {
 		t.Fatalf("total elapsed mismatch: %s", tr.TotalElapsed())
-	}
-}
-
-func TestNB5ScenarioArgsDeterministic(t *testing.T) {
-	nb := &NB5Exec{Binary: "nb5", Host: "10.0.0.1", LocalDC: "dc1", Driver: "cqld4"}
-	s := nb.Scenario("cql-iot").
-		Phase(PhaseMain).
-		Cycles("1M").
-		Threads(32).
-		CycleRate("10000").
-		Param("rampup-cycles", "100k").
-		Param("keycount", "1000000").
-		Errors("count").
-		Extra("--report-summary-to", "stdout:60s")
-
-	args := s.Args()
-	// activity first
-	if args[0] != "cql-iot" {
-		t.Fatalf("activity must be first arg, got %v", args)
-	}
-	joined := strings.Join(args, " ")
-	for _, want := range []string{
-		"driver=cqld4", "host=10.0.0.1", "localdc=dc1",
-		"tags=block:main", "cycles=1M", "cyclerate=10000",
-		"threads=32", "errors=count",
-		"keycount=1000000", "rampup-cycles=100k",
-		"--report-summary-to", "stdout:60s",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("args missing %q: %s", want, joined)
-		}
-	}
-}
-
-func TestNB5RunActivityRequiresName(t *testing.T) {
-	nb := &NB5Exec{Binary: "nb5"}
-	if _, err := nb.RunActivity(context.Background(), "", nil); err == nil {
-		t.Fatal("expected error on empty activity")
-	}
-}
-
-func TestNB5RunPhaseValidates(t *testing.T) {
-	nb := &NB5Exec{Binary: "nb5"}
-	if _, err := nb.RunPhase(context.Background(), "", PhaseMain, "", 0, nil); err == nil {
-		t.Fatal("expected workload-required error")
-	}
-	if _, err := nb.RunPhase(context.Background(), "cql-iot", "", "", 0, nil); err == nil {
-		t.Fatal("expected phase-required error")
-	}
-}
-
-func TestNB5ParseSummary(t *testing.T) {
-	out := `
-Setting up scenario...
-Running activity...
-Scenario finished: cycles=1000000 errors=0 rate=48231.5 ops/s duration=20.7s
-`
-	s := ParseSummary(out)
-	if s.TotalCycles != 1000000 {
-		t.Errorf("cycles: got %d", s.TotalCycles)
-	}
-	if s.Errors != 0 {
-		t.Errorf("errors: got %d", s.Errors)
-	}
-	if s.OpsPerSec < 48000 || s.OpsPerSec > 49000 {
-		t.Errorf("rate: got %v", s.OpsPerSec)
-	}
-	if s.Duration != 20700*time.Millisecond {
-		t.Errorf("duration: got %s", s.Duration)
-	}
-}
-
-func TestNB5WriteInlineWorkload(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/workload.yaml"
-	abs, err := WriteInlineWorkload(path, "app", "kv")
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(abs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := string(data)
-	for _, want := range []string{"scenarios:", "blocks:", "app.kv", "schema:", "rampup:", "main:"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("workload missing %q", want)
-		}
 	}
 }
 

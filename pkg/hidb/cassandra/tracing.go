@@ -4,9 +4,7 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"io"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -54,72 +52,6 @@ func (t Trace) TotalElapsed() time.Duration {
 		}
 	}
 	return time.Duration(max) * time.Microsecond
-}
-
-// ===== In-memory tracer (captures session IDs per query) =====
-
-// MemTracer implements gocql.Tracer and records the session IDs assigned to
-// each traced query. Safe for concurrent use.
-type MemTracer struct {
-	mu  sync.Mutex
-	ids []gocql.UUID
-}
-
-// NewMemTracer creates a new in-memory tracer.
-func NewMemTracer() *MemTracer { return &MemTracer{} }
-
-// Trace implements gocql.Tracer.
-func (m *MemTracer) Trace(traceId []byte) {
-	if len(traceId) != 16 {
-		return
-	}
-	var u gocql.UUID
-	copy(u[:], traceId)
-	m.mu.Lock()
-	m.ids = append(m.ids, u)
-	m.mu.Unlock()
-}
-
-// Sessions returns a snapshot of collected session IDs.
-func (m *MemTracer) Sessions() []gocql.UUID {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]gocql.UUID, len(m.ids))
-	copy(out, m.ids)
-	return out
-}
-
-// Last returns the most recent session ID (zero value if none).
-func (m *MemTracer) Last() (gocql.UUID, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.ids) == 0 {
-		return gocql.UUID{}, false
-	}
-	return m.ids[len(m.ids)-1], true
-}
-
-// Reset clears all collected session IDs.
-func (m *MemTracer) Reset() {
-	m.mu.Lock()
-	m.ids = m.ids[:0]
-	m.mu.Unlock()
-}
-
-// ===== Convenience wrappers =====
-
-// NewTraceWriter returns gocql's writer-based tracer which prints events to w.
-func NewTraceWriter(session *gocql.Session, w io.Writer) gocql.Tracer {
-	return gocql.NewTraceWriter(session, w)
-}
-
-// TraceQuery enables tracing on the provided query and returns a MemTracer
-// that captures its session ID. Use GetTrace(ctx, id) afterwards to fetch
-// the server-side trace.
-func TraceQuery(q *gocql.Query) *MemTracer {
-	t := NewMemTracer()
-	q.Trace(t)
-	return t
 }
 
 // ===== Server-side trace fetching =====
@@ -177,63 +109,6 @@ func (c *CassandraDB) GetTrace(ctx context.Context, sessionID gocql.UUID) (*Trac
 	})
 
 	return t, nil
-}
-
-// WaitForTrace polls GetTrace until the trace is visible or ctx/timeout expires.
-// Cassandra flushes traces asynchronously, so a small delay is normal.
-func (c *CassandraDB) WaitForTrace(ctx context.Context, sessionID gocql.UUID, timeout, interval time.Duration) (*Trace, error) {
-	if interval <= 0 {
-		interval = 50 * time.Millisecond
-	}
-	deadline := time.Now().Add(timeout)
-	for {
-		tr, err := c.GetTrace(ctx, sessionID)
-		if err == nil {
-			return tr, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("cassandra: trace %s not visible within %s: %w", sessionID, timeout, err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(interval):
-		}
-	}
-}
-
-// ===== Probe API: trace a one-shot query =====
-
-// TraceProbe runs a query with tracing enabled and returns the assembled
-// Trace. The query itself is executed (and its rows discarded) — use this as
-// a diagnostic / benchmark helper, not for production reads.
-//
-// wait controls how long to poll for the trace to become visible after the
-// query returns (Cassandra writes system_traces.* asynchronously).
-func (c *CassandraDB) TraceProbe(ctx context.Context, wait time.Duration, stmt string, args ...interface{}) (*Trace, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
-	}
-	q := c.session.Query(stmt, args...).WithContext(ctx)
-	tracer := TraceQuery(q)
-
-	iter := q.Iter()
-	// drain rows — we only care about trace side-effect
-	for iter.Scan() { /* no binding; Scan returns false immediately for empty bind */
-		break
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("cassandra: trace probe exec: %w", err)
-	}
-
-	id, ok := tracer.Last()
-	if !ok {
-		return nil, fmt.Errorf("cassandra: no trace id recorded (server may have tracing disabled)")
-	}
-	if wait <= 0 {
-		wait = 2 * time.Second
-	}
-	return c.WaitForTrace(ctx, id, wait, 50*time.Millisecond)
 }
 
 // ===== Formatting =====
