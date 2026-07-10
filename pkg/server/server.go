@@ -467,6 +467,14 @@ func (s *Server) getListener() (net.Listener, error) {
 
 // getInheritedListener 獲取繼承的監聽器（帶驗證）
 func (s *Server) getInheritedListener() net.Listener {
+	// FD 3 必須是「正在 listening」的 socket 才視為 parent 傳入的 listener。
+	// net.FileListener 對已連線的 TCP socket 也會成功回傳 *net.TCPListener，
+	// 少了這層 kernel 檢查，shell 湊巧留在 FD 3 的 stray socket 會被誤繼承，
+	// Accept 時以 accept4: invalid argument 讓 server 直接收攤（bugs.md #1）。
+	if !fdIsListeningSocket(3) {
+		return nil
+	}
+
 	file := os.NewFile(3, "listener")
 	if file == nil {
 		return nil
