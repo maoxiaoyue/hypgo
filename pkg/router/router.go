@@ -160,6 +160,12 @@ func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.Han
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := hypcontext.New(w, req)
 	defer c.Release()
+	// 請求結束前強制 flush 已記錄的狀態碼（冪等；hijack 後為 no-op）。
+	// responseWriter.WriteHeader 是惰性的，只有寫 body 才會真正送出；
+	// c.Redirect 在非 GET（http.Redirect 不寫 body）時若無此行，
+	// 底層從未收到 WriteHeader，Go 會自動補 200 → 瀏覽器拿到 200 + Location 不跳轉。
+	// （defer LIFO：此行先於 c.Release() 執行，writer 尚未歸還池）
+	defer c.Response.WriteHeaderNow()
 
 	urlPath := req.URL.Path
 	method := req.Method
