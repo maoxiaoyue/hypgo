@@ -122,17 +122,6 @@ type RouterGroup struct {
 	Handlers HandlersChain
 	basePath string
 	root     bool
-	engine   *Engine
-}
-
-// Engine 引擎（簡化版）
-type Engine struct {
-	HTMLRender HTMLRender
-}
-
-// HTMLRender HTML 渲染器介面
-type HTMLRender interface {
-	Instance(string, interface{}) Render
 }
 
 // RequestMetrics 請求指標

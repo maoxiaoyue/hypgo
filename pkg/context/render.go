@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 
 	"gopkg.in/yaml.v3"
 )
@@ -256,6 +257,14 @@ func (r dataRender) WriteContentType(w http.ResponseWriter) {
 var Data = dataRender{}
 
 // ===== HTML 渲染器 =====
+
+// htmlTemplates 全域 HTML 樣板集（由 router.LoadHTMLGlob / SetHTMLTemplate 設定）
+var htmlTemplates atomic.Pointer[template.Template]
+
+// SetHTMLTemplate 設定 c.HTML 使用的全域樣板集（啟動時呼叫一次；線程安全）
+func SetHTMLTemplate(t *template.Template) {
+	htmlTemplates.Store(t)
+}
 
 type htmlRender struct {
 	Template *template.Template

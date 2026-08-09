@@ -2,6 +2,7 @@
 package router
 
 import (
+	"html/template"
 	"net/http"
 	"reflect"
 	"runtime"
@@ -411,6 +412,22 @@ func collectRoutes(prefix, method string, routes []RouteInfo, n *radixNode) []Ro
 //	}).Handle(createUserHandler)
 func (r *Router) Schema(route schema.Route) *schema.SchemaRoute {
 	return schema.NewSchemaRoute(route, r)
+}
+
+// LoadHTMLGlob 以 glob 模式載入 HTML 樣板集，供 c.HTML 以樣板名渲染
+// 範例：r.LoadHTMLGlob("app/views/*.html")
+func (r *Router) LoadHTMLGlob(pattern string) error {
+	t, err := template.ParseGlob(pattern)
+	if err != nil {
+		return err
+	}
+	hypcontext.SetHTMLTemplate(t)
+	return nil
+}
+
+// SetHTMLTemplate 直接設定 c.HTML 使用的已解析樣板集
+func (r *Router) SetHTMLTemplate(t *template.Template) {
+	hypcontext.SetHTMLTemplate(t)
 }
 
 // RegisterSchema 實作 schema.SchemaRegistrar 介面
