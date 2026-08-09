@@ -103,6 +103,36 @@ func TestServerGracefulShutdown(t *testing.T) {
 	}
 }
 
+// TestStartReturnsNilOnGracefulShutdown 回歸測試：優雅關閉時 Start() 應回傳 nil。
+// 歷史 bug：Serve/ListenAndServe 回傳的 http.ErrServerClosed（預期流程）
+// 未被過濾、原樣傳給呼叫端，導致 main.go 在每次正常關閉時誤報 Server error。
+func TestStartReturnsNilOnGracefulShutdown(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.Addr = "127.0.0.1:0"
+	s := New(&cfg, logger.NewLogger())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() after graceful shutdown = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start() did not return after Shutdown")
+	}
+}
+
 func TestProtocolGetter(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
