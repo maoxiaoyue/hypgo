@@ -58,6 +58,13 @@ func NewRotation(filename string, config *RotationConfig) (*Rotation, error) {
 		r.maxAge = age
 	}
 
+	// 確保日誌目錄存在
+	if dir := filepath.Dir(filename); dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create log directory: %w", err)
+		}
+	}
+
 	if err := r.openFile(); err != nil {
 		return nil, err
 	}
@@ -114,9 +121,24 @@ func parseAge(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
+// Write 寫入日誌並在達到門檻時自動輪轉（lumberjack 同款行為：
+// 輪轉在寫入路徑內觸發，無需外部呼叫 Rotate）
 func (r *Rotation) Write(p []byte) (n int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.file == nil {
+		if err := r.openFile(); err != nil {
+			return 0, err
+		}
+	}
+
+	// 寫入前檢查門檻；達標先輪轉再寫
+	if r.shouldRotate(int64(len(p))) {
+		if err := r.rotateLocked(); err != nil {
+			return 0, err
+		}
+	}
 
 	n, err = r.file.Write(p)
 	r.size += int64(n)
@@ -124,26 +146,29 @@ func (r *Rotation) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
+// shouldRotate 判斷是否達到輪轉門檻（呼叫方須持有鎖）。
+// 年齡以「本行程開啟此檔的時間」起算（startTime），不用 ModTime——
+// ModTime 每次寫入都會刷新，持續寫入的檔案會永不過期
+func (r *Rotation) shouldRotate(incoming int64) bool {
+	if r.maxSize > 0 && r.size+incoming > r.maxSize {
+		return true
+	}
+	if r.maxAge > 0 && time.Since(r.startTime) >= r.maxAge {
+		return true
+	}
+	return false
+}
+
+// Rotate 立即強制輪轉（無視門檻）。
+// Write 已依 max_size / max_age 自動輪轉；此方法供外部（如訊號 handler）強制切檔
 func (r *Rotation) Rotate() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.rotateLocked()
+}
 
-	shouldRotate := false
-
-	// 檢查檔案大小
-	if r.maxSize > 0 && r.size >= r.maxSize {
-		shouldRotate = true
-	}
-
-	// 檢查時間
-	if r.maxAge > 0 && time.Since(r.startTime) >= r.maxAge {
-		shouldRotate = true
-	}
-
-	if !shouldRotate {
-		return nil
-	}
-
+// rotateLocked 執行輪轉（呼叫方須持有鎖）
+func (r *Rotation) rotateLocked() error {
 	// 關閉當前檔案
 	if err := r.file.Close(); err != nil {
 		return err
@@ -194,7 +219,8 @@ func (r *Rotation) backupName() string {
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
 
-	timestamp := time.Now().Format("20060102-150405")
+	// 毫秒精度：避免同一秒內連續輪轉時備份檔名衝突（rename 失敗）
+	timestamp := time.Now().Format("20060102-150405.000")
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
 }
 
@@ -248,7 +274,9 @@ func (r *Rotation) Close() error {
 	defer r.mu.Unlock()
 
 	if r.file != nil {
-		return r.file.Close()
+		err := r.file.Close()
+		r.file = nil
+		return err
 	}
 	return nil
 }

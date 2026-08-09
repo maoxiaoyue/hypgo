@@ -113,11 +113,14 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 	if c.Logger.Output != "stdout" {
 		t.Errorf("Expected Logger.Output = stdout, got %q", c.Logger.Output)
 	}
-	if c.Logger.MaxSize != 100 {
-		t.Errorf("Expected Logger.MaxSize = 100, got %d", c.Logger.MaxSize)
+	if c.Logger.Rotation.MaxSize != "100MB" {
+		t.Errorf("Expected Logger.Rotation.MaxSize = 100MB, got %q", c.Logger.Rotation.MaxSize)
 	}
-	if c.Logger.MaxAge != 7 {
-		t.Errorf("Expected Logger.MaxAge = 7, got %d", c.Logger.MaxAge)
+	if c.Logger.Rotation.MaxAge != "7d" {
+		t.Errorf("Expected Logger.Rotation.MaxAge = 7d, got %q", c.Logger.Rotation.MaxAge)
+	}
+	if c.Logger.Rotation.MaxBackups != 10 {
+		t.Errorf("Expected Logger.Rotation.MaxBackups = 10, got %d", c.Logger.Rotation.MaxBackups)
 	}
 }
 

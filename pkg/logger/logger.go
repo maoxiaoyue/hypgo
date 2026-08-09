@@ -9,10 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
-	"time"
 )
 
 // Level 日誌級別
@@ -43,7 +41,7 @@ type Logger struct {
 	json     bool         // true 時改用 slog JSON handler 輸出
 	file     *os.File
 	mu       sync.Mutex
-	rotator  *LogRotator
+	rotation *Rotation // 檔案輸出時的輪轉 writer（NewWithRotation 設定；Close 時一併關閉）
 	colorize bool
 }
 
@@ -67,6 +65,19 @@ func New(level string, output string, writer io.Writer, colorEnabled bool) (*Log
 	}, nil
 }
 
+// NewWithRotation 建立寫入 filename 且自動輪轉的 Logger。
+// 輪轉由 Rotation.Write 依 config（max_size / max_age / max_backups / compress）
+// 在寫入路徑內自動觸發；Logger.Close 會一併關閉輪轉檔案。
+func NewWithRotation(level, filename string, rc *RotationConfig, colorEnabled bool) (*Logger, error) {
+	rot, err := NewRotation(filename, rc)
+	if err != nil {
+		return nil, err
+	}
+	l, _ := New(level, "", rot, colorEnabled)
+	l.rotation = rot
+	return l, nil
+}
+
 // parseLevel 將字串轉換為 Level
 func parseLevel(level string) Level {
 	switch level {
@@ -85,15 +96,6 @@ func parseLevel(level string) Level {
 	default:
 		return INFO
 	}
-}
-
-// LogRotator 日誌輪轉器
-type LogRotator struct {
-	filename   string
-	maxSize    int64         // 最大文件大小（bytes）
-	maxAge     int           // 最大保存天數
-	maxBackups int           // 最大備份數量
-	interval   time.Duration // 輪轉間隔
 }
 
 var (
@@ -349,11 +351,6 @@ func (l *Logger) log(level Level, msg string, keysAndValues ...interface{}) {
 	} else {
 		l.logger.Println(l.formatMessage(level, msg, keysAndValues...))
 	}
-
-	// 檢查是否需要輪轉
-	if l.rotator != nil {
-		l.checkRotation()
-	}
 }
 
 // logf printf-style 日誌的共用實作（msg 含格式動詞，args 為對應參數）
@@ -377,10 +374,6 @@ func (l *Logger) logf(level Level, format string, args ...interface{}) {
 		l.slog.LogAttrs(stdcontext.Background(), level.toSlog(), msg)
 	} else {
 		l.logger.Println(l.formatMessage(level, msg))
-	}
-
-	if l.rotator != nil {
-		l.checkRotation()
 	}
 }
 
@@ -470,90 +463,6 @@ func (l *Logger) Fatalf(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-// checkRotation 檢查是否需要輪轉
-func (l *Logger) checkRotation() {
-	if l.file == nil || l.rotator == nil {
-		return
-	}
-
-	info, err := l.file.Stat()
-	if err != nil {
-		return
-	}
-
-	// 檢查文件大小
-	if l.rotator.maxSize > 0 && info.Size() >= l.rotator.maxSize {
-		l.rotate()
-	}
-
-	// 檢查文件年齡
-	if l.rotator.maxAge > 0 {
-		age := time.Since(info.ModTime()).Hours() / 24
-		if int(age) >= l.rotator.maxAge {
-			l.rotate()
-		}
-	}
-}
-
-// rotate 執行日誌輪轉
-func (l *Logger) rotate() {
-	if l.file == nil {
-		return
-	}
-
-	// 關閉當前文件
-	l.file.Close()
-
-	// 重命名文件
-	timestamp := time.Now().Format("20060102-150405")
-	newName := fmt.Sprintf("%s.%s", l.rotator.filename, timestamp)
-	os.Rename(l.rotator.filename, newName)
-
-	// 打開新文件
-	file, err := os.OpenFile(l.rotator.filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		return
-	}
-
-	l.file = file
-	l.out = file
-	l.logger.SetOutput(file)
-
-	// 清理舊備份
-	l.cleanOldBackups()
-}
-
-// cleanOldBackups 清理舊備份
-func (l *Logger) cleanOldBackups() {
-	if l.rotator.maxBackups <= 0 {
-		return
-	}
-
-	dir := filepath.Dir(l.rotator.filename)
-	base := filepath.Base(l.rotator.filename)
-
-	files, err := filepath.Glob(filepath.Join(dir, base+".*"))
-	if err != nil {
-		return
-	}
-
-	// 如果備份數量超過限制，刪除最舊的
-	if len(files) > l.rotator.maxBackups {
-		// 按檔名排序（時間戳格式 20060102-150405 保證字典序 = 時間序）
-		sort.Strings(files)
-		for i := 0; i < len(files)-l.rotator.maxBackups; i++ {
-			os.Remove(files[i])
-		}
-	}
-}
-
-// SetRotator 設定日誌輪轉器
-func (l *Logger) SetRotator(rotator *LogRotator) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.rotator = rotator
-}
-
 // Close 關閉Logger
 func (l *Logger) Close() {
 	if l == nil {
@@ -565,5 +474,9 @@ func (l *Logger) Close() {
 	if l.file != nil {
 		l.file.Close()
 		l.file = nil
+	}
+	if l.rotation != nil {
+		l.rotation.Close()
+		l.rotation = nil
 	}
 }
