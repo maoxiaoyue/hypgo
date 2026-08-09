@@ -43,5 +43,3 @@ Dockerfile.tmp.*
 /.claude/
 /md
 *.html
-hypgo.go
-hypgo_test.go

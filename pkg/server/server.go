@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -218,18 +219,28 @@ func (s *Server) Start() error {
 	}
 
 	// 自動檢測協議或使用指定協議
+	var err error
 	if s.config.Server.Protocol == "auto" {
-		return s.startAutoProtocol()
+		err = s.startAutoProtocol()
+	} else {
+		switch s.config.Server.Protocol {
+		case "http3", "h3":
+			err = s.startHTTP3()
+		case "http2", "h2":
+			err = s.startHTTP2()
+		default:
+			err = s.startHTTP1()
+		}
 	}
 
-	switch s.config.Server.Protocol {
-	case "http3", "h3":
-		return s.startHTTP3()
-	case "http2", "h2":
-		return s.startHTTP2()
-	default:
-		return s.startHTTP1()
+	// 優雅關閉時 Serve/ListenAndServe 依 stdlib 慣例回傳 http.ErrServerClosed
+	// （quic-go http3 v0.59+ 亦同）——屬預期流程而非錯誤，過濾掉，
+	// 避免呼叫端（main.go / App.Run）在正常關閉時誤報 Server error。
+	// net.ErrClosed 同理：關閉流程中 listener 先一步關掉時 Accept 的收場錯誤
+	if errors.Is(err, http.ErrServerClosed) || (errors.Is(err, net.ErrClosed) && s.shuttingDown.Load()) {
+		return nil
 	}
+	return err
 }
 
 // startAutoProtocol 自動協議選擇（同時支援 HTTP/1.1/2/3）
@@ -239,7 +250,7 @@ func (s *Server) startAutoProtocol() error {
 	// 啟動 HTTP/3 伺服器（UDP）
 	if s.config.Server.TLS.Enabled {
 		go func() {
-			if err := s.startHTTP3(); err != nil {
+			if err := s.startHTTP3(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Warningf("HTTP/3 server failed: %v", err)
 			}
 		}()
@@ -503,10 +514,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down server...")
 	s.shuttingDown.Store(true)
 
-	// 關閉監聽器（停止接受新連線）
-	if s.listener != nil {
-		s.listener.Close()
-	}
+	// 注意：不手動 Close listener——http.Server.Shutdown 的第一步就是關閉
+	// 所有 listener；搶先手動關會讓 Serve 的 Accept 以 net.ErrClosed 收場
+	// （"use of closed network connection"），而非預期的 http.ErrServerClosed
 
 	// 並行關閉 HTTP/1+2 和 HTTP/3 伺服器
 	var httpErr, h3Err error

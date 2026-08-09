@@ -92,18 +92,24 @@ func (c *Context) String(code int, format string, values ...interface{}) {
 }
 
 // HTML 回應 HTML
+// HTML 以樣板名渲染（需先以 router.LoadHTMLGlob / SetHTMLTemplate 載入樣板集）。
+// 未載入樣板時：obj 為字串則直接輸出原始 HTML；否則 panic（由 Recovery 轉 500），
+// 不再靜默輸出空白頁。
 func (c *Context) HTML(code int, name string, obj interface{}) {
-	if c.routerGroup != nil && c.routerGroup.engine != nil {
-		instance := c.routerGroup.engine.HTMLRender.Instance(name, obj)
-		c.Render(code, instance)
-	} else {
-		// 備用：直接渲染 HTML 字串
+	if t := htmlTemplates.Load(); t != nil {
+		c.Render(code, htmlRender{Template: t, Name: name, Data: obj})
+		return
+	}
+
+	// 備用：無樣板集時直接輸出 HTML 字串
+	if htmlStr, ok := obj.(string); ok {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Status(code)
-		if htmlStr, ok := obj.(string); ok {
-			io.WriteString(c.Writer, htmlStr)
-		}
+		io.WriteString(c.Writer, htmlStr)
+		return
 	}
+
+	panic(fmt.Sprintf("hypcontext: HTML 樣板 %q 未載入——請先呼叫 router.LoadHTMLGlob 或 SetHTMLTemplate", name))
 }
 
 // ===== 文件響應 =====

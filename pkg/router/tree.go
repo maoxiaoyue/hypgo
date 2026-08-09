@@ -38,22 +38,31 @@ walk:
 		if len(path) > len(n.path) {
 			if path[:len(n.path)] == n.path {
 				path = path[len(n.path):]
+				c := path[0]
 
-				// 非通配符子節點 → 用 indices 快速查找
-				if !n.wildChild {
-					c := path[0]
-					for i, index := range []byte(n.indices) {
-						if c == index {
-							n = n.children[i]
-							continue walk
+				// 1) 靜態子節點優先（用 indices 快速查找）
+				for i, index := range []byte(n.indices) {
+					if c == index {
+						if n.wildChild {
+							// 靜態與通配符並存：先走靜態子樹，
+							// 無結果時回退（backtrack）到通配符
+							if h, bp := n.children[i].search(path, p); h != nil {
+								return h, bp
+							}
+							break
 						}
+						n = n.children[i]
+						continue walk
 					}
-					// 沒找到匹配的子節點
+				}
+
+				// 2) 靜態沒中 → 通配符 fallback
+				if !n.wildChild {
 					return nil, p
 				}
 
-				// 處理通配符子節點
-				n = n.children[0]
+				// 處理通配符子節點（addChild 保證通配符恆在最後）
+				n = n.children[len(n.children)-1]
 				switch n.nType {
 				case param:
 					// 提取 :param 值（到下一個 / 為止）
@@ -142,12 +151,15 @@ func (n *radixNode) addRoute(path string, handlers []hypcontext.HandlerFunc) {
 	if i < len(path) {
 		path = path[i:]
 
-		// 當前節點有通配符子節點
-		if n.wildChild {
-			n = n.children[0]
+		c := path[0]
+
+		// 通配符註冊、且當前節點已有通配符子節點 → 相容性檢查
+		// （靜態路徑不進此分支：靜態與通配符允許並存，search 靜態優先）
+		if n.wildChild && (c == ':' || c == '*') {
+			n = n.children[len(n.children)-1] // 通配符子節點恆在最後
 			n.priority++
 
-			// 檢查通配符相容性
+			// 檢查通配符相容性（同名同型才能共用）
 			if len(path) >= len(n.path) && n.path == path[:len(n.path)] &&
 				n.nType != catchAll &&
 				(len(n.path) >= len(path) || path[len(n.path)] == '/') {
@@ -159,8 +171,6 @@ func (n *radixNode) addRoute(path string, handlers []hypcontext.HandlerFunc) {
 			}
 			return
 		}
-
-		c := path[0]
 
 		// 參數節點後接 '/' → 進入子節點繼續
 		if n.nType == param && c == '/' && len(n.children) == 1 {
@@ -232,7 +242,9 @@ func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.Han
 				path:     wildcard,
 				fullPath: fullPath,
 			}
-			n.children = []*radixNode{child}
+			// addChild 保留既有靜態子節點（通配符恆插在最後），
+			// 修正舊版直接覆寫 children 導致先註冊的靜態路由被靜默丟棄
+			n.addChild(child)
 			n.wildChild = true
 			n = child
 			n.priority++
@@ -264,11 +276,8 @@ func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.Han
 				n.path = path[:i]
 			}
 
-			// 標記父節點擁有通配符子節點（與 :param 路徑一致）
-			n.wildChild = true
-
 			// 直接創建 catchAll 節點作為子節點
-			// 無需中間節點，search 透過 wildChild 直接跳到 children[0]
+			// search 透過 wildChild 取最後一個 child（通配符恆在最後）
 			child := &radixNode{
 				path:     path[i:],
 				nType:    catchAll,
@@ -276,8 +285,10 @@ func (n *radixNode) insertChild(path, fullPath string, handlers []hypcontext.Han
 				priority: 1,
 				fullPath: fullPath,
 			}
-			n.children = []*radixNode{child}
-			n.indices = string('/')
+			// addChild 保留既有靜態子節點；不再把 '/' 塞進 indices
+			//（indices 僅供靜態子節點查找，通配符走 wildChild fallback）
+			n.addChild(child)
+			n.wildChild = true
 			return
 		}
 	}

@@ -98,12 +98,19 @@ type DatabaseConfigInterface interface {
 }
 
 type LoggerConfig struct {
-	Level        string `mapstructure:"level" yaml:"level"` // debug, info, notice, warning, emergency
-	Output       string `mapstructure:"output" yaml:"output"`
-	MaxSize      int    `mapstructure:"max_size" yaml:"max_size"`
-	MaxAge       int    `mapstructure:"max_age" yaml:"max_age"`
-	Compress     bool   `mapstructure:"compress" yaml:"compress"`
-	ColorEnabled bool   `mapstructure:"color_enabled" yaml:"color_enabled"`
+	Level    string               `mapstructure:"level" yaml:"level"` // debug, info, notice, warning, emergency
+	Output   string               `mapstructure:"output" yaml:"output"`
+	Colors   bool                 `mapstructure:"colors" yaml:"colors"`
+	Rotation LoggerRotationConfig `mapstructure:"rotation" yaml:"rotation"`
+}
+
+// LoggerRotationConfig 日誌輪轉設定（對應 config.yaml 的 logger.rotation 區段；
+// Output 為檔案路徑時生效，由 pkg/logger 的 Rotation writer 在寫入路徑自動輪轉）
+type LoggerRotationConfig struct {
+	MaxSize    string `mapstructure:"max_size" yaml:"max_size"`       // 如 "100MB"、"1GB"
+	MaxAge     string `mapstructure:"max_age" yaml:"max_age"`         // 如 "12h"、"7d"、"1w"
+	MaxBackups int    `mapstructure:"max_backups" yaml:"max_backups"` // 保留備份數
+	Compress   bool   `mapstructure:"compress" yaml:"compress"`       // 備份是否 gzip
 }
 
 // RedisConfigInterface Redis配置接口
@@ -117,11 +124,6 @@ type RedisConfigInterface interface {
 type LoggerConfigInterface interface {
 	GetLevel() string
 	GetOutput() string
-	GetFormat() string
-	GetFilename() string
-	GetMaxSize() int
-	GetMaxAge() int
-	GetMaxBackups() int
 	IsColorized() bool
 }
 
@@ -249,11 +251,14 @@ func (c *Config) ApplyDefaults() {
 	if c.Logger.Output == "" {
 		c.Logger.Output = "stdout"
 	}
-	if c.Logger.MaxSize == 0 {
-		c.Logger.MaxSize = 100 // 100MB
+	if c.Logger.Rotation.MaxSize == "" {
+		c.Logger.Rotation.MaxSize = "100MB"
 	}
-	if c.Logger.MaxAge == 0 {
-		c.Logger.MaxAge = 7 // 7天
+	if c.Logger.Rotation.MaxAge == "" {
+		c.Logger.Rotation.MaxAge = "7d"
+	}
+	if c.Logger.Rotation.MaxBackups == 0 {
+		c.Logger.Rotation.MaxBackups = 10
 	}
 }
 
@@ -470,37 +475,9 @@ func (l *LoggerConfig) GetOutput() string {
 	return l.Output
 }
 
-// GetFormat 獲取日誌格式
-func (l *LoggerConfig) GetFormat() string {
-	return "json" // 預設使用 JSON 格式
-}
-
-// GetFilename 獲取日誌文件名
-func (l *LoggerConfig) GetFilename() string {
-	if l.Output == "file" {
-		return "logs/app.log"
-	}
-	return ""
-}
-
-// GetMaxSize 獲取最大文件大小（MB）
-func (l *LoggerConfig) GetMaxSize() int {
-	return l.MaxSize
-}
-
-// GetMaxAge 獲取最大保存天數
-func (l *LoggerConfig) GetMaxAge() int {
-	return l.MaxAge
-}
-
-// GetMaxBackups 獲取最大備份數量
-func (l *LoggerConfig) GetMaxBackups() int {
-	return 10 // 預設保留 10 個備份
-}
-
 // IsColorized 是否啟用彩色輸出
 func (l *LoggerConfig) IsColorized() bool {
-	return l.ColorEnabled
+	return l.Colors
 }
 
 // ===== RedisConfig 接口實現 =====

@@ -139,7 +139,13 @@ func (w *responseWriter) Written() bool {
 // Hijack 實現 http.Hijacker 介面
 func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return hijacker.Hijack()
+		conn, rw, err := hijacker.Hijack()
+		if err == nil {
+			// 連線已交出（如 WebSocket 升級），標記已寫入，
+			// 讓請求結束時的 WriteHeaderNow 成為 no-op，避免對 hijacked 連線寫 header
+			w.written = true
+		}
+		return conn, rw, err
 	}
 	return nil, nil, fmt.Errorf("the ResponseWriter doesn't support hijacking")
 }

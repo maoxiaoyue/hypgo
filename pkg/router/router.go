@@ -2,6 +2,7 @@
 package router
 
 import (
+	"html/template"
 	"net/http"
 	"reflect"
 	"runtime"
@@ -160,6 +161,12 @@ func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.Han
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := hypcontext.New(w, req)
 	defer c.Release()
+	// 請求結束前強制 flush 已記錄的狀態碼（冪等；hijack 後為 no-op）。
+	// responseWriter.WriteHeader 是惰性的，只有寫 body 才會真正送出；
+	// c.Redirect 在非 GET（http.Redirect 不寫 body）時若無此行，
+	// 底層從未收到 WriteHeader，Go 會自動補 200 → 瀏覽器拿到 200 + Location 不跳轉。
+	// （defer LIFO：此行先於 c.Release() 執行，writer 尚未歸還池）
+	defer c.Response.WriteHeaderNow()
 
 	urlPath := req.URL.Path
 	method := req.Method
@@ -405,6 +412,22 @@ func collectRoutes(prefix, method string, routes []RouteInfo, n *radixNode) []Ro
 //	}).Handle(createUserHandler)
 func (r *Router) Schema(route schema.Route) *schema.SchemaRoute {
 	return schema.NewSchemaRoute(route, r)
+}
+
+// LoadHTMLGlob 以 glob 模式載入 HTML 樣板集，供 c.HTML 以樣板名渲染
+// 範例：r.LoadHTMLGlob("app/views/*.html")
+func (r *Router) LoadHTMLGlob(pattern string) error {
+	t, err := template.ParseGlob(pattern)
+	if err != nil {
+		return err
+	}
+	hypcontext.SetHTMLTemplate(t)
+	return nil
+}
+
+// SetHTMLTemplate 直接設定 c.HTML 使用的已解析樣板集
+func (r *Router) SetHTMLTemplate(t *template.Template) {
+	hypcontext.SetHTMLTemplate(t)
 }
 
 // RegisterSchema 實作 schema.SchemaRegistrar 介面
