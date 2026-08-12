@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -127,6 +128,104 @@ func TestStartReturnsNilOnGracefulShutdown(t *testing.T) {
 	case err := <-errCh:
 		if err != nil {
 			t.Errorf("Start() after graceful shutdown = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start() did not return after Shutdown")
+	}
+}
+
+// TestShutdownIdempotent 回歸測試：Shutdown 必須冪等。
+// 歷史 bug：二次呼叫 close 已關閉的 shutdownChan → panic。
+func TestShutdownIdempotent(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	s := New(&cfg, logger.NewLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	// 第二次呼叫不得 panic
+	if err := s.Shutdown(ctx); err != nil {
+		t.Errorf("second Shutdown should return nil, got %v", err)
+	}
+}
+
+// TestGracefulRestartDisabledOnWindows Windows 一律停用優雅重啟：
+// FD 3 繼承慣例不成立，重啟必以子行程 bind 失敗、服務消失收場，
+// 且 os.Interrupt 重啟訊號會劫持 Ctrl+C 的關閉語意。
+func TestGracefulRestartDisabledOnWindows(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.EnableGracefulRestart = true
+	s := New(&cfg, logger.NewLogger())
+
+	want := runtime.GOOS != "windows"
+	if got := s.isGracefulRestartEnabled(); got != want {
+		t.Errorf("isGracefulRestartEnabled() on %s = %v, want %v", runtime.GOOS, got, want)
+	}
+}
+
+// TestStartAppliesDefaultMiddlewares 回歸測試：Start() 必須套用預設中間件。
+// 歷史 bug：applyDefaultMiddlewares 只被零 caller 的
+// ListenAndServeWithGracefulShutdown 呼叫——主要入口跑在無 Recovery、
+// 無安全頭的狀態；handler panic 時客戶端拿不到 500。
+func TestStartAppliesDefaultMiddlewares(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.Addr = "127.0.0.1:0"
+	s := New(&cfg, logger.NewLogger())
+
+	s.Router().GET("/ok", func(c *hypcontext.Context) { c.String(200, "ok") })
+	s.Router().GET("/boom", func(c *hypcontext.Context) { panic("kaboom") })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+
+	// 等待 listener 就緒
+	var addr string
+	for i := 0; i < 50; i++ {
+		if s.listener != nil {
+			addr = s.listener.Addr().String()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("listener not ready within timeout")
+	}
+
+	// Security 中間件的安全頭應存在（證明預設中間件已套用）
+	resp, err := http.Get("http://" + addr + "/ok")
+	if err != nil {
+		t.Fatalf("GET /ok: %v", err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY (default Security middleware not applied?)", got)
+	}
+
+	// Recovery 中間件應把 handler panic 轉為 500（同時驗證 gin 式執行模型）
+	resp2, err := http.Get("http://" + addr + "/boom")
+	if err != nil {
+		t.Fatalf("GET /boom: %v (panic escaped Recovery?)", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusInternalServerError {
+		t.Errorf("GET /boom status = %d, want 500 (Recovery not working)", resp2.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() = %v, want nil", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Start() did not return after Shutdown")

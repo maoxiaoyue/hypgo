@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -55,9 +57,10 @@ type Server struct {
 	// 0-RTT 支援（帶 LRU 淘汰 + TTL）
 	sessionCache *SessionCache
 
-	// 優雅關閉（atomic 避免競態）
+	// 優雅關閉（atomic 避免競態；Once 保證 Shutdown 冪等）
 	shutdownChan chan struct{}
 	shuttingDown atomic.Bool
+	shutdownOnce sync.Once
 }
 
 // Protocol 協議類型
@@ -212,6 +215,16 @@ func (s *Server) Start() error {
 		s.router, s.config, s.logger,
 	)
 	sync.SyncSafe()
+
+	// 套用預設中間件（Recovery / Logger / Security / CORS；http3 時為 HTTP3Middleware）。
+	// v0.8.11 前僅 ListenAndServeWithGracefulShutdown 會套用（而它無人呼叫），
+	// 主要入口（App.Run / srv.Start）一直跑在無 Recovery、無請求日誌、無安全頭的狀態
+	s.applyDefaultMiddlewares()
+
+	// 監聽 SIGINT / SIGTERM，收到即優雅關閉。
+	// v0.8.11 前主要入口完全沒有訊號處理：Ctrl+C / k8s SIGTERM = 行程直接被殺，
+	// in-flight 請求丟失、PID 檔殘留
+	go s.handleShutdownSignals()
 
 	// 設置優雅重啟處理
 	if s.isGracefulRestartEnabled() {
@@ -509,8 +522,36 @@ func (s *Server) getInheritedListener() net.Listener {
 	return listener
 }
 
-// Shutdown 優雅關閉伺服器（並行處理 HTTP/1+2 和 HTTP/3）
+// handleShutdownSignals 監聽終止訊號（Ctrl+C / SIGTERM）並觸發優雅關閉。
+// Shutdown 由他處先觸發時（shutdownChan 關閉）即結束監聽。
+func (s *Server) handleShutdownSignals() {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(quit)
+
+	select {
+	case <-quit:
+		s.logger.Info("Received shutdown signal")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			s.logger.Warningf("Graceful shutdown: %v", err)
+		}
+	case <-s.shutdownChan:
+	}
+}
+
+// Shutdown 優雅關閉伺服器（並行處理 HTTP/1+2 和 HTTP/3）。
+// 冪等：重複呼叫不會 panic（v0.8.11 前二次呼叫會 close 已關閉的 channel），
+// 首次之後的呼叫回傳 nil。
 func (s *Server) Shutdown(ctx context.Context) error {
+	var err error
+	s.shutdownOnce.Do(func() { err = s.doShutdown(ctx) })
+	return err
+}
+
+// doShutdown 實際的關閉流程（僅由 shutdownOnce 執行一次）
+func (s *Server) doShutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down server...")
 	s.shuttingDown.Store(true)
 
@@ -541,6 +582,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	close(s.shutdownChan)
+	s.removePIDFile()
 
 	if httpErr != nil {
 		return httpErr
@@ -694,7 +736,10 @@ func (s *Server) removePIDFile() {
 	os.Remove("hypgo.pid")
 }
 
-// isGracefulRestartEnabled 檢查是否啟用優雅重啟（讀 config.Server.EnableGracefulRestart）
+// isGracefulRestartEnabled 檢查是否啟用優雅重啟（讀 config.Server.EnableGracefulRestart）。
+// Windows 一律停用：FD 3 繼承慣例在 Windows 不成立（子行程對同一位址 net.Listen
+// 必因父行程仍佔用而失敗，重啟必以「子死、父退、服務消失」收場），且重啟訊號
+// os.Interrupt 會劫持 Ctrl+C 的關閉語意。
 func (s *Server) isGracefulRestartEnabled() bool {
-	return s.config.Server.EnableGracefulRestart
+	return runtime.GOOS != "windows" && s.config.Server.EnableGracefulRestart
 }

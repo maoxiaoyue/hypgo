@@ -214,6 +214,15 @@ func (c *Context) Release() {
 
 // ===== 中間件執行 =====
 
+// SetHandlers 設定本請求的處理器鏈（全域中間件 + 路由 handlers）。
+// 由 Router 在派發前填入，之後以 c.Next() 驅動整條鏈（gin 式洋蔥模型）。
+// 重用池化的底層陣列，避免每請求重新配置。
+func (c *Context) SetHandlers(global, route []HandlerFunc) {
+	c.handlers = c.handlers[:0]
+	c.handlers = append(c.handlers, global...)
+	c.handlers = append(c.handlers, route...)
+}
+
 // Next 執行下一個中間件
 func (c *Context) Next() {
 	c.index++

@@ -272,24 +272,17 @@ func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
 	r.globalMW = append(r.globalMW, middleware...)
 }
 
-// executeHandlers 執行處理器鏈
-// 順序：全域中間件 → (Group 中間件 + 路由 Handler)，其中 Group 中間件已在 Group.handle() 中與 Handler 合併
+// executeHandlers 執行處理器鏈（gin 式洋蔥模型）
+// 順序：全域中間件 → (Group 中間件 + 路由 Handler)，合併進 c.handlers 後由 c.Next() 驅動。
+//
+// v0.8.11 前為攤平循序執行、c.handlers 從未填入——中間件內的 c.Next() 是 no-op，
+// 導致「包裹式」中間件全數失效：Recovery 的 defer/recover 接不到 handler 的 panic、
+// Logger 在 handler 執行前就記完 log（耗時恆 0、狀態碼恆 200）、Compression 在
+// handler 寫入前就 defer Close 掉 gzip writer。改為 c.Next() 驅動後，中間件的
+// c.Next() 會先執行鏈上其餘 handler 再返回，真正包住下游；c.Abort* 中止鏈。
 func (r *Router) executeHandlers(c *hypcontext.Context, handlers []hypcontext.HandlerFunc) {
-	// 1. 全域中間件
-	for _, h := range r.globalMW {
-		h(c)
-		if c.Response.Written() {
-			return
-		}
-	}
-
-	// 2. Group 中間件 + 路由 Handler（已合併為一個 slice）
-	for _, h := range handlers {
-		h(c)
-		if c.Response.Written() {
-			return
-		}
-	}
+	c.SetHandlers(r.globalMW, handlers)
+	c.Next()
 }
 
 // NotFound 設置 404 處理器
