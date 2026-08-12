@@ -915,6 +915,13 @@ server:
   max_concurrent_streams: 100
   max_read_frame_size: 1048576
   enable_graceful_restart: true
+  # 可信代理網段：服務跑在 nginx / LB 之後時務必設定，否則 c.ClientIP()
+  # 只回傳實際連線來源（安全預設），不會解析 X-Forwarded-For / X-Real-IP，
+  # IPWhitelist / RateLimiter 等以 ClientIP 為 key 的功能會全部失準。
+  # 支援 CIDR 或單一 IP。
+  trusted_proxies:
+    - 127.0.0.1
+    - 10.0.0.0/8
   tls:
     enabled: true
     cert_file: "certs/server.crt"
