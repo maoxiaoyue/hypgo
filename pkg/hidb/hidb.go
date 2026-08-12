@@ -22,6 +22,15 @@ type Dialect interface {
 	BunDialect() schema.Dialect // bun ORM 使用的方言實例
 }
 
+// RedisDriver Redis 協議驅動介面（與 Dialect 同規格）
+// 由 hidb/redis 子套件實現；KeyDB 兼容 Redis 協議，同樣適用。
+// 子套件只負責驅動身分與 client 建構，連線參數組裝、ping 驗證、
+// 資源追蹤 hook 由 core 的 initRedis 統一處理（對稱 initSQL）
+type RedisDriver interface {
+	Name() string                               // 驅動名稱（"redis"）
+	NewClient(opt *redis.Options) *redis.Client // 建立 client
+}
+
 // Option 設定選項（functional options 模式）
 type Option func(*Database)
 
@@ -29,6 +38,14 @@ type Option func(*Database)
 func WithDialect(d Dialect) Option {
 	return func(db *Database) {
 		db.dialect = d
+	}
+}
+
+// WithRedis 設定 Redis 驅動（與 WithDialect 同規格）
+// 可與 WithDialect 並用：SQL 主庫 + Redis 快取同時初始化
+func WithRedis(d RedisDriver) Option {
+	return func(db *Database) {
+		db.redisDriver = d
 	}
 }
 
@@ -43,11 +60,12 @@ type DatabasePlugin interface {
 
 // Database 數據庫管理器
 type Database struct {
-	config  config.DatabaseConfigInterface
-	dialect Dialect // SQL 方言（由 WithDialect 設定）
-	sqlDB   *sql.DB // 主庫（寫入）
-	hypDB   *bun.DB // 主庫 HypDB ORM 實例（寫入）
-	redisDB *redis.Client
+	config      config.DatabaseConfigInterface
+	dialect     Dialect     // SQL 方言（由 WithDialect 設定）
+	redisDriver RedisDriver // Redis 驅動（由 WithRedis 設定）
+	sqlDB       *sql.DB     // 主庫（寫入）
+	hypDB       *bun.DB     // 主庫 HypDB ORM 實例（寫入）
+	redisDB     *redis.Client
 
 	// 讀寫分離
 	replicaPool *ReplicaPool // 讀取副本池
@@ -79,14 +97,26 @@ func NewWithInterface(cfg config.DatabaseConfigInterface, opts ...Option) (*Data
 		return db, nil
 	}
 
-	// 如果有設定方言，使用通用 SQL 初始化
+	// SQL 主庫（WithDialect 設定時）
 	if db.dialect != nil {
-		return db.initSQL()
+		if _, err := db.initSQL(); err != nil {
+			return nil, err
+		}
 	}
 
-	// Redis 不需要 dialect
-	if driver == "redis" {
-		return db.initRedis()
+	// Redis（WithRedis 設定時；可與 SQL 並存，driver=redis 為 redis-only）
+	if db.redisDriver != nil {
+		if _, err := db.initRedis(); err != nil {
+			// SQL 已初始化時一併關閉，避免半初始化狀態洩漏連線
+			if db.hypDB != nil || db.sqlDB != nil {
+				db.Close()
+			}
+			return nil, err
+		}
+	}
+
+	if db.dialect != nil || db.redisDriver != nil {
+		return db, nil
 	}
 
 	// 嘗試作為插件加載
@@ -97,7 +127,7 @@ func NewWithInterface(cfg config.DatabaseConfigInterface, opts ...Option) (*Data
 		return db, nil
 	}
 
-	return nil, fmt.Errorf("unsupported database driver: %s (did you forget to use WithDialect?)", driver)
+	return nil, fmt.Errorf("unsupported database driver: %s (did you forget to use WithDialect / WithRedis?)", driver)
 }
 
 // initSQL 通用 SQL 數據庫初始化（使用 Dialect）
@@ -177,7 +207,8 @@ func (d *Database) initReplicas() error {
 	return nil
 }
 
-// initRedis 初始化 Redis 連接
+// initRedis 初始化 Redis 連接（對稱 initSQL：core 統一組裝連線
+// 參數、掛 hook、ping 驗證；client 建構交給 RedisDriver）
 func (d *Database) initRedis() (*Database, error) {
 	redisConfig := d.config.GetRedisConfig()
 	if redisConfig == nil {
@@ -189,7 +220,7 @@ func (d *Database) initRedis() (*Database, error) {
 		addr = "localhost:6379"
 	}
 
-	client := redis.NewClient(&redis.Options{
+	client := d.redisDriver.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: redisConfig.GetPassword(),
 		DB:       redisConfig.GetDB(),
