@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,12 +45,19 @@ var strongCipherSuites = []uint16{
 
 // Server 統一的 HTTP 伺服器
 type Server struct {
-	config     *config.Config
-	router     *router.Router
-	httpServer *http.Server
-	h3Server   *http3.Server
+	config *config.Config
+	router *router.Router
+	// httpServer/h3Server 用 atomic.Pointer：Start() 的寫入與 Health()/Shutdown()
+	// 的讀取可能發生在不同 goroutine（例如 Start() 尚未完成初始化時 Health
+	// 端點已被打），純指標欄位會是資料競態
+	httpServer atomic.Pointer[http.Server]
+	h3Server   atomic.Pointer[http3.Server]
 	logger     *logger.Logger
-	listener   net.Listener
+	// listener 同理用 atomic.Value（net.Listener 是介面型別，atomic.Value 存取
+	// 介面值比 atomic.Pointer[net.Listener] 少一層指標間接）：forkNewProcess
+	// 讀取時若剛好與 startHTTPx 的寫入同時發生（例如極早的 graceful restart
+	// 訊號），裸欄位會是資料競態
+	listener atomic.Value
 
 	// 協議檢測
 	protocol Protocol
@@ -61,6 +69,15 @@ type Server struct {
 	shutdownChan chan struct{}
 	shuttingDown atomic.Bool
 	shutdownOnce sync.Once
+}
+
+// getListenerAtomic 取得目前已發布的 listener（可能為 nil，尚未啟動時）
+func (s *Server) getListenerAtomic() net.Listener {
+	v := s.listener.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(net.Listener)
 }
 
 // Protocol 協議類型
@@ -337,16 +354,17 @@ func (s *Server) startHTTP3() error {
 	}
 
 	// 創建 HTTP/3 伺服器
-	s.h3Server = &http3.Server{
+	h3srv := &http3.Server{
 		Handler:         s.wrapH3Handler(),
 		Addr:            s.config.Server.Addr,
 		TLSConfig:       tlsConfig,
 		EnableDatagrams: false,
 		MaxHeaderBytes:  1 << 20,
 	}
+	s.h3Server.Store(h3srv)
 
 	// 監聽並服務
-	return s.h3Server.ListenAndServe()
+	return h3srv.ListenAndServe()
 }
 
 // startHTTP2WithFallback 啟動 HTTP/2 伺服器（支援 HTTP/1.1 降級）
@@ -381,13 +399,13 @@ func (s *Server) startHTTP2WithFallback() error {
 	if err != nil {
 		return err
 	}
-	s.listener = listener
+	s.listener.Store(listener)
 
 	// 包裝處理器以支援協議檢測
 	handler := s.wrapHandler(h2c.NewHandler(s.router, h2s))
 
 	// 創建 HTTP 伺服器
-	s.httpServer = &http.Server{
+	httpSrv := &http.Server{
 		Handler:           handler,
 		ReadTimeout:       time.Duration(s.config.Server.ReadTimeout) * time.Second,
 		ReadHeaderTimeout: time.Duration(s.config.Server.ReadTimeout) * time.Second,
@@ -398,17 +416,19 @@ func (s *Server) startHTTP2WithFallback() error {
 
 	// TLS 配置（統一 cipher suites）
 	if s.config.Server.TLS.Enabled {
-		s.httpServer.TLSConfig = &tls.Config{
+		httpSrv.TLSConfig = &tls.Config{
 			NextProtos:    []string{"h2", "http/1.1"},
 			MinVersion:    tls.VersionTLS12,
 			CipherSuites:  strongCipherSuites,
 			WrapSession:   s.getTLSWrapSession(),
 			UnwrapSession: s.getTLSUnwrapSession(),
 		}
-		return s.httpServer.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
+		s.httpServer.Store(httpSrv)
+		return httpSrv.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
 	}
 
-	return s.httpServer.Serve(listener)
+	s.httpServer.Store(httpSrv)
+	return httpSrv.Serve(listener)
 }
 
 // startHTTP2 啟動純 HTTP/2 伺服器
@@ -427,11 +447,11 @@ func (s *Server) startHTTP1() error {
 	if err != nil {
 		return err
 	}
-	s.listener = listener
+	s.listener.Store(listener)
 
 	handler := s.wrapHandler(s.router)
 
-	s.httpServer = &http.Server{
+	httpSrv := &http.Server{
 		Handler:           handler,
 		ReadTimeout:       time.Duration(s.config.Server.ReadTimeout) * time.Second,
 		ReadHeaderTimeout: time.Duration(s.config.Server.ReadTimeout) * time.Second,
@@ -442,14 +462,16 @@ func (s *Server) startHTTP1() error {
 
 	// TLS 配置（統一 cipher suites）
 	if s.config.Server.TLS.Enabled {
-		s.httpServer.TLSConfig = &tls.Config{
+		httpSrv.TLSConfig = &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			CipherSuites: strongCipherSuites,
 		}
-		return s.httpServer.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
+		s.httpServer.Store(httpSrv)
+		return httpSrv.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
 	}
 
-	return s.httpServer.Serve(listener)
+	s.httpServer.Store(httpSrv)
+	return httpSrv.Serve(listener)
 }
 
 // wrapHandler 包裝處理器以注入 Alt-Svc 標頭
@@ -564,11 +586,11 @@ func (s *Server) doShutdown(ctx context.Context) error {
 	done := make(chan struct{})
 
 	go func() {
-		if s.httpServer != nil {
-			httpErr = s.httpServer.Shutdown(ctx)
+		if hs := s.httpServer.Load(); hs != nil {
+			httpErr = hs.Shutdown(ctx)
 		}
-		if s.h3Server != nil {
-			h3Err = s.h3Server.Close()
+		if h3 := s.h3Server.Load(); h3 != nil {
+			h3Err = h3.Close()
 		}
 		close(done)
 	}()
@@ -602,14 +624,20 @@ func (s *Server) handleGracefulRestart() {
 			s.logger.Info("Received graceful restart signal")
 
 			// Fork 新進程
-			if err := s.forkNewProcess(); err != nil {
+			child, err := s.forkNewProcess()
+			if err != nil {
 				s.logger.Emergencyf("Failed to fork new process: %v", err)
 				continue
 			}
 
-			// 等待新進程啟動（poll 方式，每 200ms 最多 15 次 = 3 秒）
-			for i := 0; i < 15; i++ {
-				time.Sleep(200 * time.Millisecond)
+			// 輪詢新進程存活狀態（每 200ms 最多 15 次 = 3 秒）。
+			// 舊版只是空睡 3 秒、從不檢查任何狀態——若新進程啟動瞬間崩潰
+			// （壞的執行檔、init 階段 panic 等），舊進程仍會照常自我關閉，
+			// 造成兩個進程都不在、服務完全中斷。這裡改為真正輪詢：
+			// 只要偵測到新進程已死，就放棄本次重啟、繼續留守，不自我關閉。
+			if !s.waitForChildAlive(child, 15, 200*time.Millisecond) {
+				s.logger.Emergencyf("New process (pid=%d) exited during startup; aborting restart, this process keeps serving", child.Pid)
+				continue
 			}
 
 			// 優雅關閉
@@ -628,18 +656,18 @@ func (s *Server) handleGracefulRestart() {
 	}
 }
 
-// forkNewProcess 啟動新進程（修復 FD 洩漏）
-func (s *Server) forkNewProcess() error {
+// forkNewProcess 啟動新進程（修復 FD 洩漏）。回傳 *os.Process 供呼叫端輪詢存活狀態。
+func (s *Server) forkNewProcess() (*os.Process, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
+		return nil, fmt.Errorf("failed to get executable path: %w", err)
 	}
 
 	files := []*os.File{os.Stdin, os.Stdout, os.Stderr}
 
 	// 傳遞監聽器檔案描述符
-	if s.listener != nil {
-		if tcpListener, ok := s.listener.(*net.TCPListener); ok {
+	if ln := s.getListenerAtomic(); ln != nil {
+		if tcpListener, ok := ln.(*net.TCPListener); ok {
 			file, err := tcpListener.File()
 			if err == nil {
 				files = append(files, file)
@@ -655,11 +683,25 @@ func (s *Server) forkNewProcess() error {
 
 	process, err := os.StartProcess(executable, os.Args, attr)
 	if err != nil {
-		return fmt.Errorf("failed to start new process: %w", err)
+		return nil, fmt.Errorf("failed to start new process: %w", err)
 	}
 
 	s.logger.Infof("Started new process with PID: %d", process.Pid)
-	return nil
+	return process, nil
+}
+
+// waitForChildAlive 輪詢子進程是否仍存活，最多 attempts 次、每次間隔 interval。
+// 用 signal 0（不送任何實際訊號，僅探測進程是否存在）逐次探測；只要有一次探測
+// 失敗就視為子進程已結束，立即回傳 false（不必空等滿整個時長）。
+// 全程存活則回傳 true。
+func (s *Server) waitForChildAlive(child *os.Process, attempts int, interval time.Duration) bool {
+	for i := 0; i < attempts; i++ {
+		time.Sleep(interval)
+		if err := child.Signal(syscall.Signal(0)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // applyDefaultMiddlewares 應用預設中間件
@@ -677,7 +719,7 @@ func (s *Server) Health() error {
 		return fmt.Errorf("server is shutting down")
 	}
 
-	if s.httpServer == nil && s.h3Server == nil {
+	if s.httpServer.Load() == nil && s.h3Server.Load() == nil {
 		return fmt.Errorf("server not started")
 	}
 
@@ -724,16 +766,38 @@ func (s *Server) EnableHTTP3(config *router.HTTP3Config) {
 	s.router.EnableHTTP3(config)
 }
 
-// savePIDFile 保存 PID 檔案
+// pidFilePath PID 檔案路徑（相對於 CWD，固定檔名 hypgo.pid 以維持既有腳本相容性）
+const pidFilePath = "hypgo.pid"
+
+// savePIDFile 保存 PID 檔案。寫入前偵測既有 PID 檔是否屬於另一個仍存活的行程
+// （例如同一台機器、同一 CWD 誤起了兩個 hypgo 服務）——這種情況下直接覆寫會讓
+// 監控／部署腳本讀到錯的 PID，因此改為大聲警告後才覆寫，不靜默吞掉。
+// 注意：存活探測用 syscall.Signal(0)，Windows 上 (*os.Process).Signal 僅支援
+// os.Kill/os.Interrupt，探測必定回錯——等同於偵測不到（維持原行為，非退化）。
 func (s *Server) savePIDFile() error {
+	if data, err := os.ReadFile(pidFilePath); err == nil {
+		if oldPID, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && oldPID != os.Getpid() {
+			if proc, ferr := os.FindProcess(oldPID); ferr == nil && proc.Signal(syscall.Signal(0)) == nil {
+				s.logger.Warningf("%s already belongs to running PID %d (another hypgo instance in this CWD?); overwriting — monitoring/deploy scripts may now track the wrong process", pidFilePath, oldPID)
+			}
+		}
+	}
+
 	pid := os.Getpid()
 	pidStr := strconv.Itoa(pid)
-	return os.WriteFile("hypgo.pid", []byte(pidStr), 0644)
+	return os.WriteFile(pidFilePath, []byte(pidStr), 0644)
 }
 
-// removePIDFile 移除 PID 檔案
+// removePIDFile 移除 PID 檔案（只移除屬於自己的——避免誤刪另一個仍存活實例的 PID 檔）
 func (s *Server) removePIDFile() {
-	os.Remove("hypgo.pid")
+	data, err := os.ReadFile(pidFilePath)
+	if err != nil {
+		return
+	}
+	if pid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr != nil || pid != os.Getpid() {
+		return
+	}
+	os.Remove(pidFilePath)
 }
 
 // isGracefulRestartEnabled 檢查是否啟用優雅重啟（讀 config.Server.EnableGracefulRestart）。
