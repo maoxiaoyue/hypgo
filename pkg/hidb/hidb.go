@@ -204,6 +204,10 @@ func (d *Database) initReplicas() error {
 		d.replicaPool.Add(replica)
 	}
 
+	// 被動健康剔除：背景探測，連續失敗的副本自動摘出輪詢
+	// （否則 1/N 讀請求會持續打到死副本等逾時），恢復後自動加回
+	d.replicaPool.StartHealthCheck()
+
 	return nil
 }
 
