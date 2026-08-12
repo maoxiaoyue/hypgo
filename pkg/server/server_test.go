@@ -284,11 +284,7 @@ func TestSessionCachePutAndGetAndDelete(t *testing.T) {
 }
 
 func TestSessionCacheMaxSize(t *testing.T) {
-	sc := &SessionCache{
-		entries: make(map[string]sessionEntry),
-		maxSize: 3,
-		ttl:     time.Hour,
-	}
+	sc := newSessionCacheWith(3, time.Hour)
 
 	sc.Put("a", []byte("1"))
 	sc.Put("b", []byte("2"))
@@ -298,14 +294,38 @@ func TestSessionCacheMaxSize(t *testing.T) {
 	if sc.Len() > 3 {
 		t.Errorf("Len() = %d, want <= 3 (should evict)", sc.Len())
 	}
+
+	// O(1) 淘汰語義：最舊的 "a" 被淘汰，其餘保留
+	if _, ok := sc.GetAndDelete("a"); ok {
+		t.Error("oldest entry 'a' should have been evicted")
+	}
+	for _, k := range []string{"b", "c", "d"} {
+		if _, ok := sc.GetAndDelete(k); !ok {
+			t.Errorf("entry %q should still be present", k)
+		}
+	}
+}
+
+// TestSessionCacheDuplicatePut 同 key 重複 Put 不得在鏈表殘留孤兒節點
+func TestSessionCacheDuplicatePut(t *testing.T) {
+	sc := newSessionCacheWith(10, time.Hour)
+
+	sc.Put("k", []byte("v1"))
+	sc.Put("k", []byte("v2"))
+	if sc.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1 after duplicate Put", sc.Len())
+	}
+	if n := sc.order.Len(); n != 1 {
+		t.Fatalf("order list len = %d, want 1 (orphan node leaked)", n)
+	}
+	data, ok := sc.GetAndDelete("k")
+	if !ok || string(data) != "v2" {
+		t.Errorf("GetAndDelete = %q, %v; want v2, true", data, ok)
+	}
 }
 
 func TestSessionCacheTTLExpiry(t *testing.T) {
-	sc := &SessionCache{
-		entries: make(map[string]sessionEntry),
-		maxSize: 100,
-		ttl:     50 * time.Millisecond,
-	}
+	sc := newSessionCacheWith(100, 50*time.Millisecond)
 
 	sc.Put("expired", []byte("data"))
 	time.Sleep(100 * time.Millisecond)

@@ -4,6 +4,7 @@
 package server
 
 import (
+	"container/list"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -28,6 +29,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/middleware"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -90,15 +92,23 @@ const (
 	AUTO // 自動檢測
 )
 
-// sessionEntry 帶時間戳的 session 快取項
+// sessionEntry 帶時間戳的 session 快取項（鏈表節點值）
 type sessionEntry struct {
+	key       string
 	data      []byte
 	createdAt time.Time
 }
 
 // SessionCache 0-RTT session 快取（帶大小上限 + TTL）
+//
+// entries 提供 O(1) 查找；order 依插入時間排序（頭部最舊），
+// 過期清理與容量淘汰都從頭部彈出——O(1)（攤銷）。
+// 舊實作淘汰時對整個 map（上限 1 萬條目）做 O(n) 全表掃描，
+// 且掃描發生在每次新握手的鎖內：重連風暴時所有 TLS 握手
+// 在這個臨界區後面全域序列化
 type SessionCache struct {
-	entries map[string]sessionEntry
+	entries map[string]*list.Element
+	order   *list.List // 值為 *sessionEntry；front = 最舊
 	mu      sync.Mutex
 	maxSize int
 	ttl     time.Duration
@@ -111,10 +121,16 @@ const (
 
 // newSessionCache 建立帶預設值的 SessionCache
 func newSessionCache() *SessionCache {
+	return newSessionCacheWith(defaultSessionCacheSize, defaultSessionTTL)
+}
+
+// newSessionCacheWith 建立指定容量與 TTL 的 SessionCache（測試用）
+func newSessionCacheWith(maxSize int, ttl time.Duration) *SessionCache {
 	return &SessionCache{
-		entries: make(map[string]sessionEntry, 256),
-		maxSize: defaultSessionCacheSize,
-		ttl:     defaultSessionTTL,
+		entries: make(map[string]*list.Element, 256),
+		order:   list.New(),
+		maxSize: maxSize,
+		ttl:     ttl,
 	}
 }
 
@@ -123,18 +139,25 @@ func (c *SessionCache) Put(key string, state []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 淘汰過期條目
+	// 淘汰過期條目（從最舊端彈出，攤銷 O(1)）
 	c.evictExpiredLocked()
 
-	// 超過上限時淘汰最舊
+	// 超過上限時淘汰最舊（O(1)：鏈表頭即最舊）
 	if len(c.entries) >= c.maxSize {
-		c.evictOldestLocked()
+		c.removeElementLocked(c.order.Front())
 	}
 
-	c.entries[key] = sessionEntry{
+	// 同 key 重複 Put：先移除舊條目，避免鏈表殘留孤兒節點
+	if old, ok := c.entries[key]; ok {
+		c.removeElementLocked(old)
+	}
+
+	elem := c.order.PushBack(&sessionEntry{
+		key:       key,
 		data:      state,
 		createdAt: time.Now(),
-	}
+	})
+	c.entries[key] = elem
 }
 
 // GetAndDelete 原子性地取得並刪除 session（防止 0-RTT replay attack）
@@ -143,47 +166,45 @@ func (c *SessionCache) GetAndDelete(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[key]
+	elem, ok := c.entries[key]
 	if !ok {
 		return nil, false
 	}
+	entry := elem.Value.(*sessionEntry)
 
-	// 檢查 TTL
+	// 原子 get-and-delete，防止 race window 重放（過期條目也一併移除）
+	c.removeElementLocked(elem)
+
 	if time.Since(entry.createdAt) > c.ttl {
-		delete(c.entries, key)
 		return nil, false
 	}
-
-	// 原子 get-and-delete，防止 race window 重放
-	delete(c.entries, key)
 	return entry.data, true
 }
 
 // evictExpiredLocked 淘汰過期條目（必須持有鎖）
+// 條目依插入時間排序，從最舊端彈出直到遇到未過期者即可停止
 func (c *SessionCache) evictExpiredLocked() {
 	now := time.Now()
-	for key, entry := range c.entries {
-		if now.Sub(entry.createdAt) > c.ttl {
-			delete(c.entries, key)
+	for {
+		front := c.order.Front()
+		if front == nil {
+			return
 		}
+		if now.Sub(front.Value.(*sessionEntry).createdAt) <= c.ttl {
+			return
+		}
+		c.removeElementLocked(front)
 	}
 }
 
-// evictOldestLocked 淘汰最舊的條目（必須持有鎖）
-func (c *SessionCache) evictOldestLocked() {
-	var oldestKey string
-	var oldestTime time.Time
-	first := true
-	for key, entry := range c.entries {
-		if first || entry.createdAt.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = entry.createdAt
-			first = false
-		}
+// removeElementLocked 同步移除鏈表節點與 map 條目（必須持有鎖）
+func (c *SessionCache) removeElementLocked(elem *list.Element) {
+	if elem == nil {
+		return
 	}
-	if !first {
-		delete(c.entries, oldestKey)
-	}
+	entry := elem.Value.(*sessionEntry)
+	c.order.Remove(elem)
+	delete(c.entries, entry.key)
 }
 
 // Len 回傳目前快取條目數量
@@ -366,11 +387,26 @@ func (s *Server) startHTTP3() error {
 		UnwrapSession: s.getTLSUnwrapSession(),
 	}
 
+	// QUIC 配置：把 config 的調校值接進 HTTP/3（與 TCP 側一致），
+	// 並啟用 0-RTT——SessionCache 的 WrapSession/UnwrapSession 機制
+	// 只有在 Allow0RTT=true（quic-go 預設 false）時才真正省下握手 RTT；
+	// GetAndDelete 的單次使用語義已防範 0-RTT 重放
+	maxStreams := s.config.Server.MaxConcurrentStreams
+	if maxStreams <= 0 {
+		maxStreams = 250
+	}
+	quicConf := &quic.Config{
+		Allow0RTT:          true,
+		MaxIdleTimeout:     time.Duration(s.config.Server.IdleTimeout) * time.Second,
+		MaxIncomingStreams: int64(maxStreams),
+	}
+
 	// 創建 HTTP/3 伺服器
 	h3srv := &http3.Server{
 		Handler:         s.wrapH3Handler(),
 		Addr:            s.config.Server.Addr,
 		TLSConfig:       tlsConfig,
+		QUICConfig:      quicConf,
 		EnableDatagrams: false,
 		MaxHeaderBytes:  1 << 20,
 	}
@@ -414,8 +450,13 @@ func (s *Server) startHTTP2WithFallback() error {
 	}
 	s.listener.Store(listener)
 
-	// 包裝處理器以支援協議檢測
-	handler := s.wrapHandler(h2c.NewHandler(s.router, h2s))
+	// 明文模式才需要 h2c（cleartext HTTP/2 升級）；TLS 之上 h2c 升級
+	// 不可能發生，卻讓每個請求白付 PRI/Upgrade header 探測成本
+	var handler http.Handler = s.router
+	if !s.config.Server.TLS.Enabled {
+		handler = h2c.NewHandler(s.router, h2s)
+	}
+	handler = s.wrapHandler(handler)
 
 	// 創建 HTTP 伺服器
 	httpSrv := &http.Server{
@@ -435,6 +476,13 @@ func (s *Server) startHTTP2WithFallback() error {
 			CipherSuites:  strongCipherSuites,
 			WrapSession:   s.getTLSWrapSession(),
 			UnwrapSession: s.getTLSUnwrapSession(),
+		}
+		// 把調校過的 h2s 掛上 TLS 協商出的 h2：不呼叫 ConfigureServer 的話，
+		// net/http 會用自帶的 http2 實作與「預設值」服務 h2 流量——
+		// config 的 MaxConcurrentStreams / MaxReadFrameSize 等調校
+		// 對生產 HTTPS 完全不生效（只有 h2c 明文路徑吃得到）
+		if err := http2.ConfigureServer(httpSrv, h2s); err != nil {
+			return fmt.Errorf("http2.ConfigureServer: %w", err)
 		}
 		s.httpServer.Store(httpSrv)
 		return httpSrv.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
