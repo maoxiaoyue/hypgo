@@ -39,6 +39,12 @@ type ServerConfig struct {
 
 	// 優雅重啟
 	EnableGracefulRestart bool `mapstructure:"enable_graceful_restart" yaml:"enable_graceful_restart"`
+
+	// TrustedProxies 可信代理網段（CIDR 或單一 IP，如 "10.0.0.0/8"、"127.0.0.1"）。
+	// 只有直連來源落在此清單時，c.ClientIP() 才採信 X-Forwarded-For / X-Real-IP。
+	// 留空（預設）＝ 不信任任何代理，ClientIP 一律回傳實際連線來源。
+	// 服務位於 nginx / LB 之後時務必設定，否則 ClientIP 會是代理的位址。
+	TrustedProxies []string `mapstructure:"trusted_proxies" yaml:"trusted_proxies"`
 }
 
 type TLSConfig struct {

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -281,37 +282,97 @@ func (c *Context) SaveUploadedFile(file *multipart.FileHeader, dst string) error
 
 // ===== 客戶端信息 =====
 
-// ClientIP 獲取客戶端 IP
+// trustedProxies 可信代理網段。只有當請求的直連來源（RemoteAddr）落在此清單內時，
+// ClientIP 才會採信 X-Forwarded-For / X-Real-IP 等可偽造的轉發標頭。
+// 未設定（預設）＝ 不信任任何代理 ＝ ClientIP 一律回傳 RemoteAddr。
+var trustedProxies atomic.Pointer[[]*net.IPNet]
+
+// SetTrustedProxies 設定可信代理網段（CIDR 或單一 IP，如 "10.0.0.0/8"、"127.0.0.1"）。
+// 傳入空清單即回到「不信任任何代理」的安全預設。
+//
+// 安全模型：轉發標頭（X-Forwarded-For / X-Real-IP）由客戶端任意填寫，
+// 若無條件採信，攻擊者只要自帶標頭就能偽裝成任意 IP，繞過 IPWhitelist
+// 與 RateLimiter（兩者都以 ClientIP 為 key）。因此必須先確認「這一跳
+// 確實來自我方代理」，才有理由相信它寫下的原始客戶端 IP。
+//
+// 一般部署（服務位於 nginx 之後）：SetTrustedProxies("127.0.0.1", "10.0.0.0/8")
+func SetTrustedProxies(cidrs ...string) error {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, s := range cidrs {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if !strings.Contains(s, "/") {
+			// 單一 IP → 轉成 /32（IPv4）或 /128（IPv6）
+			ip := net.ParseIP(s)
+			if ip == nil {
+				return fmt.Errorf("context: invalid trusted proxy %q", s)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			return fmt.Errorf("context: invalid trusted proxy CIDR %q: %w", s, err)
+		}
+		nets = append(nets, n)
+	}
+	trustedProxies.Store(&nets)
+	return nil
+}
+
+// isTrustedProxy 回報 ip 是否落在已設定的可信代理網段內
+func isTrustedProxy(ip net.IP) bool {
+	p := trustedProxies.Load()
+	if p == nil || ip == nil {
+		return false
+	}
+	for _, n := range *p {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClientIP 獲取客戶端 IP。
+//
+// 僅當直連來源為可信代理（見 SetTrustedProxies）時才解析轉發標頭，
+// 否則一律回傳實際的連線來源。這讓 IPWhitelist / RateLimiter 無法
+// 被偽造的 X-Forwarded-For 繞過（未設定可信代理時為最嚴格的安全預設）。
 func (c *Context) ClientIP() string {
-	// 檢查 X-Forwarded-For
-	if xForwardedFor := c.GetHeader("X-Forwarded-For"); xForwardedFor != "" {
-		parts := strings.Split(xForwardedFor, ",")
+	remote := c.RemoteIP()
+
+	// 直連來源不是可信代理 → 轉發標頭一律不採信
+	if !isTrustedProxy(net.ParseIP(remote)) {
+		return remote
+	}
+
+	// 來自可信代理：由右往左取第一個「非可信代理」的位址，
+	// 即最靠近我方、且不由我方代理鏈產生的那一跳
+	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
-			ip := strings.TrimSpace(parts[i])
-			if ip != "" && isValidIP(ip) {
-				return ip
+			s := strings.TrimSpace(parts[i])
+			if s == "" || !isValidIP(s) {
+				continue
+			}
+			if ip := net.ParseIP(s); ip != nil && !isTrustedProxy(ip) {
+				return s
 			}
 		}
 	}
 
-	// 檢查 X-Real-IP
-	if xRealIP := c.GetHeader("X-Real-IP"); xRealIP != "" {
-		if isValidIP(xRealIP) {
-			return xRealIP
-		}
+	if xRealIP := c.GetHeader("X-Real-IP"); xRealIP != "" && isValidIP(xRealIP) {
+		return xRealIP
 	}
 
-	// 檢查 X-Appengine-Remote-Addr (App Engine)
-	if appEngine := c.GetHeader("X-Appengine-Remote-Addr"); appEngine != "" {
-		return appEngine
-	}
-
-	// 從連接獲取
-	if ip, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr)); err == nil {
-		return ip
-	}
-
-	return ""
+	return remote
 }
 
 // GetClientIP 獲取客戶端 IP（別名）
@@ -353,11 +414,10 @@ func (c *Context) RemoteIP() string {
 	return ip
 }
 
-// IsFromTrustedProxy 檢查請求是否來自可信代理
+// IsFromTrustedProxy 檢查請求的直連來源是否為可信代理（見 SetTrustedProxies）。
+// 未設定可信代理時恆為 false。
 func (c *Context) IsFromTrustedProxy() bool {
-	// 實現可信代理檢查邏輯
-	// 這裡可以維護一個可信代理 IP 列表
-	return false
+	return isTrustedProxy(net.ParseIP(c.RemoteIP()))
 }
 
 // ContentType 獲取內容類型

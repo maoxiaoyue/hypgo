@@ -226,6 +226,19 @@ func (s *Server) Start() error {
 		s.logger.Warningf("BindInput 型別不符 [%s]：handler 綁定 %s，但 Schema 宣告 %s", routeKey, bound, declared)
 	})
 
+	// 未消費的請求錯誤（c.Error / AbortWithError）接到 logger，
+	// 否則這些錯誤只會送出空的 5xx、內容徹底消失
+	hypcontext.SetRequestErrorReporter(func(method, path string, errs []error) {
+		for _, err := range errs {
+			s.logger.Error("request error", "method", method, "path", path, "err", err)
+		}
+	})
+
+	// 可信代理：未設定時 ClientIP 一律回傳實際連線來源（安全預設）
+	if err := hypcontext.SetTrustedProxies(s.config.Server.TrustedProxies...); err != nil {
+		s.logger.Warningf("Invalid trusted_proxies config: %v", err)
+	}
+
 	// AutoSync：啟動時自動同步 .hyp/context.yaml
 	sync := manifest.NewAutoSync(
 		manifest.AutoSyncConfig{Enabled: true},

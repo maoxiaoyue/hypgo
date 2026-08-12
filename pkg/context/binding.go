@@ -11,6 +11,9 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"reflect"
+	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -289,7 +292,11 @@ func (bindingForm) Bind(req *http.Request, obj interface{}) error {
 	if err := req.ParseMultipartForm(defaultMemory); err != nil && !errors.Is(err, http.ErrNotMultipart) {
 		return err
 	}
-	return mapFormToStruct(req.Form, obj)
+	// 用 PostForm（純 body）而非 Form（body ∪ query）：
+	// Form 會讓 query string 也能寫進 struct，形成大量賦值漏洞
+	// （POST /api/users?is_admin=true 可注入 body 沒有的欄位）。
+	// 需要 query 時請改用 BindQuery。
+	return mapFormToStruct(req.PostForm, obj)
 }
 
 // ===== Query 綁定器 =====
@@ -406,25 +413,146 @@ func decodeJSON(r io.Reader, obj interface{}) error {
 	return decoder.Decode(obj)
 }
 
-// mapFormToStruct 將表單映射到結構體（簡化版）
+// mapFormToStruct 以反射把表單值填入 struct，依欄位型別做字串轉換。
+//
+// 欄位名優先取 `form` tag，其次 `json` tag，最後用欄位名（不分大小寫）。
+// 舊版用「全部值當字串 → json.Marshal → json.Unmarshal」的中介做法，
+// 導致任何非字串欄位必定失敗（?page=2 綁 int 欄位回
+// "cannot unmarshal string into Go value of type int"），且完全不認 form tag。
 func mapFormToStruct(values url.Values, obj interface{}) error {
-	// 這是一個簡化的實現
-	// 實際專案中建議使用成熟的庫如 gorilla/schema 或 mapstructure
+	rv := reflect.ValueOf(obj)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("binding: target must be a non-nil pointer")
+	}
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("binding: target must point to a struct")
+	}
+	return mapFormToStructValue(values, rv)
+}
 
-	// 使用 JSON 作為中間格式（簡化實現）
-	data := make(map[string]interface{})
-	for k, v := range values {
-		if len(v) == 1 {
-			data[k] = v[0]
-		} else if len(v) > 1 {
-			data[k] = v
+func mapFormToStructValue(values url.Values, rv reflect.Value) error {
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		fv := rv.Field(i)
+		if !fv.CanSet() {
+			continue // 未匯出欄位
+		}
+
+		// 匿名嵌入的 struct：遞迴攤平
+		if field.Anonymous && fv.Kind() == reflect.Struct {
+			if err := mapFormToStructValue(values, fv); err != nil {
+				return err
+			}
+			continue
+		}
+
+		name, skip := formFieldName(field)
+		if skip {
+			continue
+		}
+
+		vs, ok := values[name]
+		if !ok || len(vs) == 0 {
+			continue // 沒給值就保持零值，不覆寫
+		}
+
+		if err := setFormValue(fv, vs); err != nil {
+			return fmt.Errorf("binding: field %q: %w", name, err)
 		}
 	}
+	return nil
+}
 
-	jsonBytes, err := json.Marshal(data)
-	if err != nil {
-		return err
+// formFieldName 取欄位對應的表單鍵名：form tag > json tag > 欄位名。
+// tag 為 "-" 時跳過該欄位。
+func formFieldName(f reflect.StructField) (name string, skip bool) {
+	for _, tag := range []string{"form", "json"} {
+		if v := f.Tag.Get(tag); v != "" {
+			v = strings.Split(v, ",")[0] // 去掉 ,omitempty 等選項
+			if v == "-" {
+				return "", true
+			}
+			if v != "" {
+				return v, false
+			}
+		}
+	}
+	return f.Name, false
+}
+
+// setFormValue 依目標欄位型別轉換字串值
+func setFormValue(fv reflect.Value, vs []string) error {
+	// slice 欄位：吃全部值（[]string / []int ...）
+	if fv.Kind() == reflect.Slice && fv.Type().Elem().Kind() != reflect.Uint8 {
+		out := reflect.MakeSlice(fv.Type(), len(vs), len(vs))
+		for i, s := range vs {
+			if err := setScalar(out.Index(i), s); err != nil {
+				return err
+			}
+		}
+		fv.Set(out)
+		return nil
+	}
+	return setScalar(fv, vs[0])
+}
+
+func setScalar(fv reflect.Value, s string) error {
+	// 指標欄位：配置後填入指向的值
+	if fv.Kind() == reflect.Ptr {
+		if fv.IsNil() {
+			fv.Set(reflect.New(fv.Type().Elem()))
+		}
+		return setScalar(fv.Elem(), s)
 	}
 
-	return json.Unmarshal(jsonBytes, obj)
+	switch fv.Kind() {
+	case reflect.String:
+		fv.SetString(s)
+	case reflect.Bool:
+		if s == "" {
+			fv.SetBool(false)
+			return nil
+		}
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return err
+		}
+		fv.SetBool(b)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if s == "" {
+			fv.SetInt(0)
+			return nil
+		}
+		n, err := strconv.ParseInt(s, 10, fv.Type().Bits())
+		if err != nil {
+			return err
+		}
+		fv.SetInt(n)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if s == "" {
+			fv.SetUint(0)
+			return nil
+		}
+		n, err := strconv.ParseUint(s, 10, fv.Type().Bits())
+		if err != nil {
+			return err
+		}
+		fv.SetUint(n)
+	case reflect.Float32, reflect.Float64:
+		if s == "" {
+			fv.SetFloat(0)
+			return nil
+		}
+		f, err := strconv.ParseFloat(s, fv.Type().Bits())
+		if err != nil {
+			return err
+		}
+		fv.SetFloat(f)
+	default:
+		// 其餘型別（struct、map…）退回 JSON 解析，支援 ?filter={"a":1} 這類用法
+		return json.Unmarshal([]byte(s), fv.Addr().Interface())
+	}
+	return nil
 }

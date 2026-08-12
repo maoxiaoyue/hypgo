@@ -244,17 +244,32 @@ func (c *Context) AcceptEarlyData() {
 
 // ===== Stream 控制 =====
 
-// Stream 串流回應（支援 HTTP/3 優化）
+// Stream 串流回應（支援 HTTP/3 優化）。
+// 回傳 true 表示客戶端已中斷連線，false 表示 step 自行結束串流。
+//
+// 每輪都檢查請求 context：少了這個檢查，客戶端關閉分頁後 step 仍會
+// 被永遠呼叫下去（多數 step 實作會忽略 Write 錯誤），goroutine 永不退出、
+// Context 也永不歸還池——每個斷線的客戶端漏一條 goroutine，可被當 DoS 向量。
 func (c *Context) Stream(step func(w io.Writer) bool) bool {
 	w := c.Writer
+	var done <-chan struct{}
+	if c.Request != nil {
+		done = c.Request.Context().Done()
+	}
+
 	for {
+		select {
+		case <-done:
+			return true // 客戶端已離線
+		default:
+		}
+
 		if !step(w) {
 			return false
 		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		// ponytail: 移除 adaptiveStreamControl —— 它只在熱路徑迴圈裡 time.Sleep，是 footgun
 	}
 }
 

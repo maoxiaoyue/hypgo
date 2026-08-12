@@ -82,13 +82,6 @@ func (c *Context) YAML(code int, obj interface{}) {
 	c.Render(code, yamlRender{Data: obj})
 }
 
-// ===== ProtoBuf 響應 =====
-
-// ProtoBuf 回應 ProtoBuf
-func (c *Context) ProtoBuf(code int, obj interface{}) {
-	c.Render(code, protoBufRender{Data: obj})
-}
-
 // ===== 文本響應 =====
 
 // String 回應字串
@@ -392,11 +385,5 @@ type Negotiate struct {
 	JSONData interface{}
 	XMLData  interface{}
 	YAMLData interface{}
-	TOMLData interface{}
 	Data     interface{}
-}
-
-// TOML 回應 TOML
-func (c *Context) TOML(code int, obj interface{}) {
-	c.Render(code, tomlRender{Data: obj})
 }

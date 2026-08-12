@@ -167,6 +167,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// 底層從未收到 WriteHeader，Go 會自動補 200 → 瀏覽器拿到 200 + Location 不跳轉。
 	// （defer LIFO：此行先於 c.Release() 執行，writer 尚未歸還池）
 	defer c.Response.WriteHeaderNow()
+	// 清理 multipart 暫存檔並回報未消費的請求錯誤（見各自函式說明）
+	defer c.Finish()
 
 	urlPath := req.URL.Path
 	method := req.Method
@@ -242,22 +244,37 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				continue
 			}
 			if handlers, _ := tree.search(urlPath, nil); handlers != nil {
-				if r.methodNotAllowed != nil {
-					r.methodNotAllowed(c)
-				} else {
-					c.Status(http.StatusMethodNotAllowed)
-					c.Writer.WriteHeaderNow()
-				}
+				// 走 executeHandlers 讓 405 也經過全域中間件：
+				// 直接呼叫會讓 Recovery / Logger / CORS / Security 全部跳過，
+				// 自訂 handler 內的 panic 直接穿透到 net/http（連線被斷而非 500）
+				r.executeHandlers(c, []hypcontext.HandlerFunc{r.methodNotAllowedHandler()})
 				return
 			}
 		}
 	}
 
-	// 404 Not Found
+	// 404 Not Found（同樣經過全域中間件）
+	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
+}
+
+// notFoundHandler 回傳 404 處理器（自訂或預設）
+func (r *Router) notFoundHandler() hypcontext.HandlerFunc {
 	if r.notFound != nil {
-		r.notFound(c)
-	} else {
+		return r.notFound
+	}
+	return func(c *hypcontext.Context) {
 		c.Status(http.StatusNotFound)
+		c.Writer.WriteHeaderNow()
+	}
+}
+
+// methodNotAllowedHandler 回傳 405 處理器（自訂或預設）
+func (r *Router) methodNotAllowedHandler() hypcontext.HandlerFunc {
+	if r.methodNotAllowed != nil {
+		return r.methodNotAllowed
+	}
+	return func(c *hypcontext.Context) {
+		c.Status(http.StatusMethodNotAllowed)
 		c.Writer.WriteHeaderNow()
 	}
 }

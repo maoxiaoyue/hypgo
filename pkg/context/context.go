@@ -229,6 +229,48 @@ func (c *Context) Release() {
 
 // ===== 中間件執行 =====
 
+// RequestErrorReporter 由上層（server）注入，用於回報請求結束時仍未被消費的
+// c.Error() 錯誤。維持 context 對 logger 的零依賴（與 BindInputReporter 同模式）。
+type RequestErrorReporter func(method, path string, errs []error)
+
+var requestErrorReporter RequestErrorReporter
+
+// SetRequestErrorReporter 設定未消費錯誤的回報函式（應於啟動階段呼叫一次）。
+func SetRequestErrorReporter(fn RequestErrorReporter) {
+	requestErrorReporter = fn
+}
+
+// Finish 於請求結束時收尾：清理 multipart 暫存檔、回報未消費的錯誤。
+// 由 router 在 ServeHTTP 以 defer 呼叫。
+func (c *Context) Finish() {
+	// 1) 清理 multipart 暫存檔。
+	// ParseMultipartForm 超過記憶體上限的部分會落地成 os.TempDir() 暫存檔。
+	// net/http 只在 HTTP/1.1、H2 的 finishRequest 幫忙 RemoveAll；
+	// quic-go 的 http3 沒有這段，HTTP/3 上傳會在磁碟無限堆積（DoS 面）。
+	if c.Request != nil && c.Request.MultipartForm != nil {
+		c.Request.MultipartForm.RemoveAll()
+	}
+
+	// 2) 回報未被消費的錯誤。
+	// c.Error()/AbortWithError() 累積的錯誤原本無任何消費者——
+	// AbortWithError(500, err) 只送出空 500，錯誤本身徹底消失、連 log 都沒有。
+	if requestErrorReporter != nil && len(c.Errors) > 0 {
+		errs := make([]error, 0, len(c.Errors))
+		for _, e := range c.Errors {
+			if e != nil && e.Err != nil {
+				errs = append(errs, e.Err)
+			}
+		}
+		if len(errs) > 0 {
+			method, path := "", ""
+			if c.Request != nil {
+				method, path = c.Request.Method, c.Request.URL.Path
+			}
+			requestErrorReporter(method, path, errs)
+		}
+	}
+}
+
 // SetHandlers 設定本請求的處理器鏈（全域中間件 + 路由 handlers）。
 // 由 Router 在派發前填入，之後以 c.Next() 驅動整條鏈（gin 式洋蔥模型）。
 // 重用池化的底層陣列，避免每請求重新配置。
