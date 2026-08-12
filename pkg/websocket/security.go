@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // SecurityConfig 安全管線配置（AES-256-GCM 加密 + HMAC-SHA256 簽名）
@@ -27,17 +28,37 @@ type SecurityConfig struct {
 
 // ===== AES-256-GCM 加密 =====
 
-// Encrypt 使用 AES-256-GCM 加密資料
-// 輸出格式：[nonce (12 bytes)][ciphertext + GCM tag]
-func Encrypt(plaintext, key []byte) ([]byte, error) {
+// aeadCache 以金鑰為 key 快取 cipher.AEAD。
+// cipher.AEAD 明文保證可跨 goroutine 併發重用（Seal/Open 無內部狀態）；
+// 先前每則訊息都重跑 aes.NewCipher + cipher.NewGCM（key 展開 + GCM
+// 配置表），廣播路徑上是每 client × 每訊息的固定 CPU/分配成本。
+// 條目數 = 相異金鑰數（hub 金鑰 + per-client 覆寫），由 app 控制
+var aeadCache sync.Map // string(key) → cipher.AEAD
+
+// getAEAD 取得（或建立並快取）金鑰對應的 AEAD
+func getAEAD(key []byte) (cipher.AEAD, error) {
+	k := string(key)
+	if v, ok := aeadCache.Load(k); ok {
+		return v.(cipher.AEAD), nil
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("aes.NewCipher: %w", err)
 	}
-
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
+	}
+	actual, _ := aeadCache.LoadOrStore(k, gcm)
+	return actual.(cipher.AEAD), nil
+}
+
+// Encrypt 使用 AES-256-GCM 加密資料
+// 輸出格式：[nonce (12 bytes)][ciphertext + GCM tag]
+func Encrypt(plaintext, key []byte) ([]byte, error) {
+	gcm, err := getAEAD(key)
+	if err != nil {
+		return nil, err
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
@@ -52,14 +73,9 @@ func Encrypt(plaintext, key []byte) ([]byte, error) {
 // Decrypt 使用 AES-256-GCM 解密資料
 // 輸入格式：[nonce (12 bytes)][ciphertext + GCM tag]
 func Decrypt(ciphertext, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
+	gcm, err := getAEAD(key)
 	if err != nil {
-		return nil, fmt.Errorf("aes.NewCipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
+		return nil, err
 	}
 
 	nonceSize := gcm.NonceSize()
@@ -134,22 +150,42 @@ func getHMACKey(client *Client, hubSec *SecurityConfig) []byte {
 	return nil
 }
 
+// hasKeyOverride 客戶端是否設定了 per-client 金鑰覆寫。
+// 廣播路徑用此判斷能否共用 hub 金鑰的一次性加密結果
+func hasKeyOverride(client *Client) bool {
+	if k, ok := client.GetMetadata("_aes_key"); ok {
+		if kk, ok2 := k.([]byte); ok2 && len(kk) > 0 {
+			return true
+		}
+	}
+	if k, ok := client.GetMetadata("_hmac_key"); ok {
+		if kk, ok2 := k.([]byte); ok2 && len(kk) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // applySecurityOut 出站安全管線：序列化後 → 簽名/加密 → 寫入 wire
 func applySecurityOut(data []byte, client *Client, hubSec *SecurityConfig) ([]byte, error) {
 	if hubSec == nil {
 		return data, nil
 	}
+	return applySecurityOutKeys(data, getAESKey(client, hubSec), getHMACKey(client, hubSec), hubSec.SignThenEncrypt)
+}
 
-	aesKey := getAESKey(client, hubSec)
-	hmacKey := getHMACKey(client, hubSec)
-
+// applySecurityOutKeys 以指定金鑰執行出站安全管線（不查 client metadata）。
+// 廣播時所有未覆寫金鑰的 client 共用 hub 金鑰——同一份明文以同一組
+// 金鑰加密一次、發給全部共用者，功能等價（先前 N 個 client 重算
+// N 次相同的 HMAC + AES）
+func applySecurityOutKeys(data, aesKey, hmacKey []byte, signThenEncrypt bool) ([]byte, error) {
 	if aesKey == nil && hmacKey == nil {
 		return data, nil
 	}
 
 	var err error
 
-	if hubSec.SignThenEncrypt {
+	if signThenEncrypt {
 		// Sign-then-Encrypt（預設）
 		if hmacKey != nil {
 			data = Sign(data, hmacKey)

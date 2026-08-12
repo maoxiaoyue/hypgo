@@ -1,8 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -62,7 +68,7 @@ func TestServerHealth(t *testing.T) {
 	}
 
 	// Fake start
-	s.httpServer = &http.Server{}
+	s.httpServer.Store(&http.Server{})
 	if err := s.Health(); err != nil {
 		t.Errorf("Expected no error from Health when started, got: %v", err)
 	}
@@ -133,6 +139,104 @@ func TestStartReturnsNilOnGracefulShutdown(t *testing.T) {
 	}
 }
 
+// TestShutdownIdempotent 回歸測試：Shutdown 必須冪等。
+// 歷史 bug：二次呼叫 close 已關閉的 shutdownChan → panic。
+func TestShutdownIdempotent(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	s := New(&cfg, logger.NewLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	// 第二次呼叫不得 panic
+	if err := s.Shutdown(ctx); err != nil {
+		t.Errorf("second Shutdown should return nil, got %v", err)
+	}
+}
+
+// TestGracefulRestartDisabledOnWindows Windows 一律停用優雅重啟：
+// FD 3 繼承慣例不成立，重啟必以子行程 bind 失敗、服務消失收場，
+// 且 os.Interrupt 重啟訊號會劫持 Ctrl+C 的關閉語意。
+func TestGracefulRestartDisabledOnWindows(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.EnableGracefulRestart = true
+	s := New(&cfg, logger.NewLogger())
+
+	want := runtime.GOOS != "windows"
+	if got := s.isGracefulRestartEnabled(); got != want {
+		t.Errorf("isGracefulRestartEnabled() on %s = %v, want %v", runtime.GOOS, got, want)
+	}
+}
+
+// TestStartAppliesDefaultMiddlewares 回歸測試：Start() 必須套用預設中間件。
+// 歷史 bug：applyDefaultMiddlewares 只被零 caller 的
+// ListenAndServeWithGracefulShutdown 呼叫——主要入口跑在無 Recovery、
+// 無安全頭的狀態；handler panic 時客戶端拿不到 500。
+func TestStartAppliesDefaultMiddlewares(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.Addr = "127.0.0.1:0"
+	s := New(&cfg, logger.NewLogger())
+
+	s.Router().GET("/ok", func(c *hypcontext.Context) { c.String(200, "ok") })
+	s.Router().GET("/boom", func(c *hypcontext.Context) { panic("kaboom") })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+
+	// 等待 listener 就緒
+	var addr string
+	for i := 0; i < 50; i++ {
+		if ln := s.getListenerAtomic(); ln != nil {
+			addr = ln.Addr().String()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("listener not ready within timeout")
+	}
+
+	// Security 中間件的安全頭應存在（證明預設中間件已套用）
+	resp, err := http.Get("http://" + addr + "/ok")
+	if err != nil {
+		t.Fatalf("GET /ok: %v", err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY (default Security middleware not applied?)", got)
+	}
+
+	// Recovery 中間件應把 handler panic 轉為 500（同時驗證 gin 式執行模型）
+	resp2, err := http.Get("http://" + addr + "/boom")
+	if err != nil {
+		t.Fatalf("GET /boom: %v (panic escaped Recovery?)", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusInternalServerError {
+		t.Errorf("GET /boom status = %d, want 500 (Recovery not working)", resp2.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start() did not return after Shutdown")
+	}
+}
+
 func TestProtocolGetter(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
@@ -180,11 +284,7 @@ func TestSessionCachePutAndGetAndDelete(t *testing.T) {
 }
 
 func TestSessionCacheMaxSize(t *testing.T) {
-	sc := &SessionCache{
-		entries: make(map[string]sessionEntry),
-		maxSize: 3,
-		ttl:     time.Hour,
-	}
+	sc := newSessionCacheWith(3, time.Hour)
 
 	sc.Put("a", []byte("1"))
 	sc.Put("b", []byte("2"))
@@ -194,14 +294,38 @@ func TestSessionCacheMaxSize(t *testing.T) {
 	if sc.Len() > 3 {
 		t.Errorf("Len() = %d, want <= 3 (should evict)", sc.Len())
 	}
+
+	// O(1) 淘汰語義：最舊的 "a" 被淘汰，其餘保留
+	if _, ok := sc.GetAndDelete("a"); ok {
+		t.Error("oldest entry 'a' should have been evicted")
+	}
+	for _, k := range []string{"b", "c", "d"} {
+		if _, ok := sc.GetAndDelete(k); !ok {
+			t.Errorf("entry %q should still be present", k)
+		}
+	}
+}
+
+// TestSessionCacheDuplicatePut 同 key 重複 Put 不得在鏈表殘留孤兒節點
+func TestSessionCacheDuplicatePut(t *testing.T) {
+	sc := newSessionCacheWith(10, time.Hour)
+
+	sc.Put("k", []byte("v1"))
+	sc.Put("k", []byte("v2"))
+	if sc.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1 after duplicate Put", sc.Len())
+	}
+	if n := sc.order.Len(); n != 1 {
+		t.Fatalf("order list len = %d, want 1 (orphan node leaked)", n)
+	}
+	data, ok := sc.GetAndDelete("k")
+	if !ok || string(data) != "v2" {
+		t.Errorf("GetAndDelete = %q, %v; want v2, true", data, ok)
+	}
 }
 
 func TestSessionCacheTTLExpiry(t *testing.T) {
-	sc := &SessionCache{
-		entries: make(map[string]sessionEntry),
-		maxSize: 100,
-		ttl:     50 * time.Millisecond,
-	}
+	sc := newSessionCacheWith(100, 50*time.Millisecond)
 
 	sc.Put("expired", []byte("data"))
 	time.Sleep(100 * time.Millisecond)
@@ -304,5 +428,166 @@ func TestShutdownAtomic(t *testing.T) {
 
 	if !s.shuttingDown.Load() {
 		t.Error("shuttingDown should be true after Store(true)")
+	}
+}
+
+// --- #5: waitForChildAlive 真輪詢測試 ---
+
+// TestWaitForChildAliveDetectsDeadProcess 回歸測試：子行程提前結束時必須提早偵測到，
+// 不能像舊版一樣不管三七二十一空睡滿整個時長（15 次 × 200ms = 3 秒）。
+func TestWaitForChildAliveDetectsDeadProcess(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	s := New(&cfg, logger.NewLogger())
+
+	// 產生一個立刻結束的子行程（執行自己但不跑任何測試）
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start helper process: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // 給它時間結束
+
+	start := time.Now()
+	alive := s.waitForChildAlive(cmd.Process, 15, 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if alive {
+		t.Error("waitForChildAlive should report false for an already-exited process")
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("waitForChildAlive took %v to detect a dead process, want early exit (~200ms), not the full 3s window", elapsed)
+	}
+}
+
+// TestWaitForChildAliveDetectsLiveProcess 子行程全程存活時應回傳 true。
+// Windows 上 (*os.Process).Signal 僅支援 os.Kill/os.Interrupt，
+// 存活探測必定回錯——這正是 graceful restart 在 Windows 停用的原因，故跳過。
+func TestWaitForChildAliveDetectsLiveProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("liveness probe via Signal(0) is unsupported on Windows (graceful restart is Windows-disabled)")
+	}
+
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	s := New(&cfg, logger.NewLogger())
+
+	cmd := exec.Command("sleep", "5")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot spawn helper process: %v", err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	if !s.waitForChildAlive(cmd.Process, 3, 50*time.Millisecond) {
+		t.Error("waitForChildAlive should report true for a process alive throughout the poll window")
+	}
+}
+
+// --- #6: Health()/Start() 無資料競態測試 ---
+
+// TestHealthNoRaceWithStart 回歸測試：Health() 讀取 httpServer/h3Server 與 Start()
+// 的寫入之間不得 race（改用 atomic.Pointer 後應無競態）。用 `go test -race` 執行時最具意義。
+func TestHealthNoRaceWithStart(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.Addr = "127.0.0.1:0"
+	s := New(&cfg, logger.NewLogger())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = s.Start()
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = s.Health()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	wg.Wait()
+}
+
+// --- #7: PID 檔多實例衝突測試 ---
+
+// TestSavePIDFileWarnsOnForeignAlivePID 回歸測試：既有 PID 檔屬於另一個仍存活的行程時
+// （同機同 CWD 誤起兩個 hypgo 實例），必須先警告才覆寫，不能靜默覆蓋。
+func TestSavePIDFileWarnsOnForeignAlivePID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("liveness probe via Signal(0) is unsupported on Windows")
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	// 起一個目前仍存活、PID 與本測試行程不同的子行程，模擬「另一個 hypgo 實例」
+	cmd := exec.Command("sleep", "5")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot spawn helper process: %v", err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	if err := os.WriteFile(pidFilePath, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	log, _ := logger.New("debug", "", &buf, false)
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	s := New(&cfg, log)
+
+	if err := s.savePIDFile(); err != nil {
+		t.Fatalf("savePIDFile: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "already belongs to running PID") {
+		t.Errorf("expected a collision warning in log output, got: %s", buf.String())
+	}
+
+	data, _ := os.ReadFile(pidFilePath)
+	if got := strings.TrimSpace(string(data)); got != strconv.Itoa(os.Getpid()) {
+		t.Errorf("pid file = %q, want %d (own pid, overwritten)", got, os.Getpid())
+	}
+}
+
+// TestRemovePIDFileOnlyRemovesOwnPID 回歸測試：removePIDFile 只能移除屬於自己的 PID 檔，
+// 避免誤刪另一個仍存活實例的 PID 檔。
+func TestRemovePIDFileOnlyRemovesOwnPID(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	s := New(&cfg, logger.NewLogger())
+
+	// 別人的 PID（removePIDFile 只比對數字，不需要真的存活）
+	if err := os.WriteFile(pidFilePath, []byte("999999"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.removePIDFile()
+	if _, err := os.Stat(pidFilePath); err != nil {
+		t.Error("removePIDFile should not remove a PID file belonging to a different process")
+	}
+
+	// 自己的 PID → 應該被移除
+	if err := os.WriteFile(pidFilePath, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.removePIDFile()
+	if _, err := os.Stat(pidFilePath); !os.IsNotExist(err) {
+		t.Error("removePIDFile should remove a PID file belonging to this process")
 	}
 }

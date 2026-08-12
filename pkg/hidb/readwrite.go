@@ -2,6 +2,7 @@
 package hidb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -12,19 +13,43 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// ReadReplica 讀取副本連接
-type ReadReplica struct {
-	sqlDB *sql.DB
-	hypDB *bun.DB
+// 健康檢查參數（刻意不做成設定：保持零配置，數值為業界常見預設）
+const (
+	healthCheckInterval  = 5 * time.Second        // 探測週期
+	healthPingTimeout    = 2 * time.Second        // 單次 ping 逾時
+	healthFailThreshold  = 3                      // 連續失敗 N 次後摘除
+)
+
+// replicaHealth 單一副本的健康狀態
+// 以指標共享：ReadReplica 以值複製進 copy-on-write slice，
+// 狀態必須跨副本存活。down 用 atomic 供無鎖讀路徑判斷；
+// fails 只由健康檢查 goroutine 單執行緒讀寫，不需同步
+type replicaHealth struct {
+	down  atomic.Bool
+	fails int
 }
 
-// ReplicaPool 讀取副本連接池（支持輪詢負載均衡）
+// ReadReplica 讀取副本連接
+type ReadReplica struct {
+	sqlDB  *sql.DB
+	hypDB  *bun.DB
+	health *replicaHealth
+}
+
+// ReplicaPool 讀取副本連接池（支持輪詢負載均衡 + 被動健康剔除）
 // GC 優化：讀路徑使用 atomic.Pointer 避免 RWMutex 競爭
 // 寫操作（Add/Close）仍使用 Mutex 保護
+//
+// 健康剔除：StartHealthCheck 啟動背景探測，連續 ping 失敗達門檻的
+// 副本被標記 down，Next/NextSQL 輪詢時跳過（一次成功即恢復）。
+// 全部副本 down 時回傳 nil，呼叫端（ReadHypDB/ReadSQL）自然回退主庫。
+// 未啟動健康檢查時行為與舊版相同（全部視為健康）
 type ReplicaPool struct {
 	replicas atomic.Pointer[[]ReadReplica] // GC 優化：讀路徑無鎖
 	counter  atomic.Uint64
 	mu       sync.Mutex // 僅保護寫操作
+	stopOnce sync.Once
+	stopCh   chan struct{} // nil = 健康檢查未啟動
 }
 
 // NewReplicaPool 創建讀取副本池
@@ -41,6 +66,10 @@ func (rp *ReplicaPool) Add(replica ReadReplica) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
 
+	if replica.health == nil {
+		replica.health = &replicaHealth{}
+	}
+
 	old := rp.replicas.Load()
 	newSlice := make([]ReadReplica, len(*old)+1)
 	copy(newSlice, *old)
@@ -48,26 +77,100 @@ func (rp *ReplicaPool) Add(replica ReadReplica) {
 	rp.replicas.Store(&newSlice)
 }
 
-// Next 獲取下一個讀取副本的 HypDB ORM 實例（輪詢）
-// GC 優化：讀路徑完全無鎖，使用 atomic.Pointer 讀取
+// Next 獲取下一個健康的讀取副本 HypDB ORM 實例（輪詢，跳過 down 副本）
+// GC 優化：讀路徑完全無鎖。全部不健康時回傳 nil（呼叫端回退主庫）
 func (rp *ReplicaPool) Next() *bun.DB {
 	replicas := *rp.replicas.Load()
-	if len(replicas) == 0 {
+	n := uint64(len(replicas))
+	if n == 0 {
 		return nil
 	}
-	idx := rp.counter.Add(1) - 1
-	return replicas[idx%uint64(len(replicas))].hypDB
+	start := rp.counter.Add(1) - 1
+	for i := uint64(0); i < n; i++ {
+		r := replicas[(start+i)%n]
+		if !r.health.down.Load() {
+			return r.hypDB
+		}
+	}
+	return nil
 }
 
-// NextSQL 獲取下一個讀取副本的原始 SQL 連接（輪詢）
-// GC 優化：讀路徑完全無鎖
+// NextSQL 獲取下一個健康的讀取副本原始 SQL 連接（輪詢，跳過 down 副本）
+// GC 優化：讀路徑完全無鎖。全部不健康時回傳 nil（呼叫端回退主庫）
 func (rp *ReplicaPool) NextSQL() *sql.DB {
 	replicas := *rp.replicas.Load()
-	if len(replicas) == 0 {
+	n := uint64(len(replicas))
+	if n == 0 {
 		return nil
 	}
-	idx := rp.counter.Add(1) - 1
-	return replicas[idx%uint64(len(replicas))].sqlDB
+	start := rp.counter.Add(1) - 1
+	for i := uint64(0); i < n; i++ {
+		r := replicas[(start+i)%n]
+		if !r.health.down.Load() {
+			return r.sqlDB
+		}
+	}
+	return nil
+}
+
+// StartHealthCheck 啟動背景健康探測 goroutine（冪等：重複呼叫無效果）。
+// 停止方式：Close()。未呼叫本方法時，Pool 行為與無健康檢查的舊版相同
+func (rp *ReplicaPool) StartHealthCheck() {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	if rp.stopCh != nil {
+		return
+	}
+	rp.stopCh = make(chan struct{})
+	go rp.healthLoop(rp.stopCh)
+}
+
+// healthLoop 週期性探測所有副本直到 stop 訊號
+func (rp *ReplicaPool) healthLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			rp.checkAll()
+		}
+	}
+}
+
+// checkAll 對所有副本做一輪 ping：連續失敗達門檻標記 down，一次成功即恢復。
+// 只由 healthLoop 單一 goroutine 呼叫（fails 因此不需同步）
+func (rp *ReplicaPool) checkAll() {
+	for _, r := range *rp.replicas.Load() {
+		if r.sqlDB == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), healthPingTimeout)
+		err := r.sqlDB.PingContext(ctx)
+		cancel()
+
+		if err != nil {
+			r.health.fails++
+			if r.health.fails >= healthFailThreshold {
+				r.health.down.Store(true)
+			}
+		} else {
+			r.health.fails = 0
+			r.health.down.Store(false)
+		}
+	}
+}
+
+// HealthyCount 回傳目前健康（未被摘除）的副本數量
+func (rp *ReplicaPool) HealthyCount() int {
+	count := 0
+	for _, r := range *rp.replicas.Load() {
+		if !r.health.down.Load() {
+			count++
+		}
+	}
+	return count
 }
 
 // Len 返回副本數量
@@ -75,10 +178,14 @@ func (rp *ReplicaPool) Len() int {
 	return len(*rp.replicas.Load())
 }
 
-// Close 關閉所有讀取副本連接
+// Close 關閉所有讀取副本連接（並停止健康檢查 goroutine）
 func (rp *ReplicaPool) Close() []error {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
+
+	if rp.stopCh != nil {
+		rp.stopOnce.Do(func() { close(rp.stopCh) })
+	}
 
 	replicas := *rp.replicas.Load()
 	var errs []error

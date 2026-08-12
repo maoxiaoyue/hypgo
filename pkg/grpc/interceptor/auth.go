@@ -38,13 +38,10 @@ func Auth(authFn AuthFunc, skipMethods ...string) grpc.UnaryServerInterceptor {
 			return handler(ctx, req)
 		}
 
-		// 從 metadata 取得 token
-		md, ok := metadata.FromIncomingContext(ctx)
-		if !ok {
-			return nil, status.Error(codes.Unauthenticated, "missing metadata")
-		}
-
-		tokens := md.Get("authorization")
+		// 從 metadata 取單一 key：FromIncomingContext 會防禦性複製
+		// 整個 MD map（map + 每 key 一個 []string 分配），每個 RPC
+		// 都付這筆成本只為讀一個 key
+		tokens := metadata.ValueFromIncomingContext(ctx, "authorization")
 		if len(tokens) == 0 {
 			return nil, status.Error(codes.Unauthenticated, "missing authorization token")
 		}

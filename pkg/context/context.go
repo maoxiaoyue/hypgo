@@ -49,6 +49,17 @@ type Context struct {
 	Response ResponseWriter
 	Writer   ResponseWriter // Gin 兼容別名
 
+	// rw 為 Acquire 時自池中借出、由本 Context 擁有的 writer。
+	// Response/Writer 是 exported 介面欄位，中間件可合法替換成包裝器
+	// （如 Compression 的 gzipWriter），因此歸還時必須還這個原始指標，
+	// 不能對 Response 做型別斷言（會 panic）。
+	rw *responseWriter
+
+	// released 保證 Release 冪等：Release/ReleaseContext 皆為 exported，
+	// 使用者若在 handler 內也 defer 一次，會與 router 的 defer 構成
+	// double-release，導致同一物件被 Put 進池兩次、被兩個並行請求共用。
+	released bool
+
 	// HTTP/3 QUIC 特定支援
 	quicConn   *QuicConnection
 	streamInfo *StreamInfo
@@ -62,7 +73,11 @@ type Context struct {
 
 	// 中間件和處理器
 	handlers []HandlerFunc
-	index    int8
+	// index 為 int32：int8 上限 127 而 abortIndex 為 63，一旦「全域中間件 +
+	// 路由 handler」總數超過 63，c.index++ 會溢位成負數，造成
+	// index out of range [-128] panic（64~127 個）或整條鏈靜默不執行、
+	// 卻回 200 空回應（128 個以上）。int32 讓上限遠高於任何實際鏈長。
+	index    int32
 	fullPath string
 
 	// 資料存儲
@@ -214,10 +229,61 @@ func (c *Context) Release() {
 
 // ===== 中間件執行 =====
 
+// RequestErrorReporter 由上層（server）注入，用於回報請求結束時仍未被消費的
+// c.Error() 錯誤。維持 context 對 logger 的零依賴（與 BindInputReporter 同模式）。
+type RequestErrorReporter func(method, path string, errs []error)
+
+var requestErrorReporter RequestErrorReporter
+
+// SetRequestErrorReporter 設定未消費錯誤的回報函式（應於啟動階段呼叫一次）。
+func SetRequestErrorReporter(fn RequestErrorReporter) {
+	requestErrorReporter = fn
+}
+
+// Finish 於請求結束時收尾：清理 multipart 暫存檔、回報未消費的錯誤。
+// 由 router 在 ServeHTTP 以 defer 呼叫。
+func (c *Context) Finish() {
+	// 1) 清理 multipart 暫存檔。
+	// ParseMultipartForm 超過記憶體上限的部分會落地成 os.TempDir() 暫存檔。
+	// net/http 只在 HTTP/1.1、H2 的 finishRequest 幫忙 RemoveAll；
+	// quic-go 的 http3 沒有這段，HTTP/3 上傳會在磁碟無限堆積（DoS 面）。
+	if c.Request != nil && c.Request.MultipartForm != nil {
+		c.Request.MultipartForm.RemoveAll()
+	}
+
+	// 2) 回報未被消費的錯誤。
+	// c.Error()/AbortWithError() 累積的錯誤原本無任何消費者——
+	// AbortWithError(500, err) 只送出空 500，錯誤本身徹底消失、連 log 都沒有。
+	if requestErrorReporter != nil && len(c.Errors) > 0 {
+		errs := make([]error, 0, len(c.Errors))
+		for _, e := range c.Errors {
+			if e != nil && e.Err != nil {
+				errs = append(errs, e.Err)
+			}
+		}
+		if len(errs) > 0 {
+			method, path := "", ""
+			if c.Request != nil {
+				method, path = c.Request.Method, c.Request.URL.Path
+			}
+			requestErrorReporter(method, path, errs)
+		}
+	}
+}
+
+// SetHandlers 設定本請求的處理器鏈（全域中間件 + 路由 handlers）。
+// 由 Router 在派發前填入，之後以 c.Next() 驅動整條鏈（gin 式洋蔥模型）。
+// 重用池化的底層陣列，避免每請求重新配置。
+func (c *Context) SetHandlers(global, route []HandlerFunc) {
+	c.handlers = c.handlers[:0]
+	c.handlers = append(c.handlers, global...)
+	c.handlers = append(c.handlers, route...)
+}
+
 // Next 執行下一個中間件
 func (c *Context) Next() {
 	c.index++
-	for c.index < int8(len(c.handlers)) {
+	for c.index < int32(len(c.handlers)) {
 		c.handlers[c.index](c)
 		c.index++
 	}

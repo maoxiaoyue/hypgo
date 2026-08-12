@@ -13,13 +13,12 @@ import (
 // ===== 全域物件池 =====
 
 var (
-	// Context 物件池
+	// Context 物件池（Params/Keys 延遲初始化：Params 每請求由
+	// AcquireParams 供給、Keys 由 Set() 首次使用時建立）
 	contextPool = &sync.Pool{
 		New: func() interface{} {
 			return &Context{
-				Params:   make(Params, 0, 8),
 				handlers: make([]HandlerFunc, 0, 8),
-				Keys:     make(map[string]interface{}, 8),
 				Errors:   make(errorMsgs, 0, 4),
 			}
 		},
@@ -75,8 +74,10 @@ func AcquireContext(w http.ResponseWriter, r *http.Request) *Context {
 	c := contextPool.Get().(*Context)
 	c.reset()
 	c.Request = r
-	c.Response = acquireResponseWriter(w)
-	c.Writer = c.Response // Gin 兼容別名，必須設置
+	rw := acquireResponseWriter(w)
+	c.rw = rw // 記住自己擁有的原始 writer，供 Release 歸還
+	c.Response = rw
+	c.Writer = rw // Gin 兼容別名，必須設置
 	c.metrics = acquireMetrics()
 	c.startTime = time.Now()
 
@@ -93,14 +94,15 @@ func AcquireContext(w http.ResponseWriter, r *http.Request) *Context {
 
 // ReleaseContext 將 Context 返回池中
 func ReleaseContext(c *Context) {
-	if c == nil {
+	// released 檢查讓重複呼叫成為 no-op（見 Context.released 說明）
+	if c == nil || c.released {
 		return
 	}
 
-	// 釋放子物件
-	if c.Response != nil {
-		releaseResponseWriter(c.Response.(*responseWriter))
-	}
+	// 釋放子物件。歸還 c.rw（本 Context 擁有的原始 writer）而非對
+	// c.Response 做型別斷言——中間件可能已把 Response 換成包裝器
+	// （如 Compression 的 gzipWriter），斷言會 panic。
+	releaseResponseWriter(c.rw)
 	if c.metrics != nil {
 		releaseMetrics(c.metrics)
 	}
@@ -111,47 +113,68 @@ func ReleaseContext(c *Context) {
 		releaseQuicConnection(c.quicConn)
 	}
 
-	// 清理並返回池中
+	// 清理並返回池中（reset 會把 released 歸零，故在其後標記）
 	c.reset()
+	c.released = true
 	contextPool.Put(c)
 }
 
 // reset 重置 Context
-// GC 優化：使用 map 重建替代逐一 delete
-// 逐一 delete 會觸發 N 次 hash 操作和 GC write barrier
-// 重建 map 只產生一次分配，且舊 map 由 GC 整體回收
 func (c *Context) reset() {
 	c.Request = nil
 	c.Response = nil
+	c.Writer = nil // 與 Response 同為別名，漏清會殘留已歸還 writer 的指標
+	c.rw = nil
 	c.quicConn = nil
 	c.streamInfo = nil
+	c.metrics = nil // 漏清會讓 double-release 把同一 metrics Put 進池兩次
 
+	// Params 歸還池中：router 每請求經 AcquireParams 取得新 slice 蓋掉
+	// 本欄位。先前只截斷（[:0]）不歸還，ReleaseParams 全 module 零呼叫
+	// 者——pool 有進無出、永遠 miss，每個帶參數請求照樣分配
+	if c.Params != nil {
+		ReleaseParams(c.Params)
+		c.Params = nil
+	}
 	// 清理切片但保留容量
-	c.Params = c.Params[:0]
 	c.handlers = c.handlers[:0]
 	c.Errors = c.Errors[:0]
 
-	// GC 優化：重建 map 替代逐一 delete
-	c.Keys = make(map[string]interface{}, 8)
+	// Keys 延遲初始化：Set() 已有 nil 檢查、讀 nil map 合法。
+	// 先前每次 reset 重建 make(map,8)，而 reset 在 Acquire 與 Release
+	// 各跑一次——未用到 Keys 的請求（多數）也付 2 次 map 分配
+	c.Keys = nil
 
-	// 清理快取：直接置 nil，下次使用時延遲初始化
+	// 清理快取：直接置 nil，下次使用時延遲初始化。
+	// rawData 有 memo 語義（GetRawData/ShouldBindBodyWith 會先看它），
+	// 漏清會讓下一個請求讀到上一個請求的完整 body —— 跨請求資料洩漏
 	c.queryCache = nil
 	c.formCache = nil
+	c.rawData = nil
 
 	c.index = -1
 	c.protocol = 0
 	c.startTime = time.Time{}
+	c.fullPath = ""    // 漏清會讓監控/日誌把本請求歸到上一個請求的路由
+	c.routerGroup = nil
+
+	// 內容協商與 cookie 設定：漏清 sameSite 會讓上一個請求設的
+	// SameSite=None 套用到下一個請求的 session cookie（CSRF 防護失效）
+	c.Accepted = nil
+	c.sameSite = 0
 
 	// Schema-first 綁定狀態
 	c.schemaInput = nil
 	c.schemaRouteKey = ""
 	c.bindInputCalled = false
+
+	c.released = false
 }
 
 // ===== ResponseWriter 池操作 =====
 
-// acquireResponseWriter 從池中獲取 ResponseWriter
-func acquireResponseWriter(w http.ResponseWriter) ResponseWriter {
+// acquireResponseWriter 從池中獲取 responseWriter（回傳具體型別，供 Context 記住所有權）
+func acquireResponseWriter(w http.ResponseWriter) *responseWriter {
 	rw := responseWriterPool.Get().(*responseWriter)
 	rw.reset()
 	rw.ResponseWriter = w

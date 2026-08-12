@@ -24,9 +24,12 @@ func (c *Context) IndentedJSON(code int, obj interface{}) {
 	c.Render(code, indentedJSONRender{Data: obj})
 }
 
-// SecureJSON 回應安全的 JSON（防止 JSON 劫持）
+// SecureJSON 回應安全的 JSON（防止 JSON 劫持）。
+// 前綴 while(1); 讓回應無法被 <script src> 當成合法 JS 執行。
 func (c *Context) SecureJSON(code int, obj interface{}) {
-	c.Render(code, secureJSONRender{Data: obj})
+	// Prefix 必須填：漏填會讓 render 的 if r.Prefix != "" 恆假，
+	// 輸出與 c.JSON 完全相同——防護名存實亡
+	c.Render(code, secureJSONRender{Prefix: "while(1);", Data: obj})
 }
 
 // JSONP 回應 JSONP
@@ -35,7 +38,9 @@ func (c *Context) JSONP(code int, obj interface{}) {
 	if callback == "" {
 		c.JSON(code, obj)
 	} else {
-		c.Render(code, jsonpJSONRender{Data: callback})
+		// Callback 與 Data 都要填：舊版把 callback 當成 Data 傳、
+		// Callback 留空，輸出成 ("callback"); —— obj 整包遺失
+		c.Render(code, jsonpJSONRender{Callback: callback, Data: obj})
 	}
 }
 
@@ -75,13 +80,6 @@ func (c *Context) WriteXML(code int, obj interface{}) error {
 // YAML 回應 YAML
 func (c *Context) YAML(code int, obj interface{}) {
 	c.Render(code, yamlRender{Data: obj})
-}
-
-// ===== ProtoBuf 響應 =====
-
-// ProtoBuf 回應 ProtoBuf
-func (c *Context) ProtoBuf(code int, obj interface{}) {
-	c.Render(code, protoBufRender{Data: obj})
 }
 
 // ===== 文本響應 =====
@@ -387,11 +385,5 @@ type Negotiate struct {
 	JSONData interface{}
 	XMLData  interface{}
 	YAMLData interface{}
-	TOMLData interface{}
 	Data     interface{}
-}
-
-// TOML 回應 TOML
-func (c *Context) TOML(code int, obj interface{}) {
-	c.Render(code, tomlRender{Data: obj})
 }

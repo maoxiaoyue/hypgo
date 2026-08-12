@@ -53,7 +53,13 @@ func Compression(config CompressionConfig) hypcontext.HandlerFunc {
 			gz := gzip.NewWriter(c.Response)
 			defer gz.Close()
 
-			c.Response = &gzipWriter{ResponseWriter: c.Response, Writer: gz}
+			// Response 與 Writer 兩個欄位都要換：框架的輸出方法
+			// （Render/JSON/String/Write…）全部走 c.Writer，只換 Response
+			// 會讓 body 以明文直送、卻帶著 Content-Encoding: gzip，
+			// 客戶端解碼失敗（實測 body = 明文 + 空 gzip 串流）
+			gw := &gzipWriter{ResponseWriter: c.Response, Writer: gz}
+			c.Response = gw
+			c.Writer = gw
 		}
 
 		c.Next()

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -28,8 +27,12 @@ type ServerConfig struct {
 	Addr         string        `mapstructure:"addr" yaml:"addr"`
 	Protocol     string        `mapstructure:"protocol" yaml:"protocol"` // "http1", "http2", "http3", "auto"
 	TLS          TLSConfig     `mapstructure:"tls" yaml:"tls"`
-	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
-	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
+	// 秒。曾為 time.Duration：預設值 30*time.Second 再被 server 乘上
+	// time.Second 後溢位 int64 成負數，http.Server 視負值為「無 timeout」，
+	// 等於預設路徑完全沒有讀寫 deadline（slow-loris 攻擊面）。
+	// 改用 int 秒與 IdleTimeout 及 config.yaml 範本（read_timeout: 30）語義一致
+	ReadTimeout  int `mapstructure:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout int `mapstructure:"write_timeout" yaml:"write_timeout"`
 
 	// HTTP/2 相關配置
 	MaxHandlers          int `mapstructure:"max_handlers" yaml:"max_handlers"`
@@ -39,6 +42,12 @@ type ServerConfig struct {
 
 	// 優雅重啟
 	EnableGracefulRestart bool `mapstructure:"enable_graceful_restart" yaml:"enable_graceful_restart"`
+
+	// TrustedProxies 可信代理網段（CIDR 或單一 IP，如 "10.0.0.0/8"、"127.0.0.1"）。
+	// 只有直連來源落在此清單時，c.ClientIP() 才採信 X-Forwarded-For / X-Real-IP。
+	// 留空（預設）＝ 不信任任何代理，ClientIP 一律回傳實際連線來源。
+	// 服務位於 nginx / LB 之後時務必設定，否則 ClientIP 會是代理的位址。
+	TrustedProxies []string `mapstructure:"trusted_proxies" yaml:"trusted_proxies"`
 }
 
 type TLSConfig struct {
@@ -204,10 +213,10 @@ func (c *Config) ApplyDefaults() {
 		c.Server.Protocol = "http2"
 	}
 	if c.Server.ReadTimeout == 0 {
-		c.Server.ReadTimeout = 30 * time.Second
+		c.Server.ReadTimeout = 30 // 秒
 	}
 	if c.Server.WriteTimeout == 0 {
-		c.Server.WriteTimeout = 30 * time.Second
+		c.Server.WriteTimeout = 30 // 秒
 	}
 
 	// HTTP/2 預設值
@@ -407,12 +416,12 @@ func (s *ServerConfig) GetProtocol() string {
 
 // GetReadTimeout 獲取讀取超時（秒）
 func (s *ServerConfig) GetReadTimeout() int {
-	return int(s.ReadTimeout.Seconds())
+	return s.ReadTimeout
 }
 
 // GetWriteTimeout 獲取寫入超時（秒）
 func (s *ServerConfig) GetWriteTimeout() int {
-	return int(s.WriteTimeout.Seconds())
+	return s.WriteTimeout
 }
 
 // GetMaxHeaderBytes 獲取最大標頭字節數

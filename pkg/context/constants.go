@@ -9,8 +9,9 @@ const (
 	// defaultMemory 默認的表單內存限制 (32 MB)
 	defaultMemory = 32 << 20
 
-	// abortIndex 中止索引
-	abortIndex = math.MaxInt8 / 2
+	// abortIndex 中止索引（配合 Context.index 的 int32；取一個遠大於任何
+	// 實際 handler 鏈長、又不會在 index++ 時溢位的哨兵值）
+	abortIndex = math.MaxInt32 / 2
 )
 
 // ===== MIME 類型常量 =====

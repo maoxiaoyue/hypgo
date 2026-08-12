@@ -107,9 +107,13 @@ func New(opts ...RouterOption) *Router {
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
 		http3Config:            nil,
+		// 存 *[]Param 而非 []Param：slice header 以值存入 interface{}
+		// 會在每次 Put 時將 24-byte header 逃逸到堆上（SA6002），
+		// 每個帶參數請求平白多一次分配
 		paramPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]Param, 0, 10)
+				p := make([]Param, 0, 10)
+				return &p
 			},
 		},
 	}
@@ -167,6 +171,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// 底層從未收到 WriteHeader，Go 會自動補 200 → 瀏覽器拿到 200 + Location 不跳轉。
 	// （defer LIFO：此行先於 c.Release() 執行，writer 尚未歸還池）
 	defer c.Response.WriteHeaderNow()
+	// 清理 multipart 暫存檔並回報未消費的請求錯誤（見各自函式說明）
+	defer c.Finish()
 
 	urlPath := req.URL.Path
 	method := req.Method
@@ -176,45 +182,46 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
 	}
 
-	// 快取查找
+	// 快取查找（僅靜態路由，無參數）
 	if r.enableCache {
-		cacheKey := method + urlPath
-		if entry := r.cache.get(cacheKey); entry != nil {
-			c.Params = r.makeContextParams(entry.params)
-			r.executeHandlers(c, entry.handlers)
+		if handlers := r.cache.get(method + urlPath); handlers != nil {
+			c.Params = r.makeContextParams(nil)
+			r.executeHandlers(c, handlers)
 			return
 		}
 	}
 
 	// Radix Tree 查找
 	if root := r.trees[method]; root != nil {
-		handlers, params := root.search(urlPath, r.getParams())
+		ps := r.getParams()
+		handlers, params := root.search(urlPath, (*ps)[:0])
 		if handlers != nil {
 			c.Params = r.makeContextParams(params)
 
 			// 只快取靜態路由（無參數）
 			if r.enableCache && len(params) == 0 {
-				r.cache.put(method+urlPath, handlers, params)
+				r.cache.put(method+urlPath, handlers)
 			}
 
 			r.executeHandlers(c, handlers)
-			r.putParams(params)
+			r.putParams(ps, params)
 			return
 		}
-		r.putParams(params)
+		r.putParams(ps, params)
 	}
 
 	// HEAD 自動回應：若無 HEAD handler，使用 GET handler
 	if method == "HEAD" {
 		if root := r.trees["GET"]; root != nil {
-			handlers, params := root.search(urlPath, r.getParams())
+			ps := r.getParams()
+			handlers, params := root.search(urlPath, (*ps)[:0])
 			if handlers != nil {
 				c.Params = r.makeContextParams(params)
 				r.executeHandlers(c, handlers)
-				r.putParams(params)
+				r.putParams(ps, params)
 				return
 			}
-			r.putParams(params)
+			r.putParams(ps, params)
 		}
 	}
 
@@ -242,22 +249,37 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				continue
 			}
 			if handlers, _ := tree.search(urlPath, nil); handlers != nil {
-				if r.methodNotAllowed != nil {
-					r.methodNotAllowed(c)
-				} else {
-					c.Status(http.StatusMethodNotAllowed)
-					c.Writer.WriteHeaderNow()
-				}
+				// 走 executeHandlers 讓 405 也經過全域中間件：
+				// 直接呼叫會讓 Recovery / Logger / CORS / Security 全部跳過，
+				// 自訂 handler 內的 panic 直接穿透到 net/http（連線被斷而非 500）
+				r.executeHandlers(c, []hypcontext.HandlerFunc{r.methodNotAllowedHandler()})
 				return
 			}
 		}
 	}
 
-	// 404 Not Found
+	// 404 Not Found（同樣經過全域中間件）
+	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
+}
+
+// notFoundHandler 回傳 404 處理器（自訂或預設）
+func (r *Router) notFoundHandler() hypcontext.HandlerFunc {
 	if r.notFound != nil {
-		r.notFound(c)
-	} else {
+		return r.notFound
+	}
+	return func(c *hypcontext.Context) {
 		c.Status(http.StatusNotFound)
+		c.Writer.WriteHeaderNow()
+	}
+}
+
+// methodNotAllowedHandler 回傳 405 處理器（自訂或預設）
+func (r *Router) methodNotAllowedHandler() hypcontext.HandlerFunc {
+	if r.methodNotAllowed != nil {
+		return r.methodNotAllowed
+	}
+	return func(c *hypcontext.Context) {
+		c.Status(http.StatusMethodNotAllowed)
 		c.Writer.WriteHeaderNow()
 	}
 }
@@ -272,24 +294,17 @@ func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
 	r.globalMW = append(r.globalMW, middleware...)
 }
 
-// executeHandlers 執行處理器鏈
-// 順序：全域中間件 → (Group 中間件 + 路由 Handler)，其中 Group 中間件已在 Group.handle() 中與 Handler 合併
+// executeHandlers 執行處理器鏈（gin 式洋蔥模型）
+// 順序：全域中間件 → (Group 中間件 + 路由 Handler)，合併進 c.handlers 後由 c.Next() 驅動。
+//
+// v0.8.11 前為攤平循序執行、c.handlers 從未填入——中間件內的 c.Next() 是 no-op，
+// 導致「包裹式」中間件全數失效：Recovery 的 defer/recover 接不到 handler 的 panic、
+// Logger 在 handler 執行前就記完 log（耗時恆 0、狀態碼恆 200）、Compression 在
+// handler 寫入前就 defer Close 掉 gzip writer。改為 c.Next() 驅動後，中間件的
+// c.Next() 會先執行鏈上其餘 handler 再返回，真正包住下游；c.Abort* 中止鏈。
 func (r *Router) executeHandlers(c *hypcontext.Context, handlers []hypcontext.HandlerFunc) {
-	// 1. 全域中間件
-	for _, h := range r.globalMW {
-		h(c)
-		if c.Response.Written() {
-			return
-		}
-	}
-
-	// 2. Group 中間件 + 路由 Handler（已合併為一個 slice）
-	for _, h := range handlers {
-		h(c)
-		if c.Response.Written() {
-			return
-		}
-	}
+	c.SetHandlers(r.globalMW, handlers)
+	c.Next()
 }
 
 // NotFound 設置 404 處理器
@@ -329,17 +344,17 @@ func (r *Router) GetHTTP3Config() *HTTP3Config {
 	return r.http3Config
 }
 
-// getParams 從池中獲取參數切片，參數池 & 轉換
-func (r *Router) getParams() []Param {
-	ps := r.paramPool.Get().([]Param)
-	return ps[:0]
+// getParams 從池中獲取參數切片箱。回傳 *[]Param 讓同一個指標箱
+// 在 Get/Put 間往返——若以值存取，slice header 每次 Put 都逃逸
+// 到堆上（SA6002），每個帶參數請求平白多一次分配
+func (r *Router) getParams() *[]Param {
+	return r.paramPool.Get().(*[]Param)
 }
 
-// putParams 返回參數切片到池
-func (r *Router) putParams(params []Param) {
-	if params != nil {
-		r.paramPool.Put(params[:0])
-	}
+// putParams 將（可能已被 search 重新配置的）切片寫回箱中並歸還池
+func (r *Router) putParams(ps *[]Param, params []Param) {
+	*ps = params[:0]
+	r.paramPool.Put(ps)
 }
 
 // makeContextParams 轉換路由參數為 Context 參數格式

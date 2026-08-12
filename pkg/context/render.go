@@ -29,7 +29,6 @@ type defaultRender struct {
 	JSON         jsonRender
 	XML          xmlRender
 	YAML         yamlRender
-	ProtoBuf     protoBufRender
 	IndentedJSON indentedJSONRender
 	SecureJSON   secureJSONRender
 	JsonpJSON    jsonpJSONRender
@@ -42,11 +41,19 @@ type jsonRender struct{ Data interface{} }
 
 func (r jsonRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	jsonBytes, err := json.Marshal(r.Data)
-	if err != nil {
+	// 池化緩衝 + Encoder：json.Marshal 每次回應都整包新配置 body，
+	// 是典型小 JSON 回應在 H1-H3 修復後的最大單筆每請求分配
+	buf := AcquireBuffer()
+	defer ReleaseBuffer(buf)
+	if err := json.NewEncoder(buf).Encode(r.Data); err != nil {
 		return err
 	}
-	_, err = w.Write(jsonBytes)
+	// Encoder 尾端固定補 '\n'，去除以維持與 json.Marshal 相同輸出
+	b := buf.Bytes()
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+	}
+	_, err := w.Write(b)
 	return err
 }
 
@@ -315,20 +322,6 @@ func (r readerRender) WriteContentType(w http.ResponseWriter) {
 // Reader 創建 Reader 渲染器
 var Reader = readerRender{}
 
-// ===== ProtoBuf 渲染器 =====
-
-type protoBufRender struct{ Data interface{} }
-
-func (r protoBufRender) Render(w http.ResponseWriter) error {
-	r.WriteContentType(w)
-	// 需要 protobuf 庫支援
-	return fmt.Errorf("protobuf render not implemented")
-}
-
-func (r protoBufRender) WriteContentType(w http.ResponseWriter) {
-	writeContentType(w, []string{"application/x-protobuf"})
-}
-
 // ===== Server-Sent Event 渲染器 =====
 type sseventRender struct {
 	Event string
@@ -373,19 +366,7 @@ func writeContentType(w http.ResponseWriter, value []string) {
 	}
 }
 
-// ===== TOML 渲染器 =====
-
-type tomlRender struct{ Data interface{} }
-
-func (r tomlRender) Render(w http.ResponseWriter) error {
-	r.WriteContentType(w)
-	// 需要 toml 庫支援
-	return fmt.Errorf("toml render not implemented")
-}
-
-func (r tomlRender) WriteContentType(w http.ResponseWriter) {
-	writeContentType(w, []string{"application/toml; charset=utf-8"})
-}
-
-// TOML 創建 TOML 渲染器
-var TOML = tomlRender{}
+// 註：ProtoBuf / TOML renderer 與其對應的 c.ProtoBuf()/c.TOML() 方法
+// 已於 v0.8.11 移除——兩者的 Render 都是無條件回傳 "not implemented"，
+// 而 Context.Render 對非 nil error 一律 panic，等於「公開 API 呼叫即崩潰」。
+// 需要這兩種格式時請自行 c.Data(code, contentType, bytes)。

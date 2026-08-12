@@ -88,7 +88,7 @@ func TestRunTestOnce_PassOnValidRoute(t *testing.T) {
 		c.JSON(200, map[string]string{"status": "ok"})
 	})
 
-	pass, reason := runTestOnce(r, TestCase{
+	pass, reason, _ := runTestOnce(r, TestCase{
 		Route:        "GET /ping",
 		ExpectStatus: 200,
 	})
@@ -107,7 +107,7 @@ func TestRunTestOnce_FailOnWrongStatus(t *testing.T) {
 		c.JSON(200, nil)
 	})
 
-	pass, reason := runTestOnce(r, TestCase{
+	pass, reason, _ := runTestOnce(r, TestCase{
 		Route:        "GET /ping",
 		ExpectStatus: 500, // 故意錯誤
 	})
@@ -121,7 +121,7 @@ func TestRunTestOnce_FailOnWrongStatus(t *testing.T) {
 
 func TestRunTestOnce_InvalidRouteFormat(t *testing.T) {
 	r := router.New()
-	pass, reason := runTestOnce(r, TestCase{Route: "INVALID"})
+	pass, reason, _ := runTestOnce(r, TestCase{Route: "INVALID"})
 	if pass {
 		t.Error("invalid route format should fail")
 	}

@@ -137,21 +137,33 @@ func (ProtobufCodec) DecodeRoomID(data []byte) string {
 
 // ===== 跨協議廣播 Helper =====
 
+// codecSlots codec Index() 的固定上界（JSON=0 / Protobuf=1 / FlatBuffers=2 / Msgpack=3）
+const codecSlots = 4
+
 // marshalForClients 將 Message 序列化後發送給多個客戶端
-// 使用惰性序列化：每種 codec 最多序列化一次，無論有多少客戶端
-// 支援安全管線（AES 加密 / HMAC 簽名），安全管線逐 client 套用
+// 惰性序列化：每種 codec 最多序列化一次，無論有多少客戶端。
+// 安全管線同樣按 codec 快取：未設 per-client 金鑰覆寫的客戶端
+// （常態）共用 hub 金鑰的一次性 Sign+Encrypt 結果——先前逐 client
+// 重算，N 個客戶端就是 N 次相同的 HMAC-SHA256 + AES-GCM。
+// 固定陣列取代 map：省每次廣播 2 個 map 分配與雜湊
 func marshalForClients(msg *Message, clients []*Client, security *SecurityConfig, onSent func(n int64)) {
-	cache := make(map[int][]byte, 4)
-	errs := make(map[int]error, 4)
+	var (
+		cache   [codecSlots][]byte // 序列化結果
+		secured [codecSlots][]byte // hub 金鑰的安全管線結果
+		errs    [codecSlots]error
+		tried   [codecSlots]bool
+	)
 
 	for _, client := range clients {
 		idx := client.codec.Index()
+		if idx < 0 || idx >= codecSlots {
+			continue
+		}
 
 		// 惰性序列化：同一 codec 只序列化一次
-		if _, cached := cache[idx]; !cached {
-			if errs[idx] == nil {
-				cache[idx], errs[idx] = client.codec.Marshal(msg)
-			}
+		if !tried[idx] {
+			tried[idx] = true
+			cache[idx], errs[idx] = client.codec.Marshal(msg)
 		}
 		if errs[idx] != nil {
 			continue
@@ -159,12 +171,24 @@ func marshalForClients(msg *Message, clients []*Client, security *SecurityConfig
 
 		data := cache[idx]
 
-		// 安全管線（逐 client 套用，因金鑰可能不同）
+		// 安全管線
 		if security != nil {
-			var err error
-			data, err = applySecurityOut(data, client, security)
-			if err != nil {
-				continue
+			if hasKeyOverride(client) {
+				// per-client 金鑰：逐 client 運算
+				var err error
+				data, err = applySecurityOut(data, client, security)
+				if err != nil {
+					continue
+				}
+			} else if secured[idx] != nil {
+				data = secured[idx]
+			} else {
+				s, err := applySecurityOutKeys(data, security.AESKey, security.HMACKey, security.SignThenEncrypt)
+				if err != nil {
+					continue
+				}
+				secured[idx] = s
+				data = s
 			}
 		}
 

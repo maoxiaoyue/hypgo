@@ -40,8 +40,8 @@ type EvalRecord struct {
 	// Status 為 "pass" 或 "fail"
 	Status string `json:"status"`
 
-	// Scores 為各評判器的評分（0.0–1.0），目前只有 "contract" 分數
-	// 未來 Item A（Probabilistic Evaluation）加入後將包含 "llm_judge"、"similarity" 等
+	// Scores 為各評判器的評分（0.0–1.0）："contract"（deterministic 結果）加上
+	// TestCase.Graders 的各評判器分數（"llm_judge"、"similarity"、"aggregate" 等）
 	Scores map[string]float64 `json:"scores,omitempty"`
 
 	// LatencyMs 為完整執行時間（含重試），單位毫秒

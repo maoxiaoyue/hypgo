@@ -165,15 +165,20 @@ func CreateUser(ctx *hypcontext.Context) {}
 // REST
 r.Schema(schema.Route{...}).Handle(handler)
 
-// gRPC (v0.8.5+)
+// gRPC / CLI / Desktop —— 保留專屬 helper
 schema.RegisterGRPC("UserService/CreateUser", "建立使用者", &pb.Req{}, &pb.Resp{})
+schema.RegisterCLI("deploy", "部署服務", &DeployArgs{}, &DeployResult{})
+schema.RegisterDesktop("view/main", "主視圖", nil, nil)
 
-// Bot (v0.8.5+)
-schema.RegisterBot("/start", "啟動 bot", nil, nil)
-
-// MCP (v0.8.5+)
-schema.RegisterMCP("search_docs", "搜尋文件", &SearchInput{}, &SearchOutput{})
+// Bot / MCP / WebSocket —— v0.8.11 起移除專屬 helper，改用 Route 資料形式
+schema.Global().Register(schema.Route{
+    Protocol: "mcp", Command: "search_docs", Summary: "搜尋文件",
+    Input: &SearchInput{}, Output: &SearchOutput{},
+})
 ```
+
+> `Protocol` 六種協議（rest/grpc/bot/mcp/websocket/cli/desktop）全部仍受支援，
+> 只是 Bot/MCP/WebSocket 的便利函式已收斂——底層 Registry 與 manifest 行為不變。
 
 ### 4.2 錯誤處理
 
@@ -192,13 +197,65 @@ errors.AbortWithAppError(c, ErrUserNotFound.With("id", userID))
 - 寫操作用 `hidb.WriteHypDB()`（走 master）
 - 交易用 `hidb.HypDBTransaction()`
 
-### 4.4 禁止事項
+### 4.4 Server 型別的併發欄位（強制）
+
+任何「有 `Start()` 阻塞方法」的 server 型別（`pkg/server.Server`、`pkg/grpc.Server`
+及未來新增的同類），其 **`listener` / `httpServer` / 各種 `*Server` 欄位一律用
+atomic 存取，不得用裸欄位**。
+
+理由：`Start()` 慣例上跑在自己的 goroutine（`go srv.Start()`），而
+`Addr()` / `Health()` / `Shutdown()` / `forkNewProcess()` 會從別的 goroutine
+讀同一批欄位——裸欄位必為資料競態。這個 bug 在 `pkg/server` 與 `pkg/grpc`
+**各自獨立長出過一次**，屬於本 codebase 的復發模式，故立為規則。
+
+```go
+type Server struct {
+    // ✅ 正確：具體指標型別用 atomic.Pointer[T]
+    httpServer atomic.Pointer[http.Server]
+    h3Server   atomic.Pointer[http3.Server]
+    // ✅ 正確：介面型別（net.Listener）用 atomic.Value
+    listener atomic.Value
+}
+
+// 一律提供 getter 收斂 nil 判斷與型別斷言
+func (s *Server) getListener() net.Listener {
+    v := s.listener.Load()
+    if v == nil {
+        return nil
+    }
+    return v.(net.Listener)
+}
+
+// 寫入端
+s.listener.Store(lis)
+s.httpServer.Store(srv)
+
+// 讀取端
+if ln := s.getListener(); ln != nil { ... }
+if hs := s.httpServer.Load(); hs != nil { ... }
+```
+
+```go
+// ❌ 錯誤：Start() 寫、Addr()/Health() 讀 → data race
+type Server struct {
+    listener   net.Listener
+    httpServer *http.Server
+}
+```
+
+**驗證**：這類改動必須跑 `go test -race ./...`（不是 `go test ./...`）。
+race detector 是唯一能穩定抓到此類問題的手段。
+
+### 4.5 禁止事項
 
 - ❌ 不使用 `panic()` 於 request handler（除 init 階段）
 - ❌ 不使用 `fmt.Println` 做日誌，用 `pkg/logger`
 - ❌ 不使用 `math/rand` 產生 token / session id，用 `crypto/rand`
 - ❌ 不在 handler 內直接 `time.Sleep`
 - ❌ 不硬編碼 DSN / API key / secret，一律從 config 讀
+- ❌ server 型別的 listener / server 欄位不得用裸欄位（見 §4.4）
+- ❌ 測試中不得用 `for x == nil {}` busy-spin 等待就緒，改用帶逾時的輪詢
+  （`time.Sleep` + deadline），否則既燒 CPU 又常伴隨資料競態
 
 ---
 
@@ -256,3 +313,4 @@ CI 會在 PR 時執行 `hyp chkcomment ./...`，缺少必填標註將阻擋合�
 
 *HypGo · AI_CODING_RULES · v1.0 · 2026-04-23*
 *§1.4 作者出處標記（人類 / AI 檔案層級，依 git 分支認定）· 2026-06-15 · claude-opus-4-8*
+*§4.1 Bot/MCP/WebSocket helper 收斂為 Route 資料形式 · §4.4 Server 型別併發欄位強制 atomic · 2026-06-23 · claude-opus-5*
