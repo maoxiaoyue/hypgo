@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -244,14 +245,12 @@ func (c *Client) reset() {
 	c.Channels = make(map[string]bool, 4)
 	c.metadata = make(map[string]interface{}, 4)
 
-	// 非阻塞 drain channel：避免持有大量 []byte 引用
-	for {
-		select {
-		case <-c.Send:
-		default:
-			return
-		}
-	}
+	// 重建 Send channel 而非 drain：handleUnregister 會先 close(Send) 再
+	// Release，而 closed channel 的接收永不阻塞——舊的「非阻塞 drain」
+	// （for { select { case <-c.Send: default: return } }）在 closed
+	// channel 上 default 分支永遠走不到，每次斷線都讓 hub goroutine
+	// 無限迴圈。重建同時解掉殘留的 []byte 引用，效果與 drain 相同
+	c.Send = make(chan []byte, 256)
 }
 
 // SetMetadata 設置客戶端元數據
@@ -296,15 +295,16 @@ type Hub struct {
 	security   *SecurityConfig // AES + HMAC 安全管線配置
 	mu         sync.RWMutex
 
-	// 統計資訊
+	// 統計資訊。atomic：MessagesReceived/BytesReceived 由每條連線的
+	// readPump 並發遞增、MessagesSent/BytesSent 由多個發送路徑遞增，
+	// 曾用裸 int64 ++（宣告了 mutex 但無任何寫入方持有）——data race
 	stats struct {
-		TotalConnections  int64
-		ActiveConnections int32
-		MessagesSent      int64
-		MessagesReceived  int64
-		BytesSent         int64
-		BytesReceived     int64
-		mu                sync.RWMutex
+		TotalConnections  atomic.Int64
+		ActiveConnections atomic.Int64
+		MessagesSent      atomic.Int64
+		MessagesReceived  atomic.Int64
+		BytesSent         atomic.Int64
+		BytesReceived     atomic.Int64
 	}
 
 	// 回調函數
@@ -372,9 +372,9 @@ func (h *Hub) Run(ctx context.Context) {
 func (h *Hub) handleRegister(client *Client) {
 	h.mu.Lock()
 	h.clients[client.ID] = client
-	h.stats.TotalConnections++
-	h.stats.ActiveConnections++
 	h.mu.Unlock()
+	h.stats.TotalConnections.Add(1)
+	h.stats.ActiveConnections.Add(1)
 
 	if h.onConnect != nil {
 		h.onConnect(client)
@@ -390,7 +390,7 @@ func (h *Hub) handleUnregister(client *Client) {
 	_, exists := h.clients[client.ID]
 	if exists {
 		delete(h.clients, client.ID)
-		h.stats.ActiveConnections--
+		h.stats.ActiveConnections.Add(-1)
 
 		// 從所有頻道移除
 		for channel := range client.Channels {
@@ -443,8 +443,8 @@ func (h *Hub) handleBroadcast(msg *Message) {
 	h.mu.RUnlock()
 
 	marshalForClients(msg, clients, h.security, func(n int64) {
-		h.stats.MessagesSent++
-		h.stats.BytesSent += n
+		h.stats.MessagesSent.Add(1)
+		h.stats.BytesSent.Add(n)
 	})
 
 	// 清除引用防止 client 被 pool 持有而無法 GC
@@ -470,9 +470,13 @@ func (h *Hub) cleanupInactiveClients() {
 	}
 	h.mu.RUnlock()
 
+	// 直接呼叫 handleUnregister 而非送進 h.unregister channel：
+	// 本函式在 Hub 的 Run goroutine 內執行，而該 channel 的唯一消費者
+	// 就是 Run 自己——一次清掃超過 channel 容量的不活躍連線時，
+	// 發送方（Run）會永久阻塞，整個 Hub 凍結
 	for _, client := range inactiveClients {
 		h.logger.Debugf("Cleaning up inactive client: %s", client.ID)
-		h.unregister <- client
+		h.handleUnregister(client)
 	}
 }
 
@@ -545,8 +549,8 @@ func (c *Client) readPump(config Config) {
 		}
 
 		c.lastActivity = time.Now()
-		c.Hub.stats.MessagesReceived++
-		c.Hub.stats.BytesReceived += int64(len(data))
+		c.Hub.stats.MessagesReceived.Add(1)
+		c.Hub.stats.BytesReceived.Add(int64(len(data)))
 
 		// 安全管線：解密 + 驗證簽名
 		if c.Hub.security != nil {
@@ -895,8 +899,8 @@ func (h *Hub) PublishToChannel(channel string, msg *Message) {
 	pubMsg.ClientID = msg.ClientID
 
 	marshalForClients(pubMsg, clients, h.security, func(n int64) {
-		h.stats.MessagesSent++
-		h.stats.BytesSent += n
+		h.stats.MessagesSent.Add(1)
+		h.stats.BytesSent.Add(n)
 	})
 }
 
@@ -944,8 +948,8 @@ func (h *Hub) SendToClient(clientID string, data interface{}) error {
 
 	select {
 	case client.Send <- msgBytes:
-		h.stats.MessagesSent++
-		h.stats.BytesSent += int64(len(msgBytes))
+		h.stats.MessagesSent.Add(1)
+		h.stats.BytesSent.Add(int64(len(msgBytes)))
 		return nil
 	default:
 		return fmt.Errorf("client %s send buffer full", clientID)
@@ -955,9 +959,7 @@ func (h *Hub) SendToClient(clientID string, data interface{}) error {
 // GetStats 獲取統計資訊
 func (h *Hub) GetStats() map[string]interface{} {
 	h.mu.RLock()
-	h.stats.mu.RLock()
 	defer h.mu.RUnlock()
-	defer h.stats.mu.RUnlock()
 
 	channelStats := make(map[string]int)
 	for channel, clients := range h.channels {
@@ -970,12 +972,12 @@ func (h *Hub) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total_connections":  h.stats.TotalConnections,
-		"active_connections": h.stats.ActiveConnections,
-		"messages_sent":      h.stats.MessagesSent,
-		"messages_received":  h.stats.MessagesReceived,
-		"bytes_sent":         h.stats.BytesSent,
-		"bytes_received":     h.stats.BytesReceived,
+		"total_connections":  h.stats.TotalConnections.Load(),
+		"active_connections": h.stats.ActiveConnections.Load(),
+		"messages_sent":      h.stats.MessagesSent.Load(),
+		"messages_received":  h.stats.MessagesReceived.Load(),
+		"bytes_sent":         h.stats.BytesSent.Load(),
+		"bytes_received":     h.stats.BytesReceived.Load(),
 		"total_clients":      len(h.clients),
 		"total_channels":     len(h.channels),
 		"total_rooms":        len(h.rooms),

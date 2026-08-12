@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -28,8 +27,12 @@ type ServerConfig struct {
 	Addr         string        `mapstructure:"addr" yaml:"addr"`
 	Protocol     string        `mapstructure:"protocol" yaml:"protocol"` // "http1", "http2", "http3", "auto"
 	TLS          TLSConfig     `mapstructure:"tls" yaml:"tls"`
-	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
-	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
+	// 秒。曾為 time.Duration：預設值 30*time.Second 再被 server 乘上
+	// time.Second 後溢位 int64 成負數，http.Server 視負值為「無 timeout」，
+	// 等於預設路徑完全沒有讀寫 deadline（slow-loris 攻擊面）。
+	// 改用 int 秒與 IdleTimeout 及 config.yaml 範本（read_timeout: 30）語義一致
+	ReadTimeout  int `mapstructure:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout int `mapstructure:"write_timeout" yaml:"write_timeout"`
 
 	// HTTP/2 相關配置
 	MaxHandlers          int `mapstructure:"max_handlers" yaml:"max_handlers"`
@@ -210,10 +213,10 @@ func (c *Config) ApplyDefaults() {
 		c.Server.Protocol = "http2"
 	}
 	if c.Server.ReadTimeout == 0 {
-		c.Server.ReadTimeout = 30 * time.Second
+		c.Server.ReadTimeout = 30 // 秒
 	}
 	if c.Server.WriteTimeout == 0 {
-		c.Server.WriteTimeout = 30 * time.Second
+		c.Server.WriteTimeout = 30 // 秒
 	}
 
 	// HTTP/2 預設值
@@ -413,12 +416,12 @@ func (s *ServerConfig) GetProtocol() string {
 
 // GetReadTimeout 獲取讀取超時（秒）
 func (s *ServerConfig) GetReadTimeout() int {
-	return int(s.ReadTimeout.Seconds())
+	return s.ReadTimeout
 }
 
 // GetWriteTimeout 獲取寫入超時（秒）
 func (s *ServerConfig) GetWriteTimeout() int {
-	return int(s.WriteTimeout.Seconds())
+	return s.WriteTimeout
 }
 
 // GetMaxHeaderBytes 獲取最大標頭字節數

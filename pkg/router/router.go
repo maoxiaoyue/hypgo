@@ -178,12 +178,11 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
 	}
 
-	// 快取查找
+	// 快取查找（僅靜態路由，無參數）
 	if r.enableCache {
-		cacheKey := method + urlPath
-		if entry := r.cache.get(cacheKey); entry != nil {
-			c.Params = r.makeContextParams(entry.params)
-			r.executeHandlers(c, entry.handlers)
+		if handlers := r.cache.get(method + urlPath); handlers != nil {
+			c.Params = r.makeContextParams(nil)
+			r.executeHandlers(c, handlers)
 			return
 		}
 	}
@@ -196,7 +195,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 			// 只快取靜態路由（無參數）
 			if r.enableCache && len(params) == 0 {
-				r.cache.put(method+urlPath, handlers, params)
+				r.cache.put(method+urlPath, handlers)
 			}
 
 			r.executeHandlers(c, handlers)

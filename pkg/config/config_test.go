@@ -88,8 +88,13 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 	if c.Server.Protocol != "http2" {
 		t.Errorf("Expected Server.Protocol = http2, got %q", c.Server.Protocol)
 	}
-	if c.Server.ReadTimeout != 30*time.Second {
-		t.Errorf("Expected Server.ReadTimeout = 30s, got %v", c.Server.ReadTimeout)
+	// 回歸防護：欄位是 int 秒。曾為 time.Duration 時，預設 30*time.Second
+	// 再被 server 乘 time.Second 溢位成負數，導致 http.Server 無讀寫 timeout
+	if c.Server.ReadTimeout != 30 {
+		t.Errorf("Expected Server.ReadTimeout = 30 (seconds), got %v", c.Server.ReadTimeout)
+	}
+	if d := time.Duration(c.Server.ReadTimeout) * time.Second; d != 30*time.Second {
+		t.Errorf("server-side conversion = %v, want 30s (must stay positive)", d)
 	}
 	if c.Server.MaxHandlers != 1000 {
 		t.Errorf("Expected Server.MaxHandlers = 1000, got %d", c.Server.MaxHandlers)

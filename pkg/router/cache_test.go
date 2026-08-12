@@ -1,6 +1,7 @@
 package router
 
 import (
+	"sync"
 	"testing"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -11,48 +12,51 @@ func TestRouteCache(t *testing.T) {
 
 	dummyHandler := func(c *hypcontext.Context) {}
 
-	// Test Get on empty cache
-	if entry := cache.get("/test"); entry != nil {
+	// 空快取查找
+	if handlers := cache.get("/test"); handlers != nil {
 		t.Errorf("Expected nil for non-existent key")
 	}
 
-	// Test Put
-	cache.put("/a", []hypcontext.HandlerFunc{dummyHandler}, nil)
-	if entry := cache.get("/a"); entry == nil {
-		t.Errorf("Expected entry for key '/a'")
+	// Put + Get
+	cache.put("/a", []hypcontext.HandlerFunc{dummyHandler})
+	if handlers := cache.get("/a"); handlers == nil {
+		t.Errorf("Expected handlers for key '/a'")
 	}
 
-	// Test Capacity and Eviction (LRU)
-	cache.put("/b", []hypcontext.HandlerFunc{dummyHandler}, nil)
-	cache.put("/c", []hypcontext.HandlerFunc{dummyHandler}, nil)
+	// 覆寫既有 key
+	cache.put("/a", []hypcontext.HandlerFunc{dummyHandler, dummyHandler})
+	if handlers := cache.get("/a"); len(handlers) != 2 {
+		t.Errorf("Expected 2 handlers after update, got %d", len(handlers))
+	}
+}
 
-	// Since capacity is 2, "/a" should be evicted
-	if entry := cache.get("/a"); entry != nil {
-		t.Errorf("Expected '/a' to be evicted")
-	}
+// TestRouteCacheConcurrentGetPut 回歸測試：舊 LRU 實作中，get 解鎖後回傳的
+// *cacheItem 可能被並發淘汰路徑清空（handlers=nil）並回收進 pool，
+// 讀取方會執行到 nil/錯誤的 handler 鏈。sync.Map 版不可能發生；
+// 本測試在 -race 下驗證並發 get/put 無 race、命中結果永不為空
+func TestRouteCacheConcurrentGetPut(t *testing.T) {
+	cache := newRouteCache(4)
+	dummyHandler := func(c *hypcontext.Context) {}
+	keys := []string{"GET/a", "GET/b", "GET/c", "GET/d", "GET/e", "GET/f"}
 
-	if entry := cache.get("/b"); entry == nil {
-		t.Errorf("Expected entry for key '/b'")
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 1000; n++ {
+				cache.put(keys[n%len(keys)], []hypcontext.HandlerFunc{dummyHandler})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 1000; n++ {
+				if h := cache.get(keys[n%len(keys)]); h != nil && len(h) == 0 {
+					t.Error("cache hit returned empty handler chain")
+					return
+				}
+			}
+		}()
 	}
-	if entry := cache.get("/c"); entry == nil {
-		t.Errorf("Expected entry for key '/c'")
-	}
-
-	// Test LRU update on Get
-	cache.get("/b")                                              // "/b" is now recently used
-	cache.put("/d", []hypcontext.HandlerFunc{dummyHandler}, nil) // should evict "/c"
-
-	if entry := cache.get("/c"); entry != nil {
-		t.Errorf("Expected '/c' to be evicted")
-	}
-	if entry := cache.get("/b"); entry == nil {
-		t.Errorf("Expected entry for key '/b'")
-	}
-
-	// Test Update existing key
-	cache.put("/b", []hypcontext.HandlerFunc{dummyHandler, dummyHandler}, nil)
-	entry := cache.get("/b")
-	if len(entry.handlers) != 2 {
-		t.Errorf("Expected entry to be updated with 2 handlers")
-	}
+	wg.Wait()
 }
