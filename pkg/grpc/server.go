@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -37,6 +39,36 @@ type Config struct {
 
 	// MaxSendMsgSize 最大發送訊息大小（bytes，預設 4MB）
 	MaxSendMsgSize int
+
+	// ===== 連線與吞吐調校（零值 = 沿用 grpc-go 預設） =====
+
+	// MaxConnectionIdle 連線閒置多久後送 GOAWAY 關閉。
+	// grpc-go 預設無限——NAT/LB 後的死連線只有寫入失敗才被發現，
+	// 閒置連線永久佔用 framer goroutine 與緩衝。建議 15m
+	MaxConnectionIdle time.Duration
+
+	// KeepaliveTime 多久沒活動就對客戶端發 ping（建議 2h）
+	KeepaliveTime time.Duration
+
+	// KeepaliveTimeout ping 後等多久沒回應即判定連線死亡（建議 20s）
+	KeepaliveTimeout time.Duration
+
+	// InitialWindowSize 每個 stream 的初始流量窗口（bytes）。
+	// grpc-go 從 64KB 起由 BDP 探測自動放大；已知高吞吐 × 高延遲
+	// 的部署可直接給大窗口，省掉大型串流回應的爬升期
+	InitialWindowSize int32
+
+	// InitialConnWindowSize 整條連線的初始流量窗口（bytes）
+	InitialConnWindowSize int32
+
+	// NumStreamWorkers 處理 stream 的固定 worker 數。
+	// 預設 0 = 每個 RPC 起一個新 goroutine；高 QPS 下是持續的
+	// goroutine 建立/銷毀與棧配置成本。建議 runtime.GOMAXPROCS(0)
+	NumStreamWorkers uint32
+
+	// MaxConcurrentStreams 單連線併發 stream 上限。
+	// 預設無上限——單一失控客戶端可無限堆積併發 handler
+	MaxConcurrentStreams uint32
 }
 
 // TLSConfig TLS 配置
@@ -102,6 +134,27 @@ func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 	}
 	if cfg.MaxSendMsgSize > 0 {
 		serverOpts = append(serverOpts, grpc.MaxSendMsgSize(cfg.MaxSendMsgSize))
+	}
+
+	// 連線與吞吐調校（只在有設定時附加，零值沿用 grpc-go 預設）
+	if cfg.MaxConnectionIdle > 0 || cfg.KeepaliveTime > 0 || cfg.KeepaliveTimeout > 0 {
+		serverOpts = append(serverOpts, grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: cfg.MaxConnectionIdle,
+			Time:              cfg.KeepaliveTime,
+			Timeout:           cfg.KeepaliveTimeout,
+		}))
+	}
+	if cfg.InitialWindowSize > 0 {
+		serverOpts = append(serverOpts, grpc.InitialWindowSize(cfg.InitialWindowSize))
+	}
+	if cfg.InitialConnWindowSize > 0 {
+		serverOpts = append(serverOpts, grpc.InitialConnWindowSize(cfg.InitialConnWindowSize))
+	}
+	if cfg.NumStreamWorkers > 0 {
+		serverOpts = append(serverOpts, grpc.NumStreamWorkers(cfg.NumStreamWorkers))
+	}
+	if cfg.MaxConcurrentStreams > 0 {
+		serverOpts = append(serverOpts, grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams))
 	}
 
 	// 使用者自訂 options（interceptor 等）

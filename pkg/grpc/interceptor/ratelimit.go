@@ -3,6 +3,7 @@ package interceptor
 
 import (
 	"context"
+	"net"
 	"sync"
 	"time"
 
@@ -24,12 +25,21 @@ type RateLimitConfig struct {
 	CleanupInterval time.Duration
 }
 
+// rateLimitEntry 單一 IP 的滑動窗口計數（entry 級鎖，非全域鎖）
 type rateLimitEntry struct {
+	mu        sync.Mutex
 	count     int
 	windowEnd time.Time
 }
 
 // RateLimit 根據客戶端 IP 限流
+//
+// 併發設計：sync.Map + entry 級鎖。舊實作是一把全域 mutex——
+// 每個 RPC 都經過同一序列化點，高併發下整台 server 的吞吐天花板
+// 就是這把鎖；且清理 goroutine 掃全表時同樣持有它，掃描期間所有
+// RPC 准入停擺。key 亦改為 IP（不含 port）：舊版以 ip:port 為 key，
+// 每條 TCP 連線一個 bucket，map 隨連線數無界成長且限流形同虛設
+// （攻擊者換連線就重置額度）。
 func RateLimit(cfg RateLimitConfig) grpc.UnaryServerInterceptor {
 	if cfg.MaxRequests <= 0 {
 		cfg.MaxRequests = 100
@@ -41,53 +51,62 @@ func RateLimit(cfg RateLimitConfig) grpc.UnaryServerInterceptor {
 		cfg.CleanupInterval = 5 * time.Minute
 	}
 
-	var mu sync.Mutex
-	clients := make(map[string]*rateLimitEntry)
+	var clients sync.Map // ip → *rateLimitEntry
 
-	// 背景清理過期 key
+	// 背景清理過期 key（Range 不阻塞其他 goroutine 的讀寫）
 	go func() {
 		ticker := time.NewTicker(cfg.CleanupInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now()
-			mu.Lock()
-			for k, v := range clients {
-				if now.After(v.windowEnd) {
-					delete(clients, k)
+			clients.Range(func(k, v interface{}) bool {
+				e := v.(*rateLimitEntry)
+				e.mu.Lock()
+				expired := now.After(e.windowEnd)
+				e.mu.Unlock()
+				if expired {
+					clients.Delete(k)
 				}
-			}
-			mu.Unlock()
+				return true
+			})
 		}
 	}()
 
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		// 取得客戶端 IP
+		// 取得客戶端 IP（去掉 ephemeral port）
 		clientIP := "unknown"
 		if p, ok := peer.FromContext(ctx); ok {
-			clientIP = p.Addr.String()
+			addr := p.Addr.String()
+			if host, _, err := net.SplitHostPort(addr); err == nil {
+				clientIP = host
+			} else {
+				clientIP = addr
+			}
 		}
 
-		mu.Lock()
-		entry, ok := clients[clientIP]
-		now := time.Now()
+		// Load 優先：命中時（常態）不做任何分配
+		v, ok := clients.Load(clientIP)
+		if !ok {
+			v, _ = clients.LoadOrStore(clientIP, &rateLimitEntry{})
+		}
+		entry := v.(*rateLimitEntry)
 
-		if !ok || now.After(entry.windowEnd) {
+		entry.mu.Lock()
+		now := time.Now()
+		if now.After(entry.windowEnd) {
 			// 新窗口
-			clients[clientIP] = &rateLimitEntry{
-				count:     1,
-				windowEnd: now.Add(cfg.Window),
-			}
-			mu.Unlock()
+			entry.count = 1
+			entry.windowEnd = now.Add(cfg.Window)
+			entry.mu.Unlock()
 			return handler(ctx, req)
 		}
-
 		entry.count++
 		if entry.count > cfg.MaxRequests {
-			mu.Unlock()
+			entry.mu.Unlock()
 			return nil, status.Errorf(codes.ResourceExhausted,
 				"rate limit exceeded: %d requests per %s", cfg.MaxRequests, cfg.Window)
 		}
-		mu.Unlock()
+		entry.mu.Unlock()
 
 		return handler(ctx, req)
 	}
