@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"testing"
+	"time"
 )
 
 func TestNewServer(t *testing.T) {
@@ -46,9 +47,14 @@ func TestServerStartStop(t *testing.T) {
 		errCh <- s.Start()
 	}()
 
-	// 等 listener ready
-	for s.listener == nil {
-		// spin briefly
+	// 等 listener ready（用 atomic getter，避免與 Start() 的寫入 race；
+	// 亦不再 busy-spin 燒 CPU）
+	deadline := time.Now().Add(2 * time.Second)
+	for s.getListener() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("listener not ready within 2s")
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	addr := s.Addr()

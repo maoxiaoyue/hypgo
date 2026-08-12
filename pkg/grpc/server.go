@@ -47,12 +47,24 @@ type TLSConfig struct {
 
 // Server gRPC 伺服器封裝
 type Server struct {
-	config       Config
-	grpcServer   *grpc.Server
-	logger       *logger.Logger
-	listener     net.Listener
+	config     Config
+	grpcServer *grpc.Server
+	logger     *logger.Logger
+	// listener 用 atomic.Value：Start() 通常跑在自己的 goroutine，
+	// 而 Addr() 由呼叫端（測試、健康檢查、註冊服務探測）從另一個 goroutine 讀，
+	// 裸欄位會是資料競態（go test -race 可穩定重現）
+	listener     atomic.Value
 	healthServer *health.Server
 	shuttingDown atomic.Bool
+}
+
+// getListener 取得目前已發布的 listener（尚未 Start 時為 nil）
+func (s *Server) getListener() net.Listener {
+	v := s.listener.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(net.Listener)
 }
 
 // New 建立新的 gRPC Server
@@ -129,7 +141,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("grpc: failed to listen on %s: %w", s.config.Addr, err)
 	}
-	s.listener = lis
+	s.listener.Store(lis)
 
 	if s.logger != nil {
 		protocol := "plaintext"
@@ -182,8 +194,8 @@ func (s *Server) IsShuttingDown() bool {
 
 // Addr 返回實際監聽地址（Start 後有效）
 func (s *Server) Addr() string {
-	if s.listener != nil {
-		return s.listener.Addr().String()
+	if lis := s.getListener(); lis != nil {
+		return lis.Addr().String()
 	}
 	return s.config.Addr
 }
