@@ -4,10 +4,19 @@ package websocket
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	flatbuffers "github.com/google/flatbuffers/go"
 	gorillaWs "github.com/gorilla/websocket"
 )
+
+// fbBuilderPool Builder 池：Builder 支援 Reset() 重用內部 buffer，
+// 先前每則訊息 NewBuilder(256) 新配置（payload 稍大還要成長重配置）
+var fbBuilderPool = &sync.Pool{
+	New: func() interface{} {
+		return flatbuffers.NewBuilder(256)
+	},
+}
 
 // FlatBuffersCodec FlatBuffers 零拷貝二進制序列化 Codec
 type FlatBuffersCodec struct{}
@@ -33,7 +42,9 @@ const (
 
 // Marshal 使用 FlatBuffers Builder 序列化 Message
 func (FlatBuffersCodec) Marshal(msg *Message) ([]byte, error) {
-	builder := flatbuffers.NewBuilder(256)
+	builder := fbBuilderPool.Get().(*flatbuffers.Builder)
+	builder.Reset()
+	defer fbBuilderPool.Put(builder)
 
 	// FlatBuffers 需要先建立所有 string/vector（底層向上建構）
 	typeOff := builder.CreateString(msg.Type)

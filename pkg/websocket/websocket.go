@@ -49,13 +49,6 @@ var (
 		},
 	}
 
-	// 緩衝區池
-	bufferPool = &sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, 4096)
-		},
-	}
-
 	// GC 優化：broadcast 用的 client slice pool
 	// 避免每次廣播都 make 新 slice（10k 客戶端 × 100msg/s = 100萬次分配/s）
 	clientSlicePool = &sync.Pool{
@@ -204,6 +197,7 @@ type Client struct {
 	isClosing    bool
 	lastActivity time.Time
 	metadata     map[string]interface{} // 客戶端元數據
+	rooms        map[string]bool        // 已加入的房間 ID（mu 保護；斷線時只走訪所屬房間）
 }
 
 // AcquireClient 從池中獲取 Client
@@ -244,6 +238,7 @@ func (c *Client) reset() {
 	// GC 優化：重建 map 替代逐一 delete
 	c.Channels = make(map[string]bool, 4)
 	c.metadata = make(map[string]interface{}, 4)
+	c.rooms = nil // 延遲初始化：多數 client 不用房間
 
 	// 重建 Send channel 而非 drain：handleUnregister 會先 close(Send) 再
 	// Release，而 closed channel 的接收永不阻塞——舊的「非阻塞 drain」
@@ -402,9 +397,19 @@ func (h *Hub) handleUnregister(client *Client) {
 			}
 		}
 
-		// 從所有房間移除
-		for _, room := range h.rooms {
-			room.RemoveClient(client)
+		// 只走訪 client 實際加入的房間。原實作掃描 hub 全部房間
+		// 並各拿一次房間鎖，全程持有 h.mu 寫鎖——斷線風暴 × 大量
+		// 房間時拉長所有廣播/註冊被擋的窗口
+		client.mu.RLock()
+		roomIDs := make([]string, 0, len(client.rooms))
+		for id := range client.rooms {
+			roomIDs = append(roomIDs, id)
+		}
+		client.mu.RUnlock()
+		for _, id := range roomIDs {
+			if room, ok := h.rooms[id]; ok {
+				room.RemoveClient(client)
+			}
 		}
 	}
 	h.mu.Unlock()
@@ -826,6 +831,14 @@ func (c *Client) JoinRoom(roomID string) {
 	c.Hub.mu.Unlock()
 
 	room.AddClient(c)
+
+	c.mu.Lock()
+	if c.rooms == nil {
+		c.rooms = make(map[string]bool, 2)
+	}
+	c.rooms[roomID] = true
+	c.mu.Unlock()
+
 	c.Hub.logger.Debugf("Client %s joined room %s", c.ID, roomID)
 }
 
@@ -837,6 +850,11 @@ func (c *Client) LeaveRoom(roomID string) {
 
 	if exists {
 		room.RemoveClient(c)
+
+		c.mu.Lock()
+		delete(c.rooms, roomID)
+		c.mu.Unlock()
+
 		c.Hub.logger.Debugf("Client %s left room %s", c.ID, roomID)
 
 		// 如果房間為空，刪除房間
