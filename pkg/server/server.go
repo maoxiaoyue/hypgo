@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -66,6 +65,9 @@ type Server struct {
 
 	// 0-RTT 支援（帶 LRU 淘汰 + TTL）
 	sessionCache *SessionCache
+
+	// Alt-Svc 標頭值（啟動時預計算；空字串 = 不廣告 H3）
+	altSvcValue string
 
 	// 優雅關閉（atomic 避免競態；Once 保證 Shutdown 冪等）
 	shutdownChan chan struct{}
@@ -282,6 +284,14 @@ func (s *Server) Start() error {
 		go s.handleGracefulRestart()
 	}
 
+	// Alt-Svc 預計算：值在啟動後不變，先前每請求 fmt.Sprintf（格式
+	// 解析 + 2 次分配）。只在 auto 模式（真的同時起 H3 listener）
+	// 廣告——舊行為只看 TLS，純 http1/http2 模式也發 Alt-Svc，
+	// 誘使客戶端做註定失敗的 QUIC 連線嘗試
+	if s.config.Server.TLS.Enabled && s.config.Server.Protocol == "auto" {
+		s.altSvcValue = fmt.Sprintf(`h3="%s"; ma=86400`, s.config.Server.Addr)
+	}
+
 	// 自動檢測協議或使用指定協議
 	var err error
 	if s.config.Server.Protocol == "auto" {
@@ -335,7 +345,9 @@ func (s *Server) getTLSWrapSession() func(tls.ConnectionState, *tls.SessionState
 		if err != nil {
 			return nil, err
 		}
-		s.sessionCache.Put(hex.EncodeToString(ticket), stateBytes)
+		// 直接以原始位元組為 map key：Go map key 可為任意二進位字串，
+		// hex 編碼徒增每握手一次 64B 字串分配與雙倍 key 記憶體
+		s.sessionCache.Put(string(ticket), stateBytes)
 		return ticket, nil
 	}
 }
@@ -344,8 +356,7 @@ func (s *Server) getTLSWrapSession() func(tls.ConnectionState, *tls.SessionState
 // 使用 GetAndDelete 原子操作防止 replay attack
 func (s *Server) getTLSUnwrapSession() func([]byte, tls.ConnectionState) (*tls.SessionState, error) {
 	return func(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
-		key := hex.EncodeToString(identity)
-		stateBytes, ok := s.sessionCache.GetAndDelete(key)
+		stateBytes, ok := s.sessionCache.GetAndDelete(string(identity))
 		if !ok {
 			return nil, nil
 		}
@@ -535,11 +546,16 @@ func (s *Server) startHTTP1() error {
 	return httpSrv.Serve(listener)
 }
 
-// wrapHandler 包裝處理器以注入 Alt-Svc 標頭
+// wrapHandler 包裝處理器以注入 Alt-Svc 標頭（值於 Start 預計算；
+// 無 H3 可廣告時不加包裝層）
 func (s *Server) wrapHandler(h http.Handler) http.Handler {
+	altSvc := s.altSvcValue
+	if altSvc == "" {
+		return h
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.config.Server.TLS.Enabled && r.ProtoMajor < 3 {
-			w.Header().Set("Alt-Svc", fmt.Sprintf(`h3="%s"; ma=86400`, s.config.Server.Addr))
+		if r.ProtoMajor < 3 {
+			w.Header().Set("Alt-Svc", altSvc)
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -547,9 +563,9 @@ func (s *Server) wrapHandler(h http.Handler) http.Handler {
 
 // wrapH3Handler 包裝 HTTP/3 處理器
 func (s *Server) wrapH3Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.router.ServeHTTP(w, r)
-	})
+	// 直接回傳 router：先前多包一層只轉呼叫的 HandlerFunc，
+	// 每請求平白多一個 call frame
+	return s.router
 }
 
 // detectProtocol 檢測請求使用的協議
