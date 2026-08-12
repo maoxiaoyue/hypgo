@@ -13,13 +13,12 @@ import (
 // ===== 全域物件池 =====
 
 var (
-	// Context 物件池
+	// Context 物件池（Params/Keys 延遲初始化：Params 每請求由
+	// AcquireParams 供給、Keys 由 Set() 首次使用時建立）
 	contextPool = &sync.Pool{
 		New: func() interface{} {
 			return &Context{
-				Params:   make(Params, 0, 8),
 				handlers: make([]HandlerFunc, 0, 8),
-				Keys:     make(map[string]interface{}, 8),
 				Errors:   make(errorMsgs, 0, 4),
 			}
 		},
@@ -121,9 +120,6 @@ func ReleaseContext(c *Context) {
 }
 
 // reset 重置 Context
-// GC 優化：使用 map 重建替代逐一 delete
-// 逐一 delete 會觸發 N 次 hash 操作和 GC write barrier
-// 重建 map 只產生一次分配，且舊 map 由 GC 整體回收
 func (c *Context) reset() {
 	c.Request = nil
 	c.Response = nil
@@ -133,13 +129,21 @@ func (c *Context) reset() {
 	c.streamInfo = nil
 	c.metrics = nil // 漏清會讓 double-release 把同一 metrics Put 進池兩次
 
+	// Params 歸還池中：router 每請求經 AcquireParams 取得新 slice 蓋掉
+	// 本欄位。先前只截斷（[:0]）不歸還，ReleaseParams 全 module 零呼叫
+	// 者——pool 有進無出、永遠 miss，每個帶參數請求照樣分配
+	if c.Params != nil {
+		ReleaseParams(c.Params)
+		c.Params = nil
+	}
 	// 清理切片但保留容量
-	c.Params = c.Params[:0]
 	c.handlers = c.handlers[:0]
 	c.Errors = c.Errors[:0]
 
-	// GC 優化：重建 map 替代逐一 delete
-	c.Keys = make(map[string]interface{}, 8)
+	// Keys 延遲初始化：Set() 已有 nil 檢查、讀 nil map 合法。
+	// 先前每次 reset 重建 make(map,8)，而 reset 在 Acquire 與 Release
+	// 各跑一次——未用到 Keys 的請求（多數）也付 2 次 map 分配
+	c.Keys = nil
 
 	// 清理快取：直接置 nil，下次使用時延遲初始化。
 	// rawData 有 memo 語義（GetRawData/ShouldBindBodyWith 會先看它），

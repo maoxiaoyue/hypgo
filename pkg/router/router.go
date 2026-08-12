@@ -107,9 +107,13 @@ func New(opts ...RouterOption) *Router {
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
 		http3Config:            nil,
+		// 存 *[]Param 而非 []Param：slice header 以值存入 interface{}
+		// 會在每次 Put 時將 24-byte header 逃逸到堆上（SA6002），
+		// 每個帶參數請求平白多一次分配
 		paramPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]Param, 0, 10)
+				p := make([]Param, 0, 10)
+				return &p
 			},
 		},
 	}
@@ -189,7 +193,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Radix Tree 查找
 	if root := r.trees[method]; root != nil {
-		handlers, params := root.search(urlPath, r.getParams())
+		ps := r.getParams()
+		handlers, params := root.search(urlPath, (*ps)[:0])
 		if handlers != nil {
 			c.Params = r.makeContextParams(params)
 
@@ -199,23 +204,24 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 
 			r.executeHandlers(c, handlers)
-			r.putParams(params)
+			r.putParams(ps, params)
 			return
 		}
-		r.putParams(params)
+		r.putParams(ps, params)
 	}
 
 	// HEAD 自動回應：若無 HEAD handler，使用 GET handler
 	if method == "HEAD" {
 		if root := r.trees["GET"]; root != nil {
-			handlers, params := root.search(urlPath, r.getParams())
+			ps := r.getParams()
+			handlers, params := root.search(urlPath, (*ps)[:0])
 			if handlers != nil {
 				c.Params = r.makeContextParams(params)
 				r.executeHandlers(c, handlers)
-				r.putParams(params)
+				r.putParams(ps, params)
 				return
 			}
-			r.putParams(params)
+			r.putParams(ps, params)
 		}
 	}
 
@@ -338,17 +344,17 @@ func (r *Router) GetHTTP3Config() *HTTP3Config {
 	return r.http3Config
 }
 
-// getParams 從池中獲取參數切片，參數池 & 轉換
-func (r *Router) getParams() []Param {
-	ps := r.paramPool.Get().([]Param)
-	return ps[:0]
+// getParams 從池中獲取參數切片箱。回傳 *[]Param 讓同一個指標箱
+// 在 Get/Put 間往返——若以值存取，slice header 每次 Put 都逃逸
+// 到堆上（SA6002），每個帶參數請求平白多一次分配
+func (r *Router) getParams() *[]Param {
+	return r.paramPool.Get().(*[]Param)
 }
 
-// putParams 返回參數切片到池
-func (r *Router) putParams(params []Param) {
-	if params != nil {
-		r.paramPool.Put(params[:0])
-	}
+// putParams 將（可能已被 search 重新配置的）切片寫回箱中並歸還池
+func (r *Router) putParams(ps *[]Param, params []Param) {
+	*ps = params[:0]
+	r.paramPool.Put(ps)
 }
 
 // makeContextParams 轉換路由參數為 Context 參數格式

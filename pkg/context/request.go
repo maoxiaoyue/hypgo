@@ -199,7 +199,7 @@ func (c *Context) GetRawData() ([]byte, error) {
 		return c.rawData, nil
 	}
 
-	body, err := ioutil.ReadAll(c.Request.Body)
+	body, err := readBodyWithHint(c.Request.Body, c.Request.ContentLength)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +208,28 @@ func (c *Context) GetRawData() ([]byte, error) {
 	c.Request.Body = ioutil.NopCloser(bytes.NewReader(body))
 
 	return body, nil
+}
+
+// maxBodyPreallocHint 依 Content-Length 預配置緩衝的上限。
+// Content-Length 由客戶端宣告，不加上限會讓「宣告 1GB、只送 1B」
+// 的請求直接配走 1GB 記憶體
+const maxBodyPreallocHint = 1 << 20 // 1MB
+
+// readBodyWithHint 以 Content-Length 預配置緩衝讀取 body。
+// io.ReadAll 從 512B 起幾何成長：1MB body 要 ~12 次重配置與複製；
+// ContentLength 幾乎總是已知，預配置後一次到位
+func readBodyWithHint(r io.Reader, hint int64) ([]byte, error) {
+	if hint > 0 {
+		if hint > maxBodyPreallocHint {
+			hint = maxBodyPreallocHint
+		}
+		buf := bytes.NewBuffer(make([]byte, 0, hint+1))
+		if _, err := buf.ReadFrom(r); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	return ioutil.ReadAll(r)
 }
 
 // SetRawData 設置原始請求體資料

@@ -41,11 +41,19 @@ type jsonRender struct{ Data interface{} }
 
 func (r jsonRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	jsonBytes, err := json.Marshal(r.Data)
-	if err != nil {
+	// 池化緩衝 + Encoder：json.Marshal 每次回應都整包新配置 body，
+	// 是典型小 JSON 回應在 H1-H3 修復後的最大單筆每請求分配
+	buf := AcquireBuffer()
+	defer ReleaseBuffer(buf)
+	if err := json.NewEncoder(buf).Encode(r.Data); err != nil {
 		return err
 	}
-	_, err = w.Write(jsonBytes)
+	// Encoder 尾端固定補 '\n'，去除以維持與 json.Marshal 相同輸出
+	b := buf.Bytes()
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+	}
+	_, err := w.Write(b)
 	return err
 }
 

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -140,7 +141,7 @@ func (c *Context) ShouldBindBodyWith(obj interface{}, bb BindingBody) error {
 	if c.rawData != nil {
 		body = c.rawData
 	} else {
-		body, err = ioutil.ReadAll(c.Request.Body)
+		body, err = readBodyWithHint(c.Request.Body, c.Request.ContentLength)
 		if err != nil {
 			return err
 		}
@@ -431,35 +432,65 @@ func mapFormToStruct(values url.Values, obj interface{}) error {
 	return mapFormToStructValue(values, rv)
 }
 
-func mapFormToStructValue(values url.Values, rv reflect.Value) error {
-	rt := rv.Type()
+// formFieldInfo 單一欄位的綁定中繼資料（per-type 快取，見 formFieldsOf）
+type formFieldInfo struct {
+	index     int
+	name      string
+	anonymous bool // 匿名嵌入 struct：遞迴攤平
+}
+
+// formFieldCache reflect.Type → []formFieldInfo
+// tag 解析結果對同一型別永不改變，先前每次綁定都重跑
+// Tag.Get + strings.Split（每欄位每請求一次 []string 分配）
+var formFieldCache sync.Map
+
+// formFieldsOf 取得（或建立並快取）型別的欄位綁定中繼資料
+func formFieldsOf(rt reflect.Type) []formFieldInfo {
+	if v, ok := formFieldCache.Load(rt); ok {
+		return v.([]formFieldInfo)
+	}
+	fields := make([]formFieldInfo, 0, rt.NumField())
 	for i := 0; i < rt.NumField(); i++ {
-		field := rt.Field(i)
-		fv := rv.Field(i)
-		if !fv.CanSet() {
+		f := rt.Field(i)
+		if f.PkgPath != "" && !f.Anonymous {
 			continue // 未匯出欄位
+		}
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			fields = append(fields, formFieldInfo{index: i, anonymous: true})
+			continue
+		}
+		name, skip := formFieldName(f)
+		if skip {
+			continue
+		}
+		fields = append(fields, formFieldInfo{index: i, name: name})
+	}
+	formFieldCache.Store(rt, fields)
+	return fields
+}
+
+func mapFormToStructValue(values url.Values, rv reflect.Value) error {
+	for _, fi := range formFieldsOf(rv.Type()) {
+		fv := rv.Field(fi.index)
+		if !fv.CanSet() {
+			continue
 		}
 
 		// 匿名嵌入的 struct：遞迴攤平
-		if field.Anonymous && fv.Kind() == reflect.Struct {
+		if fi.anonymous {
 			if err := mapFormToStructValue(values, fv); err != nil {
 				return err
 			}
 			continue
 		}
 
-		name, skip := formFieldName(field)
-		if skip {
-			continue
-		}
-
-		vs, ok := values[name]
+		vs, ok := values[fi.name]
 		if !ok || len(vs) == 0 {
 			continue // 沒給值就保持零值，不覆寫
 		}
 
 		if err := setFormValue(fv, vs); err != nil {
-			return fmt.Errorf("binding: field %q: %w", name, err)
+			return fmt.Errorf("binding: field %q: %w", fi.name, err)
 		}
 	}
 	return nil
