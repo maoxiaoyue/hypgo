@@ -62,7 +62,11 @@ type Context struct {
 
 	// 中間件和處理器
 	handlers []HandlerFunc
-	index    int8
+	// index 為 int32：int8 上限 127 而 abortIndex 為 63，一旦「全域中間件 +
+	// 路由 handler」總數超過 63，c.index++ 會溢位成負數，造成
+	// index out of range [-128] panic（64~127 個）或整條鏈靜默不執行、
+	// 卻回 200 空回應（128 個以上）。int32 讓上限遠高於任何實際鏈長。
+	index    int32
 	fullPath string
 
 	// 資料存儲
@@ -226,7 +230,7 @@ func (c *Context) SetHandlers(global, route []HandlerFunc) {
 // Next 執行下一個中間件
 func (c *Context) Next() {
 	c.index++
-	for c.index < int8(len(c.handlers)) {
+	for c.index < int32(len(c.handlers)) {
 		c.handlers[c.index](c)
 		c.index++
 	}

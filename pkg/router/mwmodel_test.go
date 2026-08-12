@@ -65,6 +65,43 @@ func TestRecoveryStyleMiddlewareCatchesPanic(t *testing.T) {
 	}
 }
 
+// TestLongMiddlewareChain 回歸測試：handler 鏈長超過舊 abortIndex(63) 仍須正確執行。
+// 歷史 bug：Context.index 為 int8、abortIndex = MaxInt8/2 = 63，一旦
+// 「全域中間件 + 路由 handler」總數超過 63：
+//   - 64~127 個 → c.index++ 溢位成 -128 → index out of range [-128] panic
+//   - 128 個以上 → 溢位後 index >= abortIndex 恆成立，整條鏈一個都不執行，
+//     卻靜默回 200 空回應（最陰險的失敗模式）
+//
+// 修法：index 改 int32、abortIndex 改 MaxInt32/2。
+func TestLongMiddlewareChain(t *testing.T) {
+	for _, n := range []int{63, 64, 130} {
+		ran := 0
+		handlerRan := false
+
+		r := New()
+		for i := 0; i < n; i++ {
+			r.Use(func(c *hypcontext.Context) { ran++; c.Next() })
+		}
+		r.GET("/x", func(c *hypcontext.Context) {
+			handlerRan = true
+			c.String(200, "ok")
+		})
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/x", nil))
+
+		if ran != n {
+			t.Errorf("chain of %d middleware: ran=%d, want %d", n, ran, n)
+		}
+		if !handlerRan {
+			t.Errorf("chain of %d middleware: handler never ran", n)
+		}
+		if w.Body.String() != "ok" {
+			t.Errorf("chain of %d middleware: body=%q, want \"ok\"", n, w.Body.String())
+		}
+	}
+}
+
 // TestAbortStopsChain c.Abort* 必須中止後續 handler
 func TestAbortStopsChain(t *testing.T) {
 	handlerRan := false
