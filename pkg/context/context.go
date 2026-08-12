@@ -49,6 +49,17 @@ type Context struct {
 	Response ResponseWriter
 	Writer   ResponseWriter // Gin 兼容別名
 
+	// rw 為 Acquire 時自池中借出、由本 Context 擁有的 writer。
+	// Response/Writer 是 exported 介面欄位，中間件可合法替換成包裝器
+	// （如 Compression 的 gzipWriter），因此歸還時必須還這個原始指標，
+	// 不能對 Response 做型別斷言（會 panic）。
+	rw *responseWriter
+
+	// released 保證 Release 冪等：Release/ReleaseContext 皆為 exported，
+	// 使用者若在 handler 內也 defer 一次，會與 router 的 defer 構成
+	// double-release，導致同一物件被 Put 進池兩次、被兩個並行請求共用。
+	released bool
+
 	// HTTP/3 QUIC 特定支援
 	quicConn   *QuicConnection
 	streamInfo *StreamInfo
