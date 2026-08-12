@@ -12,6 +12,7 @@ package contract
 // date: 2026-05-23
 
 import (
+	"context"
 	"fmt"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +48,16 @@ type TestCase struct {
 	// ExpectBody 為非空時，精確比對回應 body
 	ExpectBody string
 
+	// Graders 為 probabilistic 評判器清單（LLM-as-judge、embedding 相似度等，
+	// 見 pkg/eval）。在所有 deterministic 檢查（狀態碼 / schema / body）通過後
+	// 依序執行；任一評判器本身出錯（如 LLM 連線失敗）視為測試失敗
+	Graders []eval.Grader
+
+	// PassThreshold 為評分門檻：Graders 的加權平均分數（等權）低於此值時
+	// 測試失敗。0 表示不設門檻——只記錄分數（t.Logf / eval history），不影響
+	// pass/fail，方便漸進導入
+	PassThreshold float64
+
 	// schemaPath 為內部欄位，用於 TestAll 時保留原始 schema 路徑（含 :param）
 	schemaPath string
 }
@@ -68,13 +79,13 @@ func Test(t *testing.T, r *router.Router, tc TestCase) {
 //
 // @ai purpose: 將 HTTP 執行邏輯與 t.Errorf 解耦，支援 TestAll 的重試機制
 // @ai input: *router.Router（被測路由器）、TestCase（測試定義）
-// @ai output: pass bool（是否通過）、reason string（失敗原因，pass=true 時為空字串）
-// @ai sideeffect: 無（不呼叫任何 t.* 方法）
+// @ai output: pass bool、reason string（失敗原因）、scores（Graders 的評分，無 Graders 時為 nil）
+// @ai sideeffect: 無（不呼叫任何 t.* 方法；Graders 可能發出 LLM HTTP 請求）
 // date: 2026-05-23
-func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string) {
+func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, scores map[string]float64) {
 	method, path := parseRoute(tc.Route)
 	if method == "" || path == "" {
-		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route)
+		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route), nil
 	}
 
 	// 建立請求 body
@@ -107,7 +118,7 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string) {
 
 	// 驗證狀態碼
 	if tc.ExpectStatus > 0 && w.Code != tc.ExpectStatus {
-		return false, fmt.Sprintf("[%s] status = %d, want %d", tc.Route, w.Code, tc.ExpectStatus)
+		return false, fmt.Sprintf("[%s] status = %d, want %d", tc.Route, w.Code, tc.ExpectStatus), nil
 	}
 
 	// 驗證 schema（使用 schemaPath 或 URL path 查找）
@@ -118,18 +129,18 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string) {
 		}
 		s, ok := schema.Global().Get(method, lookupPath)
 		if !ok {
-			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route)
+			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
 		}
 		// 驗證 Input schema（請求 body）
 		if s.Input != nil && tc.Input != "" {
 			if err := validateRequest([]byte(tc.Input), s.Input); err != nil {
-				return false, fmt.Sprintf("[%s] request schema validation failed: %v", tc.Route, err)
+				return false, fmt.Sprintf("[%s] request schema validation failed: %v", tc.Route, err), nil
 			}
 		}
 		// 驗證 Output schema（回應 body）
 		if s.Output != nil {
 			if err := validateResponse(w.Body.Bytes(), s.Output); err != nil {
-				return false, fmt.Sprintf("[%s] response schema validation failed: %v", tc.Route, err)
+				return false, fmt.Sprintf("[%s] response schema validation failed: %v", tc.Route, err), nil
 			}
 		}
 	}
@@ -139,11 +150,53 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string) {
 		got := strings.TrimSpace(w.Body.String())
 		want := strings.TrimSpace(tc.ExpectBody)
 		if got != want {
-			return false, fmt.Sprintf("[%s] body = %q, want %q", tc.Route, got, want)
+			return false, fmt.Sprintf("[%s] body = %q, want %q", tc.Route, got, want), nil
 		}
 	}
 
-	return true, ""
+	// Probabilistic 評分：deterministic 檢查全數通過後才執行
+	//（結構都不對的回應沒有評分意義）
+	if len(tc.Graders) > 0 {
+		return runGraders(tc, w.Body.String())
+	}
+
+	return true, "", nil
+}
+
+// runGraders 依序執行 TestCase 的評判器並聚合分數（等權平均）。
+// 任一評判器出錯（如 LLM 連線失敗）視為測試失敗——使用者主動掛上
+// 評判器即表示評分是合約的一部分，靜默跳過會給出假信心。
+// PassThreshold=0 時只記錄分數不設門檻
+func runGraders(tc TestCase, output string) (pass bool, reason string, scores map[string]float64) {
+	sample := eval.Sample{Route: tc.Route, Input: tc.Input, Output: output}
+	results := make([]eval.GraderResult, 0, len(tc.Graders))
+	scores = make(map[string]float64, len(tc.Graders)+1)
+
+	for _, g := range tc.Graders {
+		res, err := g.Grade(context.Background(), sample)
+		if err != nil {
+			return false, fmt.Sprintf("[%s] grader %q failed: %v", tc.Route, g.Name(), err), scores
+		}
+		results = append(results, res)
+		scores[res.Name] = res.Score
+	}
+
+	agg := eval.Aggregate(results, nil)
+	scores["aggregate"] = agg
+
+	if tc.PassThreshold > 0 && agg < tc.PassThreshold {
+		var detail strings.Builder
+		for _, r := range results {
+			fmt.Fprintf(&detail, "\n  %s = %.2f", r.Name, r.Score)
+			if r.Reason != "" {
+				fmt.Fprintf(&detail, " (%s)", r.Reason)
+			}
+		}
+		return false, fmt.Sprintf("[%s] eval score %.2f below threshold %.2f:%s",
+			tc.Route, agg, tc.PassThreshold, detail.String()), scores
+	}
+
+	return true, "", scores
 }
 
 // testInternal 為 Test() 的內部共用實作
@@ -156,7 +209,10 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string) {
 // date: 2026-05-23
 func testInternal(t *testing.T, r *router.Router, tc TestCase) {
 	t.Helper()
-	pass, reason := runTestOnce(r, tc)
+	pass, reason, scores := runTestOnce(r, tc)
+	if len(scores) > 0 {
+		t.Logf("eval scores %s: %v", tc.Route, scores)
+	}
 	if !pass {
 		t.Errorf("contract: %s", reason)
 	}
@@ -241,6 +297,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				start := time.Now()
 				var pass bool
 				var reason string
+				var graderScores map[string]float64
 				for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
 					if attempt > 0 {
 						t.Logf("[retry %d/%d] %s %s", attempt, cfg.RetryCount,
@@ -249,7 +306,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 							time.Sleep(cfg.RetryDelay)
 						}
 					}
-					pass, reason = runTestOnce(r, tc)
+					pass, reason, graderScores = runTestOnce(r, tc)
 					if pass {
 						break
 					}
@@ -273,12 +330,17 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 					if pass {
 						status = "pass"
 					}
+					// contract 分數 + 各 Grader 的評分（llm_judge/similarity/aggregate…）
+					allScores := map[string]float64{"contract": score}
+					for name, s := range graderScores {
+						allScores[name] = s
+					}
 					_ = eval.AppendHistory(eval.EvalRecord{
 						Timestamp:  time.Now().UTC(),
 						GitCommit:  gitCommit,
 						Route:      route.Method + " " + route.Path,
 						Status:     status,
-						Scores:     map[string]float64{"contract": score},
+						Scores:     allScores,
 						LatencyMs:  latencyMs,
 						InputHash:  eval.HashInput(tc.Input),
 						FailReason: reason,
