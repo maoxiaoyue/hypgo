@@ -208,14 +208,15 @@ const routerSetupTemplate = `package routers
 
 import (
 	"github.com/maoxiaoyue/hypgo/pkg/router"
-	"github.com/maoxiaoyue/hypgo/pkg/middleware"
 )
 
 // Setup 設定所有路由和中間件
 // 在 main.go 中呼叫：routers.Setup(srv.Router())
 func Setup(r *router.Router) {
-	// 全域中間件
-	r.Use(middleware.DefaultMiddleware()...)
+	// Recovery / Logger / Security / CORS 由 server.Start() 自動套用（v0.8.11+），
+	// 這裡不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。
+	// 額外的全域中間件（JWT、RateLimiter、BodyLimit…）在此加：
+	// r.Use(middleware.BodyLimit(middleware.BodyLimitConfig{MaxBytes: 5 << 20}))
 
 	// 在此註冊各資源的路由
 	// Register{{.Name}}Routes(r)
@@ -270,9 +271,10 @@ type {{.Name}} struct {
 }
 
 // Create{{.Name}}Req 建立 {{.Name}} 的請求（Schema Input）
+// validate tag 由 c.BindInput 執行；不符時自動回 422（E1001）
 type Create{{.Name}}Req struct {
-	Name        string ` + "`" + `json:"name"` + "`" + `
-	Description string ` + "`" + `json:"description,omitempty"` + "`" + `
+	Name        string ` + "`" + `json:"name" validate:"required,max=100"` + "`" + `
+	Description string ` + "`" + `json:"description,omitempty" validate:"max=500"` + "`" + `
 }
 
 // Update{{.Name}}Req 更新 {{.Name}} 的請求（Schema Input）
