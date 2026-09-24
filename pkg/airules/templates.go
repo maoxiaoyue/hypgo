@@ -38,7 +38,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("app/models/        Bun ORM models + Req/Resp DTO structs (CreateXxxReq, XxxResp)\n")
 	sb.WriteString("app/services/      Business logic + Error Catalog (errors.Define) + CRUD methods\n")
 	sb.WriteString("app/controllers/   HTTP handlers — thin: parse input, call service, write response\n")
-	sb.WriteString("app/routers/       Schema-first route registration + Setup() + middleware\n")
+	sb.WriteString("routers/           Schema-first route registration + Setup() + middleware (project root, beside app/)\n")
 	sb.WriteString("app/views/         Templates / desktop (Fyne) views\n")
 	sb.WriteString("app/config/        Application configuration (config.yaml)\n")
 	sb.WriteString(".hyp/              Auto-generated project context (manifest + lint report)\n")
@@ -49,7 +49,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("- **Model** (`app/models/`, pkg/hidb): Bun ORM struct + its Req/Resp DTOs (CreateXxxReq, UpdateXxxReq, XxxResp).\n")
 	sb.WriteString("- **Service** (`app/services/`, pkg/errors): business logic, DB access, Error Catalog.\n")
 	sb.WriteString("- **Controller** (`app/controllers/`, pkg/context): parse input → call service → write response. NO business logic, NO direct DB access.\n")
-	sb.WriteString("- **Router** (`app/routers/`, pkg/router + pkg/schema): Schema-first registration + Setup() + middleware only.\n")
+	sb.WriteString("- **Router** (`routers/`, pkg/router + pkg/schema): Schema-first registration + Setup() + middleware only.\n")
 
 	sb.WriteString("\n## Key Conventions (STRICT — no exceptions)\n\n")
 	sb.WriteString("1. **Schema-first routes** (MANDATORY, pkg/schema): every API route MUST be registered with type metadata via `r.Schema(...)`. NEVER call `r.GET/POST(...)` directly for API routes.\n")

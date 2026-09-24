@@ -279,7 +279,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 		filepath.Join(projectName, "app", "controllers"),
 		filepath.Join(projectName, "app", "models"),
 		filepath.Join(projectName, "app", "services"),
-		filepath.Join(projectName, "app", "routers"),
+		filepath.Join(projectName, "routers"), // 路由層置於專案根目錄（與 app/ 平行）
 		filepath.Join(projectName, "config"),
 		filepath.Join(projectName, ".hyp"),
 		filepath.Join(projectName, "logs"),
@@ -293,6 +293,12 @@ func runNew(cmd *cobra.Command, args []string) error {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
+	}
+
+	// logs/ 是空目錄，git 不會追蹤；放 .gitkeep 讓 clone 後目錄仍存在，
+	// logger 寫 logs/app.log 時不需先手動建目錄
+	if err := createGitKeep(filepath.Join(projectName, "logs")); err != nil {
+		return err
 	}
 
 	// 創建配置文件
@@ -324,7 +330,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 創建 Router 入口（app/routers/router.go，引入 router + schema，串接 controller + model）
+	// 創建 Router 入口（routers/router.go，引入 router + schema，串接 controller + model）
 	if err := createRouterSetup(projectName, today); err != nil {
 		return err
 	}
@@ -357,11 +363,11 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── controllers/    # home.go（薄控制器）\n")
 	fmt.Printf("   │   ├── models/         # home.go（Schema Input/Output DTO）\n")
-	fmt.Printf("   │   ├── routers/        # router.go（Setup：router + schema 串接）\n")
 	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── routers/            # router.go（Setup：router + schema 串接）\n")
 	fmt.Printf("   ├── config/\n")
 	fmt.Printf("   │   └── config.yaml\n")
-	fmt.Printf("   ├── logs/\n")
+	fmt.Printf("   ├── logs/               # .gitkeep（logger 輸出 logs/app.log）\n")
 	fmt.Printf("   ├── static/\n")
 	fmt.Printf("   │   ├── css/\n")
 	fmt.Printf("   │   ├── js/\n")
@@ -462,7 +468,7 @@ func createMainFile(projectName string) error {
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/config\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/server\"\n\n" +
-		"\t\"" + projectName + "/app/routers\"\n" +
+		"\t\"" + projectName + "/routers\"\n" +
 		")\n\n" +
 		"func main() {\n" +
 		"\t// 載入配置\n" +
@@ -477,7 +483,7 @@ func createMainFile(projectName string) error {
 		"\tdefer appLog.Close()\n\n" +
 		"\t// 創建服務器\n" +
 		"\tsrv := server.New(cfg, appLog)\n\n" +
-		"\t// 設定所有路由與中間件（定義於 app/routers/router.go）\n" +
+		"\t// 設定所有路由與中間件（定義於 routers/router.go）\n" +
 		"\trouters.Setup(srv.Router())\n\n" +
 		"\t// 啟動服務器\n" +
 		"\tgo func() {\n" +
@@ -531,7 +537,7 @@ func createHomeModel(projectName, today string) error {
 	return os.WriteFile(filename, []byte(content), 0644)
 }
 
-// createRouterSetup 生成 app/routers/router.go：引入 router + schema，
+// createRouterSetup 生成 routers/router.go（專案根目錄）：引入 router + schema，
 // 以 Schema-first 串接 controller 與 model，作為專案路由的唯一入口。
 func createRouterSetup(projectName, today string) error {
 	content := "// Package routers 集中定義路由與中間件（Schema-first MVC 的 Router 層）。\n" +
@@ -575,8 +581,13 @@ func createRouterSetup(projectName, today string) error {
 		"\t// RegisterUserRoutes(r)\n" +
 		"}\n"
 
-	filename := filepath.Join(projectName, "app", "routers", "router.go")
+	filename := filepath.Join(projectName, "routers", "router.go")
 	return os.WriteFile(filename, []byte(content), 0644)
+}
+
+// createGitKeep 在空目錄放 .gitkeep，讓該目錄能被 git 追蹤（hyp new / hyp api 共用）
+func createGitKeep(dir string) error {
+	return os.WriteFile(filepath.Join(dir, ".gitkeep"), nil, 0644)
 }
 
 func createFullStackController(projectName, today string) error {

@@ -41,7 +41,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		filepath.Join(projectName, "app", "controllers"),
 		filepath.Join(projectName, "app", "models"),
 		filepath.Join(projectName, "app", "services"),
-		filepath.Join(projectName, "app", "routers"),
+		filepath.Join(projectName, "routers"), // 路由層置於專案根目錄（與 app/ 平行）
 		filepath.Join(projectName, "app", "middleware"),
 		filepath.Join(projectName, "app", "validators"),
 		filepath.Join(projectName, "config"),
@@ -60,6 +60,11 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
+	}
+
+	// logs/ 為空目錄，放 .gitkeep 讓 clone 後仍存在（.gitignore 已排除 logs/* 但保留 .gitkeep）
+	if err := createGitKeep(filepath.Join(projectName, "logs")); err != nil {
+		return err
 	}
 
 	// 創建所有必要的檔案
@@ -119,9 +124,9 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 創建 Router 入口（app/routers/router.go，引入 router + schema，串接 controller + model）
+	// 創建 Router 入口（routers/router.go，引入 router + schema，串接 controller + model）
 	if err := createAPIRouterSetup(projectName, time.Now().Format("2006-01-02")); err != nil {
-		return fmt.Errorf("failed to create app/routers/router.go: %w", err)
+		return fmt.Errorf("failed to create routers/router.go: %w", err)
 	}
 
 	// 把生成專案的 hypgo 依賴升到 @latest（如果可以）
@@ -133,7 +138,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// createAPIRouterSetup 生成 app/routers/router.go：引入 router + schema，
+// createAPIRouterSetup 生成 routers/router.go（專案根目錄）：引入 router + schema，
 // 以 Schema-first 串接 controller 與 model，作為 API 專案路由的唯一入口。
 // 在 main.go 改以 routers.Setup(srv.Router()) 取代手寫路由註冊。
 func createAPIRouterSetup(projectName, today string) error {
@@ -182,7 +187,7 @@ func createAPIRouterSetup(projectName, today string) error {
 		"\t}).Handle(controllers.CreateUser)\n" +
 		"}\n"
 
-	filename := filepath.Join(projectName, "app", "routers", "router.go")
+	filename := filepath.Join(projectName, "routers", "router.go")
 	return os.WriteFile(filename, []byte(content), 0644)
 }
 
@@ -214,9 +219,9 @@ func printSuccessMessage(projectName string) {
 	fmt.Printf("   │   ├── controllers/    # API controllers with new Context\n")
 	fmt.Printf("   │   ├── models/         # Data models with DB init\n")
 	fmt.Printf("   │   ├── services/       # Business logic layer\n")
-	fmt.Printf("   │   ├── routers/        # router.go (Setup: router + schema 串接)\n")
 	fmt.Printf("   │   ├── middleware/     # HTTP middleware\n")
 	fmt.Printf("   │   └── validators/     # Request validators\n")
+	fmt.Printf("   ├── routers/            # router.go (Setup: router + schema 串接)\n")
 	fmt.Printf("   ├── internal/\n")
 	fmt.Printf("   │   ├── logger/         # Logger initialization\n")
 	fmt.Printf("   │   ├── database/       # Database connections\n")
@@ -1785,8 +1790,9 @@ go.work
 *~
 .DS_Store
 
-# Logs
-logs/
+# Logs（保留 logs/.gitkeep 讓目錄存在）
+logs/*
+!logs/.gitkeep
 *.log
 
 # Certificates

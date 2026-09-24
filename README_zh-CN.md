@@ -141,7 +141,7 @@ hyp new desktop myapp   → Desktop（Fyne GUI）
 
 | 类型 | UI 层 | 生成方式 |
 |------|-------|---------|
-| Web | `app/controllers/` + `app/routers/` | `hyp generate controller <name>` |
+| Web | `app/controllers/` + `routers/` | `hyp generate controller <name>` |
 | CLI | `app/commands/` | `hyp generate command <name>` |
 | Desktop | `app/views/` | `hyp generate view <name>` |
 
