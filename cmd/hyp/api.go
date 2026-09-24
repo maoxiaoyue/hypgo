@@ -205,8 +205,13 @@ func createAPIAuth(projectName, today string) error {
 		"}\n\n" +
 		"// MeResp 目前登入者（Schema Output）\n" +
 		"type MeResp struct {\n" +
-		"\tID    string `json:\"id\"`\n" +
-		"\tEmail string `json:\"email\"`\n" +
+		"\tID    string   `json:\"id\"`\n" +
+		"\tEmail string   `json:\"email\"`\n" +
+		"\tRoles []string `json:\"roles\"`\n" +
+		"}\n\n" +
+		"// AdminStatsResp 管理端統計（Schema Output；需 admin 角色）\n" +
+		"type AdminStatsResp struct {\n" +
+		"\tAccounts int `json:\"accounts\"`\n" +
 		"}\n"
 	if err := os.WriteFile(filepath.Join(projectName, "app", "models", "auth.go"), []byte(model), 0644); err != nil {
 		return err
@@ -228,18 +233,23 @@ func createAPIAuth(projectName, today string) error {
 		"\tErrAuthInvalidLogin = errors.Define(\"E_auth_002\", 401, \"Invalid email or password\", \"auth\")\n" +
 		"\tErrAuthUnauthorized = errors.Define(\"E_auth_003\", 401, \"Authentication required\", \"auth\")\n" +
 		"\tErrAuthInternal     = errors.Define(\"E_auth_004\", 500, \"Authentication failed\", \"auth\")\n" +
+		"\tErrAuthForbidden    = errors.Define(\"E_auth_005\", 403, \"Insufficient permissions\", \"auth\")\n" +
 		")\n\n" +
+		"// RoleAdmin 管理者角色；第一個註冊的帳號自動取得（bootstrap），之後由管理者指派\n" +
+		"const RoleAdmin = \"admin\"\n\n" +
 		"// Account 帳號紀錄。接資料庫時改為 Bun model（bun.BaseModel + table tag）\n" +
 		"type Account struct {\n" +
 		"\tID           string\n" +
 		"\tEmail        string\n" +
 		"\tPasswordHash []byte\n" +
+		"\tRoles        []string\n" +
 		"}\n\n" +
 		"// AccountStore 帳號儲存介面；預設 MemoryAccountStore，接 hidb 時實作同介面替換：\n" +
 		"//   services.NewAuthService(&PgAccountStore{db: db}, secret, ttl)\n" +
 		"type AccountStore interface {\n" +
 		"\tFindByEmail(ctx context.Context, email string) (*Account, bool)\n" +
 		"\tCreate(ctx context.Context, a *Account) error\n" +
+		"\tCount(ctx context.Context) int\n" +
 		"}\n\n" +
 		"// MemoryAccountStore 行程內記憶體實作——重啟即清空，僅供開發／測試\n" +
 		"type MemoryAccountStore struct {\n" +
@@ -267,6 +277,12 @@ func createAPIAuth(projectName, today string) error {
 		"\ts.byEmail[a.Email] = a\n" +
 		"\treturn nil\n" +
 		"}\n\n" +
+		"// Count 帳號總數\n" +
+		"func (s *MemoryAccountStore) Count(_ context.Context) int {\n" +
+		"\ts.mu.RLock()\n" +
+		"\tdefer s.mu.RUnlock()\n" +
+		"\treturn len(s.byEmail)\n" +
+		"}\n\n" +
 		"// AuthService 註冊／登入／簽發 token\n" +
 		"type AuthService struct {\n" +
 		"\tstore  AccountStore\n" +
@@ -287,12 +303,20 @@ func createAPIAuth(projectName, today string) error {
 		"\t\treturn nil, ErrAuthInternal.With(\"reason\", err.Error())\n" +
 		"\t}\n" +
 		"\tacc := &Account{Email: email, PasswordHash: hash}\n" +
+		"\t// bootstrap：第一個帳號即管理者，之後的角色由管理者指派\n" +
+		"\tif s.store.Count(ctx) == 0 {\n" +
+		"\t\tacc.Roles = []string{RoleAdmin}\n" +
+		"\t}\n" +
 		"\tif err := s.store.Create(ctx, acc); err != nil {\n" +
 		"\t\treturn nil, ErrAuthInternal.With(\"reason\", err.Error())\n" +
 		"\t}\n" +
 		"\treturn acc, nil\n" +
 		"}\n\n" +
-		"// Login 驗證密碼並簽發 HS256 token（sub = 帳號 ID，data.email = email）\n" +
+		"// AccountCount 帳號總數（管理端統計）\n" +
+		"func (s *AuthService) AccountCount(ctx context.Context) int {\n" +
+		"\treturn s.store.Count(ctx)\n" +
+		"}\n\n" +
+		"// Login 驗證密碼並簽發 HS256 token（sub = 帳號 ID，roles = 角色，data.email = email）\n" +
 		"func (s *AuthService) Login(ctx context.Context, email, password string) (token string, expiresAt int64, appErr *errors.AppError) {\n" +
 		"\tacc, ok := s.store.FindByEmail(ctx, email)\n" +
 		"\t// 帳號不存在時仍跑一次 bcrypt，避免以回應時間差探測 email 是否已註冊\n" +
@@ -305,6 +329,7 @@ func createAPIAuth(projectName, today string) error {
 		"\t}\n\n" +
 		"\tclaims := middleware.JWTClaims{\n" +
 		"\t\tSubject: acc.ID,\n" +
+		"\t\tRoles:   acc.Roles, // JWT 中間件會自動 c.SetRoles，供 middleware.RequireRole 使用\n" +
 		"\t\tData:    map[string]interface{}{\"email\": acc.Email},\n" +
 		"\t}\n" +
 		"\ttoken, err := middleware.SignHS256(claims, s.secret, s.ttl)\n" +
@@ -346,7 +371,7 @@ func createAPIAuth(projectName, today string) error {
 		"\t\terrors.AbortWithAppError(c, appErr)\n" +
 		"\t\treturn\n" +
 		"\t}\n" +
-		"\tc.JSON(201, models.MeResp{ID: acc.ID, Email: acc.Email})\n" +
+		"\tc.JSON(201, models.MeResp{ID: acc.ID, Email: acc.Email, Roles: nonNil(acc.Roles)})\n" +
 		"}\n\n" +
 		"// Login POST /api/auth/login\n" +
 		"func (ctrl *AuthController) Login(c *hypcontext.Context) {\n" +
@@ -369,7 +394,18 @@ func createAPIAuth(projectName, today string) error {
 		"\t\treturn\n" +
 		"\t}\n" +
 		"\temail, _ := claims.Data[\"email\"].(string)\n" +
-		"\tc.JSON(200, models.MeResp{ID: claims.Subject, Email: email})\n" +
+		"\tc.JSON(200, models.MeResp{ID: claims.Subject, Email: email, Roles: nonNil(claims.Roles)})\n" +
+		"}\n\n" +
+		"// AdminStats GET /api/auth/admin/stats（需 admin 角色；由 middleware.RequireRole 把關）\n" +
+		"func (ctrl *AuthController) AdminStats(c *hypcontext.Context) {\n" +
+		"\tc.JSON(200, models.AdminStatsResp{Accounts: ctrl.Auth.AccountCount(c)})\n" +
+		"}\n\n" +
+		"// nonNil 讓 JSON 輸出 [] 而非 null\n" +
+		"func nonNil(s []string) []string {\n" +
+		"\tif s == nil {\n" +
+		"\t\treturn []string{}\n" +
+		"\t}\n" +
+		"\treturn s\n" +
 		"}\n"
 	if err := os.WriteFile(filepath.Join(projectName, "app", "controllers", "auth_controller.go"), []byte(controller), 0644); err != nil {
 		return err
@@ -393,6 +429,7 @@ func createAPIAuth(projectName, today string) error {
 		"// RegisterAuthRoutes 註冊認證路由：\n" +
 		"//   POST /api/auth/register、POST /api/auth/login（公開）\n" +
 		"//   GET  /api/auth/me（Group 掛 middleware.JWT，Validator 為框架的 HS256）\n" +
+		"//   GET  /api/auth/admin/stats（再掛 middleware.RequireRole(\"admin\")）\n" +
 		"func RegisterAuthRoutes(r *router.Router) {\n" +
 		"\tauth := services.NewAuthService(services.NewMemoryAccountStore(), jwtSecret(), 24*time.Hour)\n" +
 		"\tctrl := &controllers.AuthController{Auth: auth}\n\n" +
@@ -438,7 +475,25 @@ func createAPIAuth(projectName, today string) error {
 		"\t\t\t200: {Description: \"Current account\"},\n" +
 		"\t\t\t401: {Description: \"Missing or invalid token\"},\n" +
 		"\t\t},\n" +
-		"\t}).Handle(ctrl.Me)\n" +
+		"\t}).Handle(ctrl.Me)\n\n" +
+		"\t// 需 admin 角色：在 protected 之下再掛 RequireRole（角色來自 token 的 roles claim）\n" +
+		"\tadmin := protected.NewGroup(\"/admin\", middleware.RequireRoleWith(middleware.RequireRoleConfig{\n" +
+		"\t\tRoles: []string{services.RoleAdmin},\n" +
+		"\t\tErrorHandler: func(c *hypcontext.Context, err error) {\n" +
+		"\t\t\terrors.AbortWithAppError(c, services.ErrAuthForbidden.With(\"reason\", err.Error()))\n" +
+		"\t\t},\n" +
+		"\t}))\n" +
+		"\tadmin.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"GET\",\n" +
+		"\t\tPath:    \"/stats\",\n" +
+		"\t\tSummary: \"Admin stats\",\n" +
+		"\t\tTags:    []string{\"auth\", \"admin\"},\n" +
+		"\t\tOutput:  models.AdminStatsResp{},\n" +
+		"\t\tResponses: map[int]schema.ResponseSchema{\n" +
+		"\t\t\t200: {Description: \"Stats\"},\n" +
+		"\t\t\t403: {Description: \"Requires admin role\"},\n" +
+		"\t\t},\n" +
+		"\t}).Handle(ctrl.AdminStats)\n" +
 		"}\n\n" +
 		"// jwtSecret 讀取環境變數 JWT_SECRET；未設定時產生每次啟動不同的隨機金鑰並警告\n" +
 		"//（既有 token 會在重啟後失效——正式環境務必設定）\n" +
@@ -986,6 +1041,7 @@ HTTP/3 needs TLS: run ` + "`make cert`" + ` (self-signed cert into ` + "`certs/`
 | POST | ` + "`/api/auth/register`" + ` | ` + "`AuthController.Register`" + ` (bcrypt, 201 / 409 / 422) |
 | POST | ` + "`/api/auth/login`" + ` | ` + "`AuthController.Login`" + ` → ` + "`{token, expires_at}`" + ` (HS256) |
 | GET | ` + "`/api/auth/me`" + ` | ` + "`AuthController.Me`" + ` (requires ` + "`Authorization: Bearer <token>`" + `) |
+| GET | ` + "`/api/auth/admin/stats`" + ` | ` + "`AuthController.AdminStats`" + ` (token + ` + "`admin`" + ` role; 403 otherwise) |
 | GET | ` + "`/api/user`" + ` | ` + "`UserController.List`" + ` |
 | POST | ` + "`/api/user`" + ` | ` + "`UserController.Create`" + ` (` + "`c.BindInput`" + ` → validate → 201) |
 | GET | ` + "`/api/user/:id`" + ` | ` + "`UserController.Get`" + ` |
@@ -1008,7 +1064,8 @@ curl localhost:8080/api/auth/me -H "Authorization: Bearer $TOKEN"
 
 - ` + "`routers/auth.go`" + `: public register/login + a ` + "`protected`" + ` group (` + "`r.NewGroup(\"/api/auth\", middleware.JWT(...))`" + `). Put any route that needs a login on that group.
 - ` + "`services/auth_service.go`" + `: bcrypt password hashing, ` + "`middleware.SignHS256`" + ` for tokens. Accounts live in ` + "`MemoryAccountStore`" + ` (in-process, cleared on restart) — implement ` + "`AccountStore`" + ` on top of ` + "`hidb`" + ` and pass it to ` + "`NewAuthService`" + ` for persistence.
-- Claims in handlers: ` + "`middleware.JWTClaimsFrom(c, \"\")`" + ` → ` + "`*middleware.JWTClaims`" + ` (` + "`Subject`" + ` = account ID).
+- Claims in handlers: ` + "`middleware.JWTClaimsFrom(c, \"\")`" + ` → ` + "`*middleware.JWTClaims`" + ` (` + "`Subject`" + ` = account ID, ` + "`Roles`" + `).
+- Roles: the **first registered account becomes ` + "`admin`" + `** (bootstrap); roles travel in the token's ` + "`roles`" + ` claim and the JWT middleware exposes them via ` + "`c.GetRoles()`" + `. Gate a group with ` + "`middleware.RequireRole(\"admin\")`" + ` (see the ` + "`admin`" + ` group in ` + "`routers/auth.go`" + `).
 
 ## Adding a resource
 

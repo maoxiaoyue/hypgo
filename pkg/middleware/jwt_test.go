@@ -92,6 +92,56 @@ func TestHS256Expiry(t *testing.T) {
 	}
 }
 
+// TestRequireRole 端到端：JWT 之後掛 RequireRole，依 claims.Roles 放行／403，
+// 未經 JWT 中間件 → 401，自訂 ErrorHandler 收到可判別的 error
+func TestRequireRole(t *testing.T) {
+	r := router.New()
+	api := r.NewGroup("/api", JWT(JWTConfig{Validator: HS256Validator(testSecret)}))
+	admin := api.NewGroup("/admin", RequireRole("admin", "root"))
+	admin.GET("/ping", func(c *context.Context) { c.String(200, "pong") })
+
+	// 未掛 JWT 直接用 RequireRole → 401
+	var gotErr error
+	r.GET("/bare", RequireRoleWith(RequireRoleConfig{
+		Roles:        []string{"admin"},
+		ErrorHandler: func(c *context.Context, err error) { gotErr = err; c.AbortWithStatus(418) },
+	}), func(c *context.Context) { c.String(200, "never") })
+
+	do := func(path, token string) int {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	adminTok, _ := SignHS256(JWTClaims{Subject: "1", Roles: []string{"admin"}}, testSecret, time.Hour)
+	rootTok, _ := SignHS256(JWTClaims{Subject: "2", Roles: []string{"root"}}, testSecret, time.Hour)
+	userTok, _ := SignHS256(JWTClaims{Subject: "3", Roles: []string{"user"}}, testSecret, time.Hour)
+	noRoleTok, _ := SignHS256(JWTClaims{Subject: "4"}, testSecret, time.Hour)
+
+	if code := do("/api/admin/ping", adminTok); code != 200 {
+		t.Errorf("admin: %d, want 200", code)
+	}
+	if code := do("/api/admin/ping", rootTok); code != 200 {
+		t.Errorf("root (any-of): %d, want 200", code)
+	}
+	if code := do("/api/admin/ping", userTok); code != 403 {
+		t.Errorf("user: %d, want 403", code)
+	}
+	if code := do("/api/admin/ping", noRoleTok); code != 403 {
+		t.Errorf("no roles: %d, want 403", code)
+	}
+	if code := do("/api/admin/ping", ""); code != 401 {
+		t.Errorf("no token (JWT layer): %d, want 401", code)
+	}
+	if code := do("/bare", adminTok); code != 418 || !errors.Is(gotErr, ErrRoleUnauthenticated) {
+		t.Errorf("without JWT middleware: code %d err %v, want 418 + ErrRoleUnauthenticated", code, gotErr)
+	}
+}
+
 // TestJWTMiddlewareWithHS256Validator 端到端：Group 掛 JWT 中間件，
 // 無 token → 401；合法 token → handler 可用 JWTClaimsFrom 取回 claims
 func TestJWTMiddlewareWithHS256Validator(t *testing.T) {

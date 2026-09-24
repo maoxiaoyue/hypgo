@@ -138,6 +138,62 @@ func JWTClaimsFrom(c *hypcontext.Context, contextKey string) (*JWTClaims, bool) 
 	return claims, ok
 }
 
+// ===== 角色檢查 =====
+
+// RequireRole 錯誤（可用 errors.Is 判別；預設回 401 / 403）
+var (
+	ErrRoleUnauthenticated = errors.New("role: not authenticated")
+	ErrRoleForbidden       = errors.New("role: insufficient permissions")
+)
+
+// RequireRoleConfig 角色檢查設定
+type RequireRoleConfig struct {
+	// Roles 允許的角色，符合任一即放行（OR）
+	Roles []string
+	// ErrorHandler 自訂錯誤回應；nil 時未認證回 401、角色不符回 403（無 body）。
+	// err 為 ErrRoleUnauthenticated 或 ErrRoleForbidden
+	ErrorHandler func(c *hypcontext.Context, err error)
+}
+
+// RequireRole 要求請求者具備任一指定角色。
+// 角色來源為 c.GetRoles()：JWT 中間件搭配 HS256Validator 時會自動由 claims.Roles 填入，
+// 自訂 Validator 則需自行 c.SetRoles。必須掛在 JWT 中間件之後：
+//
+//	admin := api.NewGroup("/admin", middleware.RequireRole("admin"))
+func RequireRole(roles ...string) hypcontext.HandlerFunc {
+	return RequireRoleWith(RequireRoleConfig{Roles: roles})
+}
+
+// RequireRoleWith 帶設定的 RequireRole（可自訂錯誤回應）
+func RequireRoleWith(config RequireRoleConfig) hypcontext.HandlerFunc {
+	fail := func(c *hypcontext.Context, err error) {
+		if config.ErrorHandler != nil {
+			config.ErrorHandler(c, err)
+			return
+		}
+		if errors.Is(err, ErrRoleUnauthenticated) {
+			c.AbortWithStatus(401)
+			return
+		}
+		c.AbortWithStatus(403)
+	}
+
+	return func(c *hypcontext.Context) {
+		// 未經 JWT 中間件（或 Validator 未 SetRoles）→ 視為未認證
+		if _, ok := c.Get("roles"); !ok {
+			fail(c, ErrRoleUnauthenticated)
+			return
+		}
+		for _, role := range config.Roles {
+			if c.HasRole(role) {
+				c.Next()
+				return
+			}
+		}
+		fail(c, ErrRoleForbidden)
+	}
+}
+
 func hs256Sum(signingInput string, secret []byte) []byte {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(signingInput))

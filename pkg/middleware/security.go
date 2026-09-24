@@ -199,6 +199,10 @@ func JWT(config JWTConfig) hypcontext.HandlerFunc {
 
 		// 設置使用者資訊到 context
 		c.Set(config.ContextKey, claims)
+		// 內建 HS256 claims：同步角色到 c.SetRoles，供 RequireRole / c.HasRole 使用
+		if jc, ok := claims.(*JWTClaims); ok {
+			c.SetRoles(jc.Roles)
+		}
 		c.Next()
 	}
 }
