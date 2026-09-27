@@ -24,7 +24,7 @@ Available types:
   proto         Protobuf service definition + gRPC server for gRPC projects
 
 Generated file locations:
-  controller → app/controllers/<name>_controller.go + app/routers/<name>.go
+  controller → app/controllers/<name>_controller.go + routers/<name>.go
   model      → app/models/<name>.go
   service    → app/services/<name>_service.go
   command    → app/commands/<name>.go
@@ -82,23 +82,23 @@ func generateControllerFull(name, moduleName string) error {
 	}
 	fmt.Printf("  + app/controllers/%s_controller.go\n", lowerName)
 
-	if err := scaffold.GenerateRouter("app/routers", name, moduleName); err != nil {
+	if err := scaffold.GenerateRouter("routers", name, moduleName); err != nil {
 		return err
 	}
-	fmt.Printf("  + app/routers/%s.go\n", lowerName)
+	fmt.Printf("  + routers/%s.go\n", lowerName)
 
-	if err := scaffold.GenerateRouterSetup("app/routers", name, moduleName); err == nil {
-		fmt.Printf("  + app/routers/router.go\n")
+	if err := scaffold.GenerateRouterSetup("routers", name, moduleName); err == nil {
+		fmt.Printf("  + routers/router.go\n")
 	}
 
-	if err := scaffold.GenerateMiddleware("app/routers"); err == nil {
-		fmt.Printf("  + app/routers/middleware.go\n")
+	if err := scaffold.GenerateMiddleware("routers"); err == nil {
+		fmt.Printf("  + routers/middleware.go\n")
 	}
 
 	fmt.Printf("\n✅ Controller generated: %s\n", capName)
 	fmt.Printf("   Next steps:\n")
 	fmt.Printf("   1. Run: hyp generate model %s\n", lowerName)
-	fmt.Printf("   2. Edit app/routers/router.go → add: Register%sRoutes(r)\n", capName)
+	fmt.Printf("   2. Edit routers/router.go → add: Register%sRoutes(r)\n", capName)
 	fmt.Printf("   3. In main.go → call: routers.Setup(srv.Router())\n")
 	return nil
 }

@@ -37,18 +37,16 @@ func runAPI(cmd *cobra.Command, args []string) error {
 	projectName := args[0]
 
 	// 創建 API 項目目錄結構
+	// 與 hyp new 同構（app/{controllers,models,services} + routers/），
+	// 不再產生自製的 internal/{logger,database,cache}：框架的 pkg/logger、
+	// pkg/hidb 已涵蓋，重造一份只會與框架 API 漂移（舊版即因此編不過）
 	dirs := []string{
 		filepath.Join(projectName, "app", "controllers"),
 		filepath.Join(projectName, "app", "models"),
 		filepath.Join(projectName, "app", "services"),
-		filepath.Join(projectName, "app", "routers"),
-		filepath.Join(projectName, "app", "middleware"),
-		filepath.Join(projectName, "app", "validators"),
+		filepath.Join(projectName, "routers"), // 路由層置於專案根目錄（與 app/ 平行）
 		filepath.Join(projectName, "config"),
 		filepath.Join(projectName, ".hyp"),
-		filepath.Join(projectName, "internal", "database"),
-		filepath.Join(projectName, "internal", "logger"),
-		filepath.Join(projectName, "internal", "cache"),
 		filepath.Join(projectName, "migrations"),
 		filepath.Join(projectName, "tests"),
 		filepath.Join(projectName, "docs"),
@@ -62,33 +60,18 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 創建所有必要的檔案
+	// logs/ 為空目錄，放 .gitkeep 讓 clone 後仍存在（.gitignore 已排除 logs/* 但保留 .gitkeep）
+	if err := createGitKeep(filepath.Join(projectName, "logs")); err != nil {
+		return err
+	}
+
+	// 創建所有非 Go 檔案（設定、部署、遷移）
 	files := []fileTemplate{
-		// 主要檔案
-		{Path: "main.go", Content: mainGoContent},
 		{Path: "config/config.yaml", Content: configYamlContent},
 		{Path: ".hyp/llm.yaml", Content: llmYamlContent},
 		{Path: ".hyp/comment.yaml", Content: commentYamlContent},
 		{Path: ".hyp/config.yaml", Content: hypConfigYamlContent},
 		{Path: ".env.example", Content: envExampleContent},
-
-		// 初始化檔案
-		{Path: "internal/logger/init.go", Content: loggerInitContent},
-		{Path: "app/models/init.go", Content: modelsInitContent},
-		{Path: "internal/database/init.go", Content: databaseInitContent},
-		{Path: "internal/cache/init.go", Content: cacheInitContent},
-
-		// 控制器和中間件
-		{Path: "app/controllers/api.go", Content: apiControllerContent},
-		{Path: "app/controllers/health.go", Content: healthControllerContent},
-		{Path: "app/middleware/middleware.go", Content: middlewareContent},
-		{Path: "app/middleware/auth.go", Content: authMiddlewareContent},
-
-		// 模型和服務
-		{Path: "app/models/user.go", Content: userModelContent},
-		{Path: "app/services/user_service.go", Content: userServiceContent},
-		{Path: "app/services/auth_service.go", Content: authServiceContent},
-		{Path: "app/validators/user_validator.go", Content: userValidatorContent},
 
 		// 部署和配置
 		{Path: "Dockerfile", Content: dockerfileContent},
@@ -119,9 +102,35 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 創建 Router 入口（app/routers/router.go，引入 router + schema，串接 controller + model）
-	if err := createAPIRouterSetup(projectName, time.Now().Format("2006-01-02")); err != nil {
-		return fmt.Errorf("failed to create app/routers/router.go: %w", err)
+	today := time.Now().Format("2006-01-02")
+
+	// Go 程式碼一律走 pkg/scaffold 的生成器（與 hyp generate 同一套、有測試覆蓋），
+	// 保證產出對齊框架真實 API；user 資源 = model + service + controller + Schema 路由
+	const resource = "user"
+	gen := []struct {
+		label string
+		fn    func() error
+	}{
+		{"app/models/user.go", func() error { return scaffold.GenerateModel(filepath.Join(projectName, "app", "models"), resource) }},
+		{"app/services/user_service.go", func() error { return scaffold.GenerateService(filepath.Join(projectName, "app", "services"), resource) }},
+		{"app/controllers/user_controller.go", func() error {
+			return scaffold.GenerateController(filepath.Join(projectName, "app", "controllers"), resource, projectName)
+		}},
+		{"routers/user.go", func() error {
+			return scaffold.GenerateRouter(filepath.Join(projectName, "routers"), resource, projectName)
+		}},
+		{"routers/middleware.go", func() error { return scaffold.GenerateMiddleware(filepath.Join(projectName, "routers")) }},
+		{"app/models/health.go + app/controllers/health.go", func() error { return createAPIHealth(projectName, today) }},
+		{"auth（models/auth.go, services/auth_service.go, controllers/auth_controller.go, routers/auth.go）", func() error {
+			return createAPIAuth(projectName, today)
+		}},
+		{"routers/router.go", func() error { return createAPIRouterSetup(projectName, today) }},
+		{"main.go", func() error { return createAPIMainFile(projectName) }},
+	}
+	for _, g := range gen {
+		if err := g.fn(); err != nil {
+			return fmt.Errorf("failed to create %s: %w", g.label, err)
+		}
 	}
 
 	// 把生成專案的 hypgo 依賴升到 @latest（如果可以）
@@ -133,57 +142,464 @@ func runAPI(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// createAPIRouterSetup 生成 app/routers/router.go：引入 router + schema，
-// 以 Schema-first 串接 controller 與 model，作為 API 專案路由的唯一入口。
-// 在 main.go 改以 routers.Setup(srv.Router()) 取代手寫路由註冊。
+// createAPIRouterSetup 生成 routers/router.go（專案根目錄）：全域中間件 +
+// /health + RegisterUserRoutes（由 scaffold.GenerateRouter 產生），
+// 作為 API 專案路由的唯一入口；main.go 以 routers.Setup(...) 呼叫。
 func createAPIRouterSetup(projectName, today string) error {
 	content := "// Package routers 集中定義路由與中間件（Schema-first MVC 的 Router 層）。\n" +
 		"//\n" +
 		"// @ai:generated by=hypgo date=" + today + "\n" +
 		"package routers\n\n" +
 		"import (\n" +
-		"\t\"github.com/maoxiaoyue/hypgo/pkg/middleware\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/router\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/schema\"\n\n" +
 		"\t\"" + projectName + "/app/controllers\"\n" +
 		"\t\"" + projectName + "/app/models\"\n" +
 		")\n\n" +
 		"// Setup 註冊所有路由與中間件。\n" +
-		"// 在 main.go 呼叫：routers.Setup(srv.Router())。\n" +
+		"// 在 main.go 呼叫：routers.Setup(app.Server().Router())。\n" +
 		"func Setup(r *router.Router) {\n" +
-		"\t// 全域中間件\n" +
-		"\tr.Use(middleware.DefaultMiddleware()...)\n\n" +
-		"\t// 健康檢查\n" +
+		"\t// Recovery / Logger / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
+		"\t// 不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。\n" +
+		"\t// 額外的全域中間件（JWT、RateLimiter、BodyLimit…）在此加，或用 routers/middleware.go 的 APIMiddleware()\n\n" +
+		"\t// 健康檢查（Schema-first：宣告 Output 供 contract 測試與 manifest 使用）\n" +
 		"\tr.Schema(schema.Route{\n" +
 		"\t\tMethod:  \"GET\",\n" +
 		"\t\tPath:    \"/health\",\n" +
 		"\t\tSummary: \"Health check\",\n" +
 		"\t\tTags:    []string{\"system\"},\n" +
+		"\t\tOutput:  models.HealthResp{},\n" +
 		"\t}).Handle(controllers.HealthCheck)\n\n" +
-		"\t// 使用者資源（Schema-first：Input/Output 對齊 model DTO）\n" +
-		"\tr.Schema(schema.Route{\n" +
-		"\t\tMethod:  \"GET\",\n" +
-		"\t\tPath:    \"/api/v1/users\",\n" +
-		"\t\tSummary: \"List users\",\n" +
-		"\t\tTags:    []string{\"users\"},\n" +
-		"\t\tOutput:  models.UserListResp{},\n" +
-		"\t}).Handle(controllers.GetUsers)\n\n" +
-		"\tr.Schema(schema.Route{\n" +
-		"\t\tMethod:  \"POST\",\n" +
-		"\t\tPath:    \"/api/v1/users\",\n" +
-		"\t\tSummary: \"Create user\",\n" +
-		"\t\tTags:    []string{\"users\"},\n" +
-		"\t\tInput:   models.CreateUserRequest{},\n" +
-		"\t\tOutput:  models.UserResp{},\n" +
-		"\t\tResponses: map[int]schema.ResponseSchema{\n" +
-		"\t\t\t201: {Description: \"User created\"},\n" +
-		"\t\t\t400: {Description: \"Invalid input\"},\n" +
-		"\t\t},\n" +
-		"\t}).Handle(controllers.CreateUser)\n" +
+		"\t// 認證：/api/auth/register、/api/auth/login（公開）、/api/auth/me（需 Bearer token）\n" +
+		"\tRegisterAuthRoutes(r)\n\n" +
+		"\t// 資源路由（各資源一檔，由 hyp generate controller <name> 產生後在此註冊）\n" +
+		"\tRegisterUserRoutes(r)\n" +
 		"}\n"
 
-	filename := filepath.Join(projectName, "app", "routers", "router.go")
+	filename := filepath.Join(projectName, "routers", "router.go")
 	return os.WriteFile(filename, []byte(content), 0644)
+}
+
+// createAPIAuth 生成 JWT 認證層：以框架的 middleware.JWT + HS256 簽發／驗證，
+// bcrypt 雜湊密碼，預設記憶體帳號儲存（接 hidb 時實作 AccountStore 替換）
+func createAPIAuth(projectName, today string) error {
+	header := func(pkg, doc string) string {
+		return "// Package " + pkg + " " + doc + "\n//\n// @ai:generated by=hypgo date=" + today + "\npackage " + pkg + "\n\n"
+	}
+
+	model := header("models", "定義資料模型與 Schema 的 Request/Response DTO。") +
+		"// RegisterReq 註冊請求（Schema Input）；validate 由 c.BindInput 執行\n" +
+		"type RegisterReq struct {\n" +
+		"\tEmail    string `json:\"email\" validate:\"required,email\"`\n" +
+		"\tPassword string `json:\"password\" validate:\"required,min=8,max=72\"` // bcrypt 上限 72 bytes\n" +
+		"}\n\n" +
+		"// LoginReq 登入請求（Schema Input）\n" +
+		"type LoginReq struct {\n" +
+		"\tEmail    string `json:\"email\" validate:\"required,email\"`\n" +
+		"\tPassword string `json:\"password\" validate:\"required\"`\n" +
+		"}\n\n" +
+		"// TokenResp 登入成功回應（Schema Output）\n" +
+		"type TokenResp struct {\n" +
+		"\tToken     string `json:\"token\"`      // Bearer token（HS256）\n" +
+		"\tExpiresAt int64  `json:\"expires_at\"` // Unix 秒\n" +
+		"}\n\n" +
+		"// MeResp 目前登入者（Schema Output）\n" +
+		"type MeResp struct {\n" +
+		"\tID    string   `json:\"id\"`\n" +
+		"\tEmail string   `json:\"email\"`\n" +
+		"\tRoles []string `json:\"roles\"`\n" +
+		"}\n\n" +
+		"// AdminStatsResp 管理端統計（Schema Output；需 admin 角色）\n" +
+		"type AdminStatsResp struct {\n" +
+		"\tAccounts int `json:\"accounts\"`\n" +
+		"}\n"
+	if err := os.WriteFile(filepath.Join(projectName, "app", "models", "auth.go"), []byte(model), 0644); err != nil {
+		return err
+	}
+
+	service := header("services", "提供業務邏輯層。") +
+		"import (\n" +
+		"\t\"context\"\n" +
+		"\t\"strconv\"\n" +
+		"\t\"sync\"\n" +
+		"\t\"time\"\n\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/errors\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/middleware\"\n" +
+		"\t\"golang.org/x/crypto/bcrypt\"\n" +
+		")\n\n" +
+		"// 認證錯誤（Error Catalog）\n" +
+		"var (\n" +
+		"\tErrAuthEmailTaken   = errors.Define(\"E_auth_001\", 409, \"Email already registered\", \"auth\")\n" +
+		"\tErrAuthInvalidLogin = errors.Define(\"E_auth_002\", 401, \"Invalid email or password\", \"auth\")\n" +
+		"\tErrAuthUnauthorized = errors.Define(\"E_auth_003\", 401, \"Authentication required\", \"auth\")\n" +
+		"\tErrAuthInternal     = errors.Define(\"E_auth_004\", 500, \"Authentication failed\", \"auth\")\n" +
+		"\tErrAuthForbidden    = errors.Define(\"E_auth_005\", 403, \"Insufficient permissions\", \"auth\")\n" +
+		")\n\n" +
+		"// RoleAdmin 管理者角色；第一個註冊的帳號自動取得（bootstrap），之後由管理者指派\n" +
+		"const RoleAdmin = \"admin\"\n\n" +
+		"// Account 帳號紀錄。接資料庫時改為 Bun model（bun.BaseModel + table tag）\n" +
+		"type Account struct {\n" +
+		"\tID           string\n" +
+		"\tEmail        string\n" +
+		"\tPasswordHash []byte\n" +
+		"\tRoles        []string\n" +
+		"}\n\n" +
+		"// AccountStore 帳號儲存介面；預設 MemoryAccountStore，接 hidb 時實作同介面替換：\n" +
+		"//   services.NewAuthService(&PgAccountStore{db: db}, secret, ttl)\n" +
+		"type AccountStore interface {\n" +
+		"\tFindByEmail(ctx context.Context, email string) (*Account, bool)\n" +
+		"\tCreate(ctx context.Context, a *Account) error\n" +
+		"\tCount(ctx context.Context) int\n" +
+		"}\n\n" +
+		"// MemoryAccountStore 行程內記憶體實作——重啟即清空，僅供開發／測試\n" +
+		"type MemoryAccountStore struct {\n" +
+		"\tmu      sync.RWMutex\n" +
+		"\tbyEmail map[string]*Account\n" +
+		"\tseq     int64\n" +
+		"}\n\n" +
+		"// NewMemoryAccountStore 建立空的記憶體帳號儲存\n" +
+		"func NewMemoryAccountStore() *MemoryAccountStore {\n" +
+		"\treturn &MemoryAccountStore{byEmail: make(map[string]*Account)}\n" +
+		"}\n\n" +
+		"// FindByEmail 依 email 查帳號\n" +
+		"func (s *MemoryAccountStore) FindByEmail(_ context.Context, email string) (*Account, bool) {\n" +
+		"\ts.mu.RLock()\n" +
+		"\tdefer s.mu.RUnlock()\n" +
+		"\ta, ok := s.byEmail[email]\n" +
+		"\treturn a, ok\n" +
+		"}\n\n" +
+		"// Create 新增帳號並配發遞增 ID\n" +
+		"func (s *MemoryAccountStore) Create(_ context.Context, a *Account) error {\n" +
+		"\ts.mu.Lock()\n" +
+		"\tdefer s.mu.Unlock()\n" +
+		"\ts.seq++\n" +
+		"\ta.ID = strconv.FormatInt(s.seq, 10)\n" +
+		"\ts.byEmail[a.Email] = a\n" +
+		"\treturn nil\n" +
+		"}\n\n" +
+		"// Count 帳號總數\n" +
+		"func (s *MemoryAccountStore) Count(_ context.Context) int {\n" +
+		"\ts.mu.RLock()\n" +
+		"\tdefer s.mu.RUnlock()\n" +
+		"\treturn len(s.byEmail)\n" +
+		"}\n\n" +
+		"// AuthService 註冊／登入／簽發 token\n" +
+		"type AuthService struct {\n" +
+		"\tstore  AccountStore\n" +
+		"\tsecret []byte\n" +
+		"\tttl    time.Duration\n" +
+		"}\n\n" +
+		"// NewAuthService 建立認證服務；secret 為 HS256 金鑰、ttl 為 token 有效期\n" +
+		"func NewAuthService(store AccountStore, secret []byte, ttl time.Duration) *AuthService {\n" +
+		"\treturn &AuthService{store: store, secret: secret, ttl: ttl}\n" +
+		"}\n\n" +
+		"// Register 建立帳號（bcrypt 雜湊密碼）；email 重複回 ErrAuthEmailTaken\n" +
+		"func (s *AuthService) Register(ctx context.Context, email, password string) (*Account, *errors.AppError) {\n" +
+		"\tif _, exists := s.store.FindByEmail(ctx, email); exists {\n" +
+		"\t\treturn nil, ErrAuthEmailTaken\n" +
+		"\t}\n" +
+		"\thash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)\n" +
+		"\tif err != nil {\n" +
+		"\t\treturn nil, ErrAuthInternal.With(\"reason\", err.Error())\n" +
+		"\t}\n" +
+		"\tacc := &Account{Email: email, PasswordHash: hash}\n" +
+		"\t// bootstrap：第一個帳號即管理者，之後的角色由管理者指派\n" +
+		"\tif s.store.Count(ctx) == 0 {\n" +
+		"\t\tacc.Roles = []string{RoleAdmin}\n" +
+		"\t}\n" +
+		"\tif err := s.store.Create(ctx, acc); err != nil {\n" +
+		"\t\treturn nil, ErrAuthInternal.With(\"reason\", err.Error())\n" +
+		"\t}\n" +
+		"\treturn acc, nil\n" +
+		"}\n\n" +
+		"// AccountCount 帳號總數（管理端統計）\n" +
+		"func (s *AuthService) AccountCount(ctx context.Context) int {\n" +
+		"\treturn s.store.Count(ctx)\n" +
+		"}\n\n" +
+		"// Login 驗證密碼並簽發 HS256 token（sub = 帳號 ID，roles = 角色，data.email = email）\n" +
+		"func (s *AuthService) Login(ctx context.Context, email, password string) (token string, expiresAt int64, appErr *errors.AppError) {\n" +
+		"\tacc, ok := s.store.FindByEmail(ctx, email)\n" +
+		"\t// 帳號不存在時仍跑一次 bcrypt，避免以回應時間差探測 email 是否已註冊\n" +
+		"\tif !ok {\n" +
+		"\t\t_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))\n" +
+		"\t\treturn \"\", 0, ErrAuthInvalidLogin\n" +
+		"\t}\n" +
+		"\tif err := bcrypt.CompareHashAndPassword(acc.PasswordHash, []byte(password)); err != nil {\n" +
+		"\t\treturn \"\", 0, ErrAuthInvalidLogin\n" +
+		"\t}\n\n" +
+		"\tclaims := middleware.JWTClaims{\n" +
+		"\t\tSubject: acc.ID,\n" +
+		"\t\tRoles:   acc.Roles, // JWT 中間件會自動 c.SetRoles，供 middleware.RequireRole 使用\n" +
+		"\t\tData:    map[string]interface{}{\"email\": acc.Email},\n" +
+		"\t}\n" +
+		"\ttoken, err := middleware.SignHS256(claims, s.secret, s.ttl)\n" +
+		"\tif err != nil {\n" +
+		"\t\treturn \"\", 0, ErrAuthInternal.With(\"reason\", err.Error())\n" +
+		"\t}\n" +
+		"\treturn token, time.Now().Add(s.ttl).Unix(), nil\n" +
+		"}\n\n" +
+		"// Validator 供 middleware.JWTConfig.Validator 使用（HS256，與 Login 同一把 secret）\n" +
+		"func (s *AuthService) Validator() func(token string) (interface{}, error) {\n" +
+		"\treturn middleware.HS256Validator(s.secret)\n" +
+		"}\n\n" +
+		"// dummyHash 供「帳號不存在」路徑做等時間比對\n" +
+		"var dummyHash, _ = bcrypt.GenerateFromPassword([]byte(\"hypgo-dummy-password\"), bcrypt.DefaultCost)\n"
+	if err := os.WriteFile(filepath.Join(projectName, "app", "services", "auth_service.go"), []byte(service), 0644); err != nil {
+		return err
+	}
+
+	controller := header("controllers", "承載 HTTP handler（薄控制器：解析輸入 → 呼叫 service → 寫回應）。") +
+		"import (\n" +
+		"\thypcontext \"github.com/maoxiaoyue/hypgo/pkg/context\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/errors\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/middleware\"\n\n" +
+		"\t\"" + projectName + "/app/models\"\n" +
+		"\t\"" + projectName + "/app/services\"\n" +
+		")\n\n" +
+		"// AuthController 註冊／登入／查詢目前登入者\n" +
+		"type AuthController struct {\n" +
+		"\tAuth *services.AuthService\n" +
+		"}\n\n" +
+		"// Register POST /api/auth/register\n" +
+		"func (ctrl *AuthController) Register(c *hypcontext.Context) {\n" +
+		"\tvar req models.RegisterReq\n" +
+		"\tif !c.BindInput(&req) {\n" +
+		"\t\treturn\n" +
+		"\t}\n" +
+		"\tacc, appErr := ctrl.Auth.Register(c, req.Email, req.Password)\n" +
+		"\tif appErr != nil {\n" +
+		"\t\terrors.AbortWithAppError(c, appErr)\n" +
+		"\t\treturn\n" +
+		"\t}\n" +
+		"\tc.JSON(201, models.MeResp{ID: acc.ID, Email: acc.Email, Roles: nonNil(acc.Roles)})\n" +
+		"}\n\n" +
+		"// Login POST /api/auth/login\n" +
+		"func (ctrl *AuthController) Login(c *hypcontext.Context) {\n" +
+		"\tvar req models.LoginReq\n" +
+		"\tif !c.BindInput(&req) {\n" +
+		"\t\treturn\n" +
+		"\t}\n" +
+		"\ttoken, exp, appErr := ctrl.Auth.Login(c, req.Email, req.Password)\n" +
+		"\tif appErr != nil {\n" +
+		"\t\terrors.AbortWithAppError(c, appErr)\n" +
+		"\t\treturn\n" +
+		"\t}\n" +
+		"\tc.JSON(200, models.TokenResp{Token: token, ExpiresAt: exp})\n" +
+		"}\n\n" +
+		"// Me GET /api/auth/me（需 Authorization: Bearer <token>；claims 由 JWT 中間件放入 context）\n" +
+		"func (ctrl *AuthController) Me(c *hypcontext.Context) {\n" +
+		"\tclaims, ok := middleware.JWTClaimsFrom(c, \"\")\n" +
+		"\tif !ok {\n" +
+		"\t\terrors.AbortWithAppError(c, services.ErrAuthUnauthorized)\n" +
+		"\t\treturn\n" +
+		"\t}\n" +
+		"\temail, _ := claims.Data[\"email\"].(string)\n" +
+		"\tc.JSON(200, models.MeResp{ID: claims.Subject, Email: email, Roles: nonNil(claims.Roles)})\n" +
+		"}\n\n" +
+		"// AdminStats GET /api/auth/admin/stats（需 admin 角色；由 middleware.RequireRole 把關）\n" +
+		"func (ctrl *AuthController) AdminStats(c *hypcontext.Context) {\n" +
+		"\tc.JSON(200, models.AdminStatsResp{Accounts: ctrl.Auth.AccountCount(c)})\n" +
+		"}\n\n" +
+		"// nonNil 讓 JSON 輸出 [] 而非 null\n" +
+		"func nonNil(s []string) []string {\n" +
+		"\tif s == nil {\n" +
+		"\t\treturn []string{}\n" +
+		"\t}\n" +
+		"\treturn s\n" +
+		"}\n"
+	if err := os.WriteFile(filepath.Join(projectName, "app", "controllers", "auth_controller.go"), []byte(controller), 0644); err != nil {
+		return err
+	}
+
+	routes := header("routers", "集中定義路由與中間件（Schema-first MVC 的 Router 層）。") +
+		"import (\n" +
+		"\t\"crypto/rand\"\n" +
+		"\t\"fmt\"\n" +
+		"\t\"os\"\n" +
+		"\t\"time\"\n\n" +
+		"\thypcontext \"github.com/maoxiaoyue/hypgo/pkg/context\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/errors\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/middleware\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/router\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/schema\"\n\n" +
+		"\t\"" + projectName + "/app/controllers\"\n" +
+		"\t\"" + projectName + "/app/models\"\n" +
+		"\t\"" + projectName + "/app/services\"\n" +
+		")\n\n" +
+		"// RegisterAuthRoutes 註冊認證路由：\n" +
+		"//   POST /api/auth/register、POST /api/auth/login（公開）\n" +
+		"//   GET  /api/auth/me（Group 掛 middleware.JWT，Validator 為框架的 HS256）\n" +
+		"//   GET  /api/auth/admin/stats（再掛 middleware.RequireRole(\"admin\")）\n" +
+		"func RegisterAuthRoutes(r *router.Router) {\n" +
+		"\tauth := services.NewAuthService(services.NewMemoryAccountStore(), jwtSecret(), 24*time.Hour)\n" +
+		"\tctrl := &controllers.AuthController{Auth: auth}\n\n" +
+		"\tr.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"POST\",\n" +
+		"\t\tPath:    \"/api/auth/register\",\n" +
+		"\t\tSummary: \"Register\",\n" +
+		"\t\tTags:    []string{\"auth\"},\n" +
+		"\t\tInput:   models.RegisterReq{},\n" +
+		"\t\tOutput:  models.MeResp{},\n" +
+		"\t\tResponses: map[int]schema.ResponseSchema{\n" +
+		"\t\t\t201: {Description: \"Account created\"},\n" +
+		"\t\t\t409: {Description: \"Email already registered\"},\n" +
+		"\t\t\t422: {Description: \"Validation failed\"},\n" +
+		"\t\t},\n" +
+		"\t}).Handle(ctrl.Register)\n\n" +
+		"\tr.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"POST\",\n" +
+		"\t\tPath:    \"/api/auth/login\",\n" +
+		"\t\tSummary: \"Login\",\n" +
+		"\t\tTags:    []string{\"auth\"},\n" +
+		"\t\tInput:   models.LoginReq{},\n" +
+		"\t\tOutput:  models.TokenResp{},\n" +
+		"\t\tResponses: map[int]schema.ResponseSchema{\n" +
+		"\t\t\t200: {Description: \"Bearer token\"},\n" +
+		"\t\t\t401: {Description: \"Invalid email or password\"},\n" +
+		"\t\t},\n" +
+		"\t}).Handle(ctrl.Login)\n\n" +
+		"\t// 需登入的路由都掛在這個 Group 下；其他資源要保護時同樣用 protected.Schema(...)\n" +
+		"\tprotected := r.NewGroup(\"/api/auth\", middleware.JWT(middleware.JWTConfig{\n" +
+		"\t\tValidator: auth.Validator(),\n" +
+		"\t\tErrorHandler: func(c *hypcontext.Context, err error) {\n" +
+		"\t\t\terrors.AbortWithAppError(c, services.ErrAuthUnauthorized.With(\"reason\", err.Error()))\n" +
+		"\t\t},\n" +
+		"\t}))\n" +
+		"\tprotected.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"GET\",\n" +
+		"\t\tPath:    \"/me\",\n" +
+		"\t\tSummary: \"Current account\",\n" +
+		"\t\tTags:    []string{\"auth\"},\n" +
+		"\t\tOutput:  models.MeResp{},\n" +
+		"\t\tResponses: map[int]schema.ResponseSchema{\n" +
+		"\t\t\t200: {Description: \"Current account\"},\n" +
+		"\t\t\t401: {Description: \"Missing or invalid token\"},\n" +
+		"\t\t},\n" +
+		"\t}).Handle(ctrl.Me)\n\n" +
+		"\t// 需 admin 角色：在 protected 之下再掛 RequireRole（角色來自 token 的 roles claim）\n" +
+		"\tadmin := protected.NewGroup(\"/admin\", middleware.RequireRoleWith(middleware.RequireRoleConfig{\n" +
+		"\t\tRoles: []string{services.RoleAdmin},\n" +
+		"\t\tErrorHandler: func(c *hypcontext.Context, err error) {\n" +
+		"\t\t\terrors.AbortWithAppError(c, services.ErrAuthForbidden.With(\"reason\", err.Error()))\n" +
+		"\t\t},\n" +
+		"\t}))\n" +
+		"\tadmin.Schema(schema.Route{\n" +
+		"\t\tMethod:  \"GET\",\n" +
+		"\t\tPath:    \"/stats\",\n" +
+		"\t\tSummary: \"Admin stats\",\n" +
+		"\t\tTags:    []string{\"auth\", \"admin\"},\n" +
+		"\t\tOutput:  models.AdminStatsResp{},\n" +
+		"\t\tResponses: map[int]schema.ResponseSchema{\n" +
+		"\t\t\t200: {Description: \"Stats\"},\n" +
+		"\t\t\t403: {Description: \"Requires admin role\"},\n" +
+		"\t\t},\n" +
+		"\t}).Handle(ctrl.AdminStats)\n" +
+		"}\n\n" +
+		"// jwtSecret 讀取環境變數 JWT_SECRET；未設定時產生每次啟動不同的隨機金鑰並警告\n" +
+		"//（既有 token 會在重啟後失效——正式環境務必設定）\n" +
+		"func jwtSecret() []byte {\n" +
+		"\tif s := os.Getenv(\"JWT_SECRET\"); s != \"\" {\n" +
+		"\t\treturn []byte(s)\n" +
+		"\t}\n" +
+		"\tbuf := make([]byte, 32)\n" +
+		"\tif _, err := rand.Read(buf); err != nil {\n" +
+		"\t\tpanic(\"jwtSecret: crypto/rand unavailable: \" + err.Error())\n" +
+		"\t}\n" +
+		"\tfmt.Fprintln(os.Stderr, \"WARN: JWT_SECRET not set; using a random per-process secret (tokens won't survive restarts)\")\n" +
+		"\treturn buf\n" +
+		"}\n"
+	return os.WriteFile(filepath.Join(projectName, "routers", "auth.go"), []byte(routes), 0644)
+}
+
+// createAPIHealth 生成健康檢查的 Schema Output DTO 與 handler
+func createAPIHealth(projectName, today string) error {
+	model := "// Package models 定義資料模型與 Schema 的 Request/Response DTO。\n" +
+		"//\n" +
+		"// @ai:generated by=hypgo date=" + today + "\n" +
+		"package models\n\n" +
+		"// HealthResp 健康檢查回應（Schema Output）。\n" +
+		"type HealthResp struct {\n" +
+		"\tStatus    string `json:\"status\"`\n" +
+		"\tProtocol  string `json:\"protocol\"`\n" +
+		"\tTimestamp int64  `json:\"timestamp\"`\n" +
+		"}\n"
+	if err := os.WriteFile(filepath.Join(projectName, "app", "models", "health.go"), []byte(model), 0644); err != nil {
+		return err
+	}
+
+	ctrl := "// Package controllers 承載 HTTP handler（薄控制器：解析輸入 → 呼叫 service → 寫回應）。\n" +
+		"//\n" +
+		"// @ai:generated by=hypgo date=" + today + "\n" +
+		"package controllers\n\n" +
+		"import (\n" +
+		"\t\"time\"\n\n" +
+		"\thypcontext \"github.com/maoxiaoyue/hypgo/pkg/context\"\n\n" +
+		"\t\"" + projectName + "/app/models\"\n" +
+		")\n\n" +
+		"// HealthCheck 回報服務狀態與目前連線協議（HTTP/1.1、HTTP/2 或 HTTP/3）。\n" +
+		"func HealthCheck(c *hypcontext.Context) {\n" +
+		"\tc.JSON(200, models.HealthResp{\n" +
+		"\t\tStatus:    \"ok\",\n" +
+		"\t\tProtocol:  c.Protocol(),\n" +
+		"\t\tTimestamp: time.Now().Unix(),\n" +
+		"\t})\n" +
+		"}\n"
+	return os.WriteFile(filepath.Join(projectName, "app", "controllers", "health.go"), []byte(ctrl), 0644)
+}
+
+// createAPIMainFile 生成 main.go：以根 hypgo facade 一行式啟動，
+// 可選初始化 hidb（config 的 database.dsn 為空時略過），路由交給 routers.Setup。
+func createAPIMainFile(projectName string) error {
+	content := "package main\n\n" +
+		"import (\n" +
+		"\t\"os\"\n\n" +
+		"\t\"github.com/maoxiaoyue/hypgo\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/config\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/hidb\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/hidb/mysql\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/hidb/pg\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n\n" +
+		"\t\"" + projectName + "/routers\"\n" +
+		")\n\n" +
+		"func main() {\n" +
+		"\t// 一行式啟動：載入 config/config.yaml（找不到時用預設值）、建立 logger 與 server\n" +
+		"\tapp := hypgo.New(hypgo.WithConfigPath(\"config/config.yaml\"))\n" +
+		"\tlog := app.Logger()\n\n" +
+		"\t// 資料庫（database.dsn 留空則略過）；service 透過建構子注入：\n" +
+		"\t//   services.NewUserService(db, log)\n" +
+		"\tif db := openDatabase(app.Config(), log); db != nil {\n" +
+		"\t\tdefer db.Close()\n" +
+		"\t}\n\n" +
+		"\t// 所有路由與中間件定義於 routers/router.go\n" +
+		"\trouters.Setup(app.Server().Router())\n\n" +
+		"\t// Run 會阻塞到收到 SIGINT/SIGTERM 並完成優雅關閉\n" +
+		"\tif err := app.Run(); err != nil {\n" +
+		"\t\tlog.Errorf(\"server error: %v\", err)\n" +
+		"\t\tos.Exit(1)\n" +
+		"\t}\n" +
+		"}\n\n" +
+		"// openDatabase 依 config 的 database 區段建立 hidb 連線；dsn 為空回傳 nil\n" +
+		"func openDatabase(cfg *config.Config, log *logger.Logger) *hidb.Database {\n" +
+		"\tif cfg.Database.DSN == \"\" {\n" +
+		"\t\tlog.Info(\"database.dsn not set, skipping database init\")\n" +
+		"\t\treturn nil\n" +
+		"\t}\n\n" +
+		"\tvar dialect hidb.Dialect\n" +
+		"\tswitch cfg.Database.Driver {\n" +
+		"\tcase \"mysql\", \"tidb\":\n" +
+		"\t\tdialect = mysql.New()\n" +
+		"\tdefault:\n" +
+		"\t\tdialect = pg.New()\n" +
+		"\t}\n\n" +
+		"\tdb, err := hidb.NewWithInterface(&cfg.Database, hidb.WithDialect(dialect))\n" +
+		"\tif err != nil {\n" +
+		"\t\tlog.Errorf(\"database init failed: %v\", err)\n" +
+		"\t\tos.Exit(1)\n" +
+		"\t}\n" +
+		"\treturn db\n" +
+		"}\n"
+
+	return os.WriteFile(filepath.Join(projectName, "main.go"), []byte(content), 0644)
 }
 
 type fileTemplate struct {
@@ -211,708 +627,40 @@ func printSuccessMessage(projectName string) {
 	fmt.Printf("📁 Project Structure:\n")
 	fmt.Printf("   %s/\n", projectName)
 	fmt.Printf("   ├── app/\n")
-	fmt.Printf("   │   ├── controllers/    # API controllers with new Context\n")
-	fmt.Printf("   │   ├── models/         # Data models with DB init\n")
-	fmt.Printf("   │   ├── services/       # Business logic layer\n")
-	fmt.Printf("   │   ├── routers/        # router.go (Setup: router + schema 串接)\n")
-	fmt.Printf("   │   ├── middleware/     # HTTP middleware\n")
-	fmt.Printf("   │   └── validators/     # Request validators\n")
-	fmt.Printf("   ├── internal/\n")
-	fmt.Printf("   │   ├── logger/         # Logger initialization\n")
-	fmt.Printf("   │   ├── database/       # Database connections\n")
-	fmt.Printf("   │   └── cache/          # Redis cache\n")
-	fmt.Printf("   ├── config/             # Configuration files\n")
-	fmt.Printf("   ├── migrations/         # Database migrations\n")
-	fmt.Printf("   ├── tests/              # Test files\n")
-	fmt.Printf("   ├── docs/               # API documentation\n")
-	fmt.Printf("   ├── logs/               # Log files\n")
-	fmt.Printf("   └── main.go             # Entry point\n")
+	fmt.Printf("   │   ├── controllers/    # user_controller.go, auth_controller.go, health.go（薄控制器）\n")
+	fmt.Printf("   │   ├── models/         # user.go, auth.go, health.go（Bun model + Schema DTO）\n")
+	fmt.Printf("   │   └── services/       # user_service.go, auth_service.go（業務邏輯 + Error Catalog）\n")
+	fmt.Printf("   ├── routers/            # router.go（Setup）+ user.go / auth.go（Schema 路由）+ middleware.go\n")
+	fmt.Printf("   ├── config/config.yaml  # server / database / logger\n")
+	fmt.Printf("   ├── .hyp/               # llm.yaml / comment.yaml / config.yaml\n")
+	fmt.Printf("   ├── migrations/         # SQL migrations\n")
+	fmt.Printf("   ├── logs/               # .gitkeep（logger 輸出 logs/api.log）\n")
+	fmt.Printf("   ├── certs/              # make cert → HTTP/3 用 TLS 憑證\n")
+	fmt.Printf("   ├── Dockerfile / docker-compose.yml / Makefile\n")
+	fmt.Printf("   └── main.go             # hypgo.New() 一行式啟動 + routers.Setup\n")
 	fmt.Printf("\n🚀 Quick Start:\n")
 	fmt.Printf("   cd %s\n", projectName)
-	fmt.Printf("   cp .env.example .env    # Configure environment\n")
-	fmt.Printf("   make install-tools      # Install dev tools\n")
-	fmt.Printf("   make cert              # Generate certificates\n")
-	fmt.Printf("   make migrate           # Run migrations\n")
-	fmt.Printf("   make dev               # Start with hot reload\n")
-	fmt.Printf("\n📦 Available Commands:\n")
-	fmt.Printf("   make build             # Build binary\n")
-	fmt.Printf("   make test              # Run tests\n")
-	fmt.Printf("   make docker            # Build Docker image\n")
-	fmt.Printf("   make docker-compose-up # Start all services\n")
-	fmt.Printf("\n🌟 Features:\n")
-	fmt.Printf("   • HTTP/3 with QUIC support\n")
-	fmt.Printf("   • New Context architecture\n")
-	fmt.Printf("   • Auto-rotating logs with size limits\n")
-	fmt.Printf("   • PostgreSQL + Redis integration\n")
-	fmt.Printf("   • JWT authentication\n")
-	fmt.Printf("   • Rate limiting & CORS\n")
-	fmt.Printf("   • WebSocket support\n")
-	fmt.Printf("   • Graceful shutdown\n")
-	fmt.Printf("   • Docker ready\n")
+	fmt.Printf("   go run .                # http://localhost:8080/health\n")
+	fmt.Printf("   export JWT_SECRET=...   # /api/auth/{register,login,me}（middleware.JWT + HS256）\n")
+	fmt.Printf("   make cert               # 產生自簽憑證後，config.yaml 開 tls.enabled 即得 HTTP/3\n")
+	fmt.Printf("   hyp generate controller order   # 新增資源 → 在 routers/router.go 註冊\n")
+	fmt.Printf("   hyp lint --deep         # CI gate：Schema 完整度 + handler 型別對齊\n")
 	fmt.Printf("\n")
 }
 
 // ===== File Contents =====
 
-const mainGoContent = `package main
-
-import (
-	"context"
-	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"{{.ProjectName}}/app/controllers"
-	"{{.ProjectName}}/app/middleware"
-	"{{.ProjectName}}/app/models"
-	"{{.ProjectName}}/config"
-	"{{.ProjectName}}/internal/cache"
-	"{{.ProjectName}}/internal/database"
-	"{{.ProjectName}}/internal/logger"
-	
-	"github.com/maoxiaoyue/hypgo/pkg/server"
-	hypContext "github.com/maoxiaoyue/hypgo/pkg/context"
-)
-
-func main() {
-	// 載入配置
-	cfg, err := config.Load("config/config.yaml")
-	if err != nil {
-		fmt.Printf("Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 初始化日誌系統
-	log, err := logger.Init(cfg.Logger)
-	if err != nil {
-		fmt.Printf("Failed to initialize logger: %v\n", err)
-		os.Exit(1)
-	}
-	defer log.Close()
-
-	log.Info("Starting HypGo API Server...")
-
-	// 設置 Context 運行模式
-	switch cfg.Logger.Level {
-	case "debug":
-		hypContext.SetMode("debug")
-	case "info", "notice":
-		hypContext.SetMode("test")
-	default:
-		hypContext.SetMode("release")
-	}
-
-	// 初始化數據庫
-	db, err := database.Init(cfg.Database)
-	if err != nil {
-		log.Emergencyf("Failed to initialize database: %v", err)
-		os.Exit(1)
-	}
-	defer database.Close()
-
-	// 初始化 Redis
-	if err := cache.Init(cfg.Redis); err != nil {
-		log.Warningf("Failed to initialize Redis: %v", err)
-		// Redis 是可選的，不退出
-	}
-	defer cache.Close()
-
-	// 自動遷移數據庫
-	if cfg.Database.AutoMigrate {
-		log.Info("Running database migrations...")
-		if err := models.AutoMigrate(db); err != nil {
-			log.Errorf("Failed to migrate database: %v", err)
-		}
-	}
-
-	// 創建服務器
-	srv := server.NewWithContext(cfg, log)
-	
-	// 設置路由
-	setupRoutes(srv, cfg, log)
-
-	// 啟動服務器
-	serverErrors := make(chan error, 1)
-	go func() {
-		log.Infof("Server starting on %s with protocol %s", 
-			cfg.Server.Addr, 
-			cfg.Server.Protocol)
-		
-		switch cfg.Server.Protocol {
-		case "http3":
-			if cfg.Server.TLS.Enabled {
-				serverErrors <- srv.StartHTTP3(
-					cfg.Server.Addr,
-					cfg.Server.TLS.CertFile,
-					cfg.Server.TLS.KeyFile,
-				)
-			} else {
-				log.Warning("HTTP/3 requires TLS, falling back to HTTP/2")
-				serverErrors <- srv.StartHTTP2(cfg.Server.Addr)
-			}
-		case "http2":
-			if cfg.Server.TLS.Enabled {
-				serverErrors <- srv.StartTLS(
-					cfg.Server.Addr,
-					cfg.Server.TLS.CertFile,
-					cfg.Server.TLS.KeyFile,
-				)
-			} else {
-				serverErrors <- srv.Start(cfg.Server.Addr)
-			}
-		default:
-			serverErrors <- srv.Start(cfg.Server.Addr)
-		}
-	}()
-
-	// 優雅關閉
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case err := <-serverErrors:
-		log.Emergencyf("Server error: %v", err)
-		os.Exit(1)
-	case sig := <-shutdown:
-		log.Infof("Shutdown signal received: %v", sig)
-		
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Errorf("Server forced to shutdown: %v", err)
-			os.Exit(1)
-		}
-		
-		log.Info("Server stopped gracefully")
-	}
-}
-
-func setupRoutes(srv *server.Server, cfg *config.Config, log logger.Logger) {
-	router := srv.Router()
-	
-	// 全局中間件
-	router.Use(middleware.RequestID())
-	router.Use(middleware.Logger(log))
-	router.Use(middleware.Recovery())
-	router.Use(middleware.CORS(cfg.API.CORS))
-	router.Use(middleware.Security())
-	router.Use(middleware.Metrics())
-	
-	// 健康檢查（不需要認證）
-	router.GET("/health", controllers.HealthCheck)
-	router.GET("/metrics", controllers.Metrics)
-	
-	// API 路由組
-	api := router.Group("/api/v1")
-	
-	// 公開路由
-	auth := api.Group("/auth")
-	{
-		auth.POST("/register", controllers.Register)
-		auth.POST("/login", controllers.Login)
-		auth.POST("/refresh", controllers.RefreshToken)
-	}
-	
-	// 需要認證的路由
-	protected := api.Group("")
-	protected.Use(middleware.Auth(cfg.API.JWT.Secret))
-	{
-		// 用戶管理
-		protected.GET("/users", controllers.GetUsers)
-		protected.POST("/users", middleware.RequireRole("admin"), controllers.CreateUser)
-		protected.GET("/users/:id", controllers.GetUser)
-		protected.PUT("/users/:id", controllers.UpdateUser)
-		protected.DELETE("/users/:id", middleware.RequireRole("admin"), controllers.DeleteUser)
-		
-		// 登出
-		protected.POST("/auth/logout", controllers.Logout)
-		
-		// WebSocket
-		protected.GET("/ws", controllers.WebSocket)
-	}
-	
-	// 限流路由
-	if cfg.API.RateLimit.Enabled {
-		api.Use(middleware.RateLimit(cfg.API.RateLimit))
-	}
-}
-`
-
-const loggerInitContent = `package logger
-
-import (
-	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"time"
-
-	"github.com/maoxiaoyue/hypgo/pkg/logger"
-	"gopkg.in/natefinch/lumberjack.v2"
-)
-
-type Logger interface {
-	Debug(format string, args ...interface{})
-	Info(format string, args ...interface{})
-	Notice(format string, args ...interface{})
-	Warning(format string, args ...interface{})
-	Error(format string, args ...interface{})
-	Emergency(format string, args ...interface{})
-	Close() error
-}
-
-type Config struct {
-	Level       string ` + "`yaml:\"level\" json:\"level\"`" + `
-	Output      string ` + "`yaml:\"output\" json:\"output\"`" + `
-	File        string ` + "`yaml:\"file\" json:\"file\"`" + `
-	MaxSize     int    ` + "`yaml:\"max_size\" json:\"max_size\"`" + `         // megabytes
-	MaxAge      int    ` + "`yaml:\"max_age\" json:\"max_age\"`" + `           // days
-	MaxBackups  int    ` + "`yaml:\"max_backups\" json:\"max_backups\"`" + `
-	Compress    bool   ` + "`yaml:\"compress\" json:\"compress\"`" + `
-	Format      string ` + "`yaml:\"format\" json:\"format\"`" + `             // json or text
-	Colors      bool   ` + "`yaml:\"colors\" json:\"colors\"`" + `
-	TimeFormat  string ` + "`yaml:\"time_format\" json:\"time_format\"`" + `
-}
-
-var (
-	instance Logger
-)
-
-// Init 初始化日誌系統
-func Init(cfg Config) (Logger, error) {
-	// 設置默認值
-	if cfg.Level == "" {
-		cfg.Level = "info"
-	}
-	if cfg.Output == "" {
-		cfg.Output = "stdout"
-	}
-	if cfg.TimeFormat == "" {
-		cfg.TimeFormat = "2006-01-02 15:04:05"
-	}
-	if cfg.MaxSize == 0 {
-		cfg.MaxSize = 100 // 100MB
-	}
-	if cfg.MaxAge == 0 {
-		cfg.MaxAge = 30 // 30 days
-	}
-	if cfg.MaxBackups == 0 {
-		cfg.MaxBackups = 10
-	}
-
-	// 創建輸出 writer
-	var writer io.Writer
-	
-	switch cfg.Output {
-	case "file":
-		writer = createFileWriter(cfg)
-	case "both":
-		writer = io.MultiWriter(os.Stdout, createFileWriter(cfg))
-	default:
-		writer = os.Stdout
-	}
-
-	// 創建 logger 實例（rotation 由上面的 lumberjack writer 處理；
-	// logger.New 簽名為 (level, output, writer, colorEnabled)，writer 非 nil 時 output 被忽略）
-	log, err := logger.New(cfg.Level, "", writer, cfg.Colors)
-	
-	if err != nil {
-		return nil, fmt.Errorf("failed to create logger: %w", err)
-	}
-
-	instance = log
-	return log, nil
-}
-
-// createFileWriter 創建文件 writer
-func createFileWriter(cfg Config) io.Writer {
-	// 確保日誌目錄存在
-	dir := filepath.Dir(cfg.File)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Printf("Failed to create log directory: %v\n", err)
-	}
-
-	// 生成帶日期的檔名
-	filename := generateLogFilename(cfg.File)
-
-	// 使用 lumberjack 進行日誌輪轉
-	return &lumberjack.Logger{
-		Filename:   filename,
-		MaxSize:    cfg.MaxSize,    // megabytes
-		MaxAge:     cfg.MaxAge,      // days
-		MaxBackups: cfg.MaxBackups,
-		LocalTime:  true,
-		Compress:   cfg.Compress,
-	}
-}
-
-// generateLogFilename 生成帶日期的日誌檔名
-func generateLogFilename(baseFile string) string {
-	dir := filepath.Dir(baseFile)
-	ext := filepath.Ext(baseFile)
-	name := filepath.Base(baseFile)
-	
-	if ext != "" {
-		name = name[:len(name)-len(ext)]
-	}
-	
-	// 添加日期到檔名
-	dateStr := time.Now().Format("2006-01-02")
-	filename := fmt.Sprintf("%s-%s%s", name, dateStr, ext)
-	
-	return filepath.Join(dir, filename)
-}
-
-// Get 獲取 logger 實例
-func Get() Logger {
-	if instance == nil {
-		// 如果未初始化，返回默認 logger
-		log, _ := Init(Config{})
-		return log
-	}
-	return instance
-}
-
-// 便利函數
-func Debug(format string, args ...interface{}) {
-	Get().Debug(format, args...)
-}
-
-func Info(format string, args ...interface{}) {
-	Get().Info(format, args...)
-}
-
-func Warning(format string, args ...interface{}) {
-	Get().Warning(format, args...)
-}
-
-func Error(format string, args ...interface{}) {
-	Get().Error(format, args...)
-}
-`
-
-const modelsInitContent = `package models
-
-import (
-	"context"
-	"fmt"
-
-	"github.com/uptrace/bun"
-	"{{.ProjectName}}/internal/database"
-)
-
-// AutoMigrate 自動遷移所有模型（使用 CreateTable IfNotExists）
-func AutoMigrate(db *bun.DB) error {
-	ctx := context.Background()
-
-	models := []interface{}{
-		(*User)(nil),
-		(*Role)(nil),
-		(*Permission)(nil),
-	}
-
-	for _, model := range models {
-		if _, err := db.NewCreateTable().Model(model).IfNotExists().Exec(ctx); err != nil {
-			return fmt.Errorf("failed to create table for %T: %w", model, err)
-		}
-	}
-
-	// 創建默認角色
-	if err := createDefaultRoles(ctx, db); err != nil {
-		return fmt.Errorf("failed to create default roles: %w", err)
-	}
-
-	return nil
-}
-
-// createDefaultRoles 創建默認角色
-func createDefaultRoles(ctx context.Context, db *bun.DB) error {
-	defaultRoles := []Role{
-		{Name: "admin", Description: "Administrator with full access"},
-		{Name: "user", Description: "Regular user with limited access"},
-	}
-
-	for _, role := range defaultRoles {
-		count, err := db.NewSelect().Model((*Role)(nil)).Where("name = ?", role.Name).Count(ctx)
-		if err != nil {
-			return err
-		}
-		if count == 0 {
-			if _, err := db.NewInsert().Model(&role).Exec(ctx); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-// GetDB 獲取 HypDB 數據庫實例
-func GetDB() *bun.DB {
-	return database.GetDB()
-}
-`
-
-const databaseInitContent = `package database
-
-import (
-	"context"
-	"database/sql"
-	"fmt"
-	"time"
-
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
-	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/mysqldialect"
-	"github.com/uptrace/bun/dialect/pgdialect"
-)
-
-type Config struct {
-	Driver          string ` + "`yaml:\"driver\" json:\"driver\"`" + `
-	DSN             string ` + "`yaml:\"dsn\" json:\"dsn\"`" + `
-	MaxIdleConns    int    ` + "`yaml:\"max_idle_conns\" json:\"max_idle_conns\"`" + `
-	MaxOpenConns    int    ` + "`yaml:\"max_open_conns\" json:\"max_open_conns\"`" + `
-	ConnMaxLifetime string ` + "`yaml:\"conn_max_lifetime\" json:\"conn_max_lifetime\"`" + `
-	LogLevel        string ` + "`yaml:\"log_level\" json:\"log_level\"`" + `
-	AutoMigrate     bool   ` + "`yaml:\"auto_migrate\" json:\"auto_migrate\"`" + `
-}
-
-var (
-	hypDB *bun.DB
-	sqlDB *sql.DB
-)
-
-// Init 初始化數據庫連接
-func Init(cfg Config) (*bun.DB, error) {
-	// 設置默認值
-	if cfg.Driver == "" {
-		cfg.Driver = "postgres"
-	}
-	if cfg.MaxIdleConns == 0 {
-		cfg.MaxIdleConns = 10
-	}
-	if cfg.MaxOpenConns == 0 {
-		cfg.MaxOpenConns = 100
-	}
-	if cfg.ConnMaxLifetime == "" {
-		cfg.ConnMaxLifetime = "1h"
-	}
-
-	// 解析連接生命週期
-	lifetime, err := time.ParseDuration(cfg.ConnMaxLifetime)
-	if err != nil {
-		lifetime = time.Hour
-	}
-
-	// 根據驅動創建連接
-	var driverName string
-	switch cfg.Driver {
-	case "postgres", "postgresql":
-		driverName = "postgres"
-	case "mysql":
-		driverName = "mysql"
-	default:
-		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Driver)
-	}
-
-	sqlDB, err = sql.Open(driverName, cfg.DSN)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
-	}
-
-	// 設置連接池
-	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
-	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
-	sqlDB.SetConnMaxLifetime(lifetime)
-
-	// 測試連接
-	if err := sqlDB.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	// 創建 HypDB ORM 實例
-	switch cfg.Driver {
-	case "postgres", "postgresql":
-		hypDB = bun.NewDB(sqlDB, pgdialect.New())
-	case "mysql":
-		hypDB = bun.NewDB(sqlDB, mysqldialect.New())
-	}
-
-	return hypDB, nil
-}
-
-// GetDB 獲取 HypDB 數據庫實例
-func GetDB() *bun.DB {
-	return hypDB
-}
-
-// GetSQLDB 獲取原始 SQL 數據庫連接
-func GetSQLDB() *sql.DB {
-	return sqlDB
-}
-
-// Close 關閉數據庫連接
-func Close() error {
-	if hypDB != nil {
-		return hypDB.Close()
-	}
-	return nil
-}
-
-// Transaction 執行事務
-func Transaction(ctx context.Context, fn func(ctx context.Context, tx bun.Tx) error) error {
-	return hypDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		return fn(ctx, tx)
-	})
-}
-`
-
-const cacheInitContent = `package cache
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/redis/go-redis/v9"
-)
-
-type Config struct {
-	Addr     string ` + "`yaml:\"addr\" json:\"addr\"`" + `
-	Password string ` + "`yaml:\"password\" json:\"password\"`" + `
-	DB       int    ` + "`yaml:\"db\" json:\"db\"`" + `
-	PoolSize int    ` + "`yaml:\"pool_size\" json:\"pool_size\"`" + `
-	MinIdleConns int ` + "`yaml:\"min_idle_conns\" json:\"min_idle_conns\"`" + `
-	MaxRetries int ` + "`yaml:\"max_retries\" json:\"max_retries\"`" + `
-	DialTimeout  string ` + "`yaml:\"dial_timeout\" json:\"dial_timeout\"`" + `
-	ReadTimeout  string ` + "`yaml:\"read_timeout\" json:\"read_timeout\"`" + `
-	WriteTimeout string ` + "`yaml:\"write_timeout\" json:\"write_timeout\"`" + `
-}
-
-var (
-	client *redis.Client
-	ctx    = context.Background()
-)
-
-// Init 初始化 Redis 連接
-func Init(cfg Config) error {
-	// 設置默認值
-	if cfg.Addr == "" {
-		cfg.Addr = "localhost:6379"
-	}
-	if cfg.PoolSize == 0 {
-		cfg.PoolSize = 10
-	}
-	if cfg.MinIdleConns == 0 {
-		cfg.MinIdleConns = 5
-	}
-	if cfg.MaxRetries == 0 {
-		cfg.MaxRetries = 3
-	}
-
-	// 解析超時時間
-	dialTimeout, _ := time.ParseDuration(cfg.DialTimeout)
-	if dialTimeout == 0 {
-		dialTimeout = 5 * time.Second
-	}
-	
-	readTimeout, _ := time.ParseDuration(cfg.ReadTimeout)
-	if readTimeout == 0 {
-		readTimeout = 3 * time.Second
-	}
-	
-	writeTimeout, _ := time.ParseDuration(cfg.WriteTimeout)
-	if writeTimeout == 0 {
-		writeTimeout = 3 * time.Second
-	}
-
-	// 創建 Redis 客戶端
-	client = redis.NewClient(&redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		PoolSize:     cfg.PoolSize,
-		MinIdleConns: cfg.MinIdleConns,
-		MaxRetries:   cfg.MaxRetries,
-		DialTimeout:  dialTimeout,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-	})
-
-	// 測試連接
-	if err := client.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("failed to connect to Redis: %w", err)
-	}
-
-	return nil
-}
-
-// GetClient 獲取 Redis 客戶端
-func GetClient() *redis.Client {
-	return client
-}
-
-// Close 關閉 Redis 連接
-func Close() error {
-	if client != nil {
-		return client.Close()
-	}
-	return nil
-}
-
-// Set 設置鍵值
-func Set(key string, value interface{}, expiration time.Duration) error {
-	return client.Set(ctx, key, value, expiration).Err()
-}
-
-// Get 獲取值
-func Get(key string) (string, error) {
-	return client.Get(ctx, key).Result()
-}
-
-// Delete 刪除鍵
-func Delete(keys ...string) error {
-	return client.Del(ctx, keys...).Err()
-}
-
-// Exists 檢查鍵是否存在
-func Exists(keys ...string) (int64, error) {
-	return client.Exists(ctx, keys...).Result()
-}
-
-// SetNX 只在鍵不存在時設置
-func SetNX(key string, value interface{}, expiration time.Duration) (bool, error) {
-	return client.SetNX(ctx, key, value, expiration).Result()
-}
-
-// Incr 增加計數
-func Incr(key string) (int64, error) {
-	return client.Incr(ctx, key).Result()
-}
-
-// Expire 設置過期時間
-func Expire(key string, expiration time.Duration) error {
-	return client.Expire(ctx, key, expiration).Err()
-}
-`
-
-// 其他檔案內容常量...
-
-const configYamlContent = `# HypGo API Configuration
+// configYamlContent 對齊 pkg/config.Config 的真實欄位（server / database / logger）
+const configYamlContent = `# HypGo API Configuration（欄位對應 pkg/config.Config）
 
 server:
-  protocol: http3         # http1, http2, http3
+  protocol: auto           # http1 | http2 | http3 | auto（auto = TCP 上 H1/H2，tls 啟用時同時起 H3）
   addr: :8080
-  read_timeout: 30s
-  write_timeout: 30s
-  idle_timeout: 120s
-  keep_alive: 30s
+  read_timeout: 30         # 秒
+  write_timeout: 30
+  idle_timeout: 120
   max_handlers: 1000
-  max_concurrent_streams: 100
+  max_concurrent_streams: 250
   max_read_frame_size: 1048576
   enable_graceful_restart: true
   # 可信代理網段：服務跑在 nginx / LB 之後時務必設定，否則 c.ClientIP()
@@ -923,624 +671,38 @@ server:
     - 127.0.0.1
     - 10.0.0.0/8
   tls:
-    enabled: true
+    enabled: false         # make cert 產生自簽憑證後改 true（HTTP/3 必須 TLS）
     cert_file: "certs/server.crt"
     key_file: "certs/server.key"
-    auto_cert: false
-    domains: []
 
 database:
-  driver: postgres        # postgres, mysql, sqlite
-  dsn: "${DB_DSN}"
+  driver: postgres         # postgres | mysql | tidb（main.go 依此選 dialect）
+  dsn: ""                  # 留空 = 不連資料庫；例：postgres://user:pass@localhost:5432/app?sslmode=disable
   max_idle_conns: 10
   max_open_conns: 100
-  conn_max_lifetime: 1h
-  log_level: warning      # silent, error, warning, info
-  auto_migrate: true
-
-redis:
-  addr: "${REDIS_ADDR}"
-  password: "${REDIS_PASSWORD}"
-  db: 0
-  pool_size: 10
-  min_idle_conns: 5
-  max_retries: 3
-  dial_timeout: 5s
-  read_timeout: 3s
-  write_timeout: 3s
+  redis:                   # 需要時在 main.go 加上 hidb.WithRedis(redis.New())
+    addr: "localhost:6379"
+    password: ""
+    db: 0
 
 logger:
-  level: debug            # debug, info, notice, warning, error, emergency
-  output: both            # stdout, file, both
-  file: logs/api.log
-  max_size: 100           # MB
-  max_age: 30             # days
-  max_backups: 10
-  compress: true
-  format: json            # json, text
+  level: info              # debug | info | notice | warning | emergency
+  output: "logs/api.log"   # stdout 或檔案路徑
   colors: true
-  time_format: "2006-01-02 15:04:05"
-
-api:
-  version: "v1"
-  docs_enabled: true
-  docs_path: "/docs"
-  
-  rate_limit:
-    enabled: true
-    requests_per_minute: 60
-    burst: 10
-    
-  cors:
-    enabled: true
-    allowed_origins:
-      - "*"
-    allowed_methods:
-      - GET
-      - POST
-      - PUT
-      - DELETE
-      - OPTIONS
-      - PATCH
-    allowed_headers:
-      - Content-Type
-      - Authorization
-      - X-Request-ID
-    expose_headers:
-      - X-Request-ID
-      - X-RateLimit-Limit
-      - X-RateLimit-Remaining
-    max_age: 86400
-    
-  jwt:
-    secret: "${JWT_SECRET}"
-    issuer: "hypgo-api"
-    expiration: 24h
-    refresh_expiration: 720h
-
-monitoring:
-  metrics_enabled: true
-  metrics_path: "/metrics"
-  health_path: "/health"
-  trace_enabled: false
-  trace_provider: "jaeger"
-  trace_endpoint: "${TRACE_ENDPOINT}"
+  rotation:
+    max_size: 100MB
+    max_age: 7d
+    max_backups: 10
+    compress: true
 `
 
-const envExampleContent = `# Server Configuration
-ENV=development
-SERVER_ADDR=:8080
-SERVER_PROTOCOL=http3
+const envExampleContent = `# JWT_SECRET：HS256 簽發／驗證金鑰（routers/auth.go 讀取）。
+# 未設定時每次啟動用隨機金鑰，重啟後既有 token 失效——正式環境務必設定（≥ 32 bytes）
+JWT_SECRET=change-me-to-a-random-secret-of-at-least-32-bytes
 
-# Database Configuration
-DB_DRIVER=postgres
+# DB_DSN：供 docker-compose.yml 與 Makefile 的 migrate 目標使用；
+# 應用程式本身讀 config/config.yaml 的 database.dsn（不展開環境變數）
 DB_DSN=postgres://hypgo:password@localhost:5432/hypgo_db?sslmode=disable
-
-# Redis Configuration
-REDIS_ADDR=localhost:6379
-REDIS_PASSWORD=
-REDIS_DB=0
-
-# JWT Configuration
-JWT_SECRET=change-this-to-a-secure-secret-key-at-least-32-characters
-JWT_ISSUER=hypgo-api
-JWT_EXPIRATION=24h
-
-# CORS Configuration
-CORS_ALLOWED_ORIGINS=*
-CORS_ALLOWED_METHODS=GET,POST,PUT,DELETE,OPTIONS,PATCH
-CORS_ALLOWED_HEADERS=Content-Type,Authorization,X-Request-ID
-
-# Rate Limiting
-RATE_LIMIT_ENABLED=true
-RATE_LIMIT_REQUESTS_PER_MINUTE=60
-
-# TLS Configuration
-TLS_ENABLED=true
-TLS_CERT_FILE=certs/server.crt
-TLS_KEY_FILE=certs/server.key
-TLS_AUTO_CERT=false
-
-# Monitoring
-METRICS_ENABLED=true
-TRACE_ENABLED=false
-TRACE_ENDPOINT=http://localhost:14268/api/traces
-
-# Logging
-LOG_LEVEL=debug
-LOG_OUTPUT=both
-LOG_FILE=logs/api.log
-`
-
-const apiControllerContent = `package controllers
-
-import (
-	"net/http"
-	"strconv"
-	
-	"github.com/maoxiaoyue/hypgo/pkg/context"
-	"{{.ProjectName}}/app/models"
-	"{{.ProjectName}}/app/services"
-	"{{.ProjectName}}/internal/database"
-	"{{.ProjectName}}/internal/logger"
-)
-
-// GetUsers 獲取用戶列表
-func GetUsers(ctx *context.Context) {
-	// 獲取分頁參數
-	page := ctx.GetPage()
-	pageSize := ctx.GetPageSize()
-	
-	// 從服務層獲取數據
-	userService := services.NewUserService(database.GetDB())
-	users, total, err := userService.GetUsers(page, pageSize)
-	if err != nil {
-		logger.Errorf("Failed to get users: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
-			"error": "Failed to retrieve users",
-		})
-		return
-	}
-	
-	// 設置響應頭
-	ctx.Header("X-Total-Count", strconv.Itoa(total))
-	
-	ctx.JSON(http.StatusOK, context.H{
-		"success": true,
-		"data":    users,
-		"meta": context.H{
-			"total":     total,
-			"page":      page,
-			"page_size": pageSize,
-		},
-	})
-}
-
-// GetUser 獲取單個用戶
-func GetUser(ctx *context.Context) {
-	userID, err := strconv.Atoi(ctx.Param("id"))
-	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, context.H{
-			"error": "Invalid user ID",
-		})
-		return
-	}
-	
-	userService := services.NewUserService(database.GetDB())
-	user, err := userService.GetUserByID(userID)
-	if err != nil {
-		if err == services.ErrNotFound {
-			ctx.AbortWithStatusJSON(http.StatusNotFound, context.H{
-				"error": "User not found",
-			})
-		} else {
-			logger.Errorf("Failed to get user: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
-				"error": "Failed to retrieve user",
-			})
-		}
-		return
-	}
-	
-	ctx.JSON(http.StatusOK, context.H{
-		"success": true,
-		"data":    user,
-	})
-}
-
-// CreateUser 創建用戶
-func CreateUser(ctx *context.Context) {
-	var req models.CreateUserRequest
-	
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, context.H{
-			"error": "Invalid request data",
-			"details": err.Error(),
-		})
-		return
-	}
-	
-	userService := services.NewUserService(database.GetDB())
-	user, err := userService.CreateUser(req)
-	if err != nil {
-		if err == services.ErrDuplicate {
-			ctx.AbortWithStatusJSON(http.StatusConflict, context.H{
-				"error": "User already exists",
-			})
-		} else {
-			logger.Errorf("Failed to create user: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
-				"error": "Failed to create user",
-			})
-		}
-		return
-	}
-	
-	ctx.JSON(http.StatusCreated, context.H{
-		"success": true,
-		"message": "User created successfully",
-		"data":    user,
-	})
-}
-
-// UpdateUser 更新用戶
-func UpdateUser(ctx *context.Context) {
-	userID, err := strconv.Atoi(ctx.Param("id"))
-	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, context.H{
-			"error": "Invalid user ID",
-		})
-		return
-	}
-	
-	// 檢查權限
-	currentUserID := ctx.GetInt("user_id")
-	if currentUserID != userID && !ctx.HasRole("admin") {
-		ctx.AbortWithStatusJSON(http.StatusForbidden, context.H{
-			"error": "Permission denied",
-		})
-		return
-	}
-	
-	var req models.UpdateUserRequest
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, context.H{
-			"error": "Invalid request data",
-		})
-		return
-	}
-	
-	userService := services.NewUserService(database.GetDB())
-	user, err := userService.UpdateUser(userID, req)
-	if err != nil {
-		if err == services.ErrNotFound {
-			ctx.AbortWithStatusJSON(http.StatusNotFound, context.H{
-				"error": "User not found",
-			})
-		} else {
-			logger.Errorf("Failed to update user: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
-				"error": "Failed to update user",
-			})
-		}
-		return
-	}
-	
-	ctx.JSON(http.StatusOK, context.H{
-		"success": true,
-		"message": "User updated successfully",
-		"data":    user,
-	})
-}
-
-// DeleteUser 刪除用戶
-func DeleteUser(ctx *context.Context) {
-	userID, err := strconv.Atoi(ctx.Param("id"))
-	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, context.H{
-			"error": "Invalid user ID",
-		})
-		return
-	}
-	
-	userService := services.NewUserService(database.GetDB())
-	if err := userService.DeleteUser(userID); err != nil {
-		if err == services.ErrNotFound {
-			ctx.AbortWithStatusJSON(http.StatusNotFound, context.H{
-				"error": "User not found",
-			})
-		} else {
-			logger.Errorf("Failed to delete user: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, context.H{
-				"error": "Failed to delete user",
-			})
-		}
-		return
-	}
-	
-	ctx.Status(http.StatusNoContent)
-}
-
-// WebSocket WebSocket 連接處理
-func WebSocket(ctx *context.Context) {
-	if !ctx.IsWebsocket() {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, context.H{
-			"error": "WebSocket connection required",
-		})
-		return
-	}
-	
-	// TODO: 實現 WebSocket 邏輯
-	ctx.JSON(http.StatusNotImplemented, context.H{
-		"error": "WebSocket not implemented yet",
-	})
-}
-`
-const middlewareContent = `package middleware`
-const healthControllerContent = `package controllers
-
-import (
-	"net/http"
-	"runtime"
-	"time"
-
-	"github.com/maoxiaoyue/hypgo/pkg/context"
-	"{{.ProjectName}}/internal/cache"
-	"{{.ProjectName}}/internal/database"
-)
-
-// HealthCheck 健康檢查
-func HealthCheck(ctx *context.Context) {
-	// 檢查數據庫
-	dbStatus := "healthy"
-	if db := database.GetDB(); db != nil {
-		if err := db.Ping(); err != nil {
-			dbStatus = "unhealthy"
-		}
-	} else {
-		dbStatus = "not connected"
-	}
-
-	// 檢查 Redis
-	redisStatus := "healthy"
-	if client := cache.GetClient(); client != nil {
-		if err := client.Ping(client.Context()).Err(); err != nil {
-			redisStatus = "unhealthy"
-		}
-	} else {
-		redisStatus = "not connected"
-	}
-
-	// 系統信息
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	ctx.JSON(http.StatusOK, context.H{
-		"status":    "healthy",
-		"timestamp": time.Now().Unix(),
-		"protocol":  ctx.Protocol(),
-		"services": context.H{
-			"database": dbStatus,
-			"redis":    redisStatus,
-		},
-		"system": context.H{
-			"goroutines":   runtime.NumGoroutine(),
-			"memory_alloc": m.Alloc / 1024 / 1024,      // MB
-			"memory_sys":   m.Sys / 1024 / 1024,        // MB
-			"gc_runs":      m.NumGC,
-		},
-		"features": context.H{
-			"http3":     ctx.IsHTTP3(),
-			"http2":     ctx.IsHTTP2(),
-			"websocket": false,
-		},
-	})
-}
-
-// Metrics Prometheus 指標
-func Metrics(ctx *context.Context) {
-	// TODO: 實現 Prometheus 指標
-	ctx.String(http.StatusOK, "# HELP api_requests_total Total number of API requests\n")
-}
-`
-
-const authMiddlewareContent = `package middleware
-
-import (
-	"net/http"
-	"strings"
-	
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/maoxiaoyue/hypgo/pkg/context"
-)
-
-// Auth JWT 認證中間件
-func Auth(secret string) context.HandlerFunc {
-	return func(ctx *context.Context) {
-		token := ctx.GetJWT()
-		
-		if token == "" {
-			ctx.AbortWithStatusJSON(http.StatusUnauthorized, context.H{
-				"error": "Authorization required",
-			})
-			return
-		}
-		
-		// 解析 JWT
-		claims, err := parseJWT(token, secret)
-		if err != nil {
-			ctx.SetAuthError(err.Error())
-			ctx.AbortWithStatusJSON(http.StatusUnauthorized, context.H{
-				"error": "Invalid or expired token",
-			})
-			return
-		}
-		
-		// 設置用戶信息
-		if userID, ok := claims["user_id"].(float64); ok {
-			ctx.SetUserID(int(userID))
-		}
-		
-		if username, ok := claims["username"].(string); ok {
-			ctx.SetUser(username)
-		}
-		
-		if roles, ok := claims["roles"].([]interface{}); ok {
-			stringRoles := make([]string, len(roles))
-			for i, role := range roles {
-				if s, ok := role.(string); ok {
-					stringRoles[i] = s
-				}
-			}
-			ctx.SetRoles(stringRoles)
-		}
-		
-		ctx.SetTokenClaims(claims)
-		ctx.Next()
-	}
-}
-
-// RequireRole 要求特定角色
-func RequireRole(role string) context.HandlerFunc {
-	return func(ctx *context.Context) {
-		if !ctx.HasRole(role) {
-			ctx.AbortWithStatusJSON(http.StatusForbidden, context.H{
-				"error": "Insufficient permissions",
-				"required_role": role,
-			})
-			return
-		}
-		ctx.Next()
-	}
-}
-
-func parseJWT(tokenString, secret string) (jwt.MapClaims, error) {
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		return []byte(secret), nil
-	})
-	
-	if err != nil {
-		return nil, err
-	}
-	
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		return claims, nil
-	}
-	
-	return nil, jwt.ErrSignatureInvalid
-}
-`
-const userModelContent = `user model`
-const userServiceContent = `user service`
-const userValidatorContent = `user validator`
-const authServiceContent = `package services
-
-import (
-	"context"
-	"database/sql"
-	"errors"
-	"time"
-
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/uptrace/bun"
-	"golang.org/x/crypto/bcrypt"
-
-	"{{.ProjectName}}/app/models"
-)
-
-var (
-	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrUserDisabled       = errors.New("user account is disabled")
-)
-
-// AuthService 認證服務
-type AuthService struct {
-	db     *bun.DB
-	secret string
-}
-
-// NewAuthService 創建認證服務
-func NewAuthService(db *bun.DB) *AuthService {
-	return &AuthService{
-		db:     db,
-		secret: "your-secret-key", // 應從配置讀取
-	}
-}
-
-// Login 用戶登入
-func (s *AuthService) Login(ctx context.Context, username, password string) (*models.User, string, error) {
-	var user models.User
-
-	err := s.db.NewSelect().
-		Model(&user).
-		Where("username = ? OR email = ?", username, username).
-		Scan(ctx)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, "", ErrInvalidCredentials
-		}
-		return nil, "", err
-	}
-
-	// 驗證密碼
-	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
-		return nil, "", ErrInvalidCredentials
-	}
-
-	// 檢查用戶狀態
-	if !user.IsActive {
-		return nil, "", ErrUserDisabled
-	}
-
-	// 生成 JWT
-	token, err := s.generateToken(&user)
-	if err != nil {
-		return nil, "", err
-	}
-
-	user.Password = ""
-	return &user, token, nil
-}
-
-// Register 用戶註冊
-func (s *AuthService) Register(ctx context.Context, req models.RegisterRequest) (*models.User, string, error) {
-	// 檢查用戶是否存在
-	count, err := s.db.NewSelect().
-		Model((*models.User)(nil)).
-		Where("username = ? OR email = ?", req.Username, req.Email).
-		Count(ctx)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if count > 0 {
-		return nil, "", ErrDuplicate
-	}
-
-	// 加密密碼
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// 創建用戶
-	user := &models.User{
-		Username:  req.Username,
-		Email:     req.Email,
-		Password:  string(hashedPassword),
-		FirstName: req.FirstName,
-		LastName:  req.LastName,
-		IsActive:  true,
-	}
-
-	if _, err := s.db.NewInsert().Model(user).Exec(ctx); err != nil {
-		return nil, "", err
-	}
-
-	// 生成 token
-	token, err := s.generateToken(user)
-	if err != nil {
-		return nil, "", err
-	}
-
-	user.Password = ""
-	return user, token, nil
-}
-
-func (s *AuthService) generateToken(user *models.User) (string, error) {
-	claims := jwt.MapClaims{
-		"user_id":  user.ID,
-		"username": user.Username,
-		"email":    user.Email,
-		"exp":      time.Now().Add(24 * time.Hour).Unix(),
-		"iat":      time.Now().Unix(),
-		"iss":      "hypgo-api",
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.secret))
-}
 `
 
 const dockerfileContent = `# Build stage
@@ -1785,8 +947,9 @@ go.work
 *~
 .DS_Store
 
-# Logs
-logs/
+# Logs（保留 logs/.gitkeep 讓目錄存在）
+logs/*
+!logs/.gitkeep
 *.log
 
 # Certificates
@@ -1858,146 +1021,100 @@ tmp_dir = "tmp"
 
 const readmeContent = `# {{.ProjectName}}
 
-A high-performance API server built with HypGo framework, featuring HTTP/3 support.
+API server built with the HypGo framework — Schema-first routes, HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC).
 
-## 🚀 Features
+## Quick Start
 
-- **HTTP/3 Support** - Built-in QUIC protocol support
-- **JWT Authentication** - Secure token-based authentication
-- **Rate Limiting** - Configurable request rate limiting
-- **Database Support** - PostgreSQL, MySQL, SQLite
-- **Redis Caching** - Built-in Redis integration
-- **WebSocket Support** - Real-time communication
-- **Hot Reload** - Development mode with automatic reloading
-- **Docker Ready** - Complete Docker setup
-
-## 📋 Prerequisites
-
-- Go 1.21+
-- PostgreSQL or MySQL (optional, can use SQLite)
-- Redis (optional)
-- Docker & Docker Compose (optional)
-
-## 🛠️ Installation
-
-1. Install dependencies:
 ` + "```bash" + `
 go mod tidy
+go run .                 # http://localhost:8080/health
 ` + "```" + `
 
-2. Copy environment variables:
-` + "```bash" + `
-cp .env.example .env
-` + "```" + `
+HTTP/3 needs TLS: run ` + "`make cert`" + ` (self-signed cert into ` + "`certs/`" + `), then set ` + "`server.tls.enabled: true`" + ` in ` + "`config/config.yaml`" + `.
+` + "`server.protocol: auto`" + ` serves HTTP/1.1 + HTTP/2 over TCP and, once TLS is on, HTTP/3 over UDP as well.
 
-3. Install development tools:
-` + "```bash" + `
-make install-tools
-` + "```" + `
+## Endpoints
 
-4. Generate certificates (for HTTP/3):
-` + "```bash" + `
-make cert
-` + "```" + `
+| Method | Path | Handler |
+|--------|------|---------|
+| GET | ` + "`/health`" + ` | ` + "`controllers.HealthCheck`" + ` |
+| POST | ` + "`/api/auth/register`" + ` | ` + "`AuthController.Register`" + ` (bcrypt, 201 / 409 / 422) |
+| POST | ` + "`/api/auth/login`" + ` | ` + "`AuthController.Login`" + ` → ` + "`{token, expires_at}`" + ` (HS256) |
+| GET | ` + "`/api/auth/me`" + ` | ` + "`AuthController.Me`" + ` (requires ` + "`Authorization: Bearer <token>`" + `) |
+| GET | ` + "`/api/auth/admin/stats`" + ` | ` + "`AuthController.AdminStats`" + ` (token + ` + "`admin`" + ` role; 403 otherwise) |
+| GET | ` + "`/api/user`" + ` | ` + "`UserController.List`" + ` |
+| POST | ` + "`/api/user`" + ` | ` + "`UserController.Create`" + ` (` + "`c.BindInput`" + ` → validate → 201) |
+| GET | ` + "`/api/user/:id`" + ` | ` + "`UserController.Get`" + ` |
+| PUT | ` + "`/api/user/:id`" + ` | ` + "`UserController.Update`" + ` |
+| DELETE | ` + "`/api/user/:id`" + ` | ` + "`UserController.Delete`" + ` |
 
-## 🚦 Quick Start
+Every route is registered with ` + "`r.Schema(...)`" + ` (Input/Output types), so ` + "`hyp lint --deep`" + `,
+` + "`contract.TestAll`" + ` and ` + "`.hyp/context.yaml`" + ` all understand the API without extra work.
 
-### Development Mode
-` + "```bash" + `
-# Run with hot reload
-make dev
-` + "```" + `
+## Authentication
 
-### Production Mode
-` + "```bash" + `
-# Build binary
-make build
-
-# Run binary
-./bin/hypgo-api
-` + "```" + `
-
-### Docker
-` + "```bash" + `
-# Start all services
-make docker-compose-up
-
-# Stop all services
-make docker-compose-down
-` + "```" + `
-
-## 📡 API Endpoints
-
-### Health Check
-- ` + "`GET /health`" + ` - Health check endpoint
-- ` + "`GET /metrics`" + ` - Prometheus metrics
-
-### Authentication
-- ` + "`POST /api/v1/auth/register`" + ` - User registration
-- ` + "`POST /api/v1/auth/login`" + ` - User login
-- ` + "`POST /api/v1/auth/refresh`" + ` - Refresh token
-- ` + "`POST /api/v1/auth/logout`" + ` - User logout
-
-### Users (Protected)
-- ` + "`GET /api/v1/users`" + ` - List users
-- ` + "`POST /api/v1/users`" + ` - Create user (admin only)
-- ` + "`GET /api/v1/users/:id`" + ` - Get user details
-- ` + "`PUT /api/v1/users/:id`" + ` - Update user
-- ` + "`DELETE /api/v1/users/:id`" + ` - Delete user (admin only)
-
-### WebSocket
-- ` + "`GET /api/v1/ws`" + ` - WebSocket connection
-
-## 🧪 Testing
+Uses the framework's ` + "`middleware.JWT`" + ` with the built-in HS256 signer/validator (no external JWT library):
 
 ` + "```bash" + `
-# Run tests
-make test
-
-# Run with coverage
-make test
+export JWT_SECRET=$(openssl rand -hex 32)   # see .env.example; random per-process secret if unset
+curl -X POST localhost:8080/api/auth/register -H 'Content-Type: application/json' -d '{"email":"a@b.c","password":"secret123"}'
+TOKEN=$(curl -s -X POST localhost:8080/api/auth/login -H 'Content-Type: application/json' -d '{"email":"a@b.c","password":"secret123"}' | jq -r .token)
+curl localhost:8080/api/auth/me -H "Authorization: Bearer $TOKEN"
 ` + "```" + `
 
-## 📊 Configuration
+- ` + "`routers/auth.go`" + `: public register/login + a ` + "`protected`" + ` group (` + "`r.NewGroup(\"/api/auth\", middleware.JWT(...))`" + `). Put any route that needs a login on that group.
+- ` + "`services/auth_service.go`" + `: bcrypt password hashing, ` + "`middleware.SignHS256`" + ` for tokens. Accounts live in ` + "`MemoryAccountStore`" + ` (in-process, cleared on restart) — implement ` + "`AccountStore`" + ` on top of ` + "`hidb`" + ` and pass it to ` + "`NewAuthService`" + ` for persistence.
+- Claims in handlers: ` + "`middleware.JWTClaimsFrom(c, \"\")`" + ` → ` + "`*middleware.JWTClaims`" + ` (` + "`Subject`" + ` = account ID, ` + "`Roles`" + `).
+- Roles: the **first registered account becomes ` + "`admin`" + `** (bootstrap); roles travel in the token's ` + "`roles`" + ` claim and the JWT middleware exposes them via ` + "`c.GetRoles()`" + `. Gate a group with ` + "`middleware.RequireRole(\"admin\")`" + ` (see the ` + "`admin`" + ` group in ` + "`routers/auth.go`" + `).
 
-Edit ` + "`config/config.yaml`" + ` or use environment variables:
+## Adding a resource
 
-` + "```yaml" + `
-server:
-  protocol: http3    # http1, http2, http3
-  addr: :8080
-
-database:
-  driver: postgres
-  dsn: ${DB_DSN}
-
-logger:
-  level: debug
-  output: both       # stdout, file, both
+` + "```bash" + `
+hyp generate controller order   # app/controllers/order_controller.go + routers/order.go
+hyp generate model order        # app/models/order.go (Bun model + Req/Resp DTOs)
+hyp generate service order      # app/services/order_service.go
 ` + "```" + `
 
-## 📦 Project Structure
+Then add ` + "`RegisterOrderRoutes(r)`" + ` to ` + "`routers/router.go`" + `.
+
+## Database
+
+Set ` + "`database.dsn`" + ` in ` + "`config/config.yaml`" + ` (` + "`driver`" + `: postgres / mysql / tidb). ` + "`main.go`" + ` opens
+` + "`hidb`" + ` with the matching dialect and skips it when ` + "`dsn`" + ` is empty. Inject it into services:
+
+` + "```go" + `
+svc := services.NewUserService(db, log)
+` + "```" + `
+
+Redis: add ` + "`hidb.WithRedis(redis.New())`" + ` (import ` + "`github.com/maoxiaoyue/hypgo/pkg/hidb/redis`" + `) next to ` + "`WithDialect`" + `.
+
+## Project Structure
 
 ` + "```" + `
 .
 ├── app/
-│   ├── controllers/    # Request handlers
-│   ├── models/        # Data models
-│   ├── services/      # Business logic
-│   └── middleware/    # HTTP middleware
-├── internal/
-│   ├── logger/        # Logger initialization
-│   ├── database/      # Database connections
-│   └── cache/         # Redis cache
-├── config/           # Configuration files
-├── migrations/       # Database migrations
-├── logs/            # Log files
-└── main.go          # Entry point
+│   ├── controllers/    # thin handlers (parse → service → respond)
+│   ├── models/         # Bun models + Schema Req/Resp DTOs
+│   └── services/       # business logic + Error Catalog
+├── routers/            # router.go (Setup) + <resource>.go Schema routes + middleware.go
+├── config/config.yaml  # server / database / logger
+├── .hyp/               # llm.yaml / comment.yaml / config.yaml (AI tooling)
+├── migrations/         # SQL migrations (make migrate)
+├── logs/               # logger output (logs/api.log)
+├── certs/              # make cert
+└── main.go             # hypgo.New() one-line startup + routers.Setup
 ` + "```" + `
 
-## 📝 License
+## Tooling
 
-MIT License`
+` + "```bash" + `
+make dev          # hot reload (air)
+make test         # go test -race
+make cert         # self-signed TLS cert for HTTP/3
+make migrate      # golang-migrate (needs DB_DSN, see .env.example)
+hyp lint --deep   # Schema completeness + handler type alignment (CI gate)
+hyp context       # regenerate .hyp/context.yaml for AI tools
+` + "```" + ``
 
 const goModContent = `module {{.ProjectName}}
 
@@ -2005,17 +1122,9 @@ go 1.24
 
 require (
 	github.com/maoxiaoyue/hypgo v0.8.11
-	github.com/go-sql-driver/mysql v1.9.3
-	github.com/golang-jwt/jwt/v5 v5.2.0
-	github.com/lib/pq v1.10.9
-	github.com/redis/go-redis/v9 v9.3.0
-	github.com/spf13/viper v1.18.2
-	github.com/uptrace/bun v1.2.17
-	github.com/uptrace/bun/dialect/mysqldialect v1.2.17
-	github.com/uptrace/bun/dialect/pgdialect v1.2.17
-	golang.org/x/crypto v0.17.0
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-)`
+	golang.org/x/crypto v0.47.0 // bcrypt（auth_service.go）
+)
+`
 
 const createUsersUpSQL = `
 CREATE TABLE IF NOT EXISTS users (
