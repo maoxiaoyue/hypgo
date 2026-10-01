@@ -47,7 +47,7 @@ Examples:
 		case "cli":
 			return runNewCLI(projectName)
 		case "desktop":
-			return runNewDesktop(projectName)
+			return runNewDesktop(projectName, false)
 		case "grpc":
 			return runNewGRPC(projectName)
 		default:
@@ -108,10 +108,13 @@ Add views:
   hyp generate view settings
   hyp generate view dashboard
 
-Requires: C compiler (gcc) for CGO (Fyne dependency)`,
+Requires: C compiler (gcc) for CGO (Fyne dependency).
+The toolchain is checked after creation; pass --install-deps to let hyp
+run the platform's install command (winget / xcode-select / apt-get / dnf / pacman).`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runNewDesktop(args[0])
+		installDeps, _ := cmd.Flags().GetBool("install-deps")
+		return runNewDesktop(args[0], installDeps)
 	},
 }
 
@@ -153,6 +156,8 @@ func init() {
 	newCmd.AddCommand(newCLICmd)
 	newCmd.AddCommand(newDesktopCmd)
 	newCmd.AddCommand(newGRPCCmd)
+
+	newDesktopCmd.Flags().Bool("install-deps", false, "Install the C toolchain Fyne needs via the platform package manager")
 }
 
 // runNewCLI 生成 CLI 專案
@@ -191,8 +196,9 @@ func runNewCLI(projectName string) error {
 	return nil
 }
 
-// runNewDesktop 生成 Desktop 專案（Fyne）
-func runNewDesktop(projectName string) error {
+// runNewDesktop 生成 Desktop 專案（Fyne）。
+// installDeps 為 true 時，缺少 C 工具鏈會代為執行平台的安裝命令。
+func runNewDesktop(projectName string, installDeps bool) error {
 	if err := scaffold.GenerateDesktopProject(projectName, projectName, projectName); err != nil {
 		return fmt.Errorf("failed to create desktop project: %w", err)
 	}
@@ -223,7 +229,8 @@ func runNewDesktop(projectName string) error {
 	fmt.Printf("   hyp generate view dashboard\n")
 	fmt.Printf("\n🧩 Generate schema manifest (.hyp/context.yaml):\n")
 	fmt.Printf("   go run ./tools/genctx\n")
-	fmt.Printf("\n⚠️  Requires: C compiler (gcc) for CGO (Fyne dependency)\n")
+
+	ensureDesktopDeps(installDeps)
 
 	return nil
 }
