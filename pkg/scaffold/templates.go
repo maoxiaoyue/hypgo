@@ -754,7 +754,7 @@ const desktopGoModTemplate = `module {{.ModuleName}}
 go 1.24
 
 require (
-	fyne.io/fyne/v2 v2.5.4
+	fyne.io/fyne/v2 v2.8.1
 	github.com/maoxiaoyue/hypgo v0.8.11
 )
 `
