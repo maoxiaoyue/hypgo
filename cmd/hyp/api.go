@@ -1121,7 +1121,7 @@ const goModContent = `module {{.ProjectName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.8.11
+	github.com/maoxiaoyue/hypgo v0.9.1
 	golang.org/x/crypto v0.47.0 // bcrypt（auth_service.go）
 )
 `

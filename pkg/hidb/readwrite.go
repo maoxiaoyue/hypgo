@@ -15,9 +15,9 @@ import (
 
 // 健康檢查參數（刻意不做成設定：保持零配置，數值為業界常見預設）
 const (
-	healthCheckInterval  = 5 * time.Second        // 探測週期
-	healthPingTimeout    = 2 * time.Second        // 單次 ping 逾時
-	healthFailThreshold  = 3                      // 連續失敗 N 次後摘除
+	healthCheckInterval = 5 * time.Second // 探測週期
+	healthPingTimeout   = 2 * time.Second // 單次 ping 逾時
+	healthFailThreshold = 3               // 連續失敗 N 次後摘除
 )
 
 // replicaHealth 單一副本的健康狀態

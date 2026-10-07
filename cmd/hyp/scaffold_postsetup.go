@@ -10,7 +10,7 @@ import (
 
 // postScaffoldUpgrade 在 scaffold 完成後嘗試把專案的 hypgo 依賴升到 @latest
 // 並執行 go mod tidy。執行失敗（沒有 go / 沒網路 / 私有 module）時印警告但不中斷
-// 整個 hyp new 流程；產生的 go.mod 已有 v0.8.11 作為後備版本。
+// 整個 hyp new 流程；產生的 go.mod 已有 v0.9.1 作為後備版本。
 func postScaffoldUpgrade(projectDir string) {
 	// 確認 go 在 PATH 中
 	if _, err := exec.LookPath("go"); err != nil {
@@ -27,7 +27,7 @@ func postScaffoldUpgrade(projectDir string) {
 	get.Stderr = os.Stderr
 	if err := get.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: `go get @latest` failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "  Project still uses the bundled v0.8.11 baseline (see go.mod).\n")
+		fmt.Fprintf(os.Stderr, "  Project still uses the bundled v0.9.1 baseline (see go.mod).\n")
 		fmt.Fprintf(os.Stderr, "  Retry manually: cd %s && go get github.com/maoxiaoyue/hypgo@latest\n", projectDir)
 		return
 	}
