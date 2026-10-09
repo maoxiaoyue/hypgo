@@ -376,7 +376,7 @@ func TestGenerateCLIProject(t *testing.T) {
 	if !strings.Contains(string(mainContent), "commands.Execute") {
 		t.Error("main.go should call commands.Execute()")
 	}
-	// v0.9.1：設定在 main.go 載入（config/config.yaml），再交給 commands
+	// v0.9.2：設定在 main.go 載入（config/config.yaml），再交給 commands
 	if !strings.Contains(string(mainContent), "config.LoadConfig(configPath)") {
 		t.Error("main.go should load config/config.yaml via config.LoadConfig")
 	}

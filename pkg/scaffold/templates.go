@@ -604,7 +604,7 @@ const cliGoModTemplate = `module {{.ModuleName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.9.1
+	github.com/maoxiaoyue/hypgo v0.9.2
 	github.com/spf13/cobra v1.9.1
 )
 `
@@ -806,7 +806,7 @@ go 1.24
 
 require (
 	fyne.io/fyne/v2 v2.8.1
-	github.com/maoxiaoyue/hypgo v0.9.1
+	github.com/maoxiaoyue/hypgo v0.9.2
 )
 `
 
@@ -1092,7 +1092,7 @@ const grpcGoModTemplate = `module {{.ModuleName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.9.1
+	github.com/maoxiaoyue/hypgo v0.9.2
 	google.golang.org/grpc v1.72.0
 	google.golang.org/protobuf v1.36.8
 )

@@ -52,7 +52,7 @@ func runContext(cmd *cobra.Command, args []string) error {
 	output, _ := cmd.Flags().GetString("output")
 	format, _ := cmd.Flags().GetString("format")
 
-	// 載入設定（若存在）：v0.9.1 起 runtime 設定位於專案根目錄 config/，
+	// 載入設定（若存在）：v0.9.2 起 runtime 設定位於專案根目錄 config/，
 	// app/config/ 是舊模板的位置，保留作回退
 	var cfg *config.Config
 	for _, configPath := range []string{"config/config.yaml", "app/config/config.yaml"} {
