@@ -135,7 +135,7 @@ hyp new desktop myapp   → Desktop (Fyne GUI)
 All three share:
   app/models/     ← Data structures
   app/services/   ← Business logic + Error Catalog
-  app/config/     ← config.yaml
+  config/         ← config.yaml (runtime; loaded in main.go)
   .hyp/           ← AI manifest (auto-synced)
 ```
 

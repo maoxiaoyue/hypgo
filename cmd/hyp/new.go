@@ -67,8 +67,8 @@ Generated structure:
   │   ├── commands/      CLI subcommands (Cobra)
   │   │   └── root.go    Root command
   │   ├── models/        Data structures
-  │   ├── services/      Business logic + Error Catalog
-  │   └── config/        config.yaml
+  │   └── services/      Business logic + Error Catalog
+  ├── config/config.yaml Runtime config (loaded in main.go → commands.Cfg)
   ├── main.go            Entry point
   └── go.mod
 
@@ -95,10 +95,9 @@ Generated structure:
   │   ├── views/         GUI views (Fyne widgets + layouts)
   │   │   └── main_view.go
   │   ├── models/        Data structures
-  │   ├── services/      Business logic + Error Catalog
-  │   └── config/
-  │       └── config.yaml
-  ├── main.go            Entry point (Fyne app + window)
+  │   └── services/      Business logic + Error Catalog
+  ├── config/config.yaml Runtime config (loaded in main.go)
+  ├── main.go            Entry point (config → logger → Fyne app + window)
   └── go.mod
 
 After creation:
@@ -129,9 +128,8 @@ Generated structure:
   │   ├── proto/<name>pb/    Protobuf definitions (.proto)
   │   ├── rpc/               gRPC server implementations
   │   ├── models/            Data structures
-  │   ├── services/          Business logic + Error Catalog
-  │   └── config/
-  │       └── config.yaml
+  │   └── services/          Business logic + Error Catalog
+  ├── config/config.yaml     Runtime config: server.addr / server.tls (loaded in main.go)
   ├── main.go                gRPC server entry point
   ├── Makefile               protoc compilation commands
   └── go.mod
@@ -176,9 +174,9 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("   │   │   ├── root.go\n")
 	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol cli）\n")
 	fmt.Printf("   │   ├── models/\n")
-	fmt.Printf("   │   ├── services/\n")
-	fmt.Printf("   │   └── config/\n")
-	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── config/\n")
+	fmt.Printf("   │   └── config.yaml      # runtime 設定（main.go 載入）\n")
 	fmt.Printf("   ├── tools/\n")
 	fmt.Printf("   │   └── genctx/          # 產生 .hyp/context.yaml（go run ./tools/genctx）\n")
 	fmt.Printf("   ├── main.go\n")
@@ -213,9 +211,9 @@ func runNewDesktop(projectName string, installDeps bool) error {
 	fmt.Printf("   │   │   ├── main_view.go\n")
 	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol desktop）\n")
 	fmt.Printf("   │   ├── models/\n")
-	fmt.Printf("   │   ├── services/\n")
-	fmt.Printf("   │   └── config/\n")
-	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── config/\n")
+	fmt.Printf("   │   └── config.yaml      # runtime 設定（main.go 載入）\n")
 	fmt.Printf("   ├── tools/\n")
 	fmt.Printf("   │   └── genctx/          # 產生 .hyp/context.yaml（go run ./tools/genctx）\n")
 	fmt.Printf("   ├── main.go\n")
@@ -254,9 +252,9 @@ func runNewGRPC(projectName string) error {
 	fmt.Printf("   │   │   ├── %s_server.go\n", lowerName)
 	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol grpc）\n")
 	fmt.Printf("   │   ├── models/\n")
-	fmt.Printf("   │   ├── services/\n")
-	fmt.Printf("   │   └── config/\n")
-	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── config/\n")
+	fmt.Printf("   │   └── config.yaml      # runtime 設定（main.go 載入）\n")
 	fmt.Printf("   ├── main.go\n")
 	fmt.Printf("   ├── Makefile\n")
 	fmt.Printf("   └── go.mod\n")

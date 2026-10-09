@@ -362,7 +362,7 @@ func TestGenerateCLIProject(t *testing.T) {
 		"main.go",
 		"go.mod",
 		filepath.Join("app", "commands", "root.go"),
-		filepath.Join("app", "config", "config.yaml"),
+		filepath.Join("config", "config.yaml"),
 	}
 	for _, f := range expected {
 		path := filepath.Join(projectDir, f)
@@ -375,6 +375,16 @@ func TestGenerateCLIProject(t *testing.T) {
 	mainContent, _ := os.ReadFile(filepath.Join(projectDir, "main.go"))
 	if !strings.Contains(string(mainContent), "commands.Execute") {
 		t.Error("main.go should call commands.Execute()")
+	}
+	// v0.9.1：設定在 main.go 載入（config/config.yaml），再交給 commands
+	if !strings.Contains(string(mainContent), "config.LoadConfig(configPath)") {
+		t.Error("main.go should load config/config.yaml via config.LoadConfig")
+	}
+	if !strings.Contains(string(mainContent), `configPath = "config/config.yaml"`) {
+		t.Error("main.go should point configPath at the project-root config/config.yaml")
+	}
+	if !strings.Contains(string(mainContent), "commands.Execute(cfg)") {
+		t.Error("main.go should pass cfg to commands.Execute")
 	}
 
 	// 檢查 root.go 內容
@@ -434,7 +444,7 @@ func TestGenerateDesktopProject(t *testing.T) {
 		"main.go",
 		"go.mod",
 		filepath.Join("app", "views", "main_view.go"),
-		filepath.Join("app", "config", "config.yaml"),
+		filepath.Join("config", "config.yaml"),
 	}
 	for _, f := range expected {
 		path := filepath.Join(projectDir, f)
@@ -448,6 +458,9 @@ func TestGenerateDesktopProject(t *testing.T) {
 	s := string(mainContent)
 	if !strings.Contains(s, "fyne.io/fyne/v2") {
 		t.Error("main.go should import fyne")
+	}
+	if !strings.Contains(s, "config.LoadConfig(configPath)") {
+		t.Error("main.go should load config/config.yaml via config.LoadConfig")
 	}
 	if !strings.Contains(s, "views.MainView") {
 		t.Error("main.go should call views.MainView")
@@ -505,7 +518,7 @@ func TestGenerateGRPCProject(t *testing.T) {
 		"Makefile",
 		filepath.Join("app", "proto", "mygrpcpb", "mygrpc.proto"),
 		filepath.Join("app", "rpc", "mygrpc_server.go"),
-		filepath.Join("app", "config", "config.yaml"),
+		filepath.Join("config", "config.yaml"),
 	}
 	for _, f := range expected {
 		path := filepath.Join(projectDir, f)
@@ -519,6 +532,12 @@ func TestGenerateGRPCProject(t *testing.T) {
 	s := string(mainContent)
 	if !strings.Contains(s, "google.golang.org/grpc") {
 		t.Error("main.go should import grpc")
+	}
+	if !strings.Contains(s, "config.LoadConfig(configPath)") {
+		t.Error("main.go should load config/config.yaml via config.LoadConfig")
+	}
+	if !strings.Contains(s, "cfg.Server.Addr") {
+		t.Error("main.go should take the listen address from config")
 	}
 	if !strings.Contains(s, "reflection.Register") {
 		t.Error("main.go should enable grpc reflection")

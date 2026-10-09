@@ -418,17 +418,36 @@ func (s *{{.Name}}Service) List(ctx context.Context) ([]interface{}, error) {
 const cliMainTemplate = `package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+
+	"github.com/maoxiaoyue/hypgo/pkg/config"
 
 	"{{.ModuleName}}/app/commands"
 )
 
+// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）
+const configPath = "config/config.yaml"
+
 func main() {
+	// 載入設定：CLI 可能在任意目錄執行，檔案不存在時改用內建預設值；
+	// 其他錯誤（YAML 格式、驗證失敗）直接結束，避免帶著壞設定跑下去
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "load %s: %v\n", configPath, err)
+			os.Exit(1)
+		}
+		cfg = &config.Config{}
+		cfg.ApplyDefaults()
+	}
+
 	// 註冊 CLI 命令 Schema（Protocol "cli"；供 hyp context / contract 理解命令介面）
 	commands.RegisterSchemas()
 
-	if err := commands.Execute(); err != nil {
+	if err := commands.Execute(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -439,8 +458,13 @@ func main() {
 const cliRootTemplate = `package commands
 
 import (
+	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/spf13/cobra"
 )
+
+// Cfg 是 main.go 自 config/config.yaml 載入的 runtime 設定；
+// 子命令透過它取得 database / logger 等區段（例如 Cfg.Database.DSN）。
+var Cfg *config.Config
 
 var rootCmd = &cobra.Command{
 	Use:   "{{.LowerName}}",
@@ -448,8 +472,9 @@ var rootCmd = &cobra.Command{
 	Long:  "{{.Name}} is a CLI tool built with HypGo scaffold.",
 }
 
-// Execute 執行根命令
-func Execute() error {
+// Execute 執行根命令；cfg 由 main.go 載入後傳入
+func Execute(cfg *config.Config) error {
+	Cfg = cfg
 	return rootCmd.Execute()
 }
 
@@ -552,6 +577,7 @@ func init() {
 func run{{.Name}}(cmd *cobra.Command, args []string) error {
 	fmt.Println("Running {{.LowerName}} command...")
 
+	// 設定由 main.go 載入後放在 Cfg，例如 Cfg.Database.DSN / Cfg.Logger.Level
 	// TODO: implement {{.LowerName}} logic
 
 	return nil
@@ -559,13 +585,11 @@ func run{{.Name}}(cmd *cobra.Command, args []string) error {
 `
 
 // cliConfigTemplate — CLI 專案的 config.yaml
-const cliConfigTemplate = `# {{.Name}} Configuration
-app:
-  name: "{{.LowerName}}"
-  version: "0.1.0"
-
+const cliConfigTemplate = `# {{.Name}} runtime configuration
+# 由 main.go 以 config.LoadConfig("config/config.yaml") 載入（結構同 pkg/config.Config）；
+# 子命令透過 commands.Cfg 讀取。設計時設定（LLM、註釋開關）在 .hyp/，不在此檔。
 database:
-  driver: ""
+  driver: ""   # mysql / postgres / tidb；留空則不連線
   dsn: ""
 
 logger:
@@ -593,13 +617,43 @@ require (
 const desktopMainTemplate = `package main
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+
+	"github.com/maoxiaoyue/hypgo/pkg/config"
+	"github.com/maoxiaoyue/hypgo/pkg/logger"
 
 	"{{.ModuleName}}/app/views"
 )
 
+// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）
+const configPath = "config/config.yaml"
+
 func main() {
+	// 載入設定：桌面程式可能從非專案目錄啟動，檔案不存在時改用內建預設值；
+	// 其他錯誤（YAML 格式、驗證失敗）直接結束
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "load %s: %v\n", configPath, err)
+			os.Exit(1)
+		}
+		cfg = &config.Config{}
+		cfg.ApplyDefaults()
+	}
+
+	// logger 依設定建立；cfg.Database 等區段可在此傳給 services
+	log, err := logger.New(cfg.Logger.Level, cfg.Logger.Output, nil, cfg.Logger.Colors)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "init logger:", err)
+		os.Exit(1)
+	}
+
 	a := app.New()
 	w := a.NewWindow("{{.Name}}")
 	w.Resize(fyne.NewSize(800, 600))
@@ -610,6 +664,7 @@ func main() {
 	// 載入主畫面
 	w.SetContent(views.MainView(w))
 
+	log.Info("{{.LowerName}} started", "config", configPath)
 	w.ShowAndRun()
 }
 `
@@ -731,15 +786,11 @@ func {{.Name}}View(w fyne.Window) fyne.CanvasObject {
 `
 
 // desktopConfigTemplate — Desktop 專案的 config.yaml
-const desktopConfigTemplate = `# {{.Name}} Configuration
-app:
-  name: "{{.LowerName}}"
-  version: "0.1.0"
-  width: 800
-  height: 600
-
+const desktopConfigTemplate = `# {{.Name}} runtime configuration
+# 由 main.go 以 config.LoadConfig("config/config.yaml") 載入（結構同 pkg/config.Config）。
+# 設計時設定（LLM、註釋開關）在 .hyp/，不在此檔。
 database:
-  driver: ""
+  driver: ""   # mysql / postgres / tidb；留空則不連線
   dsn: ""
 
 logger:
@@ -774,8 +825,10 @@ import (
 	"syscall"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 
@@ -783,19 +836,34 @@ import (
 	"{{.ModuleName}}/app/rpc"
 )
 
+// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）
+const configPath = "config/config.yaml"
+
 func main() {
-	addr := ":9090"
+	// 載入設定：server.addr 為監聽位址、server.tls 為 gRPC TLS。
+	// 伺服器沒有設定檔不該靜默起跑，載入失敗直接結束
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load %s: %v", configPath, err)
+	}
+	addr := cfg.Server.Addr
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	s := grpc.NewServer(
+	var opts []grpc.ServerOption
+	if cfg.Server.TLS.Enabled {
+		creds, err := credentials.NewServerTLSFromFile(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+		if err != nil {
+			log.Fatalf("Failed to load TLS credentials: %v", err)
+		}
+		opts = append(opts, grpc.Creds(creds))
+	}
 	// Interceptor（中間件）可在此加入：
-	// grpc.UnaryInterceptor(interceptor.Logger()),
-	// grpc.ChainUnaryInterceptor(interceptor.Recovery(), interceptor.Auth()),
-	)
+	// opts = append(opts, grpc.ChainUnaryInterceptor(interceptor.Recovery(), interceptor.Logger()))
+	s := grpc.NewServer(opts...)
 
 	// 註冊服務
 	pb.Register{{.Name}}ServiceServer(s, rpc.New{{.Name}}Server())
@@ -998,20 +1066,18 @@ func RegisterSchemas() {
 `
 
 // grpcConfigTemplate — gRPC 專案的 config.yaml
-const grpcConfigTemplate = `# {{.Name}} gRPC Service Configuration
-app:
-  name: "{{.LowerName}}"
-  version: "0.1.0"
-
-grpc:
-  addr: ":9090"
-  # tls:
-  #   enabled: false
-  #   cert_file: ""
-  #   key_file: ""
+const grpcConfigTemplate = `# {{.Name}} gRPC service runtime configuration
+# 由 main.go 以 config.LoadConfig("config/config.yaml") 載入（結構同 pkg/config.Config）。
+# 設計時設定（LLM、註釋開關）在 .hyp/，不在此檔。
+server:
+  addr: ":9090"        # gRPC 監聽位址
+  tls:
+    enabled: false     # true 時 main.go 以 cert_file / key_file 建立 grpc.Creds
+    cert_file: ""
+    key_file: ""
 
 database:
-  driver: ""
+  driver: ""           # mysql / postgres / tidb；留空則不連線
   dsn: ""
 
 logger:

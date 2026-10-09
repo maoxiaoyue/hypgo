@@ -52,15 +52,18 @@ func runContext(cmd *cobra.Command, args []string) error {
 	output, _ := cmd.Flags().GetString("output")
 	format, _ := cmd.Flags().GetString("format")
 
-	// 載入設定（若存在）
+	// 載入設定（若存在）：v0.9.1 起 runtime 設定位於專案根目錄 config/，
+	// app/config/ 是舊模板的位置，保留作回退
 	var cfg *config.Config
-	configPath := "app/config/config.yaml"
-	if _, err := os.Stat(configPath); err == nil {
-		cfg = &config.Config{}
-		loader := config.NewConfigLoader(configPath)
-		if err := loader.Load(configPath, cfg); err != nil {
-			cfg = nil // 載入失敗則不含設定資訊
+	for _, configPath := range []string{"config/config.yaml", "app/config/config.yaml"} {
+		if _, err := os.Stat(configPath); err != nil {
+			continue
 		}
+		c := &config.Config{}
+		if err := config.NewConfigLoader(configPath).Load(configPath, c); err == nil {
+			cfg = c // 載入失敗則不含設定資訊
+		}
+		break
 	}
 
 	// 建立 router（目前無法自動掃描使用者路由，輸出基礎結構）

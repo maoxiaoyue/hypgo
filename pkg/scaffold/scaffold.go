@@ -170,7 +170,6 @@ func GenerateMiddleware(dir string) error {
 	return generateFile(dir, "middleware.go", middlewareTemplate, nil)
 }
 
-
 // GenerateModel 生成使用 bun ORM 的 model（含 Request/Response struct）
 func GenerateModel(dir, name string) error {
 	if err := validateName(name); err != nil {
@@ -203,7 +202,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "commands"),
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
-		filepath.Join(baseDir, "app", "config"),
+		filepath.Join(baseDir, "config"),
 		filepath.Join(baseDir, "tools", "genctx"),
 		filepath.Join(baseDir, ".hyp"),
 	}
@@ -221,7 +220,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "commands"), "root.go", cliRootTemplate},
 		{filepath.Join(baseDir, "app", "commands"), "schema.go", cliSchemaTemplate},
 		{filepath.Join(baseDir, "tools", "genctx"), "main.go", cliGenctxTemplate},
-		{filepath.Join(baseDir, "app", "config"), "config.yaml", cliConfigTemplate},
+		{filepath.Join(baseDir, "config"), "config.yaml", cliConfigTemplate},
 		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
@@ -266,7 +265,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "views"),
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
-		filepath.Join(baseDir, "app", "config"),
+		filepath.Join(baseDir, "config"),
 		filepath.Join(baseDir, "tools", "genctx"),
 		filepath.Join(baseDir, ".hyp"),
 	}
@@ -284,7 +283,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "views"), "main_view.go", desktopViewTemplate},
 		{filepath.Join(baseDir, "app", "views"), "schema.go", desktopSchemaTemplate},
 		{filepath.Join(baseDir, "tools", "genctx"), "main.go", desktopGenctxTemplate},
-		{filepath.Join(baseDir, "app", "config"), "config.yaml", desktopConfigTemplate},
+		{filepath.Join(baseDir, "config"), "config.yaml", desktopConfigTemplate},
 		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
@@ -330,7 +329,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		filepath.Join(baseDir, "app", "rpc"),
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
-		filepath.Join(baseDir, "app", "config"),
+		filepath.Join(baseDir, "config"),
 		filepath.Join(baseDir, ".hyp"),
 	}
 	for _, dir := range dirs {
@@ -349,7 +348,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, "app", "proto", lowerName+"pb"), lowerName + ".proto", grpcProtoTemplate},
 		{filepath.Join(baseDir, "app", "rpc"), lowerName + "_server.go", grpcServerTemplate},
 		{filepath.Join(baseDir, "app", "rpc"), "schema.go", grpcSchemaTemplate},
-		{filepath.Join(baseDir, "app", "config"), "config.yaml", grpcConfigTemplate},
+		{filepath.Join(baseDir, "config"), "config.yaml", grpcConfigTemplate},
 		{filepath.Join(baseDir, ".hyp"), "llm.yaml", LLMYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "comment.yaml", CommentYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},

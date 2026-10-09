@@ -40,7 +40,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("app/controllers/   HTTP handlers — thin: parse input, call service, write response\n")
 	sb.WriteString("routers/           Schema-first route registration + Setup() + middleware (project root, beside app/)\n")
 	sb.WriteString("app/views/         Templates / desktop (Fyne) views\n")
-	sb.WriteString("app/config/        Application configuration (config.yaml)\n")
+	sb.WriteString("config/            Runtime configuration (config.yaml; project root, loaded in main.go)\n")
 	sb.WriteString(".hyp/              Auto-generated project context (manifest + lint report)\n")
 	sb.WriteString("```\n")
 

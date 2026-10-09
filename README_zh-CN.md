@@ -135,7 +135,7 @@ hyp new desktop myapp   → Desktop（Fyne GUI）
 三者共用：
   app/models/     ← 数据结构
   app/services/   ← 业务逻辑 + Error Catalog
-  app/config/     ← config.yaml
+  config/         ← config.yaml (runtime; loaded in main.go)
   .hyp/           ← AI manifest（自动同步）
 ```
 
