@@ -3,9 +3,7 @@ package context
 
 import (
 	"bytes"
-	"encoding/json"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 )
@@ -56,13 +54,6 @@ var (
 	bufferPool = &sync.Pool{
 		New: func() interface{} {
 			return bytes.NewBuffer(make([]byte, 0, 1024))
-		},
-	}
-
-	// URL Values 池（用於查詢參數解析）
-	urlValuesPool = &sync.Pool{
-		New: func() interface{} {
-			return make(url.Values, 8)
 		},
 	}
 )
@@ -155,7 +146,7 @@ func (c *Context) reset() {
 	c.index = -1
 	c.protocol = 0
 	c.startTime = time.Time{}
-	c.fullPath = ""    // 漏清會讓監控/日誌把本請求歸到上一個請求的路由
+	c.fullPath = "" // 漏清會讓監控/日誌把本請求歸到上一個請求的路由
 	c.routerGroup = nil
 
 	// 內容協商與 cookie 設定：漏清 sameSite 會讓上一個請求設的
@@ -334,27 +325,6 @@ func ReleaseBuffer(buf *bytes.Buffer) {
 	bufferPool.Put(buf)
 }
 
-// ===== URL Values 池操作 =====
-
-// AcquireURLValues 從池中獲取 URL Values
-// GC 優化：重建 map 替代逐一 delete
-func AcquireURLValues() url.Values {
-	// ponytail: 直接配置即可；先前的 urlValuesPool.Get() 取出後丟棄，是無效操作
-	return make(url.Values, 8)
-}
-
-// ReleaseURLValues 將 URL Values 返回池中
-func ReleaseURLValues(v url.Values) {
-	if v == nil {
-		return
-	}
-	// 避免內存洩漏
-	if len(v) > 128 {
-		return
-	}
-	urlValuesPool.Put(v)
-}
-
 // ===== Context 池化方法更新 =====
 
 // initQuicConnectionFromPool 使用池初始化 QUIC 連接
@@ -372,81 +342,3 @@ func (c *Context) initQuicConnectionFromPool() {
 	c.streamInfo.StreamID = c.extractStreamID()
 	c.streamInfo.Priority = c.extractPriority()
 }
-
-// ===== 優化的 JSON 處理 =====
-
-// JSONWithPool 使用物件池優化的 JSON 回應
-func (c *Context) JSONWithPool(code int, obj interface{}) {
-	c.Header("Content-Type", "application/json; charset=utf-8")
-	c.Status(code)
-
-	// 從池中獲取緩衝區
-	buf := AcquireBuffer()
-	defer ReleaseBuffer(buf)
-
-	encoder := json.NewEncoder(buf)
-	if err := encoder.Encode(obj); err != nil {
-		c.Error(err)
-		return
-	}
-
-	c.Response.Write(buf.Bytes())
-}
-
-// ===== 優化的查詢參數處理 =====
-
-// GetQueryWithPool 使用池優化的查詢參數獲取
-func (c *Context) GetQueryWithPool(key string) (string, bool) {
-	if c.queryCache == nil {
-		// 從池中獲取 Values
-		c.queryCache = AcquireURLValues()
-		// 解析查詢參數
-		for k, v := range c.Request.URL.Query() {
-			c.queryCache[k] = v
-		}
-	}
-	values := c.queryCache[key]
-	if len(values) == 0 {
-		return "", false
-	}
-	return values[0], true
-}
-
-// ===== 池狀態監控 =====
-
-// PoolStats 池統計信息
-type PoolStats struct {
-	ContextPoolSize        int
-	ResponseWriterPoolSize int
-	MetricsPoolSize        int
-	BufferPoolSize         int
-}
-
-// GetPoolStats 獲取池統計信息（僅用於調試）
-func GetPoolStats() PoolStats {
-	// 注意：sync.Pool 沒有直接的方法獲取池大小
-	// 這裡只是示例，實際使用中可能需要自行維護計數器
-	return PoolStats{
-		// 需要自行實現計數邏輯
-	}
-}
-
-// ===== 效能最佳化建議 =====
-
-/*
-使用物件池的最佳實踐：
-
-1. 在處理請求時：
-   c := AcquireContext(w, r)
-   defer ReleaseContext(c)
-
-2. 使用緩衝區池處理大量資料：
-   buf := AcquireBuffer()
-   defer ReleaseBuffer(buf)
-
-3. 定期監控池的使用情況，避免內存洩漏
-
-4. 對於大物件，設置容量上限，超過上限不返回池中
-
-5. 在高並發場景下，物件池可以顯著減少 GC 壓力
-*/

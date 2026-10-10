@@ -22,19 +22,6 @@ type Render interface {
 	WriteContentType(w http.ResponseWriter)
 }
 
-// 預定義的渲染器實例
-var render = defaultRender{}
-
-type defaultRender struct {
-	JSON         jsonRender
-	XML          xmlRender
-	YAML         yamlRender
-	IndentedJSON indentedJSONRender
-	SecureJSON   secureJSONRender
-	JsonpJSON    jsonpJSONRender
-	AsciiJSON    asciiJSONRender
-}
-
 // ===== JSON 渲染器 =====
 
 type jsonRender struct{ Data interface{} }
@@ -79,9 +66,6 @@ func (r indentedJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
 
-// IndentedJSON 創建格式化 JSON 渲染器
-var IndentedJSON = indentedJSONRender{}
-
 // ===== Secure JSON 渲染器 =====
 
 type secureJSONRender struct {
@@ -109,9 +93,6 @@ func (r secureJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
 
-// SecureJSON 創建安全 JSON 渲染器
-var SecureJSON = secureJSONRender{Prefix: "while(1);"}
-
 // ===== JSONP 渲染器 =====
 
 type jsonpJSONRender struct {
@@ -134,9 +115,6 @@ func (r jsonpJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/javascript; charset=utf-8"})
 }
 
-// JsonpJSON 創建 JSONP 渲染器
-var JsonpJSON = jsonpJSONRender{}
-
 // ===== ASCII JSON 渲染器 =====
 
 type asciiJSONRender struct{ Data interface{} }
@@ -152,9 +130,6 @@ func (r asciiJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
 
-// AsciiJSON 創建 ASCII JSON 渲染器
-var AsciiJSON = asciiJSONRender{}
-
 // ===== Pure JSON 渲染器 =====
 
 type pureJSONRender struct{ Data interface{} }
@@ -169,9 +144,6 @@ func (r pureJSONRender) Render(w http.ResponseWriter) error {
 func (r pureJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
-
-// PureJSON 創建純 JSON 渲染器
-var PureJSON = pureJSONRender{}
 
 // ===== XML 渲染器 =====
 
@@ -219,9 +191,6 @@ func (r stringRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"text/plain; charset=utf-8"})
 }
 
-// String 創建字符串渲染器
-var String = stringRender{}
-
 // ===== Redirect 渲染器 =====
 
 type redirectRender struct {
@@ -240,9 +209,6 @@ func (r redirectRender) Render(w http.ResponseWriter) error {
 
 func (r redirectRender) WriteContentType(http.ResponseWriter) {}
 
-// Redirect 創建重定向渲染器
-var Redirect = redirectRender{}
-
 // ===== Data 渲染器 =====
 
 type dataRender struct {
@@ -259,9 +225,6 @@ func (r dataRender) Render(w http.ResponseWriter) error {
 func (r dataRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{r.ContentType})
 }
-
-// Data 創建數據渲染器
-var Data = dataRender{}
 
 // ===== HTML 渲染器 =====
 
@@ -291,9 +254,6 @@ func (r htmlRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"text/html; charset=utf-8"})
 }
 
-// HTML 創建 HTML 渲染器
-var HTML = htmlRender{}
-
 // ===== Reader 渲染器 =====
 
 type readerRender struct {
@@ -318,9 +278,6 @@ func (r readerRender) Render(w http.ResponseWriter) error {
 func (r readerRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{r.ContentType})
 }
-
-// Reader 創建 Reader 渲染器
-var Reader = readerRender{}
 
 // ===== Server-Sent Event 渲染器 =====
 type sseventRender struct {
@@ -352,9 +309,6 @@ func (r sseventRender) WriteContentType(w http.ResponseWriter) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 }
-
-// SSEvent 創建 SSE 渲染器
-var SSEvent = sseventRender{}
 
 // ===== 輔助函數 =====
 

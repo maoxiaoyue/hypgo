@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -146,7 +145,7 @@ func (c *Context) ShouldBindBodyWith(obj interface{}, bb BindingBody) error {
 			return err
 		}
 		c.rawData = body
-		c.Request.Body = ioutil.NopCloser(bytes.NewReader(body))
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
 	return bb.BindBody(body, obj)

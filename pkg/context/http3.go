@@ -10,20 +10,6 @@ import (
 
 // ===== HTTP/3 QUIC 優化方法 =====
 
-// initQuicConnection 初始化 QUIC 連接資訊
-func (c *Context) initQuicConnection() {
-	// 從請求中提取 QUIC 連接資訊
-	if conn, ok := c.Request.Context().Value("quic_conn").(*QuicConnection); ok {
-		c.quicConn = conn
-	}
-
-	// 初始化流資訊
-	c.streamInfo = &StreamInfo{
-		StreamID: c.extractStreamID(),
-		Priority: c.extractPriority(),
-	}
-}
-
 // extractStreamID 提取流 ID
 func (c *Context) extractStreamID() uint64 {
 	// 實現從請求中提取流 ID 的邏輯

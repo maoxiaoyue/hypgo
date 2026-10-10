@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -205,7 +204,7 @@ func (c *Context) GetRawData() ([]byte, error) {
 	}
 
 	c.rawData = body
-	c.Request.Body = ioutil.NopCloser(bytes.NewReader(body))
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 
 	return body, nil
 }
@@ -229,13 +228,13 @@ func readBodyWithHint(r io.Reader, hint int64) ([]byte, error) {
 		}
 		return buf.Bytes(), nil
 	}
-	return ioutil.ReadAll(r)
+	return io.ReadAll(r)
 }
 
 // SetRawData 設置原始請求體資料
 func (c *Context) SetRawData(data []byte) {
 	c.rawData = data
-	c.Request.Body = ioutil.NopCloser(bytes.NewReader(data))
+	c.Request.Body = io.NopCloser(bytes.NewReader(data))
 }
 
 // ===== 文件上傳 =====

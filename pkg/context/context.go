@@ -157,39 +157,6 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 	return AcquireContext(w, r)
 }
 
-// Reset 重置 Context 到初始狀態（用於物件池）
-func (c *Context) Reset(w http.ResponseWriter, r *http.Request) {
-	c.Request = r
-	if w != nil {
-		c.Response = newResponseWriter(w)
-		c.Writer = c.Response
-	} else {
-		c.Response = nil
-		c.Writer = nil
-	}
-	c.Params = c.Params[:0]
-	c.handlers = nil
-	c.index = -1
-	c.Keys = nil
-	c.Errors = c.Errors[:0]
-	c.Accepted = nil
-	c.queryCache = nil
-	c.formCache = nil
-	c.rawData = nil
-	c.fullPath = ""
-	c.schemaInput = nil
-	c.schemaRouteKey = ""
-	c.bindInputCalled = false
-	c.startTime = time.Now()
-	c.metrics = &RequestMetrics{}
-	if r != nil {
-		c.detectProtocol()
-		if c.protocol == HTTP3 {
-			c.initQuicConnection()
-		}
-	}
-}
-
 // Copy 返回當前 Context 的副本（用於 goroutine）
 func (c *Context) Copy() *Context {
 	cp := &Context{
