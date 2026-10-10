@@ -159,7 +159,7 @@ func createAPIRouterSetup(projectName, today string) error {
 		"// Setup 註冊所有路由與中間件。\n" +
 		"// 在 main.go 呼叫：routers.Setup(app.Server().Router())。\n" +
 		"func Setup(r *router.Router) {\n" +
-		"\t// Recovery / Logger / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
+		"\t// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
 		"\t// 不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。\n" +
 		"\t// 額外的全域中間件（JWT、RateLimiter、BodyLimit…）在此加，或用 routers/middleware.go 的 APIMiddleware()\n\n" +
 		"\t// 健康檢查（Schema-first：宣告 Output 供 contract 測試與 manifest 使用）\n" +

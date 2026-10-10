@@ -213,7 +213,7 @@ import (
 // Setup 設定所有路由和中間件
 // 在 main.go 中呼叫：routers.Setup(srv.Router())
 func Setup(r *router.Router) {
-	// Recovery / Logger / Security / CORS 由 server.Start() 自動套用（v0.8.11+），
+	// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），
 	// 這裡不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。
 	// 額外的全域中間件（JWT、RateLimiter、BodyLimit…）在此加：
 	// r.Use(middleware.BodyLimit(middleware.BodyLimitConfig{MaxBytes: 5 << 20}))

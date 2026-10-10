@@ -269,7 +269,7 @@ func (s *Server) Start() error {
 	)
 	sync.SyncSafe()
 
-	// 套用預設中間件（Recovery / Logger / Security / CORS；http3 時為 HTTP3Middleware）。
+	// 套用預設中間件（Recovery / Logger / RejectEarlyData / Security / CORS；http3 時為 HTTP3Middleware）。
 	// v0.8.11 前僅 ListenAndServeWithGracefulShutdown 會套用（而它無人呼叫），
 	// 主要入口（App.Run / srv.Start）一直跑在無 Recovery、無請求日誌、無安全頭的狀態
 	s.applyDefaultMiddlewares()
