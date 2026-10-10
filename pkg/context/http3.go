@@ -20,15 +20,6 @@ func (c *Context) initQuicConnection() {
 
 	c.streamInfo = &c.ownStreamInfo
 	c.streamInfo.StreamID = c.extractStreamID()
-	c.streamInfo.Priority = c.extractPriority()
-}
-
-// ensureStreamInfo 確保 streamInfo 可寫；未設定時指向 Context 自有物件
-func (c *Context) ensureStreamInfo() *StreamInfo {
-	if c.streamInfo == nil {
-		c.streamInfo = &c.ownStreamInfo
-	}
-	return c.streamInfo
 }
 
 // ensureQuicConn 確保 quicConn 可寫；未設定時指向 Context 自有物件
@@ -49,75 +40,6 @@ func (c *Context) extractStreamID() uint64 {
 		}
 	}
 	return 0
-}
-
-// extractPriority 提取優先級
-func (c *Context) extractPriority() uint8 {
-	// 實現優先級提取邏輯
-	if c.Request.Context() != nil {
-		if priority, ok := c.Request.Context().Value("stream_priority").(uint8); ok {
-			return priority
-		}
-	}
-	// 檢查 Priority header (RFC 9218)
-	if priority := c.GetHeader("Priority"); priority != "" {
-		// 解析 priority header
-		return parsePriority(priority)
-	}
-	return 0
-}
-
-// SetStreamPriority 設置流優先級（HTTP/3 特性）
-func (c *Context) SetStreamPriority(priority uint8) error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("stream priority only available in HTTP/3")
-	}
-	c.ensureStreamInfo().Priority = priority
-
-	// 實際設置 QUIC 流優先級
-	// 這裡需要調用底層 QUIC 實現的 API
-	if c.quicConn != nil && c.quicConn.conn != nil {
-		// 設置優先級的實際實現
-		// c.quicConn.conn.SetStreamPriority(c.streamInfo.StreamID, priority)
-	}
-
-	return nil
-}
-
-// GetStreamPriority 獲取流優先級
-func (c *Context) GetStreamPriority() uint8 {
-	if c.streamInfo != nil {
-		return c.streamInfo.Priority
-	}
-	return 0
-}
-
-// SetStreamWeight 設置流權重
-func (c *Context) SetStreamWeight(weight uint8) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("stream weight only available in HTTP/2 and HTTP/3")
-	}
-	c.ensureStreamInfo().Weight = weight
-	return nil
-}
-
-// GetStreamWeight 獲取流權重
-func (c *Context) GetStreamWeight() uint8 {
-	if c.streamInfo != nil {
-		return c.streamInfo.Weight
-	}
-	return 16 // 默認權重
-}
-
-// SetStreamDependency 設置流依賴
-func (c *Context) SetStreamDependency(streamID uint64, exclusive bool) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("stream dependency only available in HTTP/2 and HTTP/3")
-	}
-	si := c.ensureStreamInfo()
-	si.Dependencies = append(si.Dependencies, streamID)
-	si.Exclusive = exclusive
-	return nil
 }
 
 // GetStreamID 獲取流 ID
@@ -184,33 +106,27 @@ func (c *Context) IsHTTP1() bool {
 
 // ===== Server Push =====
 
-// Push 使用 HTTP/3 或 HTTP/2 Server Push
+// Push 發出 HTTP/2 Server Push。只有 HTTP/2 支援：HTTP/1.1 沒有 push，
+// quic-go 的 HTTP/3 也未實作；客戶端關閉 push（SETTINGS_ENABLE_PUSH=0）時
+// net/http 同樣回 http.ErrNotSupported。
 func (c *Context) Push(target string, opts *http.PushOptions) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("server push only available in HTTP/2 and HTTP/3")
+	if p, ok := c.ownWriter.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
 	}
-
-	pusher, ok := c.Writer.(http.Pusher)
-	if !ok {
-		return fmt.Errorf("server push not supported")
-	}
-
-	return pusher.Push(target, opts)
+	return http.ErrNotSupported
 }
 
-// CanPush 檢查是否支援 Server Push
+// CanPush 回報底層連線是否支援 Server Push（實際上只有 HTTP/2）。
+// 檢查底層 writer 而非 c.Writer：後者是 HypGo 的包裝，恆實作 http.Pusher。
 func (c *Context) CanPush() bool {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return false
-	}
-	_, ok := c.Writer.(http.Pusher)
+	_, ok := c.ownWriter.ResponseWriter.(http.Pusher)
 	return ok
 }
 
 // PushResources 推送多個資源
 func (c *Context) PushResources(resources map[string]*http.PushOptions) []error {
 	if !c.CanPush() {
-		return []error{fmt.Errorf("server push not supported")}
+		return []error{http.ErrNotSupported}
 	}
 
 	var errors []error
@@ -271,15 +187,6 @@ func (c *Context) Stream(step func(w io.Writer) bool) bool {
 	}
 }
 
-// StreamWithPriority 帶優先級的串流
-func (c *Context) StreamWithPriority(priority uint8, step func(w io.Writer) bool) error {
-	if err := c.SetStreamPriority(priority); err != nil {
-		return err
-	}
-	c.Stream(step)
-	return nil
-}
-
 // ===== QUIC 特定功能 =====
 
 // GetQUICConnection 獲取 QUIC 連接資訊
@@ -300,40 +207,4 @@ func (c *Context) GetStreamInfo() *StreamInfo {
 // SetStreamInfo 設置流資訊
 func (c *Context) SetStreamInfo(info *StreamInfo) {
 	c.streamInfo = info
-}
-
-// EnableDatagrams 啟用 QUIC 數據報
-func (c *Context) EnableDatagrams() error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("datagrams only available in HTTP/3")
-	}
-	// 實際啟用數據報的實現
-	c.Header("Datagram-Flow-ID", "1")
-	return nil
-}
-
-// SendDatagram 發送 QUIC 數據報
-func (c *Context) SendDatagram(data []byte) error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("datagrams only available in HTTP/3")
-	}
-	if c.quicConn == nil || c.quicConn.conn == nil {
-		return fmt.Errorf("no QUIC connection available")
-	}
-	// 實際發送數據報的實現
-	// return c.quicConn.conn.SendDatagram(data)
-	return fmt.Errorf("datagram sending not implemented")
-}
-
-// ===== 輔助函數 =====
-
-// parsePriority 解析 Priority header
-func parsePriority(header string) uint8 {
-	// 簡化的 Priority header 解析
-	// 實際應該按照 RFC 9218 解析
-	// u=3, i
-	// urgency=3, incremental=true
-
-	// 默認返回中等優先級
-	return 3
 }

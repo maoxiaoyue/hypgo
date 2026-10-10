@@ -146,8 +146,8 @@ func TestReleaseLeavesForeignObjectsIntact(t *testing.T) {
 	}
 }
 
-// TestStreamSettersDoNotAllocate 串流 / QUIC setter 改用 Context 自有物件後應零配置
-// （先前每次首用都 &StreamInfo{} / &QuicConnection{}）。
+// TestStreamSettersDoNotAllocate QUIC setter 改用 Context 自有物件後應零配置
+// （先前每次首用都 &QuicConnection{}）。
 func TestStreamSettersDoNotAllocate(t *testing.T) {
 	req := httptest.NewRequest("GET", "/x", nil)
 	req.ProtoMajor = 2
@@ -155,12 +155,29 @@ func TestStreamSettersDoNotAllocate(t *testing.T) {
 	defer ReleaseContext(c)
 
 	allocs := testing.AllocsPerRun(100, func() {
-		c.streamInfo, c.quicConn = nil, nil
+		c.quicConn = nil
 		c.SetRTT(5)
 		c.SetCongestionWindow(10)
-		_ = c.SetStreamWeight(8)
+		c.UpdateBytesRead(1)
 	})
 	if allocs != 0 {
-		t.Errorf("stream setters allocated %.0f times per call, want 0", allocs)
+		t.Errorf("QUIC setters allocated %.0f times per call, want 0", allocs)
+	}
+}
+
+// TestCanPushReflectsUnderlyingWriter CanPush 必須反映底層連線，而不是 HypGo 的
+// 包裝 writer（後者恆實作 http.Pusher）。歷史 bug：HTTP/3 上 CanPush 恆為 true，
+// Push 卻必定失敗——quic-go 沒有實作 server push。
+func TestCanPushReflectsUnderlyingWriter(t *testing.T) {
+	req := httptest.NewRequest("GET", "/x", nil)
+	req.ProtoMajor = 3
+	c := AcquireContext(httptest.NewRecorder(), req) // recorder 與 quic-go writer 一樣不支援 push
+	defer ReleaseContext(c)
+
+	if c.CanPush() {
+		t.Error("CanPush() = true on a writer without push support")
+	}
+	if err := c.Push("/app.css", nil); err != http.ErrNotSupported {
+		t.Errorf("Push() err = %v, want http.ErrNotSupported", err)
 	}
 }

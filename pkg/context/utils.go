@@ -53,7 +53,6 @@ type ResponseWriter interface {
 
 	// HTTP/3 特定方法
 	WriteHeader3(statusCode int, headers http.Header)
-	PushPromise(target string, opts *http.PushOptions) error
 	StreamID() uint64
 
 	// 狀態方法
@@ -180,12 +179,12 @@ func (w *responseWriter) Flush() {
 	}
 }
 
-// Push 實現 http.Pusher 介面 (HTTP/2 和 HTTP/3)
+// Push 實現 http.Pusher 介面（只有 HTTP/2 的底層 writer 支援）
 func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
 	if pusher, ok := w.ResponseWriter.(http.Pusher); ok {
 		return pusher.Push(target, opts)
 	}
-	return fmt.Errorf("server push not supported")
+	return http.ErrNotSupported
 }
 
 // Pusher 返回 http.Pusher
@@ -203,12 +202,6 @@ func (w *responseWriter) WriteHeader3(statusCode int, headers http.Header) {
 		}
 	}
 	w.WriteHeader(statusCode)
-}
-
-// PushPromise HTTP/3 推送承諾
-func (w *responseWriter) PushPromise(target string, opts *http.PushOptions) error {
-	// 實現 HTTP/3 特定的推送承諾邏輯
-	return w.Push(target, opts)
 }
 
 // StreamID 返回流 ID

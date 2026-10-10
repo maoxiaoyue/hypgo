@@ -3,6 +3,7 @@ package router
 import (
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
 	"testing"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -20,6 +21,9 @@ func (w *discardWriter) WriteHeader(int)             {}
 // 而後者每次歸還都把 slice header 逃逸到堆上（SA6002）——每個帶參數請求多一次配置。
 // 現在 search 直接寫進 Context 自帶的參數緩衝。
 func TestParamRouteAllocsMatchStatic(t *testing.T) {
+	if raceEnabled() {
+		t.Skip("race 模式下 sync.Pool 會隨機丟棄 Put，配置次數不穩定")
+	}
 	r := New()
 	r.GET("/static", func(c *hypcontext.Context) { c.Status(http.StatusNoContent) })
 	r.GET("/users/:id/posts/:pid", func(c *hypcontext.Context) {
@@ -39,6 +43,18 @@ func TestParamRouteAllocsMatchStatic(t *testing.T) {
 		t.Errorf("param route allocs = %.0f, static route allocs = %.0f; params should add none",
 			paramAllocs, staticAllocs)
 	}
+}
+
+// raceEnabled 回報測試是否以 -race 建置（build info 的 -race 設定）
+func raceEnabled() bool {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range bi.Settings {
+			if s.Key == "-race" {
+				return s.Value == "true"
+			}
+		}
+	}
+	return false
 }
 
 // TestParamsDoNotLeakAcrossRequests 參數緩衝隨 Context 重用，下一個請求
