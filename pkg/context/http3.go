@@ -2,6 +2,7 @@
 package context
 
 import (
+	stdcontext "context"
 	"fmt"
 	"io"
 	"net/http"
@@ -140,19 +141,42 @@ func (c *Context) PushResources(resources map[string]*http.PushOptions) []error 
 
 // ===== 0-RTT (Early Data) =====
 
-// IsEarlyData 檢查是否為 0-RTT 早期數據
-func (c *Context) IsEarlyData() bool {
-	if c.protocol != HTTP3 {
-		return false
-	}
-	// 檢查 Early-Data header
-	return c.GetHeader("Early-Data") == "1"
+// handshakeKey 存放 QUIC 連線的握手完成通道（見 WithHandshakeComplete）
+type handshakeKey struct{}
+
+// WithHandshakeComplete 把 QUIC 連線的 HandshakeComplete() 通道放進連線 context，
+// 供 IsEarlyData 判斷請求是否在握手完成前（0-RTT）送達。
+// 由 server 在 http3.Server.ConnContext 呼叫；quic-go 的請求 context 衍生自連線 context。
+func WithHandshakeComplete(ctx stdcontext.Context, done <-chan struct{}) stdcontext.Context {
+	return stdcontext.WithValue(ctx, handshakeKey{}, done)
 }
 
-// AcceptEarlyData 接受早期數據
-func (c *Context) AcceptEarlyData() {
-	if c.protocol == HTTP3 {
-		c.Header("Early-Data-Accepted", "1")
+// IsEarlyData 回報本請求是否為 0-RTT 早期資料——可被攻擊者原封重放。
+// 非冪等操作遇到 true 應回 425，客戶端會在握手完成後重送（RFC 8470）：
+//
+//	if c.IsEarlyData() { c.AbortWithStatus(http.StatusTooEarly); return }
+//
+// 兩種來源，與本請求的協議無關：
+//   - 經代理：轉發早期資料的代理會加 Early-Data: 1（RFC 8470 §5.1），後端收到的
+//     常是 HTTP/1.1 或 HTTP/2。客戶端自行偽造只會讓自己被拒，不需可信代理即可採信
+//   - 直連 HTTP/3：quic-go 收到 0-RTT 請求立即派發、不等握手。握手未完成即為早期
+//     資料；重放的 0-RTT 永遠無法完成握手，所以握手已完成的連線不會是重放
+func (c *Context) IsEarlyData() bool {
+	if c.Request == nil {
+		return false
+	}
+	if c.Request.Header.Get(HeaderEarlyData) == "1" {
+		return true
+	}
+	done, ok := c.Request.Context().Value(handshakeKey{}).(<-chan struct{})
+	if !ok {
+		return false // 非 HTTP/3，或 server 未注入（無法得知，視為已完成）
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
 	}
 }
 

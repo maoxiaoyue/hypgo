@@ -420,6 +420,11 @@ func (s *Server) startHTTP3() error {
 		QUICConfig:      quicConf,
 		EnableDatagrams: false,
 		MaxHeaderBytes:  1 << 20,
+		// 讓 c.IsEarlyData() 能分辨 0-RTT 請求：QUICConfig 開了 Allow0RTT，
+		// quic-go 收到 0-RTT 請求即派發，不等握手完成
+		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			return hypcontext.WithHandshakeComplete(ctx, c.HandshakeComplete())
+		},
 	}
 	s.h3Server.Store(h3srv)
 
