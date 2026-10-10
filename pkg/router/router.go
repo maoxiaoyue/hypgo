@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
-	"sync"
 	"unsafe"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -16,11 +15,10 @@ import (
 
 // Router 主結構
 type Router struct {
-	Group                              // 嵌入根路由組
-	trees     map[string]*radixNode    // 每個 HTTP 方法一棵 Radix Tree
-	cache     *routeCache              // LRU 路由快取
-	paramPool *sync.Pool               // 參數對象池
-	globalMW  []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
+	Group                             // 嵌入根路由組
+	trees    map[string]*radixNode    // 每個 HTTP 方法一棵 Radix Tree
+	cache    *routeCache              // LRU 路由快取
+	globalMW []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
 
 	// 配置
 	maxParams              int
@@ -48,11 +46,10 @@ type HTTP3Config struct {
 	MaxUniStreams      int64
 }
 
-// Param 路由參數
-type Param struct {
-	Key   string
-	Value string
-}
+// Param 路由參數。與 hypcontext.Param 為同一型別：radix tree 直接把參數
+// search 進 Context 自帶的緩衝，免去「router 池 → 逐一複製成 Context 參數」
+// 這一層（先前每個帶參數請求多一次配置與一次複製）
+type Param = hypcontext.Param
 
 // RouterOption 路由器選項
 type RouterOption func(*Router)
@@ -107,15 +104,6 @@ func New(opts ...RouterOption) *Router {
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
 		http3Config:            nil,
-		// 存 *[]Param 而非 []Param：slice header 以值存入 interface{}
-		// 會在每次 Put 時將 24-byte header 逃逸到堆上（SA6002），
-		// 每個帶參數請求平白多一次分配
-		paramPool: &sync.Pool{
-			New: func() interface{} {
-				p := make([]Param, 0, 10)
-				return &p
-			},
-		},
 	}
 
 	// 初始化嵌入的根 Group
@@ -185,18 +173,16 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// 快取查找（僅靜態路由，無參數）
 	if r.enableCache {
 		if handlers := r.cache.get(method + urlPath); handlers != nil {
-			c.Params = r.makeContextParams(nil)
 			r.executeHandlers(c, handlers)
 			return
 		}
 	}
 
-	// Radix Tree 查找
+	// Radix Tree 查找：參數直接 search 進 Context 自帶的緩衝（c.Params 經
+	// reset 後為長度 0 的自帶緩衝），帶參數路由零分配
 	if root := r.trees[method]; root != nil {
-		ps := r.getParams()
-		handlers, params := root.search(urlPath, (*ps)[:0])
-		if handlers != nil {
-			c.Params = r.makeContextParams(params)
+		if handlers, params := root.search(urlPath, c.Params[:0]); handlers != nil {
+			c.Params = params
 
 			// 只快取靜態路由（無參數）
 			if r.enableCache && len(params) == 0 {
@@ -204,24 +190,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 
 			r.executeHandlers(c, handlers)
-			r.putParams(ps, params)
 			return
 		}
-		r.putParams(ps, params)
 	}
 
 	// HEAD 自動回應：若無 HEAD handler，使用 GET handler
 	if method == "HEAD" {
 		if root := r.trees["GET"]; root != nil {
-			ps := r.getParams()
-			handlers, params := root.search(urlPath, (*ps)[:0])
-			if handlers != nil {
-				c.Params = r.makeContextParams(params)
+			if handlers, params := root.search(urlPath, c.Params[:0]); handlers != nil {
+				c.Params = params
 				r.executeHandlers(c, handlers)
-				r.putParams(ps, params)
 				return
 			}
-			r.putParams(ps, params)
 		}
 	}
 
@@ -342,35 +322,6 @@ func (r *Router) IsHTTP3Enabled() bool {
 // GetHTTP3Config 獲取 HTTP/3 配置
 func (r *Router) GetHTTP3Config() *HTTP3Config {
 	return r.http3Config
-}
-
-// getParams 從池中獲取參數切片箱。回傳 *[]Param 讓同一個指標箱
-// 在 Get/Put 間往返——若以值存取，slice header 每次 Put 都逃逸
-// 到堆上（SA6002），每個帶參數請求平白多一次分配
-func (r *Router) getParams() *[]Param {
-	return r.paramPool.Get().(*[]Param)
-}
-
-// putParams 將（可能已被 search 重新配置的）切片寫回箱中並歸還池
-func (r *Router) putParams(ps *[]Param, params []Param) {
-	*ps = params[:0]
-	r.paramPool.Put(ps)
-}
-
-// makeContextParams 轉換路由參數為 Context 參數格式
-// GC 優化：使用 Params pool 避免每請求分配新 slice
-func (r *Router) makeContextParams(params []Param) hypcontext.Params {
-	if len(params) == 0 {
-		return nil
-	}
-	cp := hypcontext.AcquireParams(len(params))
-	for i, p := range params {
-		cp[i] = hypcontext.Param{
-			Key:   p.Key,
-			Value: p.Value,
-		}
-	}
-	return cp
 }
 
 // RouteInfo 路由信息

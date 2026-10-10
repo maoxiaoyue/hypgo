@@ -10,6 +10,35 @@ import (
 
 // ===== HTTP/3 QUIC 優化方法 =====
 
+// initQuicConnection 初始化 HTTP/3 請求的 QUIC 資訊（使用 Context 自有物件，零分配）
+func (c *Context) initQuicConnection() {
+	if conn, ok := c.Request.Context().Value("quic_conn").(*QuicConnection); ok {
+		c.quicConn = conn // 連線層共用物件：只參照，reset 不會重置它
+	} else {
+		c.quicConn = &c.ownQuicConn
+	}
+
+	c.streamInfo = &c.ownStreamInfo
+	c.streamInfo.StreamID = c.extractStreamID()
+	c.streamInfo.Priority = c.extractPriority()
+}
+
+// ensureStreamInfo 確保 streamInfo 可寫；未設定時指向 Context 自有物件
+func (c *Context) ensureStreamInfo() *StreamInfo {
+	if c.streamInfo == nil {
+		c.streamInfo = &c.ownStreamInfo
+	}
+	return c.streamInfo
+}
+
+// ensureQuicConn 確保 quicConn 可寫；未設定時指向 Context 自有物件
+func (c *Context) ensureQuicConn() *QuicConnection {
+	if c.quicConn == nil {
+		c.quicConn = &c.ownQuicConn
+	}
+	return c.quicConn
+}
+
 // extractStreamID 提取流 ID
 func (c *Context) extractStreamID() uint64 {
 	// 實現從請求中提取流 ID 的邏輯
@@ -43,10 +72,7 @@ func (c *Context) SetStreamPriority(priority uint8) error {
 	if c.protocol != HTTP3 {
 		return fmt.Errorf("stream priority only available in HTTP/3")
 	}
-	if c.streamInfo == nil {
-		c.streamInfo = &StreamInfo{}
-	}
-	c.streamInfo.Priority = priority
+	c.ensureStreamInfo().Priority = priority
 
 	// 實際設置 QUIC 流優先級
 	// 這裡需要調用底層 QUIC 實現的 API
@@ -71,10 +97,7 @@ func (c *Context) SetStreamWeight(weight uint8) error {
 	if c.protocol != HTTP3 && c.protocol != HTTP2 {
 		return fmt.Errorf("stream weight only available in HTTP/2 and HTTP/3")
 	}
-	if c.streamInfo == nil {
-		c.streamInfo = &StreamInfo{}
-	}
-	c.streamInfo.Weight = weight
+	c.ensureStreamInfo().Weight = weight
 	return nil
 }
 
@@ -91,11 +114,9 @@ func (c *Context) SetStreamDependency(streamID uint64, exclusive bool) error {
 	if c.protocol != HTTP3 && c.protocol != HTTP2 {
 		return fmt.Errorf("stream dependency only available in HTTP/2 and HTTP/3")
 	}
-	if c.streamInfo == nil {
-		c.streamInfo = &StreamInfo{}
-	}
-	c.streamInfo.Dependencies = append(c.streamInfo.Dependencies, streamID)
-	c.streamInfo.Exclusive = exclusive
+	si := c.ensureStreamInfo()
+	si.Dependencies = append(si.Dependencies, streamID)
+	si.Exclusive = exclusive
 	return nil
 }
 
@@ -117,10 +138,7 @@ func (c *Context) GetRTT() time.Duration {
 
 // SetRTT 設置 RTT（用於測試或手動設置）
 func (c *Context) SetRTT(rtt time.Duration) {
-	if c.quicConn == nil {
-		c.quicConn = &QuicConnection{}
-	}
-	c.quicConn.rtt = rtt
+	c.ensureQuicConn().rtt = rtt
 }
 
 // GetCongestionWindow 獲取擁塞窗口大小
@@ -133,10 +151,7 @@ func (c *Context) GetCongestionWindow() uint32 {
 
 // SetCongestionWindow 設置擁塞窗口（用於測試或手動設置）
 func (c *Context) SetCongestionWindow(size uint32) {
-	if c.quicConn == nil {
-		c.quicConn = &QuicConnection{}
-	}
-	c.quicConn.congWin = size
+	c.ensureQuicConn().congWin = size
 }
 
 // GetBytesRead 獲取已讀取的字節數
@@ -149,10 +164,7 @@ func (c *Context) GetBytesRead() uint64 {
 
 // UpdateBytesRead 更新已讀取的字節數
 func (c *Context) UpdateBytesRead(bytes uint64) {
-	if c.quicConn == nil {
-		c.quicConn = &QuicConnection{}
-	}
-	c.quicConn.bytesRead += bytes
+	c.ensureQuicConn().bytesRead += bytes
 }
 
 // IsHTTP3 檢查是否為 HTTP/3
