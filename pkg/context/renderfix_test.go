@@ -86,3 +86,25 @@ func TestXMLRenderWritesNothingOnError(t *testing.T) {
 		t.Errorf("body has %d bytes, want nothing written before the error", w.Body.Len())
 	}
 }
+
+// TestJSONTrailingNewline c.JSON 與 json.Marshal 相同（無尾端換行）；PureJSON / AsciiJSON 沿用
+// Encoder 的輸出、尾端帶 '\n'。改成先緩衝再寫時不可順手改掉線上位元組。
+func TestJSONTrailingNewline(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		render func(c *Context)
+		want   string
+	}{
+		{"JSON", func(c *Context) { c.JSON(200, 1) }, "1"},
+		{"PureJSON", func(c *Context) { c.PureJSON(200, 1) }, "1\n"},
+		{"AsciiJSON", func(c *Context) { c.AsciiJSON(200, 1) }, "1\n"},
+	} {
+		w := httptest.NewRecorder()
+		c := AcquireContext(w, httptest.NewRequest("GET", "/", nil))
+		tc.render(c)
+		c.Release()
+		if got := w.Body.String(); got != tc.want {
+			t.Errorf("%s body = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

@@ -36,11 +36,12 @@ func (r jsonRender) Render(w http.ResponseWriter) error {
 		return err
 	}
 	defer ReleaseBuffer(buf)
-	_, err = w.Write(buf.Bytes())
+	b := buf.Bytes()
+	_, err = w.Write(b[:len(b)-1]) // 去掉 Encoder 尾端的 '\n'，與 json.Marshal 輸出相同
 	return err
 }
 
-// encodeJSON 把 v 編進池化緩衝（呼叫端負責 ReleaseBuffer）。
+// encodeJSON 把 v 編進池化緩衝（呼叫端負責 ReleaseBuffer），尾端帶 Encoder 固定補上的 '\n'。
 // 池化緩衝 + Encoder：json.Marshal 每次回應都整包新配置 body，
 // 是典型小 JSON 回應在 H1-H3 修復後的最大單筆每請求分配。
 // 先編完再寫 w：失敗時尚未送出任何位元組，Render 的 panic 才能由 Recovery 轉成乾淨的 500
@@ -51,10 +52,6 @@ func encodeJSON(v interface{}, escapeHTML bool) (*bytes.Buffer, error) {
 	if err := enc.Encode(v); err != nil {
 		ReleaseBuffer(buf)
 		return nil, err
-	}
-	// Encoder 尾端固定補 '\n'，去除以維持與 json.Marshal 相同輸出
-	if b := buf.Bytes(); len(b) > 0 && b[len(b)-1] == '\n' {
-		buf.Truncate(len(b) - 1)
 	}
 	return buf, nil
 }
