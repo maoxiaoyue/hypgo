@@ -248,3 +248,17 @@ func TestIsEarlyData(t *testing.T) {
 		ReleaseContext(c)
 	}
 }
+
+// TestWriteHeaderAfterWriteIsIgnored header 已送出後改狀態碼應無效：
+// Status() 必須與客戶端實際收到的一致（先前會改 status 並往 stdout 印 debug）。
+func TestWriteHeaderAfterWriteIsIgnored(t *testing.T) {
+	w := httptest.NewRecorder()
+	rw := newResponseWriter(w)
+
+	rw.Write([]byte("body"))
+	rw.WriteHeader(http.StatusInternalServerError)
+
+	if rw.Status() != http.StatusOK || w.Code != http.StatusOK {
+		t.Errorf("Status()=%d recorder=%d, want both 200", rw.Status(), w.Code)
+	}
+}

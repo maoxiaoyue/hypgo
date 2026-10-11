@@ -81,12 +81,11 @@ func newResponseWriter(w http.ResponseWriter) ResponseWriter {
 	}
 }
 
-// WriteHeader 寫入狀態碼
+// WriteHeader 記錄狀態碼，實際送出延後到 WriteHeaderNow / 首次 Write。
+// header 已送出後再改無效且不記錄：先前會改 status 並往 stdout 印 debug——
+// Status() 回報客戶端從未收到的值，生產環境還繞過 logger 刷 stdout
 func (w *responseWriter) WriteHeader(code int) {
-	if code > 0 && w.status != code {
-		if w.written {
-			debugPrint("[WARNING] Headers were already written. Wanted to override status code %d with %d", w.status, code)
-		}
+	if code > 0 && !w.written {
 		w.status = code
 	}
 }
@@ -258,12 +257,6 @@ func isValidIP(ip string) bool {
 // nameOfFunction 獲取函數名稱
 func nameOfFunction(f interface{}) string {
 	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
-}
-
-// debugPrint 調試打印
-func debugPrint(format string, values ...interface{}) {
-	// 實現調試輸出
-	fmt.Printf("[HYPGO-debug] "+format+"\n", values...)
 }
 
 // LogRequest 記錄請求信息

@@ -3,6 +3,7 @@ package context
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -169,11 +170,18 @@ func (c *Context) GetFormValue(key string) string {
 	return c.Request.FormValue(key)
 }
 
-// initFormCache 初始化表單快取
+// initFormCache 初始化表單快取。解析失敗（body 超過上限、編碼錯誤）記進 c.Errors 由 Finish 回報，
+// PostForm 系列仍回空值——先前錯誤被整個吞掉，呼叫端分不出「沒填」和「解析失敗」
 func (c *Context) initFormCache() {
-	c.Request.ParseForm()
-	c.Request.ParseMultipartForm(defaultMemory)
+	err := c.Request.ParseForm()
+	if merr := c.Request.ParseMultipartForm(defaultMemory); err == nil && merr != nil && !errors.Is(merr, http.ErrNotMultipart) {
+		err = merr
+	}
+	c.Error(err) // nil 時不做事
 	c.formCache = c.Request.PostForm
+	if c.formCache == nil {
+		c.formCache = url.Values{} // 標記已解析，避免每次呼叫重跑
+	}
 }
 
 // getFormMap 從表單數據中提取 map
@@ -516,10 +524,14 @@ func (c *Context) RequestURI() string {
 	return c.Request.RequestURI
 }
 
-// Scheme 返回請求協議（http 或 https）
+// Scheme 返回請求協議（http 或 https）。
+// X-Forwarded-Proto 等轉發標頭只在直連來源為可信代理時採信（同 ClientIP，見 SetTrustedProxies）
 func (c *Context) Scheme() string {
 	if c.Request.TLS != nil {
 		return "https"
+	}
+	if !c.IsFromTrustedProxy() {
+		return "http"
 	}
 	if scheme := c.GetHeader("X-Forwarded-Proto"); scheme != "" {
 		return scheme
@@ -536,10 +548,13 @@ func (c *Context) Scheme() string {
 	return "http"
 }
 
-// Host 返回請求的主機名
+// Host 返回請求的主機名。X-Forwarded-Host 只在直連來源為可信代理時採信（見 SetTrustedProxies）：
+// 無條件採信時，任意客戶端自帶該標頭就能把密碼重設連結、絕對路徑重導向指到自己的網域
 func (c *Context) Host() string {
-	if host := c.GetHeader("X-Forwarded-Host"); host != "" {
-		return host
+	if c.IsFromTrustedProxy() {
+		if host := c.GetHeader("X-Forwarded-Host"); host != "" {
+			return host
+		}
 	}
 	return c.Request.Host
 }
