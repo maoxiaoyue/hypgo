@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
@@ -45,6 +44,7 @@ func CSRF(config CSRFConfig) hypcontext.HandlerFunc {
 	if config.CookiePath == "" {
 		config.CookiePath = "/"
 	}
+	src := parseValueSource(config.TokenLookup, "header", "form", "query")
 
 	return func(c *hypcontext.Context) {
 		// 檢查是否跳過
@@ -71,7 +71,7 @@ func CSRF(config CSRFConfig) hypcontext.HandlerFunc {
 			handleCSRFError(c, config)
 			return
 		}
-		token := extractCSRFToken(c, config.TokenLookup)
+		token := src.get(c)
 		if token == "" || !validateCSRFToken(token, cookie) {
 			handleCSRFError(c, config)
 			return
@@ -92,34 +92,10 @@ func isSafeMethod(method string) bool {
 // generateCSRFToken 使用 crypto/rand 生成安全 CSRF token
 func generateCSRFToken(length int) string {
 	b := make([]byte, length)
-	if _, err := crand.Read(b); err != nil {
-		// fallback（極端情況）
-		for i := range b {
-			b[i] = byte(time.Now().UnixNano() % 256)
-		}
-	}
+	crand.Read(b) // Go 1.24 起保證不回傳錯誤
 	// RawURLEncoding（無 '=' 補位）：補位的 '=' 寫進 cookie 時被跳脫成 %3D，前端從 cookie 讀出
 	// 放進標頭送回的值與伺服器端解碼後的 cookie 不同，double-submit 驗證必定失敗
 	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// extractCSRFToken 從請求中提取 CSRF token
-func extractCSRFToken(c *hypcontext.Context, lookup string) string {
-	parts := strings.Split(lookup, ":")
-	if len(parts) != 2 {
-		return ""
-	}
-
-	switch parts[0] {
-	case "header":
-		return c.GetHeader(parts[1])
-	case "form":
-		return c.PostForm(parts[1])
-	case "query":
-		return c.Query(parts[1])
-	default:
-		return ""
-	}
 }
 
 // validateCSRFToken 驗證 CSRF token

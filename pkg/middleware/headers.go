@@ -20,7 +20,6 @@ type CompressionConfig struct {
 	MinLength     int      // 小於此長度（bytes）不壓縮，預設 1024
 	ExcludedPaths []string // 不壓縮的路徑
 	ExcludedTypes []string // 不壓縮的 Content-Type 前綴（如 "image/"、"video/"）
-	PreferBrotli  bool     // HTTP/3 優化：優先使用 Brotli
 }
 
 // Compression 創建 gzip 壓縮中間件。

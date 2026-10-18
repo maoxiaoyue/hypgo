@@ -150,12 +150,9 @@ func BasicAuth(config AuthConfig) hypcontext.HandlerFunc {
 
 // JWTConfig JWT 配置
 type JWTConfig struct {
-	SigningKey    []byte
-	SigningMethod string
 	ContextKey    string
-	TokenLookup   string // "header:Authorization" or "query:token" or "cookie:token"
-	TokenHeadName string // "Bearer"
-	Claims        interface{}
+	TokenLookup   string                                  // "header:Authorization" or "query:token" or "cookie:token"
+	TokenHeadName string                                  // "Bearer"
 	Validator     func(token string) (interface{}, error) // 必須提供：驗證 token 並回傳 claims
 	ErrorHandler  func(c *hypcontext.Context, err error)
 }
@@ -175,9 +172,13 @@ func JWT(config JWTConfig) hypcontext.HandlerFunc {
 	if config.TokenHeadName == "" {
 		config.TokenHeadName = "Bearer"
 	}
+	src := parseValueSource(config.TokenLookup, "header", "query", "cookie")
 
 	return func(c *hypcontext.Context) {
-		token := extractToken(c, config.TokenLookup, config.TokenHeadName)
+		token := src.get(c)
+		if src.kind == "header" {
+			token = stripAuthScheme(token, config.TokenHeadName)
+		}
 		if token == "" {
 			jwtError(c, config, fmt.Errorf("token not found"))
 			return
@@ -208,32 +209,13 @@ func jwtError(c *hypcontext.Context, config JWTConfig, err error) {
 	}
 }
 
-// extractToken 從請求中提取 token
-func extractToken(c *hypcontext.Context, lookup, headName string) string {
-	parts := strings.Split(lookup, ":")
-	if len(parts) != 2 {
-		return ""
+// stripAuthScheme 去掉標頭值開頭的驗證方案名稱（"Bearer xxx" → "xxx"）；
+// 方案名稱不分大小寫（RFC 7235），沒有方案前綴時原樣回傳
+func stripAuthScheme(value, scheme string) string {
+	if s, rest, ok := strings.Cut(value, " "); ok && strings.EqualFold(s, scheme) {
+		return rest
 	}
-
-	switch parts[0] {
-	case "header":
-		token := c.GetHeader(parts[1])
-		if token != "" && headName != "" {
-			// 驗證方案名稱不分大小寫（RFC 7235）："bearer xxx" 也要接受
-			parts := strings.SplitN(token, " ", 2)
-			if len(parts) == 2 && strings.EqualFold(parts[0], headName) {
-				return parts[1]
-			}
-		}
-		return token
-	case "query":
-		return c.Query(parts[1])
-	case "cookie":
-		cookie, _ := c.Cookie(parts[1])
-		return cookie
-	}
-
-	return ""
+	return value
 }
 
 // ===== API Key 認證中間件 =====
@@ -254,6 +236,7 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 	if config.ContextKey == "" {
 		config.ContextKey = "api_key"
 	}
+	src := parseValueSource(config.KeyLookup, "header", "query", "form")
 	// 以常數時間逐一比對：先前用 map 查找，比對時間隨 key 內容而異
 	keys := make([][]byte, 0, len(config.Keys))
 	for k, enabled := range config.Keys {
@@ -263,7 +246,7 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 	}
 
 	return func(c *hypcontext.Context) {
-		key := extractAPIKey(c, config.KeyLookup)
+		key := src.get(c)
 		if key == "" {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
@@ -287,25 +270,6 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 
 		c.Set(config.ContextKey, key)
 		c.Next()
-	}
-}
-
-// extractAPIKey 從請求中提取 API Key
-func extractAPIKey(c *hypcontext.Context, lookup string) string {
-	parts := strings.Split(lookup, ":")
-	if len(parts) != 2 {
-		return ""
-	}
-
-	switch parts[0] {
-	case "header":
-		return c.GetHeader(parts[1])
-	case "query":
-		return c.Query(parts[1])
-	case "form":
-		return c.PostForm(parts[1])
-	default:
-		return ""
 	}
 }
 

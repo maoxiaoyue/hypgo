@@ -20,7 +20,6 @@ type RecoveryConfig struct {
 	StackSize         int
 	DisableStackAll   bool
 	DisablePrintStack bool
-	LogLevel          string
 	ErrorHandler      func(c *hypcontext.Context, err interface{})
 	Output            io.Writer // panic 記錄寫到哪；nil 時為 os.Stdout，server 會接到自己的 logger
 }
@@ -62,36 +61,6 @@ func Recovery(config RecoveryConfig) hypcontext.HandlerFunc {
 			// 一律中止：自訂 ErrorHandler 若未 Abort，panic 那個 handler 之後的 handler
 			// 會被外層的 Next 迴圈繼續執行
 			c.Abort()
-		}()
-
-		c.Next()
-	}
-}
-
-// SimpleErrorHandler 簡單的錯誤處理中間件
-func SimpleErrorHandler() hypcontext.HandlerFunc {
-	return func(c *hypcontext.Context) {
-		defer func() {
-			if r := recover(); r != nil {
-				if r == http.ErrAbortHandler {
-					panic(r)
-				}
-				var err error
-				switch x := r.(type) {
-				case string:
-					err = fmt.Errorf("%s", x)
-				case error:
-					err = x
-				default:
-					err = fmt.Errorf("unknown panic: %v", r)
-				}
-
-				// 記錄錯誤並返回 500（Abort：否則 panic 之後的 handler 會繼續執行）
-				fmt.Printf("[Error] Panic recovered: %v\n", err)
-				c.AbortWithStatusJSON(http.StatusInternalServerError, map[string]string{
-					"error": "Internal Server Error",
-				})
-			}
 		}()
 
 		c.Next()

@@ -24,25 +24,53 @@ import (
 // ===== 核心工具函數 =====
 
 // secureRandHex 使用 crypto/rand 生成安全隨機 hex 字串
+// （Go 1.24 起 rand.Read 保證不回傳錯誤，先前的時間戳備援走不到）
 func secureRandHex(n int) string {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		// fallback: 用時間戳（極端情況）
-		return fmt.Sprintf("%x", time.Now().UnixNano())
-	}
+	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// valueSource 解析好的取值來源（"header:X-Token"、"query:token"、"form:csrf"、"cookie:token"）。
+// 建立中間件時解析一次：先前 CSRF / JWT / APIKey 各有一份解析函式，每個請求重新切字串，
+// 格式寫錯時靜默取不到值、一律拒絕
+type valueSource struct{ kind, name string }
+
+// parseValueSource 解析 lookup；來源不在 allowed 內或格式錯誤時 panic（設定錯誤應在啟動時發現）
+func parseValueSource(lookup string, allowed ...string) valueSource {
+	kind, name, ok := strings.Cut(lookup, ":")
+	if ok && name != "" {
+		for _, a := range allowed {
+			if kind == a {
+				return valueSource{kind: kind, name: name}
+			}
+		}
+	}
+	panic(fmt.Sprintf("middleware: invalid lookup %q (want <%s>:<name>)", lookup, strings.Join(allowed, "|")))
+}
+
+func (s valueSource) get(c *hypcontext.Context) string {
+	switch s.kind {
+	case "header":
+		return c.GetHeader(s.name)
+	case "query":
+		return c.Query(s.name)
+	case "form":
+		return c.PostForm(s.name)
+	case "cookie":
+		v, _ := c.Cookie(s.name)
+		return v
+	}
+	return ""
 }
 
 // ===== 日誌中間件 =====
 
 // LoggerConfig 日誌配置
 type LoggerConfig struct {
-	Format        string
-	TimeFormat    string
-	SkipPaths     []string
-	Output        io.Writer // nil 時寫到 os.Stdout；server 會接到自己的 logger
-	EnableLatency bool
-	EnableSize    bool
+	TimeFormat string
+	SkipPaths  []string
+	Output     io.Writer // nil 時寫到 os.Stdout；server 會接到自己的 logger
 }
 
 // sensitiveQueryKeys 記錄日誌時遮蔽值的 query 參數（不分大小寫）。
@@ -137,7 +165,6 @@ type RateLimiterConfig struct {
 	KeyFunc    KeyFunc // 獲取限制鍵的函數
 	ErrorMsg   string  // 錯誤訊息
 	StatusCode int     // 狀態碼
-	UseHTTP3   bool    // 使用 HTTP/3 優化
 }
 
 // KeyFunc 獲取速率限制鍵的函數
@@ -198,25 +225,7 @@ func RateLimiter(config RateLimiterConfig) hypcontext.HandlerFunc {
 		if last := lastSweep.Load(); now-last > int64(rateLimiterSweepEvery) && lastSweep.CompareAndSwap(last, now) {
 			go sweep(now)
 		}
-		limiter := entry.limiter
-
-		// HTTP/3 優化：使用 QUIC 的流控制特性
-		if config.UseHTTP3 {
-			// 檢查是否為 HTTP/3
-			if protoValue, exists := c.Get("protocol"); exists {
-				if proto, ok := protoValue.(string); ok && proto == "HTTP/3" {
-					// 根據 RTT 動態調整速率
-					rtt := c.GetRTT()
-					if rtt > 100*time.Millisecond {
-						// 高延遲時稍微放寬限制 (修正: 使用浮點數計算)
-						adjustedRate := float64(config.Rate) * 1.2
-						limiter.SetLimit(rate.Limit(adjustedRate))
-					}
-				}
-			}
-		}
-
-		if !limiter.Allow() {
+		if !entry.limiter.Allow() {
 			c.Header("Retry-After", "1")
 			c.Header("X-RateLimit-Limit", limitHeader)
 			c.Header("X-RateLimit-Remaining", "0")
@@ -470,7 +479,7 @@ func DefaultMiddlewareWithOutput(access, errs io.Writer) []hypcontext.HandlerFun
 	}
 }
 
-// HTTP3Middleware 創建 HTTP/3 優化的中間件組合
+// HTTP3Middleware 創建 HTTP/3 模式的中間件組合（另加壓縮與限流）
 func HTTP3Middleware() []hypcontext.HandlerFunc {
 	return HTTP3MiddlewareWithOutput(nil, nil)
 }
@@ -485,24 +494,20 @@ func HTTP3MiddlewareWithOutput(access, errs io.Writer) []hypcontext.HandlerFunc 
 		}),
 		// 日誌
 		Logger(LoggerConfig{
-			TimeFormat:    time.RFC3339,
-			EnableLatency: true,
-			EnableSize:    true,
-			Output:        access,
+			TimeFormat: time.RFC3339,
+			Output:     access,
 		}),
 		// 0-RTT 重放保護
 		RejectEarlyData(),
-		// 壓縮（優先使用 Brotli）
+		// 壓縮（gzip）
 		Compression(CompressionConfig{
-			Level:        6,
-			MinLength:    1024,
-			PreferBrotli: true,
+			Level:     6,
+			MinLength: 1024,
 		}),
-		// 速率限制（啟用 HTTP/3 優化）
+		// 速率限制
 		RateLimiter(RateLimiterConfig{
-			Rate:     100,
-			Burst:    50,
-			UseHTTP3: true,
+			Rate:  100,
+			Burst: 50,
 		}),
 	}
 }

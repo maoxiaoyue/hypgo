@@ -362,3 +362,35 @@ func TestSmallSecurityFixes(t *testing.T) {
 	}()
 	JWT(JWTConfig{})
 }
+
+// TestInvalidLookupPanicsAtConstruction 取值設定（"header:X" 等）於建立時解析，格式錯誤直接 panic。
+// 先前 CSRF / JWT / APIKey 各自在每個請求切字串，寫錯時靜默取不到值、一律拒絕
+func TestInvalidLookupPanicsAtConstruction(t *testing.T) {
+	validator := func(string) (interface{}, error) { return nil, nil }
+	for name, build := range map[string]func(){
+		"CSRF":   func() { CSRF(CSRFConfig{TokenLookup: "headerX-CSRF-Token"}) },
+		"JWT":    func() { JWT(JWTConfig{Validator: validator, TokenLookup: "form:token"}) }, // JWT 不支援 form
+		"APIKey": func() { APIKey(APIKeyConfig{KeyLookup: "cookie:k"}) },                     // APIKey 不支援 cookie
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s with an invalid lookup did not panic", name)
+				}
+			}()
+			build()
+		}()
+	}
+
+	// 合法設定照常運作：JWT 從 cookie 取 token
+	secret := []byte("s")
+	tok, _ := SignHS256(JWTClaims{Subject: "1"}, secret, time.Hour)
+	r := router.New()
+	r.Use(JWT(JWTConfig{Validator: HS256Validator(secret), TokenLookup: "cookie:jwt"}))
+	r.GET("/j", func(c *hypcontext.Context) { c.Status(204) })
+	req := httptest.NewRequest("GET", "/j", nil)
+	req.AddCookie(&http.Cookie{Name: "jwt", Value: tok})
+	if w := serve(r, req); w.Code != 204 {
+		t.Errorf("JWT from cookie = %d, want 204", w.Code)
+	}
+}
