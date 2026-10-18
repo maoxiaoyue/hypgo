@@ -33,8 +33,11 @@ func TypeName(v interface{}) string {
 	return name
 }
 
-// FieldsOf 返回 struct 的所有欄位資訊
-// 支援 json tag 解析，自動判斷 required（非 pointer 且無 omitempty）
+// FieldsOf 返回 struct 的所有 JSON 欄位資訊（依 encoding/json 規則）：
+//   - 未帶 json 名稱的內嵌 struct（含未匯出型別）展開成上層欄位，而非一個以型別名為鍵的 object
+//   - required = 非指標、無 omitempty / omitzero、且不在內嵌指標之下
+//
+// 結果寫進 manifest 的 InputFields / OutputFields，供 AI 理解 JSON 形狀
 func FieldsOf(v interface{}) []FieldInfo {
 	if v == nil {
 		return nil
@@ -46,42 +49,54 @@ func FieldsOf(v interface{}) []FieldInfo {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	return appendFields(make([]FieldInfo, 0, t.NumField()), t, false)
+}
 
-	fields := make([]FieldInfo, 0, t.NumField())
+// appendFields 為 FieldsOf 的遞迴實作；optional 表示位於內嵌指標之下（指標為 nil 時整組欄位不出現）
+// ponytail: 不處理同名欄位的遮蔽規則（較淺層者優先），實務上極少見
+func appendFields(out []FieldInfo, t reflect.Type, optional bool) []FieldInfo {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, opts, _ := strings.Cut(tag, ",")
+
+		if f.Anonymous && name == "" {
+			ft, isPtr := f.Type, f.Type.Kind() == reflect.Ptr
+			if isPtr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				if isPtr && !f.IsExported() {
+					continue // encoding/json 忽略未匯出型別的內嵌指標
+				}
+				out = appendFields(out, ft, optional || isPtr)
+				continue
+			}
+		}
 		if !f.IsExported() {
 			continue
 		}
-
-		jsonTag := f.Tag.Get("json")
-		jsonName := f.Name
-		omitempty := false
-
-		if jsonTag != "" && jsonTag != "-" {
-			parts := strings.Split(jsonTag, ",")
-			if parts[0] != "" {
-				jsonName = parts[0]
-			}
-			for _, opt := range parts[1:] {
-				if opt == "omitempty" {
-					omitempty = true
-				}
-			}
-		} else if jsonTag == "-" {
-			continue
+		if name == "" {
+			name = f.Name
 		}
-
-		required := !omitempty && f.Type.Kind() != reflect.Ptr
-
-		fields = append(fields, FieldInfo{
-			Name:     jsonName,
+		// omitzero（Go 1.24）與 omitempty 一樣：零值時根本不會序列化，不能算必填
+		omit := hasTagOpt(opts, "omitempty") || hasTagOpt(opts, "omitzero")
+		out = append(out, FieldInfo{
+			Name:     name,
 			Type:     goTypeToSchemaType(f.Type),
-			JSONTag:  jsonTag,
-			Required: required,
+			JSONTag:  tag,
+			Required: !optional && !omit && f.Type.Kind() != reflect.Ptr,
 		})
 	}
-	return fields
+	return out
+}
+
+// hasTagOpt 回報 json tag 的選項（逗號之後的部分）是否含 opt
+func hasTagOpt(opts, opt string) bool {
+	return strings.Contains(","+opts+",", ","+opt+",")
 }
 
 // ValidateJSON 驗證 JSON 資料是否符合指定的 Go struct 型別
@@ -119,37 +134,15 @@ func validateRequiredFields(data []byte, t reflect.Type) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil // 已在上層驗證過
 	}
+	// encoding/json 比對鍵名不分大小寫，必填檢查也要一致
+	present := make(map[string]struct{}, len(raw))
+	for k := range raw {
+		present[strings.ToLower(k)] = struct{}{}
+	}
 
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-
-		jsonTag := f.Tag.Get("json")
-		if jsonTag == "-" {
-			continue
-		}
-
-		jsonName := f.Name
-		omitempty := false
-		if jsonTag != "" {
-			parts := strings.Split(jsonTag, ",")
-			if parts[0] != "" {
-				jsonName = parts[0]
-			}
-			for _, opt := range parts[1:] {
-				if opt == "omitempty" {
-					omitempty = true
-				}
-			}
-		}
-
-		required := !omitempty && f.Type.Kind() != reflect.Ptr
-		if required {
-			if _, exists := raw[jsonName]; !exists {
-				return fmt.Errorf("missing required field: %s", jsonName)
-			}
+	for _, f := range appendFields(nil, t, false) {
+		if _, ok := present[strings.ToLower(f.Name)]; f.Required && !ok {
+			return fmt.Errorf("missing required field: %s", f.Name)
 		}
 	}
 	return nil

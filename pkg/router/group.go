@@ -232,19 +232,10 @@ func (g *Group) Schema(route schema.Route) *schema.SchemaRoute {
 	return schema.NewSchemaRoute(route, g)
 }
 
-// RegisterSchema 實作 schema.SchemaRegistrar 介面（Group 版本）
-// 同時將 handler 函式名稱寫入 route.HandlerNames，供 contract.Observe() 過濾使用
+// RegisterSchema 實作 schema.SchemaRegistrar 介面（Group 版本，見 schemaHandlers）
 func (g *Group) RegisterSchema(route schema.Route, handlers ...hypcontext.HandlerFunc) {
 	// route.Path 已由 Schema() 計算為絕對路徑
-	finalHandlers := g.combineHandlers(handlers)
-	g.router.addRoute(route.Method, route.Path, finalHandlers)
-	if len(route.HandlerNames) == 0 && len(handlers) > 0 {
-		names := make([]string, len(handlers))
-		for i, h := range handlers {
-			names[i] = nameOfFunction(h)
-		}
-		route.HandlerNames = names
-	}
+	g.router.addRoute(route.Method, route.Path, g.combineHandlers(schemaHandlers(&route, handlers)))
 	schema.Global().Register(route)
 }
 

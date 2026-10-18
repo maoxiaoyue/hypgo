@@ -5,6 +5,8 @@
 package schema
 
 import (
+	"strings"
+
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
@@ -104,26 +106,34 @@ type SchemaRoute struct {
 
 // NewSchemaRoute 建立新的 SchemaRoute builder
 func NewSchemaRoute(route Route, registrar SchemaRegistrar) *SchemaRoute {
-	// 自動填入型別名稱
+	return &SchemaRoute{
+		route:     normalize(route), // router 以正規化後的 Method 建路由樹
+		registrar: registrar,
+	}
+}
+
+// normalize 補齊衍生欄位：Method 轉大寫（"get" 原本會建出 "get" 路由樹，真正的 GET 請求 404）、
+// 自動填 InputName / OutputName 與 Responses 的 TypeName。
+// Responses 寫在副本上：先前直接改呼叫端的 map，多條路由共用同一個 map 時互相污染、並行註冊會競爭
+func normalize(route Route) Route {
+	route.Method = strings.ToUpper(route.Method)
 	if route.Input != nil && route.InputName == "" {
 		route.InputName = TypeName(route.Input)
 	}
 	if route.Output != nil && route.OutputName == "" {
 		route.OutputName = TypeName(route.Output)
 	}
-
-	// 自動填入 ResponseSchema 的 TypeName
-	for code, resp := range route.Responses {
-		if resp.Type != nil && resp.TypeName == "" {
-			resp.TypeName = TypeName(resp.Type)
-			route.Responses[code] = resp
+	if len(route.Responses) > 0 {
+		resps := make(map[int]ResponseSchema, len(route.Responses))
+		for code, resp := range route.Responses {
+			if resp.Type != nil && resp.TypeName == "" {
+				resp.TypeName = TypeName(resp.Type)
+			}
+			resps[code] = resp
 		}
+		route.Responses = resps
 	}
-
-	return &SchemaRoute{
-		route:     route,
-		registrar: registrar,
-	}
+	return route
 }
 
 // Handle 完成路由註冊並儲存 schema

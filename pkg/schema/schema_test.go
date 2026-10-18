@@ -149,10 +149,7 @@ func TestGenerateZeroJSONNil(t *testing.T) {
 // --- Registry ---
 
 func TestRegistryRegisterAndGet(t *testing.T) {
-	r := &Registry{
-		schemas: make([]Route, 0),
-		byKey:   make(map[string]*Route),
-	}
+	r := &Registry{}
 
 	route := Route{
 		Method:  "POST",
@@ -178,10 +175,7 @@ func TestRegistryRegisterAndGet(t *testing.T) {
 }
 
 func TestRegistryGetNotFound(t *testing.T) {
-	r := &Registry{
-		schemas: make([]Route, 0),
-		byKey:   make(map[string]*Route),
-	}
+	r := &Registry{}
 
 	_, ok := r.Get("GET", "/nonexistent")
 	if ok {
@@ -190,10 +184,7 @@ func TestRegistryGetNotFound(t *testing.T) {
 }
 
 func TestRegistryAll(t *testing.T) {
-	r := &Registry{
-		schemas: make([]Route, 0),
-		byKey:   make(map[string]*Route),
-	}
+	r := &Registry{}
 
 	r.Register(Route{Method: "GET", Path: "/a"})
 	r.Register(Route{Method: "POST", Path: "/b"})
@@ -205,10 +196,7 @@ func TestRegistryAll(t *testing.T) {
 }
 
 func TestRegistryUpdateExisting(t *testing.T) {
-	r := &Registry{
-		schemas: make([]Route, 0),
-		byKey:   make(map[string]*Route),
-	}
+	r := &Registry{}
 
 	r.Register(Route{Method: "GET", Path: "/api/v1", Summary: "v1"})
 	r.Register(Route{Method: "GET", Path: "/api/v1", Summary: "v1-updated"})
@@ -224,10 +212,7 @@ func TestRegistryUpdateExisting(t *testing.T) {
 }
 
 func TestRegistryReset(t *testing.T) {
-	r := &Registry{
-		schemas: make([]Route, 0),
-		byKey:   make(map[string]*Route),
-	}
+	r := &Registry{}
 
 	r.Register(Route{Method: "GET", Path: "/a"})
 	r.Reset()

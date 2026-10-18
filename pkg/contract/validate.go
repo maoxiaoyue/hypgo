@@ -88,7 +88,7 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 type jsonField struct {
 	reflect.StructField
 	name      string
-	omitempty bool
+	omitempty bool // omitempty 或 omitzero
 	optional  bool // 位於內嵌指標之下：指標為 nil 時整組欄位都不會出現
 }
 
@@ -151,8 +151,9 @@ func appendJSONFields(out []jsonField, t reflect.Type, optional bool) []jsonFiel
 		out = append(out, jsonField{
 			StructField: f,
 			name:        name,
-			omitempty:   strings.Contains(","+opts+",", ",omitempty,"),
-			optional:    optional,
+			// omitzero（Go 1.24）與 omitempty 一樣：零值時不會序列化，不能算必填
+			omitempty: strings.Contains(","+opts+",", ",omitempty,") || strings.Contains(","+opts+",", ",omitzero,"),
+			optional:  optional,
 		})
 	}
 	return out

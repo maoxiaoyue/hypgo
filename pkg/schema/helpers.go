@@ -12,12 +12,6 @@ func RegisterGRPC(command, summary string, input, output interface{}) {
 		Input:    input,
 		Output:   output,
 	}
-	if input != nil {
-		route.InputName = TypeName(input)
-	}
-	if output != nil {
-		route.OutputName = TypeName(output)
-	}
 	Global().Register(route)
 }
 
@@ -29,12 +23,6 @@ func RegisterCLI(command, summary string, input, output interface{}) {
 		Summary:  summary,
 		Input:    input,
 		Output:   output,
-	}
-	if input != nil {
-		route.InputName = TypeName(input)
-	}
-	if output != nil {
-		route.OutputName = TypeName(output)
 	}
 	Global().Register(route)
 }
@@ -48,12 +36,6 @@ func RegisterDesktop(command, summary string, input, output interface{}) {
 		Summary:  summary,
 		Input:    input,
 		Output:   output,
-	}
-	if input != nil {
-		route.InputName = TypeName(input)
-	}
-	if output != nil {
-		route.OutputName = TypeName(output)
 	}
 	Global().Register(route)
 }
