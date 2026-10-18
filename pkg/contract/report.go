@@ -35,7 +35,7 @@ func GenerateObserveHTML(results []ObserveResult, filter string) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(reportHTMLHeader(ts, filter, len(results), pass, fail, filterDisplay))
+	sb.WriteString(reportHTMLHeader(ts, len(results), pass, fail, filterDisplay))
 
 	for i, r := range results {
 		sb.WriteString(renderRouteCard(i, r))
@@ -46,7 +46,7 @@ func GenerateObserveHTML(results []ObserveResult, filter string) string {
 }
 
 // reportHTMLHeader 生成 HTML 文件頭部，包含完整 CSS、頁首與摘要列
-func reportHTMLHeader(ts, filter string, total, pass, fail int, filterDisplay string) string {
+func reportHTMLHeader(ts string, total, pass, fail int, filterDisplay string) string {
 	passRate := 0
 	if total > 0 {
 		passRate = pass * 100 / total
@@ -467,11 +467,7 @@ func renderRouteCard(idx int, r ObserveResult) string {
 		statusIcon = "❌"
 	}
 
-	method := r.Route.Method
-	if method == "" {
-		parts := strings.SplitN(r.Request.Method, " ", 2)
-		method = parts[0]
-	}
+	method := html.EscapeString(r.Route.Method)
 
 	// 為路徑中的 :param 加上樣式（僅用於顯示）
 	displayPath := highlightPathParams(r.Route.Path)

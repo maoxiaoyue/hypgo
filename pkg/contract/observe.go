@@ -8,8 +8,6 @@ package contract
 // date: 2026-05-23
 
 import (
-	"bytes"
-	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -182,11 +180,7 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		return nil
 	}
 
-	cfg := opt.Run
-	// 防禦性檢查：MaxWorkers 在 mergeObserveOpts 不做正規化，在此補齊
-	if cfg.MaxWorkers <= 0 {
-		cfg.MaxWorkers = runtime.GOMAXPROCS(0)
-	}
+	cfg := mergeRunConfig([]RunConfig{opt.Run})
 
 	// ── 並行路徑 ──────────────────────────────────────────────────────────
 	if cfg.Parallel && len(targets) > 1 {
@@ -210,7 +204,6 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 			if aborted.Load() {
 				break
 			}
-			route := route // capture
 
 			wg.Add(1)
 			go func() {
@@ -359,21 +352,7 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool)
 	// 解析 Route 字串（格式："METHOD /path"）
 	method, urlPath := parseRoute(tc.Route)
 
-	// 建立請求
-	req := httptest.NewRequest(method, urlPath, strings.NewReader(tc.Input))
-	if tc.Input != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range tc.Headers {
-		req.Header.Set(k, v)
-	}
-	if len(tc.Query) > 0 {
-		q := req.URL.Query()
-		for k, v := range tc.Query {
-			q.Set(k, v)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
+	req := tc.request(method, urlPath)
 
 	// 捕捉請求詳情
 	capturedReq := CapturedRequest{
@@ -431,7 +410,7 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool)
 	}
 
 	// 逐步驗證
-	steps, pass, failReason := runObserveValidation(route, tc, w.Code, respBody)
+	steps, pass, failReason := validateExchange(route, tc, w.Code, respBody)
 
 	return ObserveResult{
 		Route:      route,
@@ -448,88 +427,6 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool)
 		CPUTime:    cpuUsed,
 		Resources:  resUsed,
 	}
-}
-
-// runObserveValidation 逐步執行驗證並記錄每個步驟的結果
-//
-// @ai purpose: 四步驗證（狀態碼、回應 body 非空、Input schema、Output schema）
-// @ai input: schema.Route、TestCase（自動生成）、實際 HTTP 狀態碼、回應 body
-// @ai output: []ValidationStep、pass bool、reason string
-// @ai sideeffect: 無
-// date: 2026-05-23
-func runObserveValidation(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
-	pass = true
-
-	// Step 1：狀態碼
-	wantStatus := tc.ExpectStatus
-	statusOK := code == wantStatus
-	steps = append(steps, ValidationStep{
-		Name:   "Status Code",
-		Pass:   statusOK,
-		Detail: fmt.Sprintf("got %d, want %d", code, wantStatus),
-	})
-	if !statusOK {
-		pass = false
-		reason = fmt.Sprintf("status = %d, want %d", code, wantStatus)
-	}
-
-	// Step 2：回應 body 非空（有 Output schema 時）
-	if route.Output != nil {
-		bodyOK := len(bytes.TrimSpace(body)) > 0
-		steps = append(steps, ValidationStep{
-			Name:   "Response Body",
-			Pass:   bodyOK,
-			Detail: observeIfElse(bodyOK, "body present", "body is empty"),
-		})
-		if !bodyOK && pass {
-			pass = false
-			reason = "response body is empty"
-		}
-	}
-
-	// Step 3：Input schema 驗證
-	if route.Input != nil && tc.Input != "" {
-		err := validateRequest([]byte(tc.Input), route.Input)
-		inputOK := err == nil
-		var inputDetail string
-		if inputOK {
-			inputDetail = "matches schema"
-		} else {
-			inputDetail = err.Error()
-		}
-		steps = append(steps, ValidationStep{
-			Name:   fmt.Sprintf("Input Schema (%s)", route.InputName),
-			Pass:   inputOK,
-			Detail: inputDetail,
-		})
-		if !inputOK && pass { // 與 runTestOnce 一致：請求不符 Input schema 即失敗
-			pass = false
-			reason = "request schema validation failed: " + inputDetail
-		}
-	}
-
-	// Step 4：Output schema 驗證
-	if route.Output != nil && len(bytes.TrimSpace(body)) > 0 {
-		err := validateResponse(body, route.Output)
-		outOK := err == nil
-		var outDetail string
-		if outOK {
-			outDetail = "matches schema"
-		} else {
-			outDetail = err.Error()
-		}
-		steps = append(steps, ValidationStep{
-			Name:   fmt.Sprintf("Output Schema (%s)", route.OutputName),
-			Pass:   outOK,
-			Detail: outDetail,
-		})
-		if !outOK && pass {
-			pass = false
-			reason = err.Error()
-		}
-	}
-
-	return
 }
 
 // observeRouteMatchesFilter 判斷路由是否符合過濾字串
@@ -573,20 +470,6 @@ func mergeObserveOpts(opts []ObserveOptions) ObserveOptions {
 		return opts[0]
 	}
 	return ObserveOptions{}
-}
-
-// observeIfElse 為內部使用的三元表達式替代
-//
-// @ai purpose: 消除 if/else 的樣板程式碼
-// @ai input: cond bool、t string（true 時回傳）、f string（false 時回傳）
-// @ai output: string
-// @ai sideeffect: 無
-// date: 2026-05-23
-func observeIfElse(cond bool, t, f string) string {
-	if cond {
-		return t
-	}
-	return f
 }
 
 // openObserveBrowser 在預設瀏覽器中開啟指定路徑的 HTML 報告

@@ -13,59 +13,37 @@ import (
 )
 
 // validateResponse 驗證回應 body 是否符合 Output schema
-// 三層檢查：可反序列化 → 必填欄位存在 → validate: 約束（格式 / 範圍 / 列舉）
 func validateResponse(body []byte, outputType interface{}) error {
-	if outputType == nil {
-		return nil
-	}
-	if len(body) == 0 {
-		return fmt.Errorf("response body is empty")
-	}
-
-	t := reflect.TypeOf(outputType)
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	// 嘗試反序列化
-	instance := reflect.New(t).Interface()
-	if err := json.Unmarshal(body, instance); err != nil {
-		return fmt.Errorf("response does not match Output schema %s: %w", t.Name(), err)
-	}
-
-	// 驗證必填欄位
-	if err := validateRequiredFields(body, t); err != nil {
-		return err
-	}
-
-	// 驗證 validate: 約束
-	return validateConstraints(instance)
+	return validateBody(body, outputType, "response", "Output")
 }
 
 // validateRequest 驗證請求 body 是否符合 Input schema
-// 與 validateResponse 對稱：反序列化 → 必填欄位 → validate: 約束
 func validateRequest(body []byte, inputType interface{}) error {
-	if inputType == nil {
+	return validateBody(body, inputType, "request", "Input")
+}
+
+// validateBody 三層檢查：可反序列化 → 必填欄位存在 → validate: 約束（格式 / 範圍 / 列舉）。
+// kind / schemaName 只用於錯誤訊息（"response" / "Output"）
+func validateBody(body []byte, typ interface{}, kind, schemaName string) error {
+	if typ == nil {
 		return nil
 	}
 	if len(body) == 0 {
-		return fmt.Errorf("request body is empty")
+		return fmt.Errorf("%s body is empty", kind)
 	}
 
-	t := reflect.TypeOf(inputType)
+	t := reflect.TypeOf(typ)
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 
 	instance := reflect.New(t).Interface()
 	if err := json.Unmarshal(body, instance); err != nil {
-		return fmt.Errorf("request does not match Input schema %s: %w", t.Name(), err)
+		return fmt.Errorf("%s does not match %s schema %s: %w", kind, schemaName, t.Name(), err)
 	}
-
 	if err := validateRequiredFields(body, t); err != nil {
 		return err
 	}
-
 	return validateConstraints(instance)
 }
 

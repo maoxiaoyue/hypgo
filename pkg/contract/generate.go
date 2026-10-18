@@ -607,12 +607,13 @@ func resolvePath(path string) string {
 func guessParamValue(name string) string {
 	lower := strings.ToLower(name)
 	switch {
+	// uuid / guid 必須在 id 之前：兩者都含 "id"，先前此分支永遠走不到，:uuid 被填成 "1"
+	case strings.Contains(lower, "uuid"), strings.Contains(lower, "guid"):
+		return "00000000-0000-0000-0000-000000000000"
 	case strings.Contains(lower, "id"):
 		return "1"
 	case strings.Contains(lower, "slug"):
 		return "test-slug"
-	case strings.Contains(lower, "uuid"), strings.Contains(lower, "guid"):
-		return "00000000-0000-0000-0000-000000000000"
 	case strings.Contains(lower, "date"):
 		return "2026-06-10"
 	case strings.Contains(lower, "year"):

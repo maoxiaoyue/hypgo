@@ -12,8 +12,11 @@ package contract
 // date: 2026-05-23
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
@@ -88,40 +91,13 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route), nil
 	}
 
-	// 建立請求 body
-	var bodyStr string
-	if tc.Input != "" {
-		bodyStr = tc.Input
-	}
-	req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
-	if tc.Input != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	// 設定自訂標頭
-	for k, v := range tc.Headers {
-		req.Header.Set(k, v)
-	}
-
-	// 設定 query 參數
-	if len(tc.Query) > 0 {
-		q := req.URL.Query()
-		for k, v := range tc.Query {
-			q.Set(k, v)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	// 執行請求
+	req := tc.request(method, path)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// 驗證狀態碼
-	if tc.ExpectStatus > 0 && w.Code != tc.ExpectStatus {
-		return false, fmt.Sprintf("[%s] status = %d, want %d", tc.Route, w.Code, tc.ExpectStatus), nil
-	}
-
-	// 驗證 schema（TestAll 帶 schemaPath；手動 Test 以實際路徑比對路由樣式）
+	// 要驗 schema 時取得路由宣告（TestAll 帶 schemaPath；手動 Test 以實際路徑比對路由樣式）；
+	// 否則用零值，validateExchange 只檢查狀態碼
+	var route schema.Route
 	if tc.ExpectSchema {
 		var s *schema.Route
 		var ok bool
@@ -133,18 +109,10 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 		if !ok {
 			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
 		}
-		// 驗證 Input schema（請求 body）
-		if s.Input != nil && tc.Input != "" {
-			if err := validateRequest([]byte(tc.Input), s.Input); err != nil {
-				return false, fmt.Sprintf("[%s] request schema validation failed: %v", tc.Route, err), nil
-			}
-		}
-		// 驗證 Output schema（回應 body）
-		if s.Output != nil {
-			if err := validateResponse(w.Body.Bytes(), s.Output); err != nil {
-				return false, fmt.Sprintf("[%s] response schema validation failed: %v", tc.Route, err), nil
-			}
-		}
+		route = *s
+	}
+	if _, ok, why := validateExchange(route, tc, w.Code, w.Body.Bytes()); !ok {
+		return false, fmt.Sprintf("[%s] %s", tc.Route, why), nil
 	}
 
 	// 精確比對 body
@@ -163,6 +131,66 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 	}
 
 	return true, "", nil
+}
+
+// request 依 TestCase 組出請求；有 Input 時預設 Content-Type: application/json（Headers 可覆寫）
+func (tc TestCase) request(method, path string) *http.Request {
+	req := buildRequest(method, path, tc.Input, tc.Headers, tc.Query)
+	if tc.Input != "" && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req
+}
+
+// validateExchange 依序檢查一次 HTTP 交換：狀態碼 → 回應 body 非空 → Input schema → Output schema。
+// runTestOnce（Test / TestAll）與 Observe 共用，兩邊判定才不會分歧；reason 為第一個失敗步驟的原因。
+// route 沒有 Input / Output 時只檢查狀態碼；tc.ExpectStatus 為 0 時不檢查狀態碼
+func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
+	pass = true
+	step := func(name, okDetail string, err error) {
+		s := ValidationStep{Name: name, Pass: err == nil, Detail: okDetail}
+		if err != nil {
+			s.Detail = err.Error()
+			if pass {
+				pass, reason = false, s.Detail
+			}
+		}
+		steps = append(steps, s)
+	}
+
+	if tc.ExpectStatus > 0 {
+		var err error
+		if code != tc.ExpectStatus {
+			err = fmt.Errorf("status = %d, want %d", code, tc.ExpectStatus)
+		}
+		step("Status Code", fmt.Sprintf("got %d, want %d", code, tc.ExpectStatus), err)
+	}
+
+	hasBody := len(bytes.TrimSpace(body)) > 0
+	if route.Output != nil {
+		var err error
+		if !hasBody {
+			err = errors.New("response body is empty")
+		}
+		step("Response Body", "body present", err)
+	}
+
+	if route.Input != nil && tc.Input != "" {
+		var err error
+		if e := validateRequest([]byte(tc.Input), route.Input); e != nil {
+			err = fmt.Errorf("request schema validation failed: %w", e)
+		}
+		step(fmt.Sprintf("Input Schema (%s)", route.InputName), "matches schema", err)
+	}
+
+	if route.Output != nil && hasBody {
+		var err error
+		if e := validateResponse(body, route.Output); e != nil {
+			err = fmt.Errorf("response schema validation failed: %w", e)
+		}
+		step(fmt.Sprintf("Output Schema (%s)", route.OutputName), "matches schema", err)
+	}
+	return steps, pass, reason
 }
 
 // runGraders 依序執行 TestCase 的評判器並聚合分數（等權平均）。
@@ -269,8 +297,6 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 	}
 
 	for _, route := range routes {
-		route := route // capture for goroutine / closure
-
 		if route.IsREST() {
 			name := route.Method + " " + route.Path
 			t.Run(name, func(t *testing.T) {

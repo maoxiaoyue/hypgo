@@ -16,6 +16,7 @@ package contract
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -116,6 +117,22 @@ func (b *RequestBuilder) Expect(status int) *RequestBuilder {
 	return b
 }
 
+// buildRequest 組出測試請求（body、標頭、query），RequestBuilder 與 TestCase 共用
+func buildRequest(method, target, body string, headers, query map[string]string) *http.Request {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if len(query) > 0 {
+		q := req.URL.Query()
+		for k, v := range query {
+			q.Set(k, v)
+		}
+		req.URL.RawQuery = q.Encode()
+	}
+	return req
+}
+
 // Run 執行測試請求並回傳結果
 func (b *RequestBuilder) Run(t *testing.T) *TestResult {
 	t.Helper()
@@ -123,27 +140,8 @@ func (b *RequestBuilder) Run(t *testing.T) *TestResult {
 		t.Fatalf("%s %s: %v", b.method, b.path, b.err)
 	}
 
-	// 建立請求
-	bodyReader := strings.NewReader(b.body)
-	req := httptest.NewRequest(b.method, b.path, bodyReader)
-
-	// 設定 headers
-	for k, v := range b.headers {
-		req.Header.Set(k, v)
-	}
-
-	// 設定 query
-	if len(b.query) > 0 {
-		q := req.URL.Query()
-		for k, v := range b.query {
-			q.Set(k, v)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	// 執行
 	w := httptest.NewRecorder()
-	b.router.ServeHTTP(w, req)
+	b.router.ServeHTTP(w, buildRequest(b.method, b.path, b.body, b.headers, b.query))
 
 	result := &TestResult{
 		Status:  w.Code,

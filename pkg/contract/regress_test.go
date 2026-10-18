@@ -143,7 +143,7 @@ func TestObserveReportsFailuresToT(t *testing.T) {
 		N int `json:"n" validate:"min=5"`
 	}
 	tc := TestCase{ExpectStatus: 200, Input: `{"n":1}`}
-	_, pass, reason := runObserveValidation(schema.Route{Input: in{}}, tc, 200, nil)
+	_, pass, reason := validateExchange(schema.Route{Input: in{}}, tc, 200, nil)
 	if pass {
 		t.Error("Input schema violation must fail the observe result")
 	} else if !strings.Contains(reason, "request schema") {
@@ -204,5 +204,20 @@ func TestFixtureAndReportEdgeCases(t *testing.T) {
 	html := GenerateObserveHTML([]ObserveResult{{Route: schema.Route{Method: "GET", Path: "/"}, Pass: true}}, "<script>")
 	if strings.Contains(html, "<script>」") {
 		t.Error("filter is inserted into the report without HTML escaping")
+	}
+}
+
+// TestResolvePathUUIDParam 回歸測試：:uuid / :guid 參數要填 UUID。
+// 歷史 bug：guessParamValue 先判斷是否含 "id"，而 uuid、guid 都含 "id"，UUID 分支永遠走不到。
+func TestResolvePathUUIDParam(t *testing.T) {
+	const uuid = "00000000-0000-0000-0000-000000000000"
+	for path, want := range map[string]string{
+		"/files/:uuid": "/files/" + uuid,
+		"/files/:guid": "/files/" + uuid,
+		"/users/:id":   "/users/1",
+	} {
+		if got := resolvePath(path); got != want {
+			t.Errorf("resolvePath(%q) = %q, want %q", path, got, want)
+		}
 	}
 }
