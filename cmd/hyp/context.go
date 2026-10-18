@@ -20,7 +20,7 @@ var contextCmd = &cobra.Command{
 routes, configuration, and schema metadata.
 
 The manifest enables AI tools to understand the project structure with
-minimal tokens (~500 tokens vs ~5,000 for reading source files).
+a fraction of the tokens needed to read the source files.
 
 Routes are registered by your own code, so this command runs the project
 (go run <pkg>) with HYPGO_MANIFEST_OUT set: server.Start() writes the manifest

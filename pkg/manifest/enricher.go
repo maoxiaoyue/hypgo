@@ -5,8 +5,6 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
 // EnrichConfig 控制 Manifest 自動推斷行為
@@ -17,7 +15,7 @@ type EnrichConfig struct {
 	// InferTags 從路徑推斷 Tags（預設 true）
 	InferTags bool
 
-	// IncludeFields 在 manifest 中包含 Input/Output 的欄位資訊（預設 true）
+	// IncludeFields 在 manifest 的 types 區段列出路由引用型別的欄位（預設 true）
 	IncludeFields bool
 
 	// LLMEnricher 可選的 LLM 增強器（nil 表示不使用）
@@ -44,22 +42,11 @@ type LLMEnricher interface {
 	EnrichRoutes(routes []RouteManifest)
 }
 
-// enrichRoute 為單條路由補上 Tags 與 Input / Output 欄位資訊。
+// enrichRoute 為單條路由推斷 Tags（LLM 不產生 tags，先填好可一併作為 prompt 的上下文）。
 // Summary / Description 要等全部路由收集完才由 enrichSummaries 處理（LLM 需整批送出）
-func enrichRoute(rm *RouteManifest, schemaRoute *schema.Route, cfg EnrichConfig) {
-	// 推斷 Tags（LLM 不產生 tags，先填好可一併作為 prompt 的上下文）
+func enrichRoute(rm *RouteManifest, cfg EnrichConfig) {
 	if cfg.InferTags && len(rm.Tags) == 0 {
 		rm.Tags = inferTags(rm)
-	}
-
-	// 填入欄位資訊
-	if cfg.IncludeFields && schemaRoute != nil {
-		if schemaRoute.Input != nil {
-			rm.InputFields = schema.FieldsOf(schemaRoute.Input)
-		}
-		if schemaRoute.Output != nil {
-			rm.OutputFields = schema.FieldsOf(schemaRoute.Output)
-		}
 	}
 }
 

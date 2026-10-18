@@ -50,9 +50,12 @@ func TestDefaultManifestIncludesFields(t *testing.T) {
 	r := router.New()
 	r.Schema(schema.Route{Method: "POST", Path: "/f", Input: regressIn{}}).Handle(listOrdersHandler)
 
-	rm := routeByPath(NewCollector(r, nil).Collect(), "/f")
-	if rm == nil || len(rm.InputFields) != 1 || rm.InputFields[0].Name != "name" {
-		t.Errorf("InputFields = %+v, want [name]", rm)
+	m := NewCollector(r, nil).Collect()
+	if rm := routeByPath(m, "/f"); rm == nil || rm.InputType != "regressIn" {
+		t.Fatalf("route = %+v, want input_type regressIn", rm)
+	}
+	if f := m.Types["regressIn"]; len(f) != 1 || f[0].Name != "name" {
+		t.Errorf("types[regressIn] = %+v, want [name]", f)
 	}
 }
 

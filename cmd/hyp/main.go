@@ -14,7 +14,7 @@ var (
 		Long: `HypGo CLI - Modern Go web framework with AI-human collaborative development.
 
 AI Collaboration:
-  context        Generate project manifest for AI tools (~500 tokens vs ~5,000)
+  context        Generate project manifest for AI tools
   ai-rules       Generate config files for Codex, Gemini, Cursor, Copilot, Windsurf
   chkcomment     Check annotation completeness in Go source files
   impact         Analyze change impact before modifying shared packages

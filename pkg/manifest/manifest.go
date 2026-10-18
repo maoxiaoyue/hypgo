@@ -12,16 +12,20 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
-// Manifest 描述整個 HypGo 應用程式的結構
+// Manifest 描述整個 HypGo 應用程式的結構。
+// 欄位依「越少變動越前面」排列，generated_at 在最後：manifest 放進 AI 的固定 prompt 前綴時，
+// prompt cache 從第一個變動處開始失效，先前 generated_at 在第 3 行，內容一有變動整份都要重新計價
 type Manifest struct {
-	Version     string          `json:"version" yaml:"version"`
-	Framework   string          `json:"framework" yaml:"framework"`
-	GeneratedAt time.Time       `json:"generated_at" yaml:"generated_at"`
-	Server      ServerInfo      `json:"server" yaml:"server"`
-	Routes      []RouteManifest `json:"routes" yaml:"routes"`
-	Models      []ModelManifest `json:"models,omitempty" yaml:"models,omitempty"`
-	Database    *DatabaseInfo   `json:"database,omitempty" yaml:"database,omitempty"`
-	Lint        *LintReport     `json:"lint,omitempty" yaml:"lint,omitempty"`
+	Version   string          `json:"version" yaml:"version"`
+	Framework string          `json:"framework" yaml:"framework"`
+	Server    ServerInfo      `json:"server" yaml:"server"`
+	Database  *DatabaseInfo   `json:"database,omitempty" yaml:"database,omitempty"`
+	Routes    []RouteManifest `json:"routes" yaml:"routes"`
+	// Types 路由引用的型別欄位，每個型別只列一次（EnrichConfig.IncludeFields）
+	Types       map[string]TypeFields `json:"types,omitempty" yaml:"types,omitempty"`
+	Models      []ModelManifest       `json:"models,omitempty" yaml:"models,omitempty"`
+	Lint        *LintReport           `json:"lint,omitempty" yaml:"lint,omitempty"`
+	GeneratedAt time.Time             `json:"generated_at" yaml:"generated_at"`
 }
 
 // LintReport 描述 Schema 完整度檢查結果
@@ -49,20 +53,20 @@ type ServerInfo struct {
 
 // RouteManifest 描述單一路由（含 schema metadata，支援多協議）
 type RouteManifest struct {
-	// 多協議支援
-	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest", "grpc", "bot", "mcp", "websocket", "cli"
+	// 多協議支援；REST 路由留空（省略輸出），其餘為 "grpc", "bot", "mcp", "websocket", "cli"
+	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"`
 	Command  string `json:"command,omitempty" yaml:"command,omitempty"`   // 非 REST 命令標識
 	Platform string `json:"platform,omitempty" yaml:"platform,omitempty"` // bot 專用平台
 
 	// REST 欄位
 	Method       string   `json:"method,omitempty" yaml:"method,omitempty"`
 	Path         string   `json:"path,omitempty" yaml:"path,omitempty"`
-	HandlerNames []string `json:"handler_names,omitempty" yaml:"handler_names,omitempty"`
+	HandlerNames []string `json:"handler_names,omitempty" yaml:"handler_names,omitempty,flow"`
 
 	// 共用 metadata
 	Summary     string         `json:"summary,omitempty" yaml:"summary,omitempty"`
 	Description string         `json:"description,omitempty" yaml:"description,omitempty"`
-	Tags        []string       `json:"tags,omitempty" yaml:"tags,omitempty"`
+	Tags        []string       `json:"tags,omitempty" yaml:"tags,omitempty,flow"`
 	InputType   string         `json:"input_type,omitempty" yaml:"input_type,omitempty"`
 	OutputType  string         `json:"output_type,omitempty" yaml:"output_type,omitempty"`
 	Responses   map[int]string `json:"responses,omitempty" yaml:"responses,omitempty"`
@@ -70,10 +74,6 @@ type RouteManifest struct {
 	ResponseTypes map[int]string        `json:"response_types,omitempty" yaml:"response_types,omitempty"`
 	Params        []schema.ParamSchema  `json:"params,omitempty" yaml:"params,omitempty"`
 	Headers       []schema.HeaderSchema `json:"headers,omitempty" yaml:"headers,omitempty"`
-
-	// 推斷/增強的欄位（IncludeFields 開啟時填入）
-	InputFields  []schema.FieldInfo `json:"input_fields,omitempty" yaml:"input_fields,omitempty"`
-	OutputFields []schema.FieldInfo `json:"output_fields,omitempty" yaml:"output_fields,omitempty"`
 }
 
 // DatabaseInfo 描述資料庫配置
