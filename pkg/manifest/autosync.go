@@ -99,6 +99,8 @@ func (a *AutoSync) Sync() error {
 	// 構建 collector：若 llmCfg 啟用，建立 enricher 並掛上錯誤回報 callback
 	enrichCfg := DefaultEnrichConfig()
 	var errCount int64
+	var cache *cachingEnricher
+	cachePath := filepath.Join(dir, DefaultLLMCacheFilename)
 
 	if llmCfg != nil && llmCfg.IsEnabled() {
 		reporter := a.buildErrorReporter(&errCount)
@@ -108,14 +110,16 @@ func (a *AutoSync) Sync() error {
 				a.logger.Warningf("AutoSync: LLM enricher init failed (%v); using pure Go inference", err)
 			}
 		} else if enricher != nil {
-			enrichCfg.LLMEnricher = enricher
+			// detail 同時是快取鍵的模型識別：換 provider / model 即重新產生
+			detail := string(llmCfg.Mode)
+			if llmCfg.Mode == config.LLMModeAPI {
+				detail = "api/" + llmCfg.API.Provider + "/" + llmCfg.API.Model
+			} else if llmCfg.Mode == config.LLMModeOllama {
+				detail = "ollama/" + llmCfg.Ollama.Model
+			}
+			cache = newCachingEnricher(enricher, detail, loadLLMCache(cachePath))
+			enrichCfg.LLMEnricher = cache
 			if a.logger != nil {
-				detail := string(llmCfg.Mode)
-				if llmCfg.Mode == config.LLMModeAPI {
-					detail = "api/" + llmCfg.API.Provider + "/" + llmCfg.API.Model
-				} else if llmCfg.Mode == config.LLMModeOllama {
-					detail = "ollama/" + llmCfg.Ollama.Model
-				}
 				a.logger.Infof("AutoSync: LLM enrichment enabled (%s)", detail)
 			}
 		}
@@ -123,6 +127,15 @@ func (a *AutoSync) Sync() error {
 
 	collector := NewCollectorWithModelsAndEnrich(a.router, a.appCfg, migrate.GlobalRegistry(), enrichCfg)
 	m := collector.Collect()
+
+	if cache != nil {
+		if err := cache.save(cachePath); err != nil && a.logger != nil {
+			a.logger.Warningf("AutoSync: save LLM cache %s: %v", cachePath, err)
+		}
+		if hits, misses := cache.stats(); a.logger != nil {
+			a.logger.Infof("AutoSync: LLM enrichment %d cached, %d requested", hits, misses)
+		}
+	}
 
 	// 若 LLM 期間累積了錯誤，給一條 summary（避免使用者誤以為 LLM 有生效）
 	if total := atomic.LoadInt64(&errCount); total > maxEnricherErrorsReported && a.logger != nil {
