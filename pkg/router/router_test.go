@@ -168,13 +168,15 @@ func TestRouter_EnableHTTP3(t *testing.T) {
 
 	r.GET("/test", func(c *hypcontext.Context) {})
 
+	// Alt-Svc 由 server 依實際監聽位址設定，router 不得覆寫。
+	// 歷史 bug：EnableHTTP3 後 router 每個請求寫死 h3=":443"，蓋掉 server 設好的正確埠
 	w := httptest.NewRecorder()
+	w.Header().Set("Alt-Svc", `h3=":8443"; ma=86400`) // server.wrapHandler 先設好的值
 	req, _ := http.NewRequest("GET", "/test", nil)
 	r.ServeHTTP(w, req)
 
-	// Check if Alt-Svc header is injected
-	if w.Header().Get("Alt-Svc") == "" {
-		t.Errorf("Expected Alt-Svc header for HTTP/3")
+	if got := w.Header().Get("Alt-Svc"); got != `h3=":8443"; ma=86400` {
+		t.Errorf("router overwrote Alt-Svc: %q", got)
 	}
 }
 

@@ -3,6 +3,7 @@ package router
 
 import (
 	"net/http"
+	"strings"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
@@ -102,7 +103,7 @@ func (g *Group) BasePath() string {
 	return g.basePath
 }
 
-// GroupUse 為路由組添加中間件
+// GroupUse 為路由組添加中間件，只影響之後註冊的路由（中間件鏈在註冊時合併）
 // 返回 *Group 以支援鏈式調用
 //
 // EX：
@@ -179,23 +180,19 @@ func (g *Group) Any(relativePath string, handlers ...hypcontext.HandlerFunc) IRo
 	return g.returnObj()
 }
 
-// Match 註冊指定多個 HTTP 方法的路由
+// Match 註冊指定多個 HTTP 方法的路由（方法名稱同 Handle 驗證，"get" 等無效名稱會 panic）
 func (g *Group) Match(methods []string, relativePath string, handlers ...hypcontext.HandlerFunc) IRoutes {
 	for _, method := range methods {
-		g.handle(method, relativePath, handlers)
+		g.Handle(method, relativePath, handlers...)
 	}
 	return g.returnObj()
 }
 
-// Static 服務靜態文件目錄
+// Static 服務靜態文件目錄。
+// 委派給 StaticFS：先前自己拼 relativePath+"/*filepath"，Static("/assets/", …) 會產生
+// "/assets//*filepath" 而全部 404；且每個請求都重建 http.StripPrefix
 func (g *Group) Static(relativePath, dir string) IRoutes {
-	absolutePath := joinPaths(g.basePath, relativePath)
-	fs := http.FileServer(http.Dir(dir))
-	handler := func(c *hypcontext.Context) {
-		http.StripPrefix(absolutePath, fs).ServeHTTP(c.Writer, c.Request)
-	}
-	g.handle(http.MethodGet, relativePath+"/*filepath", []hypcontext.HandlerFunc{handler})
-	return g.returnObj()
+	return g.StaticFS(relativePath, http.Dir(dir))
 }
 
 // StaticFile 服務單個靜態文件
@@ -216,7 +213,7 @@ func (g *Group) StaticFS(relativePath string, fs http.FileSystem) IRoutes {
 		fileServer.ServeHTTP(c.Writer, c.Request)
 	}
 	urlPattern := relativePath
-	if urlPattern[len(urlPattern)-1] != '/' {
+	if !strings.HasSuffix(urlPattern, "/") { // 空字串時先前 urlPattern[len-1] 會 panic
 		urlPattern += "/"
 	}
 	urlPattern += "*filepath"

@@ -4,8 +4,10 @@ package router
 import (
 	"html/template"
 	"net/http"
+	"net/url"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"unsafe"
 
@@ -17,13 +19,10 @@ import (
 type Router struct {
 	Group                             // 嵌入根路由組
 	trees    map[string]*radixNode    // 每個 HTTP 方法一棵 Radix Tree
-	cache    *routeCache              // LRU 路由快取
 	globalMW []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
 
 	// 配置
 	maxParams              int
-	enableCache            bool
-	cacheSize              int
 	caseSensitive          bool
 	strictSlash            bool
 	handleMethodNotAllowed bool
@@ -53,15 +52,6 @@ type Param = hypcontext.Param
 
 // RouterOption 路由器選項
 type RouterOption func(*Router)
-
-// WithCache 設置快取大小
-func WithCache(size int) RouterOption {
-	return func(r *Router) {
-		r.enableCache = true
-		r.cacheSize = size
-		r.cache = newRouteCache(size)
-	}
-}
 
 // WithMaxParams 設置最大參數數
 func WithMaxParams(n int) RouterOption {
@@ -95,11 +85,8 @@ func WithMethodNotAllowed(enabled bool) RouterOption {
 func New(opts ...RouterOption) *Router {
 	r := &Router{
 		trees:                  make(map[string]*radixNode),
-		cache:                  newRouteCache(1000),
 		globalMW:               make([]hypcontext.HandlerFunc, 0),
 		maxParams:              10,
-		enableCache:            true,
-		cacheSize:              1000,
 		caseSensitive:          false,
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
@@ -123,7 +110,8 @@ func New(opts ...RouterOption) *Router {
 }
 
 // addRoute 註冊路由到 Radix Tree
-// 這是所有路由的最終入口，由 Group.handle() 調用
+// 這是所有路由的最終入口，由 Group.handle() 調用。
+// 路由須在開始服務前註冊完成：radix tree 不加鎖，服務中途註冊會與查找產生 data race
 func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.HandlerFunc) {
 	if absolutePath == "" {
 		panic("router: path cannot be empty")
@@ -165,30 +153,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	urlPath := req.URL.Path
 	method := req.Method
 
-	// HTTP/3 Alt-Svc 標頭
-	if r.http3Config != nil && r.http3Config.Enabled {
-		w.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
-	}
-
-	// 快取查找（僅靜態路由，無參數）
-	if r.enableCache {
-		if handlers := r.cache.get(method + urlPath); handlers != nil {
-			r.executeHandlers(c, handlers)
-			return
-		}
-	}
+	// Alt-Svc 由 server.wrapHandler 依實際監聽位址設定。先前這裡在 EnableHTTP3 後
+	// 每個請求寫死 h3=":443"，蓋掉 server 設好的正確值，客戶端往錯的埠嘗試 HTTP/3。
+	//
+	// 不再有路由快取：radix tree 的靜態查找本身零分配，快取只多出 method+path 字串拼接
+	// 與 sync.Map 成本（500 條路由實測：有快取 71ns / 1 alloc，無快取 56ns / 0 alloc）
 
 	// Radix Tree 查找：參數直接 search 進 Context 自帶的緩衝（c.Params 經
 	// reset 後為長度 0 的自帶緩衝），帶參數路由零分配
 	if root := r.trees[method]; root != nil {
 		if handlers, params := root.search(urlPath, c.Params[:0]); handlers != nil {
 			c.Params = params
-
-			// 只快取靜態路由（無參數）
-			if r.enableCache && len(params) == 0 {
-				r.cache.put(method+urlPath, handlers)
-			}
-
 			r.executeHandlers(c, handlers)
 			return
 		}
@@ -205,8 +180,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 尾部斜線重導向
-	if r.strictSlash {
+	// 尾部斜線重導向（URL.Path 可能為空，例如 HTTP/2 CONNECT）
+	if r.strictSlash && urlPath != "" {
 		var tryPath string
 		if urlPath[len(urlPath)-1] == '/' {
 			tryPath = urlPath[:len(urlPath)-1]
@@ -215,8 +190,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		if root := r.trees[method]; root != nil {
 			if handlers, _ := root.search(tryPath, nil); handlers != nil {
-				req.URL.Path = tryPath
-				http.Redirect(w, req, tryPath, http.StatusMovedPermanently)
+				r.executeHandlers(c, []hypcontext.HandlerFunc{trailingSlashRedirect(method, tryPath, req.URL.RawQuery)})
 				return
 			}
 		}
@@ -224,22 +198,54 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// 405 Method Not Allowed
 	if r.handleMethodNotAllowed {
+		var allow []string
 		for m, tree := range r.trees {
 			if m == method {
 				continue
 			}
 			if handlers, _ := tree.search(urlPath, nil); handlers != nil {
-				// 走 executeHandlers 讓 405 也經過全域中間件：
-				// 直接呼叫會讓 Recovery / Logger / CORS / Security 全部跳過，
-				// 自訂 handler 內的 panic 直接穿透到 net/http（連線被斷而非 500）
-				r.executeHandlers(c, []hypcontext.HandlerFunc{r.methodNotAllowedHandler()})
-				return
+				allow = append(allow, m)
 			}
+		}
+		if len(allow) > 0 {
+			// RFC 9110 §15.5.6：405 必須帶 Allow。有 GET 即可 HEAD（見上方 HEAD 自動回應）
+			if containsString(allow, http.MethodGet) && !containsString(allow, http.MethodHead) {
+				allow = append(allow, http.MethodHead)
+			}
+			sort.Strings(allow)
+			c.Header("Allow", strings.Join(allow, ", "))
+			// 走 executeHandlers 讓 405 也經過全域中間件：
+			// 直接呼叫會讓 Recovery / Logger / CORS / Security 全部跳過，
+			// 自訂 handler 內的 panic 直接穿透到 net/http（連線被斷而非 500）
+			r.executeHandlers(c, []hypcontext.HandlerFunc{r.methodNotAllowedHandler()})
+			return
 		}
 	}
 
 	// 404 Not Found（同樣經過全域中間件）
 	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
+}
+
+// trailingSlashRedirect 回傳尾斜線重導向的 handler。經 executeHandlers 執行，全域中間件
+// （CORS / Security…）照常套用；以 c.Redirect 寫入 c.Writer，不會與 router 收尾的
+// WriteHeaderNow 重複寫標頭。先前直接 http.Redirect 到底層 writer：中間件全被跳過、
+// 每次重導向 server log 多兩行 superfluous WriteHeader；且一律 301 又丟掉 query string
+func trailingSlashRedirect(method, path, rawQuery string) hypcontext.HandlerFunc {
+	code := http.StatusMovedPermanently
+	if method != http.MethodGet && method != http.MethodHead {
+		code = http.StatusPermanentRedirect // 308：保留方法與 body；301 會讓瀏覽器把 POST 改成 GET
+	}
+	location := (&url.URL{Path: path, RawQuery: rawQuery}).RequestURI()
+	return func(c *hypcontext.Context) { c.Redirect(code, location) }
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // notFoundHandler 回傳 404 處理器（自訂或預設）
@@ -298,7 +304,7 @@ func (r *Router) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 	r.handleMethodNotAllowed = true
 }
 
-// EnableHTTP3 啟用 HTTP/3 支援
+// EnableHTTP3 記錄 HTTP/3 設定。Alt-Svc 廣告由 server 依實際監聽位址處理，router 不再寫入
 func (r *Router) EnableHTTP3(config *HTTP3Config) {
 	if config == nil {
 		config = &HTTP3Config{
