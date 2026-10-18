@@ -104,7 +104,7 @@ func (a *AutoSync) Sync() error {
 
 	if llmCfg != nil && llmCfg.IsEnabled() {
 		reporter := a.buildErrorReporter(&errCount)
-		enricher, err := NewLLMEnricherFromConfigWithReporter(llmCfg, reporter)
+		enricher, err := NewLLMEnricherFromConfig(llmCfg, reporter)
 		if err != nil {
 			if a.logger != nil {
 				a.logger.Warningf("AutoSync: LLM enricher init failed (%v); using pure Go inference", err)
@@ -125,7 +125,7 @@ func (a *AutoSync) Sync() error {
 		}
 	}
 
-	collector := NewCollectorWithModelsAndEnrich(a.router, a.appCfg, migrate.GlobalRegistry(), enrichCfg)
+	collector := newCollector(a.router, a.appCfg, migrate.GlobalRegistry(), enrichCfg)
 	m := collector.Collect()
 
 	if cache != nil {

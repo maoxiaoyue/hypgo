@@ -25,7 +25,6 @@ Output includes:
   - All registered routes with method, path, and handler names
   - Schema metadata (Input/Output types, summary, tags) if available
   - Database configuration (driver, replicas)
-  - Middleware stack
 
 The manifest is also auto-generated on Server.Start() via AutoSync
 and saved to .hyp/context.yaml. This command allows you to generate

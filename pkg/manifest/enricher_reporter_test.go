@@ -40,7 +40,7 @@ func TestAPIEnricher_ReportsHTTPError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	enricher, err := NewLLMEnricherFromConfigWithReporter(cfg, reporter)
+	enricher, err := NewLLMEnricherFromConfig(cfg, reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestAPIEnricher_NilReporterDoesNotPanic(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	enricher, err := NewLLMEnricherFromConfig(cfg) // 沒傳 reporter
+	enricher, err := NewLLMEnricherFromConfig(cfg, nil) // 沒傳 reporter
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,6 @@ type Manifest struct {
 	Server      ServerInfo      `json:"server" yaml:"server"`
 	Routes      []RouteManifest `json:"routes" yaml:"routes"`
 	Models      []ModelManifest `json:"models,omitempty" yaml:"models,omitempty"`
-	Middleware  []string        `json:"middleware,omitempty" yaml:"middleware,omitempty"`
 	Database    *DatabaseInfo   `json:"database,omitempty" yaml:"database,omitempty"`
 	Lint        *LintReport     `json:"lint,omitempty" yaml:"lint,omitempty"`
 }

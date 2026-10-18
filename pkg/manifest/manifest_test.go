@@ -248,7 +248,7 @@ func TestCollectorWithModels(t *testing.T) {
 	r := router.New()
 	registry := setupModelRegistry()
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	if len(m.Models) != 2 {
@@ -270,7 +270,7 @@ func TestCollectorModelStructName(t *testing.T) {
 	registry := migrate.NewRegistry()
 	registry.Register((*testUser)(nil))
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	if len(m.Models) != 1 {
@@ -290,7 +290,7 @@ func TestCollectorModelFields(t *testing.T) {
 	registry := migrate.NewRegistry()
 	registry.Register((*testUser)(nil))
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	fields := m.Models[0].Fields
@@ -341,7 +341,7 @@ func TestCollectorModelDefault(t *testing.T) {
 	registry := migrate.NewRegistry()
 	registry.Register((*testUser)(nil))
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	fields := m.Models[0].Fields
@@ -364,7 +364,7 @@ func TestCollectorNilModelRegistry(t *testing.T) {
 	schema.Global().Reset()
 	r := router.New()
 
-	c := NewCollectorWithModels(r, nil, nil)
+	c := newCollector(r, nil, nil, DefaultEnrichConfig())
 	m := c.Collect()
 
 	if m.Models != nil {
@@ -377,7 +377,7 @@ func TestCollectorEmptyModelRegistry(t *testing.T) {
 	r := router.New()
 	registry := migrate.NewRegistry() // 空的 registry
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	if m.Models != nil {
@@ -390,7 +390,7 @@ func TestManifestModelsInYAML(t *testing.T) {
 	r := router.New()
 	registry := setupModelRegistry()
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	var buf bytes.Buffer
@@ -415,7 +415,7 @@ func TestManifestModelsInJSON(t *testing.T) {
 	r := router.New()
 	registry := setupModelRegistry()
 
-	c := NewCollectorWithModels(r, nil, registry)
+	c := newCollector(r, nil, registry, DefaultEnrichConfig())
 	m := c.Collect()
 
 	var buf bytes.Buffer

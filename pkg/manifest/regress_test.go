@@ -65,7 +65,7 @@ func TestLLMSummaryIsUsed(t *testing.T) {
 	r.Schema(schema.Route{Method: "GET", Path: "/api/orders"}).Handle(listOrdersHandler)
 	r.Schema(schema.Route{Method: "GET", Path: "/api/declared", Summary: "Human summary"}).Handle(listOrdersHandler)
 
-	enr, err := NewLLMEnricherFromConfig(fakeOllama(t, 0))
+	enr, err := NewLLMEnricherFromConfig(fakeOllama(t, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestLLMSummaryIsUsed(t *testing.T) {
 		t.Errorf("declared summary overwritten: %q", got.Summary)
 	}
 
-	broken, _ := NewLLMEnricherFromConfig(&config.LLMConfig{Mode: config.LLMModeOllama, Ollama: config.OllamaConfig{URL: "http://127.0.0.1:1", Model: "m", Timeout: 1}})
+	broken, _ := NewLLMEnricherFromConfig(&config.LLMConfig{Mode: config.LLMModeOllama, Ollama: config.OllamaConfig{URL: "http://127.0.0.1:1", Model: "m", Timeout: 1}}, nil)
 	cfg.LLMEnricher = broken
 	if got := routeByPath(NewCollectorWithEnrich(r, nil, cfg).Collect(), "/api/orders"); got.Summary == "" {
 		t.Error("summary inference must still run when the LLM fails")
