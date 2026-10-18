@@ -10,6 +10,8 @@ package contract
 import (
 	"fmt"
 	"html"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -620,7 +622,8 @@ func renderRouteCard(idx int, r ObserveResult) string {
 
 	sb.WriteString(`
         <div class="http-headers">`)
-	for k, v := range r.Request.Headers {
+	for _, k := range slices.Sorted(maps.Keys(r.Request.Headers)) { // 固定順序，報告可 diff
+		v := r.Request.Headers[k]
 		fmt.Fprintf(&sb, `
           <div class="http-header-row">
             <span class="header-key">%s</span>
@@ -650,7 +653,8 @@ func renderRouteCard(idx int, r ObserveResult) string {
 
 	sb.WriteString(`
         <div class="http-headers">`)
-	for k, v := range r.Response.Headers {
+	for _, k := range slices.Sorted(maps.Keys(r.Response.Headers)) {
+		v := r.Response.Headers[k]
 		fmt.Fprintf(&sb, `
           <div class="http-header-row">
             <span class="header-key">%s</span>

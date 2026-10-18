@@ -186,10 +186,11 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 	if cfg.Parallel && len(targets) > 1 {
 		sem := make(chan struct{}, cfg.MaxWorkers)
 		var (
-			mu      sync.Mutex
 			wg      sync.WaitGroup
 			aborted atomic.Bool
-			results []ObserveResult
+			// 依路由原始順序寫入各自的槽位：結果與報告順序固定，不隨完成先後變動。
+			// 每個 goroutine 只寫自己的索引，不需鎖
+			slots = make([]*ObserveResult, len(targets))
 		)
 
 		// 速率限制器
@@ -200,7 +201,7 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 			defer ticker.Stop()
 		}
 
-		for _, route := range targets {
+		for i, route := range targets {
 			if aborted.Load() {
 				break
 			}
@@ -224,10 +225,7 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 				}
 
 				result := captureWithRetry(r, route, cfg)
-
-				mu.Lock()
-				results = append(results, result)
-				mu.Unlock()
+				slots[i] = &result
 
 				if !result.Pass && cfg.FailFast {
 					aborted.Store(true)
@@ -235,6 +233,13 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 			}()
 		}
 		wg.Wait()
+
+		results := make([]ObserveResult, 0, len(targets))
+		for _, res := range slots {
+			if res != nil { // FailFast 後未執行的路由留空
+				results = append(results, *res)
+			}
+		}
 
 		return writeObserveReport(t, results, filter, opt)
 	}
@@ -347,7 +352,6 @@ func reportObserveFailures(errorf func(format string, args ...interface{}), resu
 // @ai:modified by=claude-opus-4-8 date=2026-06-15 reason=新增記憶體/CPU/資源使用量測（measure 參數）
 func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool) ObserveResult {
 	tc := generateTestCase(route)
-	tc.schemaPath = route.Path
 
 	// 解析 Route 字串（格式："METHOD /path"）
 	method, urlPath := parseRoute(tc.Route)

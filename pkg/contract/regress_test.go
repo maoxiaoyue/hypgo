@@ -90,7 +90,7 @@ func TestGeneratedCasesPassForCorrectHandlers(t *testing.T) {
 
 	for _, rt := range schema.Global().All() {
 		tc := generateTestCase(rt)
-		tc.schemaPath = rt.Path
+		tc.schemaRoute = &rt
 		if pass, reason, _ := runTestOnce(r, tc); !pass {
 			t.Errorf("%s %s: %s (query=%v)", rt.Method, rt.Path, reason, tc.Query)
 		}
@@ -219,5 +219,55 @@ func TestResolvePathUUIDParam(t *testing.T) {
 		if got := resolvePath(path); got != want {
 			t.Errorf("resolvePath(%q) = %q, want %q", path, got, want)
 		}
+	}
+}
+
+// TestRequiredFieldsMatchKeysLikeEncodingJSON 回歸測試：必填檢查的鍵名比對與 encoding/json 相同（不分大小寫）。
+// 歷史 bug：{"Name":"a"} 能解碼進 json:"name"，必填檢查卻精確比對、判定欄位缺漏。
+func TestRequiredFieldsMatchKeysLikeEncodingJSON(t *testing.T) {
+	if err := validateResponse([]byte(`{"ID":1,"Name":"a","EMAIL":"a@b.co"}`), userResp{}); err != nil {
+		t.Errorf("case-insensitive keys rejected: %v", err)
+	}
+	if err := validateResponse([]byte(`{"ID":1,"Name":"a"}`), userResp{}); err == nil {
+		t.Error("missing email not detected")
+	}
+}
+
+// TestObserveParallelKeepsRouteOrder 回歸測試：並行模式的結果依路由原始順序排列，不隨完成先後變動。
+func TestObserveParallelKeepsRouteOrder(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	paths := []string{"/o1", "/o2", "/o3", "/o4", "/o5", "/o6"}
+	for i, p := range paths {
+		delay := time.Duration(len(paths)-i) * 5 * time.Millisecond // 越前面的路由越慢完成
+		r.Schema(schema.Route{Method: "GET", Path: p, Summary: p}).
+			Handle(func(c *hypcontext.Context) { time.Sleep(delay); c.Status(http.StatusOK) })
+	}
+
+	want := make([]string, 0, len(paths))
+	for _, rt := range schema.Global().All() {
+		want = append(want, rt.Path)
+	}
+	results := ObserveAll(t, r, ObserveOptions{
+		Silent:     true,
+		OutputPath: filepath.Join(t.TempDir(), "o.html"),
+		Run:        RunConfig{Parallel: true, MaxWorkers: len(paths)},
+	})
+	got := make([]string, 0, len(results))
+	for _, res := range results {
+		got = append(got, res.Route.Path)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("result order = %v, want %v", got, want)
+	}
+
+	// 報告中的標頭依鍵名排序
+	rep := GenerateObserveHTML([]ObserveResult{{
+		Route:   schema.Route{Method: "GET", Path: "/"},
+		Request: CapturedRequest{Headers: map[string]string{"Zeta": "1", "Alpha": "2", "Mid": "3"}},
+	}}, "")
+	a, m, z := strings.Index(rep, ">Alpha<"), strings.Index(rep, ">Mid<"), strings.Index(rep, ">Zeta<")
+	if !(a >= 0 && a < m && m < z) {
+		t.Errorf("headers not sorted in report (Alpha=%d Mid=%d Zeta=%d)", a, m, z)
 	}
 }

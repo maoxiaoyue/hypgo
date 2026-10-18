@@ -342,7 +342,7 @@ func TestCaptureRouteExchange_RecordsResourceUsage(t *testing.T) {
 
 func TestRunObserveValidation_StatusCodeStep(t *testing.T) {
 	route := schema.Route{Path: "/orders"}
-	tc := TestCase{ExpectStatus: 201, schemaPath: "/orders"}
+	tc := TestCase{ExpectStatus: 201}
 
 	steps, pass, reason := validateExchange(route, tc, 200, []byte(`{"id":1}`))
 
@@ -369,7 +369,7 @@ func TestRunObserveValidation_AllPass(t *testing.T) {
 		Output:     userResp{},
 		OutputName: "userResp",
 	}
-	tc := TestCase{ExpectStatus: 200, schemaPath: "/orders"}
+	tc := TestCase{ExpectStatus: 200}
 	body := []byte(`{"id":1,"name":"test","email":"x@x.com"}`)
 
 	steps, pass, _ := validateExchange(route, tc, 200, body)

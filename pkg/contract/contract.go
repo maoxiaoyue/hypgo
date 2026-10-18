@@ -61,8 +61,9 @@ type TestCase struct {
 	// pass/fail，方便漸進導入
 	PassThreshold float64
 
-	// schemaPath 為內部欄位，用於 TestAll 時保留原始 schema 路徑（含 :param）
-	schemaPath string
+	// schemaRoute 為內部欄位：TestAll / Observe 已持有路由宣告，直接帶入，
+	// 不必再以路徑查 registry（手動 Test 為 nil，改以實際路徑比對路由樣式）
+	schemaRoute *schema.Route
 }
 
 // Test 執行單一 contract 測試
@@ -95,19 +96,15 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// 要驗 schema 時取得路由宣告（TestAll 帶 schemaPath；手動 Test 以實際路徑比對路由樣式）；
-	// 否則用零值，validateExchange 只檢查狀態碼
+	// 要驗 schema 時取得路由宣告；否則用零值，validateExchange 只檢查狀態碼
 	var route schema.Route
 	if tc.ExpectSchema {
-		var s *schema.Route
-		var ok bool
-		if tc.schemaPath != "" {
-			s, ok = schema.Global().Get(method, tc.schemaPath)
-		} else {
-			s, ok = lookupSchema(method, req.URL.Path)
-		}
-		if !ok {
-			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
+		s := tc.schemaRoute
+		if s == nil {
+			var ok bool
+			if s, ok = lookupSchema(method, req.URL.Path); !ok {
+				return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
+			}
 		}
 		route = *s
 	}
@@ -324,7 +321,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				}
 
 				tc := generateTestCase(route)
-				tc.schemaPath = route.Path
+				tc.schemaRoute = &route
 
 				// 重試迴圈（含計時，用於 RecordHistory）
 				start := time.Now()

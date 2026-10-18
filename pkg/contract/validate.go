@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/go-playground/validator/v10"
 	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
@@ -54,19 +55,26 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	required := requiredJSONNames(t)
+	if len(required) == 0 {
+		return nil // 沒有必填欄位就不必再解一次 body
+	}
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil
 	}
+	// encoding/json 比對鍵名不分大小寫：{"Name":…} 也會填進 json:"name"。
+	// 先前精確比對，這種回應型別解碼成功、必填檢查卻判全部欄位缺漏
+	present := make(map[string]struct{}, len(raw))
+	for k := range raw {
+		present[strings.ToLower(k)] = struct{}{}
+	}
 
 	var missing []string
-	for _, f := range jsonFields(t) {
-		required := !f.omitempty && !f.optional && f.Type.Kind() != reflect.Ptr
-		if required {
-			if _, exists := raw[f.name]; !exists {
-				missing = append(missing, f.name)
-			}
+	for _, name := range required {
+		if _, ok := present[strings.ToLower(name)]; !ok {
+			missing = append(missing, name)
 		}
 	}
 
@@ -88,7 +96,27 @@ type jsonField struct {
 // （含未匯出型別）展開成上層欄位，而不是當成一個名為型別名的鍵。
 // 必填檢查與測試資料生成共用，兩邊對 JSON 形狀的認知才會一致
 func jsonFields(t reflect.Type) []jsonField {
-	return appendJSONFields(nil, t, false)
+	if v, ok := jsonFieldCache.Load(t); ok {
+		return v.([]jsonField)
+	}
+	fields := appendJSONFields(nil, t, false)
+	jsonFieldCache.Store(t, fields)
+	return fields
+}
+
+// jsonFieldCache reflect.Type → []jsonField。tag 解析結果對同一型別永不改變，
+// 先前每次驗證 / 生成都重新走一遍反射
+var jsonFieldCache sync.Map
+
+// requiredJSONNames 回傳必填欄位的 JSON 名稱：非 omitempty、非指標、不在內嵌指標之下
+func requiredJSONNames(t reflect.Type) []string {
+	var names []string
+	for _, f := range jsonFields(t) {
+		if !f.omitempty && !f.optional && f.Type.Kind() != reflect.Ptr {
+			names = append(names, f.name)
+		}
+	}
+	return names
 }
 
 // ponytail: 不處理同名欄位的遮蔽規則（較淺層者優先），實務上極少見
