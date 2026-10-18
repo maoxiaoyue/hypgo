@@ -872,7 +872,7 @@ func main() {
 	rpc.RegisterSchemas()
 
 	// 同步 manifest 到 .hyp/context.yaml（gRPC 不走 server.Start 的 AutoSync，故啟動時主動寫一次）
-	manifest.NewAutoSync(manifest.AutoSyncConfig{Enabled: true}, router.New(), nil, nil).SyncSafe()
+	manifest.NewAutoSync(manifest.AutoSyncConfig{Enabled: true}, router.New(), nil, nil).Run()
 
 	// 啟用 gRPC reflection（方便 grpcurl 偵錯）
 	reflection.Register(s)

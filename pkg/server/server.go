@@ -262,12 +262,12 @@ func (s *Server) Start() error {
 		s.logger.Warningf("Invalid trusted_proxies config: %v", err)
 	}
 
-	// AutoSync：啟動時自動同步 .hyp/context.yaml
-	sync := manifest.NewAutoSync(
-		manifest.AutoSyncConfig{Enabled: true},
+	// AutoSync：啟動時自動同步 .hyp/context.yaml（server.disable_auto_sync 可關閉；
+	// 設定了 LLM 時於背景執行，不卡住啟動）
+	manifest.NewAutoSync(
+		manifest.AutoSyncConfig{Enabled: !s.config.Server.DisableAutoSync},
 		s.router, s.config, s.logger,
-	)
-	sync.SyncSafe()
+	).Run()
 
 	// 套用預設中間件（Recovery / Logger / RejectEarlyData / Security / CORS；http3 時為 HTTP3Middleware）。
 	// v0.8.11 前僅 ListenAndServeWithGracefulShutdown 會套用（而它無人呼叫），

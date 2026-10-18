@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 )
@@ -94,8 +95,8 @@ func buildEnrichPrompt(route RouteManifest) string {
 	if route.OutputType != "" {
 		sb.WriteString(fmt.Sprintf("  OutputType: %s\n", route.OutputType))
 	}
-	if len(route.HandlerNames) > 0 {
-		sb.WriteString(fmt.Sprintf("  Handler: %s\n", route.HandlerNames[0]))
+	if h := primaryHandler(route.HandlerNames); h != "" {
+		sb.WriteString(fmt.Sprintf("  Handler: %s\n", h))
 	}
 	if len(route.Tags) > 0 {
 		sb.WriteString(fmt.Sprintf("  Tags: %s\n", strings.Join(route.Tags, ", ")))
@@ -156,9 +157,13 @@ func sanitizeResponse(s string) string {
 	// 移除潛在的 HTML/script 標籤
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
-	// 限制長度
+	// 限制長度（退到字元邊界：中文約 166 字就超過 500 bytes，先前會切出不合法的 UTF-8）
 	if len(s) > 500 {
-		s = s[:500]
+		cut := 500
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
 	}
 	return s
 }

@@ -48,6 +48,10 @@ type ServerConfig struct {
 	// 留空（預設）＝ 不信任任何代理，ClientIP 一律回傳實際連線來源。
 	// 服務位於 nginx / LB 之後時務必設定，否則 ClientIP 會是代理的位址。
 	TrustedProxies []string `mapstructure:"trusted_proxies" yaml:"trusted_proxies"`
+
+	// DisableAutoSync 關閉啟動時自動產生 .hyp/context.yaml（預設 false＝開啟）。
+	// 正式環境建議設為 true：不寫檔、不呼叫 LLM，唯讀檔案系統也不會出現寫入警告
+	DisableAutoSync bool `mapstructure:"disable_auto_sync" yaml:"disable_auto_sync"`
 }
 
 type TLSConfig struct {

@@ -3,6 +3,8 @@ package manifest
 
 import (
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
@@ -15,18 +17,21 @@ type EnrichConfig struct {
 	// InferTags 從路徑推斷 Tags（預設 true）
 	InferTags bool
 
-	// IncludeFields 在 manifest 中包含 Input/Output 的欄位資訊（預設 false）
+	// IncludeFields 在 manifest 中包含 Input/Output 的欄位資訊（預設 true）
 	IncludeFields bool
 
 	// LLMEnricher 可選的 LLM 增強器（nil 表示不使用）
 	LLMEnricher LLMEnricher
 }
 
-// DefaultEnrichConfig 回傳預設配置（純推斷，零成本）
+// DefaultEnrichConfig 回傳預設配置（純推斷，零成本）。
+// IncludeFields 預設開啟：先前預設關閉且無任何呼叫端打開，manifest 從不含 Input/Output
+// 的欄位形狀，AI 讀 .hyp/context.yaml 只看得到型別名稱
 func DefaultEnrichConfig() EnrichConfig {
 	return EnrichConfig{
-		InferSummary: true,
-		InferTags:    true,
+		InferSummary:  true,
+		InferTags:     true,
+		IncludeFields: true,
 	}
 }
 
@@ -38,14 +43,12 @@ type LLMEnricher interface {
 	EnrichRoute(route RouteManifest) RouteManifest
 }
 
-// enrichRoute 用智慧推斷填補 RouteManifest 的空白欄位
+// enrichRoute 用智慧推斷填補 RouteManifest 的空白欄位。
+// LLM 在 Summary 推斷之前執行：LLM 只回填空白欄位，先前推斷先把 Summary 填滿，
+// LLM 產生的 summary 永遠被丟棄（API 模式白付每條路由一次呼叫）。
+// Summary 推斷改為 LLM 未提供（停用或失敗）時的退路
 func enrichRoute(rm *RouteManifest, schemaRoute *schema.Route, cfg EnrichConfig) {
-	// 推斷 Summary
-	if cfg.InferSummary && rm.Summary == "" {
-		rm.Summary = inferSummary(rm)
-	}
-
-	// 推斷 Tags
+	// 推斷 Tags（LLM 不產生 tags，先填好可一併作為 prompt 的上下文）
 	if cfg.InferTags && len(rm.Tags) == 0 {
 		rm.Tags = inferTags(rm)
 	}
@@ -63,6 +66,11 @@ func enrichRoute(rm *RouteManifest, schemaRoute *schema.Route, cfg EnrichConfig)
 	// LLM 增強（可選）
 	if cfg.LLMEnricher != nil {
 		*rm = cfg.LLMEnricher.EnrichRoute(*rm)
+	}
+
+	// 推斷 Summary
+	if cfg.InferSummary && rm.Summary == "" {
+		rm.Summary = inferSummary(rm)
 	}
 }
 
@@ -89,6 +97,8 @@ func inferSummary(rm *RouteManifest) string {
 		return "WebSocket: " + humanize(rm.Command)
 	case "cli":
 		return "CLI command: " + rm.Command
+	case "desktop":
+		return "Desktop view: " + rm.Command
 	default:
 		return ""
 	}
@@ -97,20 +107,19 @@ func inferSummary(rm *RouteManifest) string {
 // inferRESTSummary 從 handler 名和路徑推斷 REST 路由的 Summary
 func inferRESTSummary(rm *RouteManifest) string {
 	// 優先從 handler 名推斷
-	if len(rm.HandlerNames) > 0 {
-		name := rm.HandlerNames[0]
+	if name := primaryHandler(rm.HandlerNames); name != "" {
 		// "controllers.(*UserController).Create" → "Create User"
 		if parts := strings.Split(name, "."); len(parts) >= 2 {
-			method := parts[len(parts)-1]
+			method := capitalize(humanizeMethod(strings.TrimSuffix(parts[len(parts)-1], "Handler")))
 			// 嘗試從 controller 名取得資源名
 			for _, p := range parts {
 				p = strings.Trim(p, "(*)")
 				if strings.HasSuffix(p, "Controller") {
 					resource := strings.TrimSuffix(p, "Controller")
-					return humanizeMethod(method) + " " + resource
+					return method + " " + resource
 				}
 			}
-			return humanizeMethod(method)
+			return method
 		}
 	}
 
@@ -137,13 +146,39 @@ func inferRESTSummary(rm *RouteManifest) string {
 	return ""
 }
 
+// primaryHandler 回傳代表路由的 handler 名稱：鏈上最後一個具名函式。
+// 第一個常是 Handle(authMW, handler) 帶入的中介層（先前推斷出 "auth M W"）；
+// 匿名函式（"pkg.Setup.func1"）沒有語意，跳過後改由路徑推斷（先前推斷出 "func1"）
+func primaryHandler(names []string) string {
+	for i := len(names) - 1; i >= 0; i-- {
+		last := names[i][strings.LastIndex(names[i], ".")+1:]
+		if !isAnonymousFunc(last) {
+			return names[i]
+		}
+	}
+	return ""
+}
+
+// isAnonymousFunc 判斷名稱是否為編譯器替匿名函式產生的 "funcN"
+func isAnonymousFunc(s string) bool {
+	if !strings.HasPrefix(s, "func") || len(s) == len("func") {
+		return false
+	}
+	for _, r := range s[len("func"):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // inferGRPCSummary 從 gRPC 命令推斷 Summary
 func inferGRPCSummary(command string) string {
 	// "UserService/CreateUser" → "Create User (gRPC)"
 	parts := strings.Split(command, "/")
 	if len(parts) == 2 {
 		method := parts[1]
-		return humanizeMethod(method) + " (gRPC)"
+		return capitalize(humanizeMethod(method)) + " (gRPC)"
 	}
 	return "gRPC: " + command
 }
@@ -193,33 +228,39 @@ func extractResource(path string) string {
 	return ""
 }
 
-// humanize 將 snake_case 或 camelCase 轉為可讀字串
+// humanize 將 snake_case 或 kebab-case 轉為可讀字串
 func humanize(s string) string {
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, "-", " ")
-	if len(s) > 0 {
-		s = strings.ToUpper(s[:1]) + s[1:]
-	}
-	return s
+	return capitalize(s)
 }
 
-// humanizeMethod 將方法名轉為可讀字串
+// humanizeMethod 將方法名轉為可讀字串，連續大寫視為一個縮寫
 // "CreateUser" → "Create User"
-// "GetByID" → "Get By ID"
+// "GetByID" → "Get By ID"（先前逐字母拆成 "Get By I D"）
+// "HTTPServer" → "HTTP Server"
 func humanizeMethod(method string) string {
-	var result []rune
-	for i, r := range method {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			result = append(result, ' ')
+	rs := []rune(method)
+	var b strings.Builder
+	for i, r := range rs {
+		if i > 0 && unicode.IsUpper(r) {
+			prev := rs[i-1]
+			nextLower := i+1 < len(rs) && unicode.IsLower(rs[i+1])
+			if unicode.IsLower(prev) || unicode.IsDigit(prev) || (unicode.IsUpper(prev) && nextLower) {
+				b.WriteByte(' ')
+			}
 		}
-		result = append(result, r)
+		b.WriteRune(r)
 	}
-	return string(result)
+	return b.String()
 }
 
+// capitalize 將首字轉大寫。以 rune 處理：先前 s[:1] 只取一個 byte，
+// 非 ASCII 開頭（"訂單"）會被切成不合法的 UTF-8
 func capitalize(s string) string {
-	if s == "" {
+	r, size := utf8.DecodeRuneInString(s)
+	if size == 0 {
 		return ""
 	}
-	return strings.ToUpper(s[:1]) + s[1:]
+	return string(unicode.ToUpper(r)) + s[size:]
 }

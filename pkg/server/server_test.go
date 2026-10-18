@@ -84,6 +84,7 @@ func TestServerGracefulShutdown(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	go func() {
@@ -116,6 +117,7 @@ func TestStartReturnsNilOnGracefulShutdown(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	errCh := make(chan error, 1)
@@ -181,6 +183,7 @@ func TestStartAppliesDefaultMiddlewares(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	s.Router().GET("/ok", func(c *hypcontext.Context) { c.String(200, "ok") })
@@ -493,6 +496,7 @@ func TestHealthNoRaceWithStart(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	var wg sync.WaitGroup
