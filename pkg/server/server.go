@@ -851,11 +851,6 @@ func (s *Server) Manifest() *manifest.Manifest {
 	return c.Collect()
 }
 
-// EnableHTTP3 啟用 HTTP/3
-func (s *Server) EnableHTTP3(config *router.HTTP3Config) {
-	s.router.EnableHTTP3(config)
-}
-
 // pidFilePath PID 檔案路徑（相對於 CWD，固定檔名 hypgo.pid 以維持既有腳本相容性）
 const pidFilePath = "hypgo.pid"
 

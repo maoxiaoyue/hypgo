@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"unsafe"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
@@ -22,27 +21,12 @@ type Router struct {
 	globalMW []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
 
 	// 配置
-	maxParams              int
-	caseSensitive          bool
 	strictSlash            bool
 	handleMethodNotAllowed bool
-
-	// HTTP/3 配置
-	http3Config *HTTP3Config
 
 	// 404/405 處理器
 	notFound         hypcontext.HandlerFunc
 	methodNotAllowed hypcontext.HandlerFunc
-}
-
-// HTTP3Config HTTP/3 配置
-type HTTP3Config struct {
-	Enabled            bool
-	MaxHeaderBytes     int
-	EnableDatagrams    bool
-	EnableWebtransport bool
-	MaxBidiStreams     int64
-	MaxUniStreams      int64
 }
 
 // Param 路由參數。與 hypcontext.Param 為同一型別：radix tree 直接把參數
@@ -52,13 +36,6 @@ type Param = hypcontext.Param
 
 // RouterOption 路由器選項
 type RouterOption func(*Router)
-
-// WithMaxParams 設置最大參數數
-func WithMaxParams(n int) RouterOption {
-	return func(r *Router) {
-		r.maxParams = n
-	}
-}
 
 // WithStrictSlash 設置嚴格斜線模式
 func WithStrictSlash(enabled bool) RouterOption {
@@ -86,11 +63,8 @@ func New(opts ...RouterOption) *Router {
 	r := &Router{
 		trees:                  make(map[string]*radixNode),
 		globalMW:               make([]hypcontext.HandlerFunc, 0),
-		maxParams:              10,
-		caseSensitive:          false,
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
-		http3Config:            nil,
 	}
 
 	// 初始化嵌入的根 Group
@@ -128,13 +102,7 @@ func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.Han
 		r.trees[method] = &radixNode{nType: root}
 	}
 
-	root := r.trees[method]
-	root.addRoute(absolutePath, handlers)
-
-	// 更新最大參數數
-	if pc := countParams(absolutePath); pc > r.maxParams {
-		r.maxParams = pc
-	}
+	r.trees[method].addRoute(absolutePath, handlers)
 }
 
 // ServeHTTP 實現 http.Handler 介面
@@ -153,8 +121,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	urlPath := req.URL.Path
 	method := req.Method
 
-	// Alt-Svc 由 server.wrapHandler 依實際監聽位址設定。先前這裡在 EnableHTTP3 後
-	// 每個請求寫死 h3=":443"，蓋掉 server 設好的正確值，客戶端往錯的埠嘗試 HTTP/3。
+	// Alt-Svc 由 server.wrapHandler 依實際監聽位址設定（router 不寫入）。
 	//
 	// 不再有路由快取：radix tree 的靜態查找本身零分配，快取只多出 method+path 字串拼接
 	// 與 sync.Map 成本（500 條路由實測：有快取 71ns / 1 alloc，無快取 56ns / 0 alloc）
@@ -304,32 +271,6 @@ func (r *Router) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 	r.handleMethodNotAllowed = true
 }
 
-// EnableHTTP3 記錄 HTTP/3 設定。Alt-Svc 廣告由 server 依實際監聽位址處理，router 不再寫入
-func (r *Router) EnableHTTP3(config *HTTP3Config) {
-	if config == nil {
-		config = &HTTP3Config{
-			Enabled:            true,
-			MaxHeaderBytes:     1 << 20, // 1MB
-			EnableDatagrams:    false,
-			EnableWebtransport: false,
-			MaxBidiStreams:     100,
-			MaxUniStreams:      100,
-		}
-	}
-	config.Enabled = true
-	r.http3Config = config
-}
-
-// IsHTTP3Enabled 檢查是否啟用了 HTTP/3
-func (r *Router) IsHTTP3Enabled() bool {
-	return r.http3Config != nil && r.http3Config.Enabled
-}
-
-// GetHTTP3Config 獲取 HTTP/3 配置
-func (r *Router) GetHTTP3Config() *HTTP3Config {
-	return r.http3Config
-}
-
 // RouteInfo 路由信息
 type RouteInfo struct {
 	Method       string
@@ -461,22 +402,17 @@ func joinPaths(base, relative string) string {
 	return finalPath
 }
 
-// longestCommonPrefix 最長公共前綴（使用 unsafe 加速）
+// longestCommonPrefix 最長公共前綴。
+// 直接對 string 取索引：先前以 unsafe 把 string header 當 []byte header 讀，cap 讀到
+// header 之外的記憶體（未定義行為），而且並沒有比取索引快
 func longestCommonPrefix(a, b string) int {
-	max := len(a)
-	if len(b) < max {
-		max = len(b)
-	}
-	if max > 0 {
-		ap := *(*[]byte)(unsafe.Pointer(&a))
-		bp := *(*[]byte)(unsafe.Pointer(&b))
-		for i := 0; i < max; i++ {
-			if ap[i] != bp[i] {
-				return i
-			}
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
 		}
 	}
-	return max
+	return n
 }
 
 // findWildcard 查找路徑中的通配符
@@ -498,15 +434,4 @@ func findWildcard(path string) (string, int, bool) {
 		return path[i:], i, valid
 	}
 	return "", -1, false
-}
-
-// countParams 計算路徑中的參數數量
-func countParams(path string) int {
-	n := 0
-	for i := 0; i < len(path); i++ {
-		if path[i] == ':' || path[i] == '*' {
-			n++
-		}
-	}
-	return n
 }
