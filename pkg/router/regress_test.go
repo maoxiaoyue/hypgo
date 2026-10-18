@@ -130,3 +130,36 @@ func TestMatchValidatesMethods(t *testing.T) {
 	}()
 	New().Match([]string{"get"}, "/x", func(c *hypcontext.Context) {})
 }
+
+// TestMethodOverrideRoutesBeforeMatching 迴歸測試：方法覆寫在路由比對之前生效，且只允許 PUT / PATCH / DELETE。
+// 歷史 bug：middleware.MethodOverride 在比對之後才改寫 c.Request.Method，POST 永遠只對到 POST 路由
+func TestMethodOverrideRoutesBeforeMatching(t *testing.T) {
+	r := New()
+	r.EnableMethodOverride()
+	r.POST("/items/1", func(c *hypcontext.Context) { c.String(200, "post") })
+	r.DELETE("/items/1", func(c *hypcontext.Context) { c.String(200, "delete") })
+	r.PUT("/items/1", func(c *hypcontext.Context) { c.String(200, "put") })
+	r.GET("/items/1", func(c *hypcontext.Context) { c.String(200, "get") })
+
+	send := func(header, form string) string {
+		req := httptest.NewRequest("POST", "/items/1", strings.NewReader(form))
+		if header != "" {
+			req.Header.Set("X-HTTP-Method-Override", header)
+		}
+		if form != "" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Body.String()
+	}
+	if got := send("DELETE", ""); got != "delete" {
+		t.Errorf("header override DELETE -> %q", got)
+	}
+	if got := send("", "_method=put"); got != "put" {
+		t.Errorf("form override put -> %q", got)
+	}
+	if got := send("GET", ""); got != "post" {
+		t.Errorf("override to GET must be ignored, got %q", got)
+	}
+}

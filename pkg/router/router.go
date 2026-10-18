@@ -23,6 +23,7 @@ type Router struct {
 	// 配置
 	strictSlash            bool
 	handleMethodNotAllowed bool
+	methodOverride         bool
 
 	// 404/405 處理器
 	notFound         hypcontext.HandlerFunc
@@ -118,6 +119,11 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// 清理 multipart 暫存檔並回報未消費的請求錯誤（見各自函式說明）
 	defer c.Finish()
 
+	if r.methodOverride && req.Method == http.MethodPost {
+		if m := overrideMethod(req); m != "" {
+			req.Method = m
+		}
+	}
 	urlPath := req.URL.Path
 	method := req.Method
 
@@ -191,6 +197,30 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// 404 Not Found（同樣經過全域中間件）
 	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
+}
+
+// EnableMethodOverride 讓 POST 請求以 X-HTTP-Method-Override 標頭或表單欄位 _method
+// 改用 PUT / PATCH / DELETE 路由（HTML 表單只能送 GET / POST）。
+// 在路由比對前改寫方法，所以必須在 router 層做：先前的 middleware.MethodOverride 在比對之後
+// 才執行，POST 永遠只對到 POST 路由。只允許改成這三種方法，避免改成 GET / CONNECT 等繞過檢查
+func (r *Router) EnableMethodOverride() {
+	r.methodOverride = true
+}
+
+// overrideMethod 回傳覆寫後的方法；不合法或未指定時回空字串
+func overrideMethod(req *http.Request) string {
+	m := req.Header.Get("X-HTTP-Method-Override")
+	if m == "" {
+		ct := req.Header.Get("Content-Type")
+		if strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "multipart/form-data") {
+			m = req.PostFormValue("_method")
+		}
+	}
+	switch m = strings.ToUpper(strings.TrimSpace(m)); m {
+	case http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return m
+	}
+	return ""
 }
 
 // trailingSlashRedirect 回傳尾斜線重導向的 handler。經 executeHandlers 執行，全域中間件

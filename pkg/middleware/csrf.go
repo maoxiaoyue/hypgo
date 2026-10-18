@@ -5,8 +5,8 @@ import (
 	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +29,9 @@ type CSRFConfig struct {
 	Skipper        func(c *hypcontext.Context) bool
 }
 
-// CSRF 創建 CSRF 保護中間件
+// CSRF 創建 CSRF 保護中間件（double-submit cookie）。
+// token 在 cookie 存在期間固定不變：先前每個 GET 與每次驗證成功都換新 token，
+// 多分頁或頁面上其他請求一來，先前頁面表單帶的 token 就失效
 func CSRF(config CSRFConfig) hypcontext.HandlerFunc {
 	if config.TokenLength == 0 {
 		config.TokenLength = 32
@@ -51,40 +53,31 @@ func CSRF(config CSRFConfig) hypcontext.HandlerFunc {
 			return
 		}
 
-		// 對於安全的方法（GET, HEAD, OPTIONS），只生成 token
+		cookie, _ := c.Cookie(config.CookieName)
+
+		// 對於安全的方法（GET, HEAD, OPTIONS）：沿用既有 token，沒有才產生
 		if isSafeMethod(c.Request.Method) {
-			token := generateCSRFToken(config.TokenLength)
-			c.Set("csrf_token", token)
-			setCSRFCookie(c, config, token)
+			if cookie == "" {
+				cookie = generateCSRFToken(config.TokenLength)
+				setCSRFCookie(c, config, cookie)
+			}
+			c.Set("csrf_token", cookie)
 			c.Next()
 			return
 		}
 
 		// 對於不安全的方法，驗證 token
-		cookie, err := c.Cookie(config.CookieName)
-		if err != nil || cookie == "" {
+		if cookie == "" {
 			handleCSRFError(c, config)
 			return
 		}
-
-		// 從請求中提取 token
 		token := extractCSRFToken(c, config.TokenLookup)
-		if token == "" {
+		if token == "" || !validateCSRFToken(token, cookie) {
 			handleCSRFError(c, config)
 			return
 		}
 
-		// 驗證 token
-		if !validateCSRFToken(token, cookie) {
-			handleCSRFError(c, config)
-			return
-		}
-
-		// 設置新的 token
-		newToken := generateCSRFToken(config.TokenLength)
-		c.Set("csrf_token", newToken)
-		setCSRFCookie(c, config, newToken)
-
+		c.Set("csrf_token", cookie)
 		c.Next()
 	}
 }
@@ -105,7 +98,9 @@ func generateCSRFToken(length int) string {
 			b[i] = byte(time.Now().UnixNano() % 256)
 		}
 	}
-	return base64.URLEncoding.EncodeToString(b)
+	// RawURLEncoding（無 '=' 補位）：補位的 '=' 寫進 cookie 時被跳脫成 %3D，前端從 cookie 讀出
+	// 放進標頭送回的值與伺服器端解碼後的 cookie 不同，double-submit 驗證必定失敗
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // extractCSRFToken 從請求中提取 CSRF token
@@ -160,53 +155,76 @@ func handleCSRFError(c *hypcontext.Context, config CSRFConfig) {
 type CORSConfig struct {
 	AllowOrigins     []string
 	AllowMethods     []string
-	AllowHeaders     []string
+	AllowHeaders     []string // 空時回應 preflight 請求的 Access-Control-Request-Headers
 	ExposeHeaders    []string
 	AllowCredentials bool
 	MaxAge           int
 }
 
-// CORS 創建 CORS 中間件
+// CORS 創建 CORS 中間件。
+//
+// 先前的實作：沒帶 Origin 的一般 OPTIONS 也一律回 204（使用者註冊的 OPTIONS 路由永遠到不了）；
+// 反射 Origin 卻沒有 Vary: Origin（中間快取可能把 A 網域的回應給 B 網域）；
+// 設定 "*" 時也回傳請求的 Origin 而非字面的 "*"
 func CORS(config CORSConfig) hypcontext.HandlerFunc {
-	// 預處理允許的來源
+	allowAll := false
 	allowOrigins := make(map[string]bool)
 	for _, origin := range config.AllowOrigins {
-		allowOrigins[origin] = true
+		if origin == "*" {
+			allowAll = true
+		} else {
+			allowOrigins[origin] = true
+		}
+	}
+	// 標頭值預先算好，不在每個 preflight 重新 Join
+	methods := strings.Join(config.AllowMethods, ", ")
+	headers := strings.Join(config.AllowHeaders, ", ")
+	expose := strings.Join(config.ExposeHeaders, ", ")
+	maxAge := ""
+	if config.MaxAge > 0 {
+		maxAge = strconv.Itoa(config.MaxAge)
 	}
 
 	return func(c *hypcontext.Context) {
 		origin := c.GetHeader("Origin")
-
-		// 檢查來源是否允許
-		if origin != "" {
-			allowed := false
-			if allowOrigins["*"] {
-				allowed = true
-			} else if allowOrigins[origin] {
-				allowed = true
-			}
-			if allowed {
-				c.Header("Access-Control-Allow-Origin", origin)
-
-				if config.AllowCredentials {
-					c.Header("Access-Control-Allow-Credentials", "true")
-				}
-
-				if len(config.ExposeHeaders) > 0 {
-					c.Header("Access-Control-Expose-Headers", strings.Join(config.ExposeHeaders, ","))
-				}
-			}
+		if origin == "" {
+			c.Next() // 非 CORS 請求（含一般 OPTIONS）不處理
+			return
 		}
 
-		// 處理預檢請求
-		if c.Request.Method == "OPTIONS" {
-			c.Header("Access-Control-Allow-Methods", strings.Join(config.AllowMethods, ","))
-			c.Header("Access-Control-Allow-Headers", strings.Join(config.AllowHeaders, ","))
+		h := c.Writer.Header()
+		h.Add("Vary", "Origin")
+		if !allowAll && !allowOrigins[origin] {
+			c.Next() // 不允許的來源：不給 CORS 標頭，由瀏覽器擋下
+			return
+		}
 
-			if config.MaxAge > 0 {
-				c.Header("Access-Control-Max-Age", fmt.Sprintf("%d", config.MaxAge))
+		// 允許所有來源且不帶憑證時回字面 "*"；帶憑證時規範禁止 "*"，只能反射 Origin
+		if allowAll && !config.AllowCredentials {
+			h.Set("Access-Control-Allow-Origin", "*")
+		} else {
+			h.Set("Access-Control-Allow-Origin", origin)
+		}
+		if config.AllowCredentials {
+			h.Set("Access-Control-Allow-Credentials", "true")
+		}
+		if expose != "" {
+			h.Set("Access-Control-Expose-Headers", expose)
+		}
+
+		// preflight：OPTIONS 且帶 Access-Control-Request-Method
+		if c.Request.Method == http.MethodOptions && c.GetHeader("Access-Control-Request-Method") != "" {
+			h.Add("Vary", "Access-Control-Request-Method")
+			h.Add("Vary", "Access-Control-Request-Headers")
+			h.Set("Access-Control-Allow-Methods", methods)
+			if headers != "" {
+				h.Set("Access-Control-Allow-Headers", headers)
+			} else if req := c.GetHeader("Access-Control-Request-Headers"); req != "" {
+				h.Set("Access-Control-Allow-Headers", req)
 			}
-
+			if maxAge != "" {
+				h.Set("Access-Control-Max-Age", maxAge)
+			}
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
