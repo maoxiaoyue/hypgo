@@ -71,6 +71,9 @@ walk:
 						end++
 					}
 
+					if end == 0 {
+						return nil, p // 空的參數值不匹配：/users//posts 不該對到 /users/:id/posts
+					}
 					if p == nil {
 						p = make([]Param, 0, 4)
 					}
@@ -104,7 +107,13 @@ walk:
 				}
 			}
 		} else if path == n.path {
-			// 完全匹配
+			// 完全匹配。本節點沒有 handler 但掛著 catch-all 時，由 catch-all 接住空的剩餘路徑：
+			// 否則 /static/*filepath 對不到 /static/，目錄首頁（index.html）永遠 404
+			if n.handlers == nil && n.wildChild {
+				if w := n.children[len(n.children)-1]; w.nType == catchAll {
+					return w.handlers, append(p, Param{Key: w.path[1:], Value: "/"})
+				}
+			}
 			return n.handlers, p
 		}
 

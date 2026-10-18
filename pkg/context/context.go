@@ -49,23 +49,29 @@ type Context struct {
 	Response ResponseWriter
 	Writer   ResponseWriter // Gin 兼容別名
 
-	// rw 為 Acquire 時自池中借出、由本 Context 擁有的 writer。
+	// ownWriter 為本 Context 擁有的 writer，內嵌隨 Context 一起池化。
 	// Response/Writer 是 exported 介面欄位，中間件可合法替換成包裝器
-	// （如 Compression 的 gzipWriter），因此歸還時必須還這個原始指標，
+	// （如 Compression 的 gzipWriter），因此 reset 一律重置這個原始 writer，
 	// 不能對 Response 做型別斷言（會 panic）。
-	rw *responseWriter
+	ownWriter responseWriter
 
 	// released 保證 Release 冪等：Release/ReleaseContext 皆為 exported，
 	// 使用者若在 handler 內也 defer 一次，會與 router 的 defer 構成
 	// double-release，導致同一物件被 Put 進池兩次、被兩個並行請求共用。
 	released bool
 
-	// HTTP/3 QUIC 特定支援
-	quicConn   *QuicConnection
-	streamInfo *StreamInfo
+	// HTTP/3 QUIC 特定支援。指標可能指向下方自有的 ownQuicConn / ownStreamInfo，
+	// 也可能是外部物件（SetQUICConnection / SetStreamInfo 或 request context
+	// 帶入）；reset 只重置自有的，外部物件只解除參照
+	quicConn      *QuicConnection
+	streamInfo    *StreamInfo
+	ownQuicConn   QuicConnection
+	ownStreamInfo StreamInfo
 
-	// 路由參數
+	// 路由參數。paramsBuf 為本 Context 自帶的參數緩衝，reset 時 Params
+	// 一律指回它，router 直接在上面 search（見 pool.go paramsBufCap）
 	Params      Params
+	paramsBuf   Params
 	queryCache  url.Values
 	formCache   url.Values
 	rawData     []byte
@@ -92,7 +98,7 @@ type Context struct {
 
 	// 效能監控
 	startTime time.Time
-	metrics   *RequestMetrics
+	metrics   RequestMetrics
 
 	// 內容協商
 	Accepted []string
@@ -155,39 +161,6 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 	// contextPool 為 package 級單例、恆非 nil，故一律走物件池
 	// （原本的非池 fallback 分支永不可達，已移除）
 	return AcquireContext(w, r)
-}
-
-// Reset 重置 Context 到初始狀態（用於物件池）
-func (c *Context) Reset(w http.ResponseWriter, r *http.Request) {
-	c.Request = r
-	if w != nil {
-		c.Response = newResponseWriter(w)
-		c.Writer = c.Response
-	} else {
-		c.Response = nil
-		c.Writer = nil
-	}
-	c.Params = c.Params[:0]
-	c.handlers = nil
-	c.index = -1
-	c.Keys = nil
-	c.Errors = c.Errors[:0]
-	c.Accepted = nil
-	c.queryCache = nil
-	c.formCache = nil
-	c.rawData = nil
-	c.fullPath = ""
-	c.schemaInput = nil
-	c.schemaRouteKey = ""
-	c.bindInputCalled = false
-	c.startTime = time.Now()
-	c.metrics = &RequestMetrics{}
-	if r != nil {
-		c.detectProtocol()
-		if c.protocol == HTTP3 {
-			c.initQuicConnection()
-		}
-	}
 }
 
 // Copy 返回當前 Context 的副本（用於 goroutine）
@@ -449,10 +422,10 @@ func (c *Context) Protocol() string {
 
 // ===== 效能監控 =====
 
-// GetMetrics 獲取請求指標
+// GetMetrics 獲取請求指標（指向 Context 內部，請求結束後不可再使用）
 func (c *Context) GetMetrics() *RequestMetrics {
 	c.metrics.Duration = time.Since(c.startTime)
-	return c.metrics
+	return &c.metrics
 }
 
 // RecordBytesIn 記錄輸入位元組

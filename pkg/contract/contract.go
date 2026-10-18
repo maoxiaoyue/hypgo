@@ -12,8 +12,11 @@ package contract
 // date: 2026-05-23
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
@@ -58,8 +61,9 @@ type TestCase struct {
 	// pass/fail，方便漸進導入
 	PassThreshold float64
 
-	// schemaPath 為內部欄位，用於 TestAll 時保留原始 schema 路徑（含 :param）
-	schemaPath string
+	// schemaRoute 為內部欄位：TestAll / Observe 已持有路由宣告，直接帶入，
+	// 不必再以路徑查 registry（手動 Test 為 nil，改以實際路徑比對路由樣式）
+	schemaRoute *schema.Route
 }
 
 // Test 執行單一 contract 測試
@@ -88,61 +92,24 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route), nil
 	}
 
-	// 建立請求 body
-	var bodyStr string
-	if tc.Input != "" {
-		bodyStr = tc.Input
-	}
-	req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
-	if tc.Input != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	// 設定自訂標頭
-	for k, v := range tc.Headers {
-		req.Header.Set(k, v)
-	}
-
-	// 設定 query 參數
-	if len(tc.Query) > 0 {
-		q := req.URL.Query()
-		for k, v := range tc.Query {
-			q.Set(k, v)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	// 執行請求
+	req := tc.request(method, path)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// 驗證狀態碼
-	if tc.ExpectStatus > 0 && w.Code != tc.ExpectStatus {
-		return false, fmt.Sprintf("[%s] status = %d, want %d", tc.Route, w.Code, tc.ExpectStatus), nil
-	}
-
-	// 驗證 schema（使用 schemaPath 或 URL path 查找）
+	// 要驗 schema 時取得路由宣告；否則用零值，validateExchange 只檢查狀態碼
+	var route schema.Route
 	if tc.ExpectSchema {
-		lookupPath := path
-		if tc.schemaPath != "" {
-			lookupPath = tc.schemaPath
-		}
-		s, ok := schema.Global().Get(method, lookupPath)
-		if !ok {
-			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
-		}
-		// 驗證 Input schema（請求 body）
-		if s.Input != nil && tc.Input != "" {
-			if err := validateRequest([]byte(tc.Input), s.Input); err != nil {
-				return false, fmt.Sprintf("[%s] request schema validation failed: %v", tc.Route, err), nil
+		s := tc.schemaRoute
+		if s == nil {
+			var ok bool
+			if s, ok = lookupSchema(method, req.URL.Path); !ok {
+				return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
 			}
 		}
-		// 驗證 Output schema（回應 body）
-		if s.Output != nil {
-			if err := validateResponse(w.Body.Bytes(), s.Output); err != nil {
-				return false, fmt.Sprintf("[%s] response schema validation failed: %v", tc.Route, err), nil
-			}
-		}
+		route = *s
+	}
+	if _, ok, why := validateExchange(route, tc, w.Code, w.Body.Bytes()); !ok {
+		return false, fmt.Sprintf("[%s] %s", tc.Route, why), nil
 	}
 
 	// 精確比對 body
@@ -161,6 +128,76 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 	}
 
 	return true, "", nil
+}
+
+// request 依 TestCase 組出請求；有 Input 時預設 Content-Type: application/json（Headers 可覆寫）
+func (tc TestCase) request(method, path string) *http.Request {
+	req := buildRequest(method, path, tc.Input, tc.Headers, tc.Query)
+	if tc.Input != "" && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req
+}
+
+// validateExchange 依序檢查一次 HTTP 交換：狀態碼 → 回應 body 非空 → Input schema → 回應 schema。
+// runTestOnce（Test / TestAll）與 Observe 共用，兩邊判定才不會分歧；reason 為第一個失敗步驟的原因。
+// route 沒有 Input / Output 時只檢查狀態碼；tc.ExpectStatus 為 0 時不檢查狀態碼
+func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
+	pass = true
+	step := func(name, okDetail string, err error) {
+		s := ValidationStep{Name: name, Pass: err == nil, Detail: okDetail}
+		if err != nil {
+			s.Detail = err.Error()
+			if pass {
+				pass, reason = false, s.Detail
+			}
+		}
+		steps = append(steps, s)
+	}
+
+	if tc.ExpectStatus > 0 {
+		var err error
+		if code != tc.ExpectStatus {
+			err = fmt.Errorf("status = %d, want %d", code, tc.ExpectStatus)
+		}
+		step("Status Code", fmt.Sprintf("got %d, want %d", code, tc.ExpectStatus), err)
+	}
+
+	// 回應 body 的 schema：該狀態碼在 Responses 宣告了 Type 就用它，否則 2xx 用 Output；
+	// 非 2xx 且未宣告時不驗 body——錯誤回應不是 Output 的形狀（先前一律拿 Output 驗，
+	// 手動 Test 期望 404 並開 ExpectSchema 時必定失敗）
+	bodyType, bodyName := route.Output, route.OutputName
+	if rs, ok := route.Responses[code]; ok && rs.Type != nil {
+		bodyType, bodyName = rs.Type, rs.TypeName
+	} else if code < 200 || code >= 300 {
+		bodyType = nil
+	}
+
+	hasBody := len(bytes.TrimSpace(body)) > 0
+	if bodyType != nil {
+		var err error
+		if !hasBody {
+			err = errors.New("response body is empty")
+		}
+		step("Response Body", "body present", err)
+	}
+
+	if route.Input != nil && tc.Input != "" {
+		var err error
+		if e := validateRequest([]byte(tc.Input), route.Input); e != nil {
+			err = fmt.Errorf("request schema validation failed: %w", e)
+		}
+		step(fmt.Sprintf("Input Schema (%s)", route.InputName), "matches schema", err)
+	}
+
+	if bodyType != nil && hasBody {
+		var err error
+		if e := validateResponse(body, bodyType); e != nil {
+			err = fmt.Errorf("response schema validation failed: %w", e)
+		}
+		step(fmt.Sprintf("Output Schema (%s)", bodyName), "matches schema", err)
+	}
+	return steps, pass, reason
 }
 
 // runGraders 依序執行 TestCase 的評判器並聚合分數（等權平均）。
@@ -248,6 +285,9 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 	// FailFast 信號：atomic 確保 goroutine 間無鎖可見
 	var aborted atomic.Bool
 
+	// 並行上限：t.Parallel 的並行數由 go test -parallel 決定，這裡再以 MaxWorkers 收斂
+	sem := make(chan struct{}, cfg.MaxWorkers)
+
 	// 速率限制器：由所有子測試 goroutine 共享競爭接收（goroutine-safe）
 	var limiterCh <-chan time.Time
 	if cfg.RateLimit > 0 {
@@ -264,8 +304,6 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 	}
 
 	for _, route := range routes {
-		route := route // capture for goroutine / closure
-
 		if route.IsREST() {
 			name := route.Method + " " + route.Path
 			t.Run(name, func(t *testing.T) {
@@ -277,6 +315,8 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 
 				if cfg.Parallel {
 					t.Parallel()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 				}
 
 				// 並行模式下，goroutine 重新啟動後再次檢查
@@ -291,7 +331,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				}
 
 				tc := generateTestCase(route)
-				tc.schemaPath = route.Path
+				tc.schemaRoute = &route
 
 				// 重試迴圈（含計時，用於 RecordHistory）
 				start := time.Now()
@@ -357,6 +397,8 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				}
 				if cfg.Parallel {
 					t.Parallel()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 				}
 				testSchemaCompleteness(t, route)
 				// FailFast：testSchemaCompleteness 失敗後設定 aborted
@@ -414,6 +456,41 @@ func TestRoute(t *testing.T, r *router.Router, method, path string, expectStatus
 	if w.Code != expectStatus {
 		t.Errorf("%s %s: status = %d, want %d", method, path, w.Code, expectStatus)
 	}
+}
+
+// lookupSchema 依實際請求路徑找 REST schema：先精確查表（靜態路由），再比對 :param / *wildcard 樣式。
+// 先前只精確查表，手動 Test 傳 "GET /api/users/1" 永遠找不到 "/api/users/:id" 的 schema
+func lookupSchema(method, path string) (*schema.Route, bool) {
+	if s, ok := schema.Global().Get(method, path); ok {
+		return s, true
+	}
+	for _, rt := range schema.Global().All() {
+		if rt.IsREST() && rt.Method == method && pathMatches(rt.Path, path) {
+			return &rt, true
+		}
+	}
+	return nil, false
+}
+
+// pathMatches 回報 path 是否符合路由樣式（:name 吃一個非空區段，*name 吃剩餘全部）
+func pathMatches(pattern, path string) bool {
+	ps, xs := strings.Split(pattern, "/"), strings.Split(path, "/")
+	for i, p := range ps {
+		if strings.HasPrefix(p, "*") {
+			return true
+		}
+		if i >= len(xs) {
+			return false
+		}
+		if strings.HasPrefix(p, ":") {
+			if xs[i] == "" {
+				return false
+			}
+		} else if p != xs[i] {
+			return false
+		}
+	}
+	return len(ps) == len(xs)
 }
 
 // parseRoute 解析 "METHOD /path" 格式

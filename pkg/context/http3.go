@@ -2,6 +2,7 @@
 package context
 
 import (
+	stdcontext "context"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,18 +11,24 @@ import (
 
 // ===== HTTP/3 QUIC 優化方法 =====
 
-// initQuicConnection 初始化 QUIC 連接資訊
+// initQuicConnection 初始化 HTTP/3 請求的 QUIC 資訊（使用 Context 自有物件，零分配）
 func (c *Context) initQuicConnection() {
-	// 從請求中提取 QUIC 連接資訊
 	if conn, ok := c.Request.Context().Value("quic_conn").(*QuicConnection); ok {
-		c.quicConn = conn
+		c.quicConn = conn // 連線層共用物件：只參照，reset 不會重置它
+	} else {
+		c.quicConn = &c.ownQuicConn
 	}
 
-	// 初始化流資訊
-	c.streamInfo = &StreamInfo{
-		StreamID: c.extractStreamID(),
-		Priority: c.extractPriority(),
+	c.streamInfo = &c.ownStreamInfo
+	c.streamInfo.StreamID = c.extractStreamID()
+}
+
+// ensureQuicConn 確保 quicConn 可寫；未設定時指向 Context 自有物件
+func (c *Context) ensureQuicConn() *QuicConnection {
+	if c.quicConn == nil {
+		c.quicConn = &c.ownQuicConn
 	}
+	return c.quicConn
 }
 
 // extractStreamID 提取流 ID
@@ -34,83 +41,6 @@ func (c *Context) extractStreamID() uint64 {
 		}
 	}
 	return 0
-}
-
-// extractPriority 提取優先級
-func (c *Context) extractPriority() uint8 {
-	// 實現優先級提取邏輯
-	if c.Request.Context() != nil {
-		if priority, ok := c.Request.Context().Value("stream_priority").(uint8); ok {
-			return priority
-		}
-	}
-	// 檢查 Priority header (RFC 9218)
-	if priority := c.GetHeader("Priority"); priority != "" {
-		// 解析 priority header
-		return parsePriority(priority)
-	}
-	return 0
-}
-
-// SetStreamPriority 設置流優先級（HTTP/3 特性）
-func (c *Context) SetStreamPriority(priority uint8) error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("stream priority only available in HTTP/3")
-	}
-	if c.streamInfo == nil {
-		c.streamInfo = &StreamInfo{}
-	}
-	c.streamInfo.Priority = priority
-
-	// 實際設置 QUIC 流優先級
-	// 這裡需要調用底層 QUIC 實現的 API
-	if c.quicConn != nil && c.quicConn.conn != nil {
-		// 設置優先級的實際實現
-		// c.quicConn.conn.SetStreamPriority(c.streamInfo.StreamID, priority)
-	}
-
-	return nil
-}
-
-// GetStreamPriority 獲取流優先級
-func (c *Context) GetStreamPriority() uint8 {
-	if c.streamInfo != nil {
-		return c.streamInfo.Priority
-	}
-	return 0
-}
-
-// SetStreamWeight 設置流權重
-func (c *Context) SetStreamWeight(weight uint8) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("stream weight only available in HTTP/2 and HTTP/3")
-	}
-	if c.streamInfo == nil {
-		c.streamInfo = &StreamInfo{}
-	}
-	c.streamInfo.Weight = weight
-	return nil
-}
-
-// GetStreamWeight 獲取流權重
-func (c *Context) GetStreamWeight() uint8 {
-	if c.streamInfo != nil {
-		return c.streamInfo.Weight
-	}
-	return 16 // 默認權重
-}
-
-// SetStreamDependency 設置流依賴
-func (c *Context) SetStreamDependency(streamID uint64, exclusive bool) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("stream dependency only available in HTTP/2 and HTTP/3")
-	}
-	if c.streamInfo == nil {
-		c.streamInfo = &StreamInfo{}
-	}
-	c.streamInfo.Dependencies = append(c.streamInfo.Dependencies, streamID)
-	c.streamInfo.Exclusive = exclusive
-	return nil
 }
 
 // GetStreamID 獲取流 ID
@@ -131,10 +61,7 @@ func (c *Context) GetRTT() time.Duration {
 
 // SetRTT 設置 RTT（用於測試或手動設置）
 func (c *Context) SetRTT(rtt time.Duration) {
-	if c.quicConn == nil {
-		c.quicConn = &QuicConnection{}
-	}
-	c.quicConn.rtt = rtt
+	c.ensureQuicConn().rtt = rtt
 }
 
 // GetCongestionWindow 獲取擁塞窗口大小
@@ -147,10 +74,7 @@ func (c *Context) GetCongestionWindow() uint32 {
 
 // SetCongestionWindow 設置擁塞窗口（用於測試或手動設置）
 func (c *Context) SetCongestionWindow(size uint32) {
-	if c.quicConn == nil {
-		c.quicConn = &QuicConnection{}
-	}
-	c.quicConn.congWin = size
+	c.ensureQuicConn().congWin = size
 }
 
 // GetBytesRead 獲取已讀取的字節數
@@ -163,10 +87,7 @@ func (c *Context) GetBytesRead() uint64 {
 
 // UpdateBytesRead 更新已讀取的字節數
 func (c *Context) UpdateBytesRead(bytes uint64) {
-	if c.quicConn == nil {
-		c.quicConn = &QuicConnection{}
-	}
-	c.quicConn.bytesRead += bytes
+	c.ensureQuicConn().bytesRead += bytes
 }
 
 // IsHTTP3 檢查是否為 HTTP/3
@@ -186,33 +107,27 @@ func (c *Context) IsHTTP1() bool {
 
 // ===== Server Push =====
 
-// Push 使用 HTTP/3 或 HTTP/2 Server Push
+// Push 發出 HTTP/2 Server Push。只有 HTTP/2 支援：HTTP/1.1 沒有 push，
+// quic-go 的 HTTP/3 也未實作；客戶端關閉 push（SETTINGS_ENABLE_PUSH=0）時
+// net/http 同樣回 http.ErrNotSupported。
 func (c *Context) Push(target string, opts *http.PushOptions) error {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return fmt.Errorf("server push only available in HTTP/2 and HTTP/3")
+	if p, ok := c.ownWriter.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
 	}
-
-	pusher, ok := c.Writer.(http.Pusher)
-	if !ok {
-		return fmt.Errorf("server push not supported")
-	}
-
-	return pusher.Push(target, opts)
+	return http.ErrNotSupported
 }
 
-// CanPush 檢查是否支援 Server Push
+// CanPush 回報底層連線是否支援 Server Push（實際上只有 HTTP/2）。
+// 檢查底層 writer 而非 c.Writer：後者是 HypGo 的包裝，恆實作 http.Pusher。
 func (c *Context) CanPush() bool {
-	if c.protocol != HTTP3 && c.protocol != HTTP2 {
-		return false
-	}
-	_, ok := c.Writer.(http.Pusher)
+	_, ok := c.ownWriter.ResponseWriter.(http.Pusher)
 	return ok
 }
 
 // PushResources 推送多個資源
 func (c *Context) PushResources(resources map[string]*http.PushOptions) []error {
 	if !c.CanPush() {
-		return []error{fmt.Errorf("server push not supported")}
+		return []error{http.ErrNotSupported}
 	}
 
 	var errors []error
@@ -226,19 +141,42 @@ func (c *Context) PushResources(resources map[string]*http.PushOptions) []error 
 
 // ===== 0-RTT (Early Data) =====
 
-// IsEarlyData 檢查是否為 0-RTT 早期數據
-func (c *Context) IsEarlyData() bool {
-	if c.protocol != HTTP3 {
-		return false
-	}
-	// 檢查 Early-Data header
-	return c.GetHeader("Early-Data") == "1"
+// handshakeKey 存放 QUIC 連線的握手完成通道（見 WithHandshakeComplete）
+type handshakeKey struct{}
+
+// WithHandshakeComplete 把 QUIC 連線的 HandshakeComplete() 通道放進連線 context，
+// 供 IsEarlyData 判斷請求是否在握手完成前（0-RTT）送達。
+// 由 server 在 http3.Server.ConnContext 呼叫；quic-go 的請求 context 衍生自連線 context。
+func WithHandshakeComplete(ctx stdcontext.Context, done <-chan struct{}) stdcontext.Context {
+	return stdcontext.WithValue(ctx, handshakeKey{}, done)
 }
 
-// AcceptEarlyData 接受早期數據
-func (c *Context) AcceptEarlyData() {
-	if c.protocol == HTTP3 {
-		c.Header("Early-Data-Accepted", "1")
+// IsEarlyData 回報本請求是否為 0-RTT 早期資料——可被攻擊者原封重放。
+// 非冪等操作遇到 true 應回 425，客戶端會在握手完成後重送（RFC 8470）：
+//
+//	if c.IsEarlyData() { c.AbortWithStatus(http.StatusTooEarly); return }
+//
+// 兩種來源，與本請求的協議無關：
+//   - 經代理：轉發早期資料的代理會加 Early-Data: 1（RFC 8470 §5.1），後端收到的
+//     常是 HTTP/1.1 或 HTTP/2。客戶端自行偽造只會讓自己被拒，不需可信代理即可採信
+//   - 直連 HTTP/3：quic-go 收到 0-RTT 請求立即派發、不等握手。握手未完成即為早期
+//     資料；重放的 0-RTT 永遠無法完成握手，所以握手已完成的連線不會是重放
+func (c *Context) IsEarlyData() bool {
+	if c.Request == nil {
+		return false
+	}
+	if c.Request.Header.Get(HeaderEarlyData) == "1" {
+		return true
+	}
+	done, ok := c.Request.Context().Value(handshakeKey{}).(<-chan struct{})
+	if !ok {
+		return false // 非 HTTP/3，或 server 未注入（無法得知，視為已完成）
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -273,15 +211,6 @@ func (c *Context) Stream(step func(w io.Writer) bool) bool {
 	}
 }
 
-// StreamWithPriority 帶優先級的串流
-func (c *Context) StreamWithPriority(priority uint8, step func(w io.Writer) bool) error {
-	if err := c.SetStreamPriority(priority); err != nil {
-		return err
-	}
-	c.Stream(step)
-	return nil
-}
-
 // ===== QUIC 特定功能 =====
 
 // GetQUICConnection 獲取 QUIC 連接資訊
@@ -302,40 +231,4 @@ func (c *Context) GetStreamInfo() *StreamInfo {
 // SetStreamInfo 設置流資訊
 func (c *Context) SetStreamInfo(info *StreamInfo) {
 	c.streamInfo = info
-}
-
-// EnableDatagrams 啟用 QUIC 數據報
-func (c *Context) EnableDatagrams() error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("datagrams only available in HTTP/3")
-	}
-	// 實際啟用數據報的實現
-	c.Header("Datagram-Flow-ID", "1")
-	return nil
-}
-
-// SendDatagram 發送 QUIC 數據報
-func (c *Context) SendDatagram(data []byte) error {
-	if c.protocol != HTTP3 {
-		return fmt.Errorf("datagrams only available in HTTP/3")
-	}
-	if c.quicConn == nil || c.quicConn.conn == nil {
-		return fmt.Errorf("no QUIC connection available")
-	}
-	// 實際發送數據報的實現
-	// return c.quicConn.conn.SendDatagram(data)
-	return fmt.Errorf("datagram sending not implemented")
-}
-
-// ===== 輔助函數 =====
-
-// parsePriority 解析 Priority header
-func parsePriority(header string) uint8 {
-	// 簡化的 Priority header 解析
-	// 實際應該按照 RFC 9218 解析
-	// u=3, i
-	// urgency=3, incremental=true
-
-	// 默認返回中等優先級
-	return 3
 }

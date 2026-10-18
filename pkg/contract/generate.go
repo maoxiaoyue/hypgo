@@ -3,6 +3,7 @@ package contract
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -75,9 +76,14 @@ func generateTestCase(route schema.Route) TestCase {
 		ExpectSchema: route.Output != nil,
 	}
 
-	// 生成請求 body
-	if route.Input != nil && needsBody(route.Method) {
-		tc.Input = generateMinimalJSON(route.Input)
+	// 生成請求 body；GET / HEAD 沒有 body，Input 改放 query（c.BindInput 對它們綁 query string）
+	if route.Input != nil {
+		switch {
+		case needsBody(route.Method):
+			tc.Input = generateMinimalJSON(route.Input)
+		case route.Method == "GET" || route.Method == "HEAD":
+			tc.Query = generateQuery(route.Input)
+		}
 	}
 
 	// 判斷期望狀態碼
@@ -112,30 +118,77 @@ func generateMinimalJSON(typ interface{}) string {
 	return string(data)
 }
 
-// structFields 將 struct 的每個 exported 欄位生成 JSON 名稱 → 測試值的 map
+// structFields 將 struct 的每個 JSON 欄位（內嵌 struct 已展開）生成 JSON 名稱 → 測試值的 map
 func structFields(t reflect.Type) map[string]interface{} {
 	fields := make(map[string]interface{})
+	for _, f := range jsonFields(t) {
+		fields[f.Name] = generateFieldValue(f.StructField, f.Name)
+	}
+	return fields
+}
+
+// generateQuery 為 GET / HEAD 的 Input 生成 query 參數。
+// 鍵名規則與 pkg/context 的 Query 綁定器一致：form tag > json tag > 欄位名，內嵌 struct 展開；
+// 巢狀 struct / map 無法以 query 表示，略過
+func generateQuery(typ interface{}) map[string]string {
+	t := reflect.TypeOf(typ)
+	for t != nil && t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t == nil || t.Kind() != reflect.Struct {
+		return nil
+	}
+	q := make(map[string]string)
+	addQueryFields(q, t)
+	return q
+}
+
+func addQueryFields(q map[string]string, t reflect.Type) {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			addQueryFields(q, f.Type)
+			continue
+		}
 		if !f.IsExported() {
 			continue
 		}
-
-		jsonTag := f.Tag.Get("json")
-		if jsonTag == "-" {
+		name := queryFieldName(f)
+		if name == "" {
 			continue
 		}
-
-		jsonName := f.Name
-		if jsonTag != "" {
-			if first := strings.Split(jsonTag, ",")[0]; first != "" {
-				jsonName = first
-			}
+		if s, ok := queryString(generateFieldValue(f, name)); ok {
+			q[name] = s
 		}
-
-		fields[jsonName] = generateFieldValue(f, jsonName)
 	}
-	return fields
+}
+
+// queryFieldName 回傳欄位的 query 鍵名；"-" 表示不綁定，回傳空字串
+func queryFieldName(f reflect.StructField) string {
+	for _, tag := range []string{"form", "json"} {
+		if name, _, _ := strings.Cut(f.Tag.Get(tag), ","); name != "" {
+			if name == "-" {
+				return ""
+			}
+			return name
+		}
+	}
+	return f.Name
+}
+
+// queryString 把生成的測試值轉成 query 字串；切片取第一個元素（TestCase.Query 為單值）
+func queryString(v interface{}) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case bool, int64, uint64, float64:
+		return fmt.Sprint(x), true
+	case []interface{}:
+		if len(x) > 0 {
+			return queryString(x[0])
+		}
+	}
+	return "", false
 }
 
 // generateFieldValue 為單一 struct 欄位生成合理的測試值
@@ -554,12 +607,13 @@ func resolvePath(path string) string {
 func guessParamValue(name string) string {
 	lower := strings.ToLower(name)
 	switch {
+	// uuid / guid 必須在 id 之前：兩者都含 "id"，先前此分支永遠走不到，:uuid 被填成 "1"
+	case strings.Contains(lower, "uuid"), strings.Contains(lower, "guid"):
+		return "00000000-0000-0000-0000-000000000000"
 	case strings.Contains(lower, "id"):
 		return "1"
 	case strings.Contains(lower, "slug"):
 		return "test-slug"
-	case strings.Contains(lower, "uuid"), strings.Contains(lower, "guid"):
-		return "00000000-0000-0000-0000-000000000000"
 	case strings.Contains(lower, "date"):
 		return "2026-06-10"
 	case strings.Contains(lower, "year"):
@@ -587,6 +641,10 @@ func guessExpectedStatus(route schema.Route) int {
 	case "POST":
 		return 201
 	case "DELETE":
+		// 宣告了 Output 就表示會回 body，204 不得帶 body——預設 204 會讓此類路由必定失敗
+		if route.Output != nil {
+			return 200
+		}
 		return 204
 	default:
 		return 200

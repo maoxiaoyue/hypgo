@@ -7,65 +7,45 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
 	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
 // validateResponse 驗證回應 body 是否符合 Output schema
-// 三層檢查：可反序列化 → 必填欄位存在 → validate: 約束（格式 / 範圍 / 列舉）
 func validateResponse(body []byte, outputType interface{}) error {
-	if outputType == nil {
-		return nil
-	}
-	if len(body) == 0 {
-		return fmt.Errorf("response body is empty")
-	}
-
-	t := reflect.TypeOf(outputType)
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	// 嘗試反序列化
-	instance := reflect.New(t).Interface()
-	if err := json.Unmarshal(body, instance); err != nil {
-		return fmt.Errorf("response does not match Output schema %s: %w", t.Name(), err)
-	}
-
-	// 驗證必填欄位
-	if err := validateRequiredFields(body, t); err != nil {
-		return err
-	}
-
-	// 驗證 validate: 約束
-	return validateConstraints(instance)
+	return validateBody(body, outputType, "response", "Output")
 }
 
 // validateRequest 驗證請求 body 是否符合 Input schema
-// 與 validateResponse 對稱：反序列化 → 必填欄位 → validate: 約束
 func validateRequest(body []byte, inputType interface{}) error {
-	if inputType == nil {
+	return validateBody(body, inputType, "request", "Input")
+}
+
+// validateBody 三層檢查：可反序列化 → 必填欄位存在 → validate: 約束（格式 / 範圍 / 列舉）。
+// kind / schemaName 只用於錯誤訊息（"response" / "Output"）
+func validateBody(body []byte, typ interface{}, kind, schemaName string) error {
+	if typ == nil {
 		return nil
 	}
 	if len(body) == 0 {
-		return fmt.Errorf("request body is empty")
+		return fmt.Errorf("%s body is empty", kind)
 	}
 
-	t := reflect.TypeOf(inputType)
+	t := reflect.TypeOf(typ)
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 
 	instance := reflect.New(t).Interface()
 	if err := json.Unmarshal(body, instance); err != nil {
-		return fmt.Errorf("request does not match Input schema %s: %w", t.Name(), err)
+		return fmt.Errorf("%s does not match %s schema %s: %w", kind, schemaName, t.Name(), err)
 	}
-
 	if err := validateRequiredFields(body, t); err != nil {
 		return err
 	}
-
 	return validateConstraints(instance)
 }
 
@@ -76,43 +56,26 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	required := requiredJSONNames(t)
+	if len(required) == 0 {
+		return nil // 沒有必填欄位就不必再解一次 body
+	}
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil
 	}
+	// encoding/json 比對鍵名不分大小寫：{"Name":…} 也會填進 json:"name"。
+	// 先前精確比對，這種回應型別解碼成功、必填檢查卻判全部欄位缺漏
+	present := make(map[string]struct{}, len(raw))
+	for k := range raw {
+		present[strings.ToLower(k)] = struct{}{}
+	}
 
 	var missing []string
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-
-		jsonTag := f.Tag.Get("json")
-		if jsonTag == "-" {
-			continue
-		}
-
-		jsonName := f.Name
-		omitempty := false
-		if jsonTag != "" {
-			parts := strings.Split(jsonTag, ",")
-			if parts[0] != "" {
-				jsonName = parts[0]
-			}
-			for _, opt := range parts[1:] {
-				if opt == "omitempty" {
-					omitempty = true
-				}
-			}
-		}
-
-		required := !omitempty && f.Type.Kind() != reflect.Ptr
-		if required {
-			if _, exists := raw[jsonName]; !exists {
-				missing = append(missing, jsonName)
-			}
+	for _, name := range required {
+		if _, ok := present[strings.ToLower(name)]; !ok {
+			missing = append(missing, name)
 		}
 	}
 
@@ -120,6 +83,32 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// jsonFields 回傳 t 的 JSON 欄位（規則見 schema.JSONFields；與 manifest 的 FieldsOf 同一套），
+// 必填檢查與測試資料生成共用
+func jsonFields(t reflect.Type) []schema.JSONField {
+	if v, ok := jsonFieldCache.Load(t); ok {
+		return v.([]schema.JSONField)
+	}
+	fields := schema.JSONFields(t)
+	jsonFieldCache.Store(t, fields)
+	return fields
+}
+
+// jsonFieldCache reflect.Type → []schema.JSONField。tag 解析結果對同一型別永不改變，
+// 先前每次驗證 / 生成都重新走一遍反射
+var jsonFieldCache sync.Map
+
+// requiredJSONNames 回傳必填欄位的 JSON 名稱
+func requiredJSONNames(t reflect.Type) []string {
+	var names []string
+	for _, f := range jsonFields(t) {
+		if f.Required {
+			names = append(names, f.Name)
+		}
+	}
+	return names
 }
 
 // validateConstraints 以 go-playground/validator 執行 validate: tag 的語意/格式約束檢查

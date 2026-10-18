@@ -18,7 +18,7 @@ func (m *mockDBConfig) GetMaxIdleConns() int                        { return 0 }
 func (m *mockDBConfig) GetMaxOpenConns() int                        { return 0 }
 func (m *mockDBConfig) GetRedisConfig() config.RedisConfigInterface { return nil }
 
-// TestRedisRequiresWithRedis 回歸測試：v0.8.11 起 Redis 與 mysql/pg 同規格，
+// TestRedisRequiresWithRedis 回歸測試：v0.9.0 起 Redis 與 mysql/pg 同規格，
 // core 不再依 driver 字串特判自動初始化——driver: "redis" 未傳 WithRedis
 // 時應得到與 SQL 路徑同格式的提示錯誤，而非靜默或 panic
 func TestRedisRequiresWithRedis(t *testing.T) {

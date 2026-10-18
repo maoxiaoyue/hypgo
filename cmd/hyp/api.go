@@ -159,7 +159,7 @@ func createAPIRouterSetup(projectName, today string) error {
 		"// Setup 註冊所有路由與中間件。\n" +
 		"// 在 main.go 呼叫：routers.Setup(app.Server().Router())。\n" +
 		"func Setup(r *router.Router) {\n" +
-		"\t// Recovery / Logger / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
+		"\t// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
 		"\t// 不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。\n" +
 		"\t// 額外的全域中間件（JWT、RateLimiter、BodyLimit…）在此加，或用 routers/middleware.go 的 APIMiddleware()\n\n" +
 		"\t// 健康檢查（Schema-first：宣告 Output 供 contract 測試與 manifest 使用）\n" +
@@ -552,6 +552,7 @@ func createAPIHealth(projectName, today string) error {
 func createAPIMainFile(projectName string) error {
 	content := "package main\n\n" +
 		"import (\n" +
+		"\t\"fmt\"\n" +
 		"\t\"os\"\n\n" +
 		"\t\"github.com/maoxiaoyue/hypgo\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/config\"\n" +
@@ -561,9 +562,16 @@ func createAPIMainFile(projectName string) error {
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n\n" +
 		"\t\"" + projectName + "/routers\"\n" +
 		")\n\n" +
+		"// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）\n" +
+		"const configPath = \"config/config.yaml\"\n\n" +
 		"func main() {\n" +
-		"\t// 一行式啟動：載入 config/config.yaml（找不到時用預設值）、建立 logger 與 server\n" +
-		"\tapp := hypgo.New(hypgo.WithConfigPath(\"config/config.yaml\"))\n" +
+		"\t// 嚴格載入設定：檔案不存在或內容無效即結束，不靜默退回預設值起跑；\n" +
+		"\t// logger 與 server 依 config 建立\n" +
+		"\tapp, err := hypgo.NewWithConfig(configPath)\n" +
+		"\tif err != nil {\n" +
+		"\t\tfmt.Fprintf(os.Stderr, \"load %s: %v\\n\", configPath, err)\n" +
+		"\t\tos.Exit(1)\n" +
+		"\t}\n" +
 		"\tlog := app.Logger()\n\n" +
 		"\t// 資料庫（database.dsn 留空則略過）；service 透過建構子注入：\n" +
 		"\t//   services.NewUserService(db, log)\n" +
@@ -637,7 +645,7 @@ func printSuccessMessage(projectName string) {
 	fmt.Printf("   ├── logs/               # .gitkeep（logger 輸出 logs/api.log）\n")
 	fmt.Printf("   ├── certs/              # make cert → HTTP/3 用 TLS 憑證\n")
 	fmt.Printf("   ├── Dockerfile / docker-compose.yml / Makefile\n")
-	fmt.Printf("   └── main.go             # hypgo.New() 一行式啟動 + routers.Setup\n")
+	fmt.Printf("   └── main.go             # hypgo.NewWithConfig 嚴格載入設定 + routers.Setup\n")
 	fmt.Printf("\n🚀 Quick Start:\n")
 	fmt.Printf("   cd %s\n", projectName)
 	fmt.Printf("   go run .                # http://localhost:8080/health\n")
@@ -1102,7 +1110,7 @@ Redis: add ` + "`hidb.WithRedis(redis.New())`" + ` (import ` + "`github.com/maox
 ├── migrations/         # SQL migrations (make migrate)
 ├── logs/               # logger output (logs/api.log)
 ├── certs/              # make cert
-└── main.go             # hypgo.New() one-line startup + routers.Setup
+└── main.go             # hypgo.NewWithConfig (strict config) + routers.Setup
 ` + "```" + `
 
 ## Tooling
@@ -1121,7 +1129,7 @@ const goModContent = `module {{.ProjectName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.8.11
+	github.com/maoxiaoyue/hypgo v0.9.2
 	golang.org/x/crypto v0.47.0 // bcrypt（auth_service.go）
 )
 `

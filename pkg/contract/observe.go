@@ -8,8 +8,6 @@ package contract
 // date: 2026-05-23
 
 import (
-	"bytes"
-	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -88,7 +86,8 @@ type ObserveResult struct {
 }
 
 // ObserveAll 以觀察模式執行所有 schema-registered REST 路由的 contract 測試
-// 捕捉每條路由的完整 HTTP 交換並生成 HTML 報告
+// 捕捉每條路由的完整 HTTP 交換並生成 HTML 報告。
+// 失敗的路由以 t.Errorf 回報（與 TestAll 相同）；只想產生報告、自行判讀結果時傳 nil t
 //
 // 用法：
 //
@@ -181,20 +180,17 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		return nil
 	}
 
-	cfg := opt.Run
-	// 防禦性檢查：MaxWorkers 在 mergeObserveOpts 不做正規化，在此補齊
-	if cfg.MaxWorkers <= 0 {
-		cfg.MaxWorkers = runtime.GOMAXPROCS(0)
-	}
+	cfg := mergeRunConfig([]RunConfig{opt.Run})
 
 	// ── 並行路徑 ──────────────────────────────────────────────────────────
 	if cfg.Parallel && len(targets) > 1 {
 		sem := make(chan struct{}, cfg.MaxWorkers)
 		var (
-			mu      sync.Mutex
 			wg      sync.WaitGroup
 			aborted atomic.Bool
-			results []ObserveResult
+			// 依路由原始順序寫入各自的槽位：結果與報告順序固定，不隨完成先後變動。
+			// 每個 goroutine 只寫自己的索引，不需鎖
+			slots = make([]*ObserveResult, len(targets))
 		)
 
 		// 速率限制器
@@ -205,11 +201,10 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 			defer ticker.Stop()
 		}
 
-		for _, route := range targets {
+		for i, route := range targets {
 			if aborted.Load() {
 				break
 			}
-			route := route // capture
 
 			wg.Add(1)
 			go func() {
@@ -230,10 +225,7 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 				}
 
 				result := captureWithRetry(r, route, cfg)
-
-				mu.Lock()
-				results = append(results, result)
-				mu.Unlock()
+				slots[i] = &result
 
 				if !result.Pass && cfg.FailFast {
 					aborted.Store(true)
@@ -241,6 +233,13 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 			}()
 		}
 		wg.Wait()
+
+		results := make([]ObserveResult, 0, len(targets))
+		for _, res := range slots {
+			if res != nil { // FailFast 後未執行的路由留空
+				results = append(results, *res)
+			}
+		}
 
 		return writeObserveReport(t, results, filter, opt)
 	}
@@ -306,24 +305,41 @@ func writeObserveReport(t *testing.T, results []ObserveResult, filter string, op
 
 	outPath := opt.OutputPath
 	if outPath == "" {
-		if err := os.MkdirAll(".hyp", 0o755); err == nil {
-			ts := time.Now().Format("20060102_150405")
-			outPath = filepath.Join(".hyp", fmt.Sprintf("observe_%s.html", ts))
-		}
+		outPath = filepath.Join(".hyp", "observe_"+time.Now().Format("20060102_150405")+".html")
 	}
-	if outPath != "" {
-		htmlContent := GenerateObserveHTML(results, filter)
-		if err := os.WriteFile(outPath, []byte(htmlContent), 0o644); err == nil {
-			if t != nil && !opt.Silent {
-				t.Logf("[observe] report → %s", outPath)
-			}
-			if opt.OpenBrowser {
-				openObserveBrowser(outPath)
-			}
+	// 先前目錄或檔案寫入失敗時完全無訊息，使用者只會發現報告不見了
+	err := os.MkdirAll(filepath.Dir(outPath), 0o755)
+	if err == nil {
+		err = os.WriteFile(outPath, []byte(GenerateObserveHTML(results, filter)), 0o644)
+	}
+	switch {
+	case err != nil:
+		if t != nil {
+			t.Errorf("[observe] write report %s: %v", outPath, err)
+		}
+	default:
+		if t != nil && !opt.Silent {
+			t.Logf("[observe] report → %s", outPath)
+		}
+		if opt.OpenBrowser {
+			openObserveBrowser(outPath)
 		}
 	}
 
+	if t != nil {
+		reportObserveFailures(t.Errorf, results)
+	}
 	return results
+}
+
+// reportObserveFailures 以 errorf 回報每條失敗路由：與 TestAll 一致，觀察到失敗即讓測試失敗。
+// 先前 Observe 從不呼叫 t.Errorf，路由失敗時測試仍是綠的
+func reportObserveFailures(errorf func(format string, args ...interface{}), results []ObserveResult) {
+	for _, r := range results {
+		if !r.Pass {
+			errorf("observe: [%s %s] %s", r.Route.Method, r.Route.Path, r.FailReason)
+		}
+	}
 }
 
 // captureRouteExchange 執行一條路由的測試並捕捉完整的 HTTP 交換記錄
@@ -336,26 +352,11 @@ func writeObserveReport(t *testing.T, results []ObserveResult, filter string, op
 // @ai:modified by=claude-opus-4-8 date=2026-06-15 reason=新增記憶體/CPU/資源使用量測（measure 參數）
 func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool) ObserveResult {
 	tc := generateTestCase(route)
-	tc.schemaPath = route.Path
 
 	// 解析 Route 字串（格式："METHOD /path"）
 	method, urlPath := parseRoute(tc.Route)
 
-	// 建立請求
-	req := httptest.NewRequest(method, urlPath, strings.NewReader(tc.Input))
-	if tc.Input != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range tc.Headers {
-		req.Header.Set(k, v)
-	}
-	if len(tc.Query) > 0 {
-		q := req.URL.Query()
-		for k, v := range tc.Query {
-			q.Set(k, v)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
+	req := tc.request(method, urlPath)
 
 	// 捕捉請求詳情
 	capturedReq := CapturedRequest{
@@ -413,7 +414,7 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool)
 	}
 
 	// 逐步驗證
-	steps, pass, failReason := runObserveValidation(route, tc, w.Code, respBody)
+	steps, pass, failReason := validateExchange(route, tc, w.Code, respBody)
 
 	return ObserveResult{
 		Route:      route,
@@ -430,84 +431,6 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool)
 		CPUTime:    cpuUsed,
 		Resources:  resUsed,
 	}
-}
-
-// runObserveValidation 逐步執行驗證並記錄每個步驟的結果
-//
-// @ai purpose: 四步驗證（狀態碼、回應 body 非空、Input schema、Output schema）
-// @ai input: schema.Route、TestCase（自動生成）、實際 HTTP 狀態碼、回應 body
-// @ai output: []ValidationStep、pass bool、reason string
-// @ai sideeffect: 無
-// date: 2026-05-23
-func runObserveValidation(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
-	pass = true
-
-	// Step 1：狀態碼
-	wantStatus := tc.ExpectStatus
-	statusOK := code == wantStatus
-	steps = append(steps, ValidationStep{
-		Name:   "Status Code",
-		Pass:   statusOK,
-		Detail: fmt.Sprintf("got %d, want %d", code, wantStatus),
-	})
-	if !statusOK {
-		pass = false
-		reason = fmt.Sprintf("status = %d, want %d", code, wantStatus)
-	}
-
-	// Step 2：回應 body 非空（有 Output schema 時）
-	if route.Output != nil {
-		bodyOK := len(bytes.TrimSpace(body)) > 0
-		steps = append(steps, ValidationStep{
-			Name:   "Response Body",
-			Pass:   bodyOK,
-			Detail: observeIfElse(bodyOK, "body present", "body is empty"),
-		})
-		if !bodyOK && pass {
-			pass = false
-			reason = "response body is empty"
-		}
-	}
-
-	// Step 3：Input schema 驗證
-	if route.Input != nil && tc.Input != "" {
-		err := validateRequest([]byte(tc.Input), route.Input)
-		inputOK := err == nil
-		var inputDetail string
-		if inputOK {
-			inputDetail = "matches schema"
-		} else {
-			inputDetail = err.Error()
-		}
-		steps = append(steps, ValidationStep{
-			Name:   fmt.Sprintf("Input Schema (%s)", route.InputName),
-			Pass:   inputOK,
-			Detail: inputDetail,
-		})
-	}
-
-	// Step 4：Output schema 驗證
-	if route.Output != nil && len(bytes.TrimSpace(body)) > 0 {
-		err := validateResponse(body, route.Output)
-		outOK := err == nil
-		var outDetail string
-		if outOK {
-			outDetail = "matches schema"
-		} else {
-			outDetail = err.Error()
-		}
-		steps = append(steps, ValidationStep{
-			Name:   fmt.Sprintf("Output Schema (%s)", route.OutputName),
-			Pass:   outOK,
-			Detail: outDetail,
-		})
-		if !outOK && pass {
-			pass = false
-			reason = err.Error()
-		}
-	}
-
-	return
 }
 
 // observeRouteMatchesFilter 判斷路由是否符合過濾字串
@@ -551,20 +474,6 @@ func mergeObserveOpts(opts []ObserveOptions) ObserveOptions {
 		return opts[0]
 	}
 	return ObserveOptions{}
-}
-
-// observeIfElse 為內部使用的三元表達式替代
-//
-// @ai purpose: 消除 if/else 的樣板程式碼
-// @ai input: cond bool、t string（true 時回傳）、f string（false 時回傳）
-// @ai output: string
-// @ai sideeffect: 無
-// date: 2026-05-23
-func observeIfElse(cond bool, t, f string) string {
-	if cond {
-		return t
-	}
-	return f
 }
 
 // openObserveBrowser 在預設瀏覽器中開啟指定路徑的 HTML 報告

@@ -3,9 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
+	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 )
 
 func TestNewServer(t *testing.T) {
@@ -84,6 +87,7 @@ func TestServerGracefulShutdown(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	go func() {
@@ -116,6 +120,7 @@ func TestStartReturnsNilOnGracefulShutdown(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	errCh := make(chan error, 1)
@@ -181,6 +186,7 @@ func TestStartAppliesDefaultMiddlewares(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	s.Router().GET("/ok", func(c *hypcontext.Context) { c.String(200, "ok") })
@@ -493,6 +499,7 @@ func TestHealthNoRaceWithStart(t *testing.T) {
 	cfg := config.Config{}
 	cfg.ApplyDefaults()
 	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.DisableAutoSync = true // 測試不往原始碼目錄寫 .hyp/context.yaml
 	s := New(&cfg, logger.NewLogger())
 
 	var wg sync.WaitGroup
@@ -589,5 +596,41 @@ func TestRemovePIDFileOnlyRemovesOwnPID(t *testing.T) {
 	s.removePIDFile()
 	if _, err := os.Stat(pidFilePath); !os.IsNotExist(err) {
 		t.Error("removePIDFile should remove a PID file belonging to this process")
+	}
+}
+
+// TestStartWritesManifestWhenRequested 迴歸測試：設了 HYPGO_MANIFEST_OUT 時，Start 寫出含真實路由的
+// manifest 後立即返回、不開始監聽。hyp context 以此取得使用者路由（先前它用空的 router.New()，沒有任何路由）。
+func TestStartWritesManifestWhenRequested(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "manifest.json")
+	t.Setenv(manifest.ManifestOutEnv, out)
+
+	cfg := config.Config{}
+	cfg.ApplyDefaults()
+	cfg.Server.Addr = "127.0.0.1:0"
+	s := New(&cfg, logger.NewLogger())
+	s.Router().GET("/api/real", func(c *hypcontext.Context) {})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start() = %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start() kept running (should return without listening)")
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("manifest is not JSON: %v", err)
+	}
+	if len(m.Routes) != 1 || m.Routes[0].Path != "/api/real" {
+		t.Errorf("routes = %+v, want /api/real", m.Routes)
 	}
 }

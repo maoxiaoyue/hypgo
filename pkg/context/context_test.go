@@ -213,3 +213,52 @@ func TestValueWithHypContextKey(t *testing.T) {
 		t.Error("Value(hypContextKey{}) should return the Context itself")
 	}
 }
+
+// TestIsEarlyData 歷史 bug：只在 HTTP/3 上檢查 Early-Data 標頭——但這個標頭只會
+// 由代理加上，後端收到的是 HTTP/1.1 或 HTTP/2，於是恆為 false；直連 HTTP/3 的
+// 0-RTT 又沒有這個標頭（quic-go 不加），同樣恆為 false。0-RTT 防重放兩頭落空。
+func TestIsEarlyData(t *testing.T) {
+	open := make(chan struct{})
+	closed := make(chan struct{})
+	close(closed)
+
+	cases := []struct {
+		name   string
+		header string
+		done   chan struct{} // nil = server 未注入
+		want   bool
+	}{
+		{"proxy header over HTTP/1.1", "1", nil, true},
+		{"no signal", "", nil, false},
+		{"HTTP/3 handshake pending", "", open, true},
+		{"HTTP/3 handshake complete", "", closed, false},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest("POST", "/pay", nil)
+		if tc.header != "" {
+			req.Header.Set("Early-Data", tc.header)
+		}
+		if tc.done != nil {
+			req = req.WithContext(WithHandshakeComplete(req.Context(), tc.done))
+		}
+		c := AcquireContext(httptest.NewRecorder(), req)
+		if got := c.IsEarlyData(); got != tc.want {
+			t.Errorf("%s: IsEarlyData() = %v, want %v", tc.name, got, tc.want)
+		}
+		ReleaseContext(c)
+	}
+}
+
+// TestWriteHeaderAfterWriteIsIgnored header 已送出後改狀態碼應無效：
+// Status() 必須與客戶端實際收到的一致（先前會改 status 並往 stdout 印 debug）。
+func TestWriteHeaderAfterWriteIsIgnored(t *testing.T) {
+	w := httptest.NewRecorder()
+	rw := newResponseWriter(w)
+
+	rw.Write([]byte("body"))
+	rw.WriteHeader(http.StatusInternalServerError)
+
+	if rw.Status() != http.StatusOK || w.Code != http.StatusOK {
+		t.Errorf("Status()=%d recorder=%d, want both 200", rw.Status(), w.Code)
+	}
+}

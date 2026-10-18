@@ -332,6 +332,24 @@ func MethodOverride() hypcontext.HandlerFunc {
 	}
 }
 
+// RejectEarlyData 對非安全方法的 0-RTT 早期資料回 425 Too Early（RFC 8470），
+// 客戶端會在握手完成後重送。早期資料可被攻擊者重放，單次使用 session ticket
+// 也擋不住「搶先重放 + 原請求改走 1-RTT 重送」造成的重複執行。
+// 安全方法（GET / HEAD / OPTIONS / TRACE）不改變狀態，照常放行。
+func RejectEarlyData() hypcontext.HandlerFunc {
+	return func(c *hypcontext.Context) {
+		switch c.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		default:
+			if c.IsEarlyData() {
+				c.AbortWithStatus(http.StatusTooEarly)
+				return
+			}
+		}
+		c.Next()
+	}
+}
+
 // ===== 預設中間件配置 =====
 
 // DefaultMiddleware 創建預設中間件組合
@@ -346,6 +364,8 @@ func DefaultMiddleware() []hypcontext.HandlerFunc {
 		Logger(LoggerConfig{
 			TimeFormat: time.RFC3339,
 		}),
+		// 0-RTT 重放保護（auto 模式同時服務 HTTP/3；經代理的早期資料在任何協議都可能出現）
+		RejectEarlyData(),
 		// 安全頭
 		Security(SecurityConfig{
 			XSSProtection:      "1; mode=block",
@@ -375,6 +395,8 @@ func HTTP3Middleware() []hypcontext.HandlerFunc {
 			EnableLatency: true,
 			EnableSize:    true,
 		}),
+		// 0-RTT 重放保護
+		RejectEarlyData(),
 		// 壓縮（優先使用 Brotli）
 		Compression(CompressionConfig{
 			Level:        6,

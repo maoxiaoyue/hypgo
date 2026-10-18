@@ -65,3 +65,34 @@ func TestSetTrustedProxiesRejectsGarbage(t *testing.T) {
 		t.Error("SetTrustedProxies should reject an invalid CIDR")
 	}
 }
+
+// TestHostSchemeIgnoreForwardedHeadersWhenUntrusted 回歸測試（安全）：
+// Host() / Scheme() 與 ClientIP 同一套可信代理閘門。
+// 歷史 bug：兩者無條件採信 X-Forwarded-Host / X-Forwarded-Proto，任意客戶端自帶標頭就能讓
+// Host() 回自己的網域 —— 拿去組密碼重設連結、絕對路徑重導向就是 host header injection。
+func TestHostSchemeIgnoreForwardedHeadersWhenUntrusted(t *testing.T) {
+	newCtx := func() *Context {
+		req := httptest.NewRequest("GET", "http://app.example/", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("X-Forwarded-Host", "evil.example")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		return AcquireContext(httptest.NewRecorder(), req)
+	}
+
+	SetTrustedProxies()
+	c := newCtx()
+	if h, s := c.Host(), c.Scheme(); h != "app.example" || s != "http" {
+		t.Errorf("untrusted: Host()=%q Scheme()=%q, want app.example / http", h, s)
+	}
+	c.Release()
+
+	if err := SetTrustedProxies("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	defer SetTrustedProxies()
+	c = newCtx()
+	defer c.Release()
+	if h, s := c.Host(), c.Scheme(); h != "evil.example" || s != "https" {
+		t.Errorf("trusted proxy: Host()=%q Scheme()=%q, want forwarded values", h, s)
+	}
+}

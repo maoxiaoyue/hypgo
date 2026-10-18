@@ -7,14 +7,18 @@ package manifest
 // 在 Server 啟動時自動生成專案 manifest，永遠與程式碼同步。
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
+	"gopkg.in/yaml.v3"
 )
 
 // maxEnricherErrorsReported AutoSync 在每次 Sync 中最多回報幾條 enricher 錯誤
@@ -23,6 +27,10 @@ const maxEnricherErrorsReported = 5
 
 // DefaultContextPath 預設的 context 檔案路徑
 const DefaultContextPath = ".hyp/context.yaml"
+
+// ManifestOutEnv 設定此環境變數時，server.Start() 在路由註冊完成後把 manifest（JSON）
+// 寫到該路徑並直接返回、不開始監聽。hyp context 以此執行使用者專案取得真實路由
+const ManifestOutEnv = "HYPGO_MANIFEST_OUT"
 
 // DefaultLLMConfigFilename LLM 設定檔在 .hyp/ 內的固定檔名
 const DefaultLLMConfigFilename = "llm.yaml"
@@ -38,7 +46,7 @@ type AutoSyncConfig struct {
 	// Format 輸出格式（"yaml" 或 "json"，預設 "yaml"）
 	Format string
 
-	// LLMConfig 選用：啟用 LLM 智慧增強，自動補完 Summary/Tags/Description。
+	// LLMConfig 選用：啟用 LLM 智慧增強，自動補完 Summary/Description。
 	// 為 nil 時 AutoSync 會嘗試從輸出檔的同目錄載入 llm.yaml（預設 .hyp/llm.yaml）；
 	// mode=none、檔案不存在、或載入失敗時退回純 Go 推斷。
 	//
@@ -95,30 +103,43 @@ func (a *AutoSync) Sync() error {
 	// 構建 collector：若 llmCfg 啟用，建立 enricher 並掛上錯誤回報 callback
 	enrichCfg := DefaultEnrichConfig()
 	var errCount int64
+	var cache *cachingEnricher
+	cachePath := filepath.Join(dir, DefaultLLMCacheFilename)
 
 	if llmCfg != nil && llmCfg.IsEnabled() {
 		reporter := a.buildErrorReporter(&errCount)
-		enricher, err := NewLLMEnricherFromConfigWithReporter(llmCfg, reporter)
+		enricher, err := NewLLMEnricherFromConfig(llmCfg, reporter)
 		if err != nil {
 			if a.logger != nil {
 				a.logger.Warningf("AutoSync: LLM enricher init failed (%v); using pure Go inference", err)
 			}
 		} else if enricher != nil {
-			enrichCfg.LLMEnricher = enricher
+			// detail 同時是快取鍵的模型識別：換 provider / model 即重新產生
+			detail := string(llmCfg.Mode)
+			if llmCfg.Mode == config.LLMModeAPI {
+				detail = "api/" + llmCfg.API.Provider + "/" + llmCfg.API.Model
+			} else if llmCfg.Mode == config.LLMModeOllama {
+				detail = "ollama/" + llmCfg.Ollama.Model
+			}
+			cache = newCachingEnricher(enricher, detail, loadLLMCache(cachePath))
+			enrichCfg.LLMEnricher = cache
 			if a.logger != nil {
-				detail := string(llmCfg.Mode)
-				if llmCfg.Mode == config.LLMModeAPI {
-					detail = "api/" + llmCfg.API.Provider + "/" + llmCfg.API.Model
-				} else if llmCfg.Mode == config.LLMModeOllama {
-					detail = "ollama/" + llmCfg.Ollama.Model
-				}
 				a.logger.Infof("AutoSync: LLM enrichment enabled (%s)", detail)
 			}
 		}
 	}
 
-	collector := NewCollectorWithModelsAndEnrich(a.router, a.appCfg, migrate.GlobalRegistry(), enrichCfg)
+	collector := newCollector(a.router, a.appCfg, migrate.GlobalRegistry(), enrichCfg)
 	m := collector.Collect()
+
+	if cache != nil {
+		if err := cache.save(cachePath); err != nil && a.logger != nil {
+			a.logger.Warningf("AutoSync: save LLM cache %s: %v", cachePath, err)
+		}
+		if hits, misses := cache.stats(); a.logger != nil {
+			a.logger.Infof("AutoSync: LLM enrichment %d cached, %d requested", hits, misses)
+		}
+	}
 
 	// 若 LLM 期間累積了錯誤，給一條 summary（避免使用者誤以為 LLM 有生效）
 	if total := atomic.LoadInt64(&errCount); total > maxEnricherErrorsReported && a.logger != nil {
@@ -131,10 +152,18 @@ func (a *AutoSync) Sync() error {
 		a.logger.Info(FormatLint(m.Lint))
 	}
 
+	data, changed, err := a.render(m)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil // 內容與現有檔案相同：不重寫，避免每次啟動都只因 generated_at 改動檔案
+	}
+
 	// 原子寫入：先寫 temp file，再 rename
 	// 防止寫入中途斷電或磁碟滿導致 context.yaml 損壞
 	tmpPath := a.config.Path + ".tmp"
-	if err := SaveToFile(tmpPath, m, a.config.Format); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		os.Remove(tmpPath) // 清理失敗的 temp file
 		return err
 	}
@@ -148,6 +177,64 @@ func (a *AutoSync) Sync() error {
 	}
 
 	return nil
+}
+
+// render 序列化 manifest；回報內容是否與現有檔案不同。
+// 比對時沿用現有檔案的 generated_at：除了時間戳之外都沒變就不必重寫
+// （先前每次啟動 / 跑測試都只因 generated_at 改動檔案，納入版控的 context.yaml 永遠是 modified）
+func (a *AutoSync) render(m *Manifest) (data []byte, changed bool, err error) {
+	encode := func() ([]byte, error) {
+		var buf bytes.Buffer
+		var err error
+		if a.config.Format == "json" {
+			err = WriteJSON(&buf, m)
+		} else {
+			err = WriteYAML(&buf, m)
+		}
+		return buf.Bytes(), err
+	}
+
+	if old, readErr := os.ReadFile(a.config.Path); readErr == nil {
+		var prev struct {
+			GeneratedAt time.Time `json:"generated_at" yaml:"generated_at"`
+		}
+		var perr error
+		if a.config.Format == "json" {
+			perr = json.Unmarshal(old, &prev)
+		} else {
+			perr = yaml.Unmarshal(old, &prev)
+		}
+		if perr == nil && !prev.GeneratedAt.IsZero() {
+			now := m.GeneratedAt
+			m.GeneratedAt = prev.GeneratedAt
+			same, err := encode()
+			if err != nil {
+				return nil, false, err
+			}
+			if bytes.Equal(same, old) {
+				return same, false, nil
+			}
+			m.GeneratedAt = now
+		}
+	}
+
+	data, err = encode()
+	return data, true, err
+}
+
+// Run 供 server 啟動時呼叫：未設定 LLM 時同步執行（純推斷，毫秒級，啟動時即輸出 Schema lint）；
+// 設定了 LLM 時改在背景執行——LLM 每條路由一次請求（每次最長 timeout 秒），同步執行會卡住啟動。
+// 背景同步完成前 .hyp/context.yaml 維持上一版
+func (a *AutoSync) Run() {
+	if !a.config.Enabled {
+		return
+	}
+	if cfg := a.resolveLLMConfig(filepath.Dir(a.config.Path)); cfg != nil && cfg.IsEnabled() {
+		a.config.LLMConfig = cfg // 已解析，背景 Sync 不必再讀檔
+		go a.SyncSafe()
+		return
+	}
+	a.SyncSafe()
 }
 
 // SyncSafe 同步但不 panic（用於非關鍵路徑）

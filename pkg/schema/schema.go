@@ -5,6 +5,8 @@
 package schema
 
 import (
+	"strings"
+
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 )
 
@@ -27,7 +29,7 @@ type HeaderSchema struct {
 // ResponseSchema 描述特定狀態碼的回應
 type ResponseSchema struct {
 	Description string      `json:"description" yaml:"description"`
-	Type        interface{} `json:"-" yaml:"-"` // Go struct type（用於驗證）
+	Type        interface{} `json:"-" yaml:"-"` // 此狀態碼的回應 body 型別：contract 依實際狀態碼以它驗證（未宣告時 2xx 用 Route.Output）
 	TypeName    string      `json:"type_name,omitempty" yaml:"type_name,omitempty"`
 }
 
@@ -46,11 +48,13 @@ type ResponseSchema struct {
 // 非 REST 使用範例：
 //
 //	schema.RegisterGRPC("UserService/CreateUser", "Create user", Input{}, Output{})
-//	schema.RegisterBot("/start", "Start the bot", nil, WelcomeMsg{})
-//	schema.RegisterMCP("search_repos", "Search repos", Input{}, Output{})
+//	schema.RegisterCLI("process", "Process files", Input{}, Output{})
+//	schema.RegisterDesktop("view/main", "Main window", nil, MainView{})
+//
+// 其他協議（bot / mcp / websocket …）沒有專用 helper，以 Global().Register 直接註冊
 type Route struct {
 	// 通用欄位（所有協議共用）
-	Protocol    string      `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest"(default), "grpc", "bot", "mcp", "websocket", "cli", "desktop"
+	Protocol    string      `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest"(default)、"grpc"、"cli"、"desktop"；其他協議（"bot"、"mcp"…）可自訂
 	Command     string      `json:"command,omitempty" yaml:"command,omitempty"`   // 非 REST 的命令標識
 	Platform    string      `json:"platform,omitempty" yaml:"platform,omitempty"` // bot 專用平台："telegram", "line", "discord", "whatsapp"
 	Summary     string      `json:"summary,omitempty" yaml:"summary,omitempty"`
@@ -104,26 +108,34 @@ type SchemaRoute struct {
 
 // NewSchemaRoute 建立新的 SchemaRoute builder
 func NewSchemaRoute(route Route, registrar SchemaRegistrar) *SchemaRoute {
-	// 自動填入型別名稱
+	return &SchemaRoute{
+		route:     normalize(route), // router 以正規化後的 Method 建路由樹
+		registrar: registrar,
+	}
+}
+
+// normalize 補齊衍生欄位：Method 轉大寫（"get" 原本會建出 "get" 路由樹，真正的 GET 請求 404）、
+// 自動填 InputName / OutputName 與 Responses 的 TypeName。
+// Responses 寫在副本上：先前直接改呼叫端的 map，多條路由共用同一個 map 時互相污染、並行註冊會競爭
+func normalize(route Route) Route {
+	route.Method = strings.ToUpper(route.Method)
 	if route.Input != nil && route.InputName == "" {
 		route.InputName = TypeName(route.Input)
 	}
 	if route.Output != nil && route.OutputName == "" {
 		route.OutputName = TypeName(route.Output)
 	}
-
-	// 自動填入 ResponseSchema 的 TypeName
-	for code, resp := range route.Responses {
-		if resp.Type != nil && resp.TypeName == "" {
-			resp.TypeName = TypeName(resp.Type)
-			route.Responses[code] = resp
+	if len(route.Responses) > 0 {
+		resps := make(map[int]ResponseSchema, len(route.Responses))
+		for code, resp := range route.Responses {
+			if resp.Type != nil && resp.TypeName == "" {
+				resp.TypeName = TypeName(resp.Type)
+			}
+			resps[code] = resp
 		}
+		route.Responses = resps
 	}
-
-	return &SchemaRoute{
-		route:     route,
-		registrar: registrar,
-	}
+	return route
 }
 
 // Handle 完成路由註冊並儲存 schema

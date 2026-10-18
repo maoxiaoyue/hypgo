@@ -2,73 +2,62 @@
 package schema
 
 import (
+	"strings"
 	"sync"
 )
 
 // Registry 儲存所有 schema-registered 路由的全域註冊表
-// 執行緒安全，使用 sync.RWMutex 保護
-// 支援多協議：REST、gRPC、Bot、MCP、WebSocket、CLI
+// 執行緒安全，使用 sync.RWMutex 保護；零值即可使用
+// 支援多協議：REST、gRPC、CLI、Desktop…
 type Registry struct {
 	mu      sync.RWMutex
 	schemas []Route
-	byKey   map[string]*Route // key = RouteKey()
+	// byKey 存 schemas 的索引而非元素指標：指標在切片擴容後會指向舊陣列，
+	// 重複註冊時只改到舊副本——Get 看到新宣告、All() 仍是舊的
+	byKey map[string]int // key = RouteKey()
 }
 
-var globalRegistry = &Registry{
-	schemas: make([]Route, 0),
-	byKey:   make(map[string]*Route),
-}
+var globalRegistry = &Registry{}
 
 // Global 返回全域 schema 註冊表
 func Global() *Registry {
 	return globalRegistry
 }
 
-// Register 註冊一個路由 schema（支援所有協議）
+// Register 註冊一個路由 schema（支援所有協議）；同 key 重複註冊時以新宣告取代。
+// 衍生欄位（Method 大寫、InputName / OutputName / Responses TypeName）於此補齊，
+// 直接呼叫 Register 與經 router.Schema / RegisterGRPC 等註冊的結果一致
 func (r *Registry) Register(route Route) {
+	route = normalize(route)
+	key := route.RouteKey()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	key := route.RouteKey()
-	if existing, ok := r.byKey[key]; ok {
-		*existing = route
+	if i, ok := r.byKey[key]; ok {
+		r.schemas[i] = route
 		return
 	}
-
-	r.schemas = append(r.schemas, route)
-	r.byKey[key] = &r.schemas[len(r.schemas)-1]
-}
-
-// Get 根據 method 和 path 查詢 REST schema（向後相容）
-func (r *Registry) Get(method, path string) (*Route, bool) {
-	return r.GetByKey("rest|" + method + " " + path)
-}
-
-// GetByKey 根據完整 key 查詢 schema
-func (r *Registry) GetByKey(key string) (*Route, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	route, ok := r.byKey[key]
-	return route, ok
-}
-
-// GetByProtocol 回傳指定協議的所有 schema
-func (r *Registry) GetByProtocol(protocol string) []Route {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	var result []Route
-	for _, route := range r.schemas {
-		p := route.Protocol
-		if p == "" {
-			p = "rest"
-		}
-		if p == protocol {
-			result = append(result, route)
-		}
+	if r.byKey == nil {
+		r.byKey = make(map[string]int)
 	}
-	return result
+	r.byKey[key] = len(r.schemas)
+	r.schemas = append(r.schemas, route)
+}
+
+// Get 根據 method 和 path 查詢 REST schema。回傳副本：呼叫端修改不會繞過鎖改到註冊表
+// （Route 內的 slice / map 仍與註冊表共用，勿就地修改）。
+// 其他協議或依協議篩選請走 All()
+func (r *Registry) Get(method, path string) (*Route, bool) {
+	key := Route{Method: strings.ToUpper(method), Path: path}.RouteKey()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	i, ok := r.byKey[key]
+	if !ok {
+		return nil, false
+	}
+	route := r.schemas[i]
+	return &route, true
 }
 
 // All 返回所有已註冊的路由 schema（副本）
@@ -93,6 +82,6 @@ func (r *Registry) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.schemas = make([]Route, 0)
-	r.byKey = make(map[string]*Route)
+	r.schemas = nil
+	r.byKey = nil
 }

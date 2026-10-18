@@ -137,32 +137,6 @@ func TestAutoSync_LLMEnricher_AppliedToManifest(t *testing.T) {
 	}
 }
 
-func TestNewCollectorWithModelsAndLLM_NilLLM(t *testing.T) {
-	r := setupAutoSyncRouter()
-	c, err := NewCollectorWithModelsAndLLM(r, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c == nil {
-		t.Fatal("collector should not be nil")
-	}
-	if c.enrichCfg.LLMEnricher != nil {
-		t.Error("LLM enricher should be nil when llmCfg is nil")
-	}
-}
-
-func TestNewCollectorWithModelsAndLLM_ModeNone(t *testing.T) {
-	r := setupAutoSyncRouter()
-	cfg := &config.LLMConfig{Mode: config.LLMModeNone}
-	c, err := NewCollectorWithModelsAndLLM(r, nil, nil, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.enrichCfg.LLMEnricher != nil {
-		t.Error("LLM enricher should be nil when mode=none")
-	}
-}
-
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

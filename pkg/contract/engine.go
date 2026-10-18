@@ -31,7 +31,8 @@ type RunConfig struct {
 	// TestAll 使用 t.Parallel()，ObserveAll/Observe 使用 goroutine pool
 	Parallel bool
 
-	// MaxWorkers 限制並行 goroutine 數量
+	// MaxWorkers 限制同時執行的路由數（TestAll 的子測試與 Observe 的 goroutine 皆適用；
+	// TestAll 另受 go test -parallel 限制，取兩者較小者）
 	// 0 或負值 → 自動設為 runtime.GOMAXPROCS(0)
 	MaxWorkers int
 

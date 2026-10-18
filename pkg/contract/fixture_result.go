@@ -38,7 +38,7 @@ func (r *TestResult) Header(key string) string {
 	return r.Headers.Get(key)
 }
 
-// HasHeader 檢查是否有指定的 response header
+// HasHeader 檢查是否有指定的 response header（值為空字串也算存在）
 func (r *TestResult) HasHeader(key string) bool {
-	return r.Headers.Get(key) != ""
+	return len(r.Headers.Values(key)) > 0
 }

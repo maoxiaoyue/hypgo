@@ -4,7 +4,7 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.8.11-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
+[![Version](https://img.shields.io/badge/Version-0.9.2-orange.svg)](https://github.com/maoxiaoyue/hypgo/releases)
 
 [English](README.md) | [繁體中文](README_zh-TW.md) | [简体中文](README_zh-CN.md)
 
@@ -135,7 +135,7 @@ hyp new desktop myapp   → Desktop（Fyne GUI）
 三者共用：
   app/models/     ← 資料結構
   app/services/   ← 業務邏輯 + Error Catalog
-  app/config/     ← config.yaml
+  config/         ← config.yaml (runtime; loaded in main.go)
   .hyp/           ← AI manifest（自動同步）
 ```
 

@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -146,7 +146,7 @@ func (c *Context) ShouldBindBodyWith(obj interface{}, bb BindingBody) error {
 			return err
 		}
 		c.rawData = body
-		c.Request.Body = ioutil.NopCloser(bytes.NewReader(body))
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
 	return bb.BindBody(body, obj)
@@ -207,8 +207,10 @@ var binding = defaultBinding{}
 type defaultBinding struct{}
 
 func (defaultBinding) Default(method, contentType string) Binding {
-	if method == "GET" {
-		return Form
+	// GET / HEAD 沒有 body：綁 query string。Form 綁定器只讀 PostForm（防大量賦值），
+	// 對 GET 永遠是空的，先前 GET 的 ShouldBind / BindInput 會靜默綁出全零值
+	if method == http.MethodGet || method == http.MethodHead {
+		return Query
 	}
 
 	switch contentType {
@@ -403,7 +405,8 @@ type bindingHeader struct{}
 func (bindingHeader) Name() string { return "header" }
 
 func (bindingHeader) Bind(req *http.Request, obj interface{}) error {
-	return mapFormToStruct(url.Values(req.Header), obj)
+	// Go 以 canonical 形式存 header key（X-Api-Key）；tag 寫 X-API-Key 也要對得到
+	return mapToStruct(url.Values(req.Header), obj, textproto.CanonicalMIMEHeaderKey)
 }
 
 // ===== 輔助函數 =====
@@ -421,6 +424,11 @@ func decodeJSON(r io.Reader, obj interface{}) error {
 // 導致任何非字串欄位必定失敗（?page=2 綁 int 欄位回
 // "cannot unmarshal string into Go value of type int"），且完全不認 form tag。
 func mapFormToStruct(values url.Values, obj interface{}) error {
+	return mapToStruct(values, obj, nil)
+}
+
+// mapToStruct 同 mapFormToStruct；keyFn 非 nil 時先轉換欄位鍵名再查表（header 綁定用）
+func mapToStruct(values url.Values, obj interface{}, keyFn func(string) string) error {
 	rv := reflect.ValueOf(obj)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		return fmt.Errorf("binding: target must be a non-nil pointer")
@@ -429,7 +437,7 @@ func mapFormToStruct(values url.Values, obj interface{}) error {
 	if rv.Kind() != reflect.Struct {
 		return fmt.Errorf("binding: target must point to a struct")
 	}
-	return mapFormToStructValue(values, rv)
+	return mapFormToStructValue(values, rv, keyFn)
 }
 
 // formFieldInfo 單一欄位的綁定中繼資料（per-type 快取，見 formFieldsOf）
@@ -469,7 +477,7 @@ func formFieldsOf(rt reflect.Type) []formFieldInfo {
 	return fields
 }
 
-func mapFormToStructValue(values url.Values, rv reflect.Value) error {
+func mapFormToStructValue(values url.Values, rv reflect.Value, keyFn func(string) string) error {
 	for _, fi := range formFieldsOf(rv.Type()) {
 		fv := rv.Field(fi.index)
 		if !fv.CanSet() {
@@ -478,13 +486,17 @@ func mapFormToStructValue(values url.Values, rv reflect.Value) error {
 
 		// 匿名嵌入的 struct：遞迴攤平
 		if fi.anonymous {
-			if err := mapFormToStructValue(values, fv); err != nil {
+			if err := mapFormToStructValue(values, fv, keyFn); err != nil {
 				return err
 			}
 			continue
 		}
 
-		vs, ok := values[fi.name]
+		key := fi.name
+		if keyFn != nil {
+			key = keyFn(key)
+		}
+		vs, ok := values[key]
 		if !ok || len(vs) == 0 {
 			continue // 沒給值就保持零值，不覆寫
 		}

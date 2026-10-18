@@ -153,7 +153,7 @@ func TestSanitizeResponse(t *testing.T) {
 
 func TestNewLLMEnricherFromConfigNone(t *testing.T) {
 	cfg := &config.LLMConfig{Mode: "none"}
-	enricher, err := NewLLMEnricherFromConfig(cfg)
+	enricher, err := NewLLMEnricherFromConfig(cfg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestNewLLMEnricherFromConfigNone(t *testing.T) {
 }
 
 func TestNewLLMEnricherFromConfigNil(t *testing.T) {
-	enricher, err := NewLLMEnricherFromConfig(nil)
+	enricher, err := NewLLMEnricherFromConfig(nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestNewLLMEnricherFromConfigNil(t *testing.T) {
 
 func TestNewLLMEnricherFromConfigInvalidMode(t *testing.T) {
 	cfg := &config.LLMConfig{Mode: "invalid"}
-	_, err := NewLLMEnricherFromConfig(cfg)
+	_, err := NewLLMEnricherFromConfig(cfg, nil)
 	if err == nil {
 		t.Error("invalid mode should return error")
 	}
@@ -199,7 +199,7 @@ func TestOllamaEnricherIntegration(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	enricher, err := NewLLMEnricherFromConfig(cfg)
+	enricher, err := NewLLMEnricherFromConfig(cfg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestAPIEnricherOpenAIIntegration(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	enricher, err := NewLLMEnricherFromConfig(cfg)
+	enricher, err := NewLLMEnricherFromConfig(cfg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestAPIEnricherAnthropicIntegration(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	enricher, err := NewLLMEnricherFromConfig(cfg)
+	enricher, err := NewLLMEnricherFromConfig(cfg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestOllamaEnricherServerError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	enricher, err := NewLLMEnricherFromConfig(cfg)
+	enricher, err := NewLLMEnricherFromConfig(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

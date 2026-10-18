@@ -1,6 +1,8 @@
 package context
 
 import (
+	"encoding/json"
+	"encoding/xml"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -41,5 +43,68 @@ func TestJSONPCarriesPayload(t *testing.T) {
 	}
 	if !strings.Contains(body, `{"n":7}`) {
 		t.Errorf("JSONP body = %q, want the payload inside the callback", body)
+	}
+}
+
+// TestAsciiJSONEscapesNonASCII 回歸測試：AsciiJSON 輸出必須是純 ASCII，且能無損解回原字串。
+// 歷史 bug：asciiJSONRender 只是 SetEscapeHTML(false)，與 PureJSON 完全相同，中文原樣輸出。
+func TestAsciiJSONEscapesNonASCII(t *testing.T) {
+	w := httptest.NewRecorder()
+	c := AcquireContext(w, httptest.NewRequest("GET", "/x", nil))
+	defer c.Release()
+
+	const want = "中文<b>😀"
+	c.AsciiJSON(200, map[string]string{"s": want})
+
+	body := w.Body.Bytes()
+	for _, b := range body {
+		if b >= 0x80 {
+			t.Fatalf("AsciiJSON body %q contains non-ASCII byte", body)
+		}
+	}
+	var got map[string]string
+	if err := json.Unmarshal(body, &got); err != nil || got["s"] != want {
+		t.Errorf("AsciiJSON round-trip = %q, %v; want %q", got["s"], err, want)
+	}
+}
+
+// TestXMLRenderWritesNothingOnError 回歸測試：編碼失敗時不得已送出半截 body。
+// 歷史 bug：xml.NewEncoder(w) 直接串流，大 payload 的前段已隨 bufio 分塊送出、header 已是 200，
+// 之後 Render 的 panic 由 Recovery 轉 500 也送不出去。
+func TestXMLRenderWritesNothingOnError(t *testing.T) {
+	w := httptest.NewRecorder()
+	data := struct {
+		XMLName xml.Name `xml:"r"`
+		Big     string
+		Bad     chan int
+	}{Big: strings.Repeat("x", 64<<10), Bad: make(chan int)}
+
+	if err := (xmlRender{Data: data}).Render(w); err == nil {
+		t.Fatal("expected encode error for chan field")
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("body has %d bytes, want nothing written before the error", w.Body.Len())
+	}
+}
+
+// TestJSONTrailingNewline c.JSON 與 json.Marshal 相同（無尾端換行）；PureJSON / AsciiJSON 沿用
+// Encoder 的輸出、尾端帶 '\n'。改成先緩衝再寫時不可順手改掉線上位元組。
+func TestJSONTrailingNewline(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		render func(c *Context)
+		want   string
+	}{
+		{"JSON", func(c *Context) { c.JSON(200, 1) }, "1"},
+		{"PureJSON", func(c *Context) { c.PureJSON(200, 1) }, "1\n"},
+		{"AsciiJSON", func(c *Context) { c.AsciiJSON(200, 1) }, "1\n"},
+	} {
+		w := httptest.NewRecorder()
+		c := AcquireContext(w, httptest.NewRequest("GET", "/", nil))
+		tc.render(c)
+		c.Release()
+		if got := w.Body.String(); got != tc.want {
+			t.Errorf("%s body = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

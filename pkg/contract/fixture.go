@@ -15,6 +15,8 @@ package contract
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -31,6 +33,7 @@ type RequestBuilder struct {
 	headers      map[string]string
 	query        map[string]string
 	expectStatus int
+	err          error // 建構階段的錯誤（如 WithJSON 序列化失敗），於 Run 時回報
 }
 
 // Request 建立新的 RequestBuilder
@@ -82,10 +85,10 @@ func (b *RequestBuilder) PATCH(path string) *RequestBuilder {
 func (b *RequestBuilder) WithJSON(v interface{}) *RequestBuilder {
 	data, err := json.Marshal(v)
 	if err != nil {
-		b.body = "{}"
-	} else {
-		b.body = string(data)
+		// 先前靜默改送 "{}"，測試會在離原因很遠的地方失敗
+		b.err = fmt.Errorf("WithJSON: %w", err)
 	}
+	b.body = string(data)
 	b.headers["Content-Type"] = "application/json"
 	return b
 }
@@ -114,31 +117,31 @@ func (b *RequestBuilder) Expect(status int) *RequestBuilder {
 	return b
 }
 
-// Run 執行測試請求並回傳結果
-func (b *RequestBuilder) Run(t *testing.T) *TestResult {
-	t.Helper()
-
-	// 建立請求
-	bodyReader := strings.NewReader(b.body)
-	req := httptest.NewRequest(b.method, b.path, bodyReader)
-
-	// 設定 headers
-	for k, v := range b.headers {
+// buildRequest 組出測試請求（body、標頭、query），RequestBuilder 與 TestCase 共用
+func buildRequest(method, target, body string, headers, query map[string]string) *http.Request {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-
-	// 設定 query
-	if len(b.query) > 0 {
+	if len(query) > 0 {
 		q := req.URL.Query()
-		for k, v := range b.query {
+		for k, v := range query {
 			q.Set(k, v)
 		}
 		req.URL.RawQuery = q.Encode()
 	}
+	return req
+}
 
-	// 執行
+// Run 執行測試請求並回傳結果
+func (b *RequestBuilder) Run(t *testing.T) *TestResult {
+	t.Helper()
+	if b.err != nil {
+		t.Fatalf("%s %s: %v", b.method, b.path, b.err)
+	}
+
 	w := httptest.NewRecorder()
-	b.router.ServeHTTP(w, req)
+	b.router.ServeHTTP(w, buildRequest(b.method, b.path, b.body, b.headers, b.query))
 
 	result := &TestResult{
 		Status:  w.Code,

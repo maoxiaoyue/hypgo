@@ -4,11 +4,11 @@ package router
 import (
 	"html/template"
 	"net/http"
+	"net/url"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
-	"sync"
-	"unsafe"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
@@ -16,62 +16,26 @@ import (
 
 // Router 主結構
 type Router struct {
-	Group                              // 嵌入根路由組
-	trees     map[string]*radixNode    // 每個 HTTP 方法一棵 Radix Tree
-	cache     *routeCache              // LRU 路由快取
-	paramPool *sync.Pool               // 參數對象池
-	globalMW  []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
+	Group                             // 嵌入根路由組
+	trees    map[string]*radixNode    // 每個 HTTP 方法一棵 Radix Tree
+	globalMW []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
 
 	// 配置
-	maxParams              int
-	enableCache            bool
-	cacheSize              int
-	caseSensitive          bool
 	strictSlash            bool
 	handleMethodNotAllowed bool
-
-	// HTTP/3 配置
-	http3Config *HTTP3Config
 
 	// 404/405 處理器
 	notFound         hypcontext.HandlerFunc
 	methodNotAllowed hypcontext.HandlerFunc
 }
 
-// HTTP3Config HTTP/3 配置
-type HTTP3Config struct {
-	Enabled            bool
-	MaxHeaderBytes     int
-	EnableDatagrams    bool
-	EnableWebtransport bool
-	MaxBidiStreams     int64
-	MaxUniStreams      int64
-}
-
-// Param 路由參數
-type Param struct {
-	Key   string
-	Value string
-}
+// Param 路由參數。與 hypcontext.Param 為同一型別：radix tree 直接把參數
+// search 進 Context 自帶的緩衝，免去「router 池 → 逐一複製成 Context 參數」
+// 這一層（先前每個帶參數請求多一次配置與一次複製）
+type Param = hypcontext.Param
 
 // RouterOption 路由器選項
 type RouterOption func(*Router)
-
-// WithCache 設置快取大小
-func WithCache(size int) RouterOption {
-	return func(r *Router) {
-		r.enableCache = true
-		r.cacheSize = size
-		r.cache = newRouteCache(size)
-	}
-}
-
-// WithMaxParams 設置最大參數數
-func WithMaxParams(n int) RouterOption {
-	return func(r *Router) {
-		r.maxParams = n
-	}
-}
 
 // WithStrictSlash 設置嚴格斜線模式
 func WithStrictSlash(enabled bool) RouterOption {
@@ -98,24 +62,9 @@ func WithMethodNotAllowed(enabled bool) RouterOption {
 func New(opts ...RouterOption) *Router {
 	r := &Router{
 		trees:                  make(map[string]*radixNode),
-		cache:                  newRouteCache(1000),
 		globalMW:               make([]hypcontext.HandlerFunc, 0),
-		maxParams:              10,
-		enableCache:            true,
-		cacheSize:              1000,
-		caseSensitive:          false,
 		strictSlash:            false,
 		handleMethodNotAllowed: true,
-		http3Config:            nil,
-		// 存 *[]Param 而非 []Param：slice header 以值存入 interface{}
-		// 會在每次 Put 時將 24-byte header 逃逸到堆上（SA6002），
-		// 每個帶參數請求平白多一次分配
-		paramPool: &sync.Pool{
-			New: func() interface{} {
-				p := make([]Param, 0, 10)
-				return &p
-			},
-		},
 	}
 
 	// 初始化嵌入的根 Group
@@ -135,7 +84,8 @@ func New(opts ...RouterOption) *Router {
 }
 
 // addRoute 註冊路由到 Radix Tree
-// 這是所有路由的最終入口，由 Group.handle() 調用
+// 這是所有路由的最終入口，由 Group.handle() 調用。
+// 路由須在開始服務前註冊完成：radix tree 不加鎖，服務中途註冊會與查找產生 data race
 func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.HandlerFunc) {
 	if absolutePath == "" {
 		panic("router: path cannot be empty")
@@ -152,13 +102,7 @@ func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.Han
 		r.trees[method] = &radixNode{nType: root}
 	}
 
-	root := r.trees[method]
-	root.addRoute(absolutePath, handlers)
-
-	// 更新最大參數數
-	if pc := countParams(absolutePath); pc > r.maxParams {
-		r.maxParams = pc
-	}
+	r.trees[method].addRoute(absolutePath, handlers)
 }
 
 // ServeHTTP 實現 http.Handler 介面
@@ -177,56 +121,34 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	urlPath := req.URL.Path
 	method := req.Method
 
-	// HTTP/3 Alt-Svc 標頭
-	if r.http3Config != nil && r.http3Config.Enabled {
-		w.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
-	}
+	// Alt-Svc 由 server.wrapHandler 依實際監聽位址設定（router 不寫入）。
+	//
+	// 不再有路由快取：radix tree 的靜態查找本身零分配，快取只多出 method+path 字串拼接
+	// 與 sync.Map 成本（500 條路由實測：有快取 71ns / 1 alloc，無快取 56ns / 0 alloc）
 
-	// 快取查找（僅靜態路由，無參數）
-	if r.enableCache {
-		if handlers := r.cache.get(method + urlPath); handlers != nil {
-			c.Params = r.makeContextParams(nil)
-			r.executeHandlers(c, handlers)
-			return
-		}
-	}
-
-	// Radix Tree 查找
+	// Radix Tree 查找：參數直接 search 進 Context 自帶的緩衝（c.Params 經
+	// reset 後為長度 0 的自帶緩衝），帶參數路由零分配
 	if root := r.trees[method]; root != nil {
-		ps := r.getParams()
-		handlers, params := root.search(urlPath, (*ps)[:0])
-		if handlers != nil {
-			c.Params = r.makeContextParams(params)
-
-			// 只快取靜態路由（無參數）
-			if r.enableCache && len(params) == 0 {
-				r.cache.put(method+urlPath, handlers)
-			}
-
+		if handlers, params := root.search(urlPath, c.Params[:0]); handlers != nil {
+			c.Params = params
 			r.executeHandlers(c, handlers)
-			r.putParams(ps, params)
 			return
 		}
-		r.putParams(ps, params)
 	}
 
 	// HEAD 自動回應：若無 HEAD handler，使用 GET handler
 	if method == "HEAD" {
 		if root := r.trees["GET"]; root != nil {
-			ps := r.getParams()
-			handlers, params := root.search(urlPath, (*ps)[:0])
-			if handlers != nil {
-				c.Params = r.makeContextParams(params)
+			if handlers, params := root.search(urlPath, c.Params[:0]); handlers != nil {
+				c.Params = params
 				r.executeHandlers(c, handlers)
-				r.putParams(ps, params)
 				return
 			}
-			r.putParams(ps, params)
 		}
 	}
 
-	// 尾部斜線重導向
-	if r.strictSlash {
+	// 尾部斜線重導向（URL.Path 可能為空，例如 HTTP/2 CONNECT）
+	if r.strictSlash && urlPath != "" {
 		var tryPath string
 		if urlPath[len(urlPath)-1] == '/' {
 			tryPath = urlPath[:len(urlPath)-1]
@@ -235,8 +157,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		if root := r.trees[method]; root != nil {
 			if handlers, _ := root.search(tryPath, nil); handlers != nil {
-				req.URL.Path = tryPath
-				http.Redirect(w, req, tryPath, http.StatusMovedPermanently)
+				r.executeHandlers(c, []hypcontext.HandlerFunc{trailingSlashRedirect(method, tryPath, req.URL.RawQuery)})
 				return
 			}
 		}
@@ -244,22 +165,54 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// 405 Method Not Allowed
 	if r.handleMethodNotAllowed {
+		var allow []string
 		for m, tree := range r.trees {
 			if m == method {
 				continue
 			}
 			if handlers, _ := tree.search(urlPath, nil); handlers != nil {
-				// 走 executeHandlers 讓 405 也經過全域中間件：
-				// 直接呼叫會讓 Recovery / Logger / CORS / Security 全部跳過，
-				// 自訂 handler 內的 panic 直接穿透到 net/http（連線被斷而非 500）
-				r.executeHandlers(c, []hypcontext.HandlerFunc{r.methodNotAllowedHandler()})
-				return
+				allow = append(allow, m)
 			}
+		}
+		if len(allow) > 0 {
+			// RFC 9110 §15.5.6：405 必須帶 Allow。有 GET 即可 HEAD（見上方 HEAD 自動回應）
+			if containsString(allow, http.MethodGet) && !containsString(allow, http.MethodHead) {
+				allow = append(allow, http.MethodHead)
+			}
+			sort.Strings(allow)
+			c.Header("Allow", strings.Join(allow, ", "))
+			// 走 executeHandlers 讓 405 也經過全域中間件：
+			// 直接呼叫會讓 Recovery / Logger / CORS / Security 全部跳過，
+			// 自訂 handler 內的 panic 直接穿透到 net/http（連線被斷而非 500）
+			r.executeHandlers(c, []hypcontext.HandlerFunc{r.methodNotAllowedHandler()})
+			return
 		}
 	}
 
 	// 404 Not Found（同樣經過全域中間件）
 	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
+}
+
+// trailingSlashRedirect 回傳尾斜線重導向的 handler。經 executeHandlers 執行，全域中間件
+// （CORS / Security…）照常套用；以 c.Redirect 寫入 c.Writer，不會與 router 收尾的
+// WriteHeaderNow 重複寫標頭。先前直接 http.Redirect 到底層 writer：中間件全被跳過、
+// 每次重導向 server log 多兩行 superfluous WriteHeader；且一律 301 又丟掉 query string
+func trailingSlashRedirect(method, path, rawQuery string) hypcontext.HandlerFunc {
+	code := http.StatusMovedPermanently
+	if method != http.MethodGet && method != http.MethodHead {
+		code = http.StatusPermanentRedirect // 308：保留方法與 body；301 會讓瀏覽器把 POST 改成 GET
+	}
+	location := (&url.URL{Path: path, RawQuery: rawQuery}).RequestURI()
+	return func(c *hypcontext.Context) { c.Redirect(code, location) }
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // notFoundHandler 回傳 404 處理器（自訂或預設）
@@ -316,61 +269,6 @@ func (r *Router) NotFound(handler hypcontext.HandlerFunc) {
 func (r *Router) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 	r.methodNotAllowed = handler
 	r.handleMethodNotAllowed = true
-}
-
-// EnableHTTP3 啟用 HTTP/3 支援
-func (r *Router) EnableHTTP3(config *HTTP3Config) {
-	if config == nil {
-		config = &HTTP3Config{
-			Enabled:            true,
-			MaxHeaderBytes:     1 << 20, // 1MB
-			EnableDatagrams:    false,
-			EnableWebtransport: false,
-			MaxBidiStreams:     100,
-			MaxUniStreams:      100,
-		}
-	}
-	config.Enabled = true
-	r.http3Config = config
-}
-
-// IsHTTP3Enabled 檢查是否啟用了 HTTP/3
-func (r *Router) IsHTTP3Enabled() bool {
-	return r.http3Config != nil && r.http3Config.Enabled
-}
-
-// GetHTTP3Config 獲取 HTTP/3 配置
-func (r *Router) GetHTTP3Config() *HTTP3Config {
-	return r.http3Config
-}
-
-// getParams 從池中獲取參數切片箱。回傳 *[]Param 讓同一個指標箱
-// 在 Get/Put 間往返——若以值存取，slice header 每次 Put 都逃逸
-// 到堆上（SA6002），每個帶參數請求平白多一次分配
-func (r *Router) getParams() *[]Param {
-	return r.paramPool.Get().(*[]Param)
-}
-
-// putParams 將（可能已被 search 重新配置的）切片寫回箱中並歸還池
-func (r *Router) putParams(ps *[]Param, params []Param) {
-	*ps = params[:0]
-	r.paramPool.Put(ps)
-}
-
-// makeContextParams 轉換路由參數為 Context 參數格式
-// GC 優化：使用 Params pool 避免每請求分配新 slice
-func (r *Router) makeContextParams(params []Param) hypcontext.Params {
-	if len(params) == 0 {
-		return nil
-	}
-	cp := hypcontext.AcquireParams(len(params))
-	for i, p := range params {
-		cp[i] = hypcontext.Param{
-			Key:   p.Key,
-			Value: p.Value,
-		}
-	}
-	return cp
 }
 
 // RouteInfo 路由信息
@@ -445,13 +343,19 @@ func (r *Router) SetHTMLTemplate(t *template.Template) {
 	hypcontext.SetHTMLTemplate(t)
 }
 
-// RegisterSchema 實作 schema.SchemaRegistrar 介面
-// 同時將 handler 函式名稱寫入 route.HandlerNames，供 contract.Observe() 過濾使用
-//
-// 若路由宣告了 Input 型別，會在 handler 鏈前置一個標記，於每次請求將該型別寫入
-// Context，供 c.BindInput() 在執行期對齊「實作綁定型別」與「Schema 宣告型別」。
+// RegisterSchema 實作 schema.SchemaRegistrar 介面（見 schemaHandlers）
 func (r *Router) RegisterSchema(route schema.Route, handlers ...hypcontext.HandlerFunc) {
-	// 先以原始 handlers 計算 HandlerNames（不含後續注入的標記）
+	r.Group.handle(route.Method, route.Path, schemaHandlers(&route, handlers))
+	schema.Global().Register(route)
+}
+
+// schemaHandlers 為 schema 路由準備 handler 鏈，Router 與 Group 共用：
+//   - 以原始 handlers 填入 route.HandlerNames，供 contract.Observe() 過濾
+//   - 宣告了 Input 型別時前置一個標記，於每次請求將該型別寫入 Context，
+//     供 c.BindInput() 在執行期對齊「實作綁定型別」與「Schema 宣告型別」
+//
+// 先前 Group 版本是另一份實作、漏了標記：group 底下的路由綁錯 struct 完全不會被回報
+func schemaHandlers(route *schema.Route, handlers []hypcontext.HandlerFunc) []hypcontext.HandlerFunc {
 	if len(route.HandlerNames) == 0 && len(handlers) > 0 {
 		names := make([]string, len(handlers))
 		for i, h := range handlers {
@@ -459,20 +363,12 @@ func (r *Router) RegisterSchema(route schema.Route, handlers ...hypcontext.Handl
 		}
 		route.HandlerNames = names
 	}
-
-	// 前置 schema-input 標記，供 BindInput 對齊型別
-	finalHandlers := handlers
-	if route.Input != nil {
-		key := route.RouteKey()
-		input := route.Input
-		marker := func(c *hypcontext.Context) {
-			c.SetSchemaInput(key, input)
-		}
-		finalHandlers = append([]hypcontext.HandlerFunc{marker}, handlers...)
+	if route.Input == nil {
+		return handlers
 	}
-
-	r.Group.handle(route.Method, route.Path, finalHandlers)
-	schema.Global().Register(route)
+	key, input := route.RouteKey(), route.Input
+	marker := func(c *hypcontext.Context) { c.SetSchemaInput(key, input) }
+	return append([]hypcontext.HandlerFunc{marker}, handlers...)
 }
 
 // nameOfFunction 透過反射取得函式名稱（短名稱）
@@ -506,22 +402,17 @@ func joinPaths(base, relative string) string {
 	return finalPath
 }
 
-// longestCommonPrefix 最長公共前綴（使用 unsafe 加速）
+// longestCommonPrefix 最長公共前綴。
+// 直接對 string 取索引：先前以 unsafe 把 string header 當 []byte header 讀，cap 讀到
+// header 之外的記憶體（未定義行為），而且並沒有比取索引快
 func longestCommonPrefix(a, b string) int {
-	max := len(a)
-	if len(b) < max {
-		max = len(b)
-	}
-	if max > 0 {
-		ap := *(*[]byte)(unsafe.Pointer(&a))
-		bp := *(*[]byte)(unsafe.Pointer(&b))
-		for i := 0; i < max; i++ {
-			if ap[i] != bp[i] {
-				return i
-			}
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
 		}
 	}
-	return max
+	return n
 }
 
 // findWildcard 查找路徑中的通配符
@@ -543,15 +434,4 @@ func findWildcard(path string) (string, int, bool) {
 		return path[i:], i, valid
 	}
 	return "", -1, false
-}
-
-// countParams 計算路徑中的參數數量
-func countParams(path string) int {
-	n := 0
-	for i := 0; i < len(path); i++ {
-		if path[i] == ':' || path[i] == '*' {
-			n++
-		}
-	}
-	return n
 }

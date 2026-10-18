@@ -24,89 +24,24 @@ type Collector struct {
 // NewCollector 建立新的 Collector（使用預設推斷配置）
 // config 可為 nil（不含伺服器資訊）
 func NewCollector(r *router.Router, cfg *config.Config) *Collector {
-	return &Collector{
-		router:    r,
-		config:    cfg,
-		registry:  schema.Global(),
-		enrichCfg: DefaultEnrichConfig(),
-	}
+	return newCollector(r, cfg, nil, DefaultEnrichConfig())
 }
 
-// NewCollectorWithEnrich 建立帶自訂推斷配置的 Collector
+// NewCollectorWithEnrich 建立帶自訂推斷配置的 Collector。
+// 要 LLM 增強時把 NewLLMEnricherFromConfig 的結果放進 enrichCfg.LLMEnricher
 func NewCollectorWithEnrich(r *router.Router, cfg *config.Config, enrichCfg EnrichConfig) *Collector {
-	return &Collector{
-		router:    r,
-		config:    cfg,
-		registry:  schema.Global(),
-		enrichCfg: enrichCfg,
-	}
+	return newCollector(r, cfg, nil, enrichCfg)
 }
 
-// NewCollectorWithModels 建立帶 Model 描述的 Collector
-// registry 為 nil 時不收集 model 資訊
-func NewCollectorWithModels(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry) *Collector {
+// newCollector 為共用建構；models 為 nil 時不收集 model 資訊（AutoSync 帶入 migrate 的全域註冊表）
+func newCollector(r *router.Router, cfg *config.Config, models *migrate.ModelRegistry, enrichCfg EnrichConfig) *Collector {
 	return &Collector{
 		router:          r,
 		config:          cfg,
 		registry:        schema.Global(),
-		migrateRegistry: registry,
-		enrichCfg:       DefaultEnrichConfig(),
-	}
-}
-
-// NewCollectorWithLLM 建立帶 LLM 增強的 Collector
-// llmCfg 為 nil 或 mode=none 時退回純推斷模式
-func NewCollectorWithLLM(r *router.Router, cfg *config.Config, llmCfg *config.LLMConfig) (*Collector, error) {
-	enrichCfg := DefaultEnrichConfig()
-
-	if llmCfg != nil && llmCfg.IsEnabled() {
-		enricher, err := NewLLMEnricherFromConfig(llmCfg)
-		if err != nil {
-			return nil, err
-		}
-		enrichCfg.LLMEnricher = enricher
-	}
-
-	return &Collector{
-		router:    r,
-		config:    cfg,
-		registry:  schema.Global(),
-		enrichCfg: enrichCfg,
-	}, nil
-}
-
-// NewCollectorWithModelsAndEnrich 建立同時帶 Model 描述與自訂 EnrichConfig 的 Collector
-// 給 AutoSync 等需要組合 Model 註冊器 + LLM Enricher（含 reporter）的場景使用
-func NewCollectorWithModelsAndEnrich(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry, enrichCfg EnrichConfig) *Collector {
-	return &Collector{
-		router:          r,
-		config:          cfg,
-		registry:        schema.Global(),
-		migrateRegistry: registry,
+		migrateRegistry: models,
 		enrichCfg:       enrichCfg,
 	}
-}
-
-// NewCollectorWithModelsAndLLM 建立同時帶 Model 描述與 LLM 增強的 Collector
-// registry 為 nil 時不收集 model 資訊；llmCfg 為 nil 或 mode=none 時退回純推斷
-func NewCollectorWithModelsAndLLM(r *router.Router, cfg *config.Config, registry *migrate.ModelRegistry, llmCfg *config.LLMConfig) (*Collector, error) {
-	enrichCfg := DefaultEnrichConfig()
-
-	if llmCfg != nil && llmCfg.IsEnabled() {
-		enricher, err := NewLLMEnricherFromConfig(llmCfg)
-		if err != nil {
-			return nil, err
-		}
-		enrichCfg.LLMEnricher = enricher
-	}
-
-	return &Collector{
-		router:          r,
-		config:          cfg,
-		registry:        schema.Global(),
-		migrateRegistry: registry,
-		enrichCfg:       enrichCfg,
-	}, nil
 }
 
 // Collect 組裝完整的 Manifest
@@ -168,12 +103,7 @@ func (c *Collector) collectRoutes() []RouteManifest {
 					rm.HandlerNames = s.HandlerNames
 				}
 
-				if len(s.Responses) > 0 {
-					rm.Responses = make(map[int]string)
-					for code, resp := range s.Responses {
-						rm.Responses[code] = resp.Description
-					}
-				}
+				applySchemaDetails(&rm, s)
 			}
 
 			// 智慧推斷回填空白欄位
@@ -200,16 +130,10 @@ func (c *Collector) collectRoutes() []RouteManifest {
 			OutputType:  s.OutputName,
 		}
 
-		if len(s.Responses) > 0 {
-			rm.Responses = make(map[int]string)
-			for code, resp := range s.Responses {
-				rm.Responses[code] = resp.Description
-			}
-		}
+		applySchemaDetails(&rm, &s)
 
 		// 智慧推斷回填空白欄位
-		sCopy := s
-		enrichRoute(&rm, &sCopy, c.enrichCfg)
+		enrichRoute(&rm, &s, c.enrichCfg)
 
 		manifests = append(manifests, rm)
 	}
@@ -301,4 +225,23 @@ func structName(model interface{}) string {
 		t = t.Elem()
 	}
 	return t.Name()
+}
+
+// applySchemaDetails 把 schema 宣告的 Params / Headers / Responses（含各狀態碼的型別名稱）寫進 manifest。
+// 先前 Params、Headers 與 Responses 的 Type 宣告了也沒有任何地方讀，AI 從 manifest 看不到
+func applySchemaDetails(rm *RouteManifest, s *schema.Route) {
+	rm.Params = s.Params
+	rm.Headers = s.Headers
+	for code, resp := range s.Responses {
+		if rm.Responses == nil {
+			rm.Responses = make(map[int]string, len(s.Responses))
+		}
+		rm.Responses[code] = resp.Description
+		if resp.TypeName != "" {
+			if rm.ResponseTypes == nil {
+				rm.ResponseTypes = make(map[int]string)
+			}
+			rm.ResponseTypes[code] = resp.TypeName
+		}
+	}
 }

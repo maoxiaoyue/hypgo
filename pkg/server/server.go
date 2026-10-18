@@ -239,6 +239,14 @@ func (s *Server) Use(middlewares ...hypcontext.HandlerFunc) {
 
 // Start 根據配置啟動伺服器
 func (s *Server) Start() error {
+	// hyp context 以 HYPGO_MANIFEST_OUT 執行專案：此時路由已註冊完，寫出 manifest 後即返回，
+	// 不寫 PID 檔、不開始監聽，也不動 .hyp/context.yaml
+	if out := os.Getenv(manifest.ManifestOutEnv); out != "" {
+		return manifest.NewAutoSync(manifest.AutoSyncConfig{
+			Enabled: true, Path: out, Format: "json", DisableLLMAutoDiscovery: true,
+		}, s.router, s.config, s.logger).Sync()
+	}
+
 	// 保存 PID 檔案
 	if err := s.savePIDFile(); err != nil {
 		s.logger.Warningf("Failed to save PID file: %v", err)
@@ -262,14 +270,14 @@ func (s *Server) Start() error {
 		s.logger.Warningf("Invalid trusted_proxies config: %v", err)
 	}
 
-	// AutoSync：啟動時自動同步 .hyp/context.yaml
-	sync := manifest.NewAutoSync(
-		manifest.AutoSyncConfig{Enabled: true},
+	// AutoSync：啟動時自動同步 .hyp/context.yaml（server.disable_auto_sync 可關閉；
+	// 設定了 LLM 時於背景執行，不卡住啟動）
+	manifest.NewAutoSync(
+		manifest.AutoSyncConfig{Enabled: !s.config.Server.DisableAutoSync},
 		s.router, s.config, s.logger,
-	)
-	sync.SyncSafe()
+	).Run()
 
-	// 套用預設中間件（Recovery / Logger / Security / CORS；http3 時為 HTTP3Middleware）。
+	// 套用預設中間件（Recovery / Logger / RejectEarlyData / Security / CORS；http3 時為 HTTP3Middleware）。
 	// v0.8.11 前僅 ListenAndServeWithGracefulShutdown 會套用（而它無人呼叫），
 	// 主要入口（App.Run / srv.Start）一直跑在無 Recovery、無請求日誌、無安全頭的狀態
 	s.applyDefaultMiddlewares()
@@ -420,6 +428,11 @@ func (s *Server) startHTTP3() error {
 		QUICConfig:      quicConf,
 		EnableDatagrams: false,
 		MaxHeaderBytes:  1 << 20,
+		// 讓 c.IsEarlyData() 能分辨 0-RTT 請求：QUICConfig 開了 Allow0RTT，
+		// quic-go 收到 0-RTT 請求即派發，不等握手完成
+		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			return hypcontext.WithHandshakeComplete(ctx, c.HandshakeComplete())
+		},
 	}
 	s.h3Server.Store(h3srv)
 
@@ -836,11 +849,6 @@ func (s *Server) GetProtocol() string {
 func (s *Server) Manifest() *manifest.Manifest {
 	c := manifest.NewCollector(s.router, s.config)
 	return c.Collect()
-}
-
-// EnableHTTP3 啟用 HTTP/3
-func (s *Server) EnableHTTP3(config *router.HTTP3Config) {
-	s.router.EnableHTTP3(config)
 }
 
 // pidFilePath PID 檔案路徑（相對於 CWD，固定檔名 hypgo.pid 以維持既有腳本相容性）

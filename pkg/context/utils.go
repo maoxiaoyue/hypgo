@@ -53,7 +53,6 @@ type ResponseWriter interface {
 
 	// HTTP/3 特定方法
 	WriteHeader3(statusCode int, headers http.Header)
-	PushPromise(target string, opts *http.PushOptions) error
 	StreamID() uint64
 
 	// 狀態方法
@@ -82,12 +81,11 @@ func newResponseWriter(w http.ResponseWriter) ResponseWriter {
 	}
 }
 
-// WriteHeader 寫入狀態碼
+// WriteHeader 記錄狀態碼，實際送出延後到 WriteHeaderNow / 首次 Write。
+// header 已送出後再改無效且不記錄：先前會改 status 並往 stdout 印 debug——
+// Status() 回報客戶端從未收到的值，生產環境還繞過 logger 刷 stdout
 func (w *responseWriter) WriteHeader(code int) {
-	if code > 0 && w.status != code {
-		if w.written {
-			debugPrint("[WARNING] Headers were already written. Wanted to override status code %d with %d", w.status, code)
-		}
+	if code > 0 && !w.written {
 		w.status = code
 	}
 }
@@ -180,12 +178,12 @@ func (w *responseWriter) Flush() {
 	}
 }
 
-// Push 實現 http.Pusher 介面 (HTTP/2 和 HTTP/3)
+// Push 實現 http.Pusher 介面（只有 HTTP/2 的底層 writer 支援）
 func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
 	if pusher, ok := w.ResponseWriter.(http.Pusher); ok {
 		return pusher.Push(target, opts)
 	}
-	return fmt.Errorf("server push not supported")
+	return http.ErrNotSupported
 }
 
 // Pusher 返回 http.Pusher
@@ -203,12 +201,6 @@ func (w *responseWriter) WriteHeader3(statusCode int, headers http.Header) {
 		}
 	}
 	w.WriteHeader(statusCode)
-}
-
-// PushPromise HTTP/3 推送承諾
-func (w *responseWriter) PushPromise(target string, opts *http.PushOptions) error {
-	// 實現 HTTP/3 特定的推送承諾邏輯
-	return w.Push(target, opts)
 }
 
 // StreamID 返回流 ID
@@ -265,12 +257,6 @@ func isValidIP(ip string) bool {
 // nameOfFunction 獲取函數名稱
 func nameOfFunction(f interface{}) string {
 	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
-}
-
-// debugPrint 調試打印
-func debugPrint(format string, values ...interface{}) {
-	// 實現調試輸出
-	fmt.Printf("[HYPGO-debug] "+format+"\n", values...)
 }
 
 // LogRequest 記錄請求信息

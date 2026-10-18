@@ -2,6 +2,7 @@
 package context
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"strconv"
 	"sync/atomic"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,39 +25,35 @@ type Render interface {
 	WriteContentType(w http.ResponseWriter)
 }
 
-// 預定義的渲染器實例
-var render = defaultRender{}
-
-type defaultRender struct {
-	JSON         jsonRender
-	XML          xmlRender
-	YAML         yamlRender
-	IndentedJSON indentedJSONRender
-	SecureJSON   secureJSONRender
-	JsonpJSON    jsonpJSONRender
-	AsciiJSON    asciiJSONRender
-}
-
 // ===== JSON 渲染器 =====
 
 type jsonRender struct{ Data interface{} }
 
 func (r jsonRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	// 池化緩衝 + Encoder：json.Marshal 每次回應都整包新配置 body，
-	// 是典型小 JSON 回應在 H1-H3 修復後的最大單筆每請求分配
-	buf := AcquireBuffer()
-	defer ReleaseBuffer(buf)
-	if err := json.NewEncoder(buf).Encode(r.Data); err != nil {
+	buf, err := encodeJSON(r.Data, true)
+	if err != nil {
 		return err
 	}
-	// Encoder 尾端固定補 '\n'，去除以維持與 json.Marshal 相同輸出
+	defer ReleaseBuffer(buf)
 	b := buf.Bytes()
-	if n := len(b); n > 0 && b[n-1] == '\n' {
-		b = b[:n-1]
-	}
-	_, err := w.Write(b)
+	_, err = w.Write(b[:len(b)-1]) // 去掉 Encoder 尾端的 '\n'，與 json.Marshal 輸出相同
 	return err
+}
+
+// encodeJSON 把 v 編進池化緩衝（呼叫端負責 ReleaseBuffer），尾端帶 Encoder 固定補上的 '\n'。
+// 池化緩衝 + Encoder：json.Marshal 每次回應都整包新配置 body，
+// 是典型小 JSON 回應在 H1-H3 修復後的最大單筆每請求分配。
+// 先編完再寫 w：失敗時尚未送出任何位元組，Render 的 panic 才能由 Recovery 轉成乾淨的 500
+func encodeJSON(v interface{}, escapeHTML bool) (*bytes.Buffer, error) {
+	buf := AcquireBuffer()
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(escapeHTML)
+	if err := enc.Encode(v); err != nil {
+		ReleaseBuffer(buf)
+		return nil, err
+	}
+	return buf, nil
 }
 
 func (r jsonRender) WriteContentType(w http.ResponseWriter) {
@@ -78,9 +77,6 @@ func (r indentedJSONRender) Render(w http.ResponseWriter) error {
 func (r indentedJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
-
-// IndentedJSON 創建格式化 JSON 渲染器
-var IndentedJSON = indentedJSONRender{}
 
 // ===== Secure JSON 渲染器 =====
 
@@ -109,9 +105,6 @@ func (r secureJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
 
-// SecureJSON 創建安全 JSON 渲染器
-var SecureJSON = secureJSONRender{Prefix: "while(1);"}
-
 // ===== JSONP 渲染器 =====
 
 type jsonpJSONRender struct {
@@ -134,26 +127,55 @@ func (r jsonpJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/javascript; charset=utf-8"})
 }
 
-// JsonpJSON 創建 JSONP 渲染器
-var JsonpJSON = jsonpJSONRender{}
-
 // ===== ASCII JSON 渲染器 =====
 
 type asciiJSONRender struct{ Data interface{} }
 
 func (r asciiJSONRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	encoder := json.NewEncoder(w)
-	encoder.SetEscapeHTML(false)
-	return encoder.Encode(r.Data)
+	buf, err := encodeJSON(r.Data, true)
+	if err != nil {
+		return err
+	}
+	defer ReleaseBuffer(buf)
+	_, err = w.Write(escapeNonASCII(buf.Bytes()))
+	return err
+}
+
+// escapeNonASCII 把非 ASCII 字元轉成 JSON 的 \uXXXX（BMP 以外用 UTF-16 代理對），輸出保證純 ASCII。
+// 先前 AsciiJSON 只是 SetEscapeHTML(false)，與 PureJSON 完全相同、中文原樣輸出
+func escapeNonASCII(b []byte) []byte {
+	i := 0
+	for i < len(b) && b[i] < utf8.RuneSelf {
+		i++
+	}
+	if i == len(b) {
+		return b
+	}
+	out := make([]byte, 0, 2*len(b))
+	out = append(out, b[:i]...)
+	for _, r := range string(b[i:]) {
+		switch {
+		case r < utf8.RuneSelf:
+			out = append(out, byte(r))
+		case r > 0xFFFF:
+			hi, lo := utf16.EncodeRune(r)
+			out = appendUnicodeEscape(appendUnicodeEscape(out, hi), lo)
+		default:
+			out = appendUnicodeEscape(out, r)
+		}
+	}
+	return out
+}
+
+func appendUnicodeEscape(out []byte, r rune) []byte {
+	const hex = "0123456789abcdef"
+	return append(out, '\\', 'u', hex[r>>12&0xf], hex[r>>8&0xf], hex[r>>4&0xf], hex[r&0xf])
 }
 
 func (r asciiJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
-
-// AsciiJSON 創建 ASCII JSON 渲染器
-var AsciiJSON = asciiJSONRender{}
 
 // ===== Pure JSON 渲染器 =====
 
@@ -161,25 +183,33 @@ type pureJSONRender struct{ Data interface{} }
 
 func (r pureJSONRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	encoder := json.NewEncoder(w)
-	encoder.SetEscapeHTML(false)
-	return encoder.Encode(r.Data)
+	buf, err := encodeJSON(r.Data, false)
+	if err != nil {
+		return err
+	}
+	defer ReleaseBuffer(buf)
+	_, err = w.Write(buf.Bytes())
+	return err
 }
 
 func (r pureJSONRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"application/json; charset=utf-8"})
 }
 
-// PureJSON 創建純 JSON 渲染器
-var PureJSON = pureJSONRender{}
-
 // ===== XML 渲染器 =====
 
 type xmlRender struct{ Data interface{} }
 
+// Render 先 Marshal 再寫：串流 Encoder 遇到不可序列化的欄位時，前段內容已隨 bufio 分塊送出、
+// header 已是 200，Recovery 的 500 再也送不出去
 func (r xmlRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	return xml.NewEncoder(w).Encode(r.Data)
+	b, err := xml.Marshal(r.Data)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(b)
+	return err
 }
 
 func (r xmlRender) WriteContentType(w http.ResponseWriter) {
@@ -192,7 +222,12 @@ type yamlRender struct{ Data interface{} }
 
 func (r yamlRender) Render(w http.ResponseWriter) error {
 	r.WriteContentType(w)
-	return yaml.NewEncoder(w).Encode(r.Data)
+	b, err := yaml.Marshal(r.Data) // 同 xmlRender：先編完再寫
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(b)
+	return err
 }
 
 func (r yamlRender) WriteContentType(w http.ResponseWriter) {
@@ -219,9 +254,6 @@ func (r stringRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"text/plain; charset=utf-8"})
 }
 
-// String 創建字符串渲染器
-var String = stringRender{}
-
 // ===== Redirect 渲染器 =====
 
 type redirectRender struct {
@@ -240,9 +272,6 @@ func (r redirectRender) Render(w http.ResponseWriter) error {
 
 func (r redirectRender) WriteContentType(http.ResponseWriter) {}
 
-// Redirect 創建重定向渲染器
-var Redirect = redirectRender{}
-
 // ===== Data 渲染器 =====
 
 type dataRender struct {
@@ -259,9 +288,6 @@ func (r dataRender) Render(w http.ResponseWriter) error {
 func (r dataRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{r.ContentType})
 }
-
-// Data 創建數據渲染器
-var Data = dataRender{}
 
 // ===== HTML 渲染器 =====
 
@@ -291,9 +317,6 @@ func (r htmlRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{"text/html; charset=utf-8"})
 }
 
-// HTML 創建 HTML 渲染器
-var HTML = htmlRender{}
-
 // ===== Reader 渲染器 =====
 
 type readerRender struct {
@@ -318,9 +341,6 @@ func (r readerRender) Render(w http.ResponseWriter) error {
 func (r readerRender) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, []string{r.ContentType})
 }
-
-// Reader 創建 Reader 渲染器
-var Reader = readerRender{}
 
 // ===== Server-Sent Event 渲染器 =====
 type sseventRender struct {
@@ -352,9 +372,6 @@ func (r sseventRender) WriteContentType(w http.ResponseWriter) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 }
-
-// SSEvent 創建 SSE 渲染器
-var SSEvent = sseventRender{}
 
 // ===== 輔助函數 =====
 

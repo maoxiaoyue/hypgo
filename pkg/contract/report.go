@@ -10,8 +10,11 @@ package contract
 import (
 	"fmt"
 	"html"
+	"maps"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // GenerateObserveHTML 將觀察結果列表轉換為完整的自包含 HTML 報告
@@ -30,11 +33,11 @@ func GenerateObserveHTML(results []ObserveResult, filter string) string {
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	filterDisplay := "（全部路由）"
 	if filter != "" {
-		filterDisplay = fmt.Sprintf("「%s」", filter)
+		filterDisplay = "「" + html.EscapeString(filter) + "」" // 會插進 <title> 與頁面，需跳脫
 	}
 
 	var sb strings.Builder
-	sb.WriteString(reportHTMLHeader(ts, filter, len(results), pass, fail, filterDisplay))
+	sb.WriteString(reportHTMLHeader(ts, len(results), pass, fail, filterDisplay))
 
 	for i, r := range results {
 		sb.WriteString(renderRouteCard(i, r))
@@ -45,7 +48,7 @@ func GenerateObserveHTML(results []ObserveResult, filter string) string {
 }
 
 // reportHTMLHeader 生成 HTML 文件頭部，包含完整 CSS、頁首與摘要列
-func reportHTMLHeader(ts, filter string, total, pass, fail int, filterDisplay string) string {
+func reportHTMLHeader(ts string, total, pass, fail int, filterDisplay string) string {
 	passRate := 0
 	if total > 0 {
 		passRate = pass * 100 / total
@@ -466,11 +469,7 @@ func renderRouteCard(idx int, r ObserveResult) string {
 		statusIcon = "❌"
 	}
 
-	method := r.Route.Method
-	if method == "" {
-		parts := strings.SplitN(r.Request.Method, " ", 2)
-		method = parts[0]
-	}
+	method := html.EscapeString(r.Route.Method)
 
 	// 為路徑中的 :param 加上樣式（僅用於顯示）
 	displayPath := highlightPathParams(r.Route.Path)
@@ -623,7 +622,8 @@ func renderRouteCard(idx int, r ObserveResult) string {
 
 	sb.WriteString(`
         <div class="http-headers">`)
-	for k, v := range r.Request.Headers {
+	for _, k := range slices.Sorted(maps.Keys(r.Request.Headers)) { // 固定順序，報告可 diff
+		v := r.Request.Headers[k]
 		fmt.Fprintf(&sb, `
           <div class="http-header-row">
             <span class="header-key">%s</span>
@@ -653,7 +653,8 @@ func renderRouteCard(idx int, r ObserveResult) string {
 
 	sb.WriteString(`
         <div class="http-headers">`)
-	for k, v := range r.Response.Headers {
+	for _, k := range slices.Sorted(maps.Keys(r.Response.Headers)) {
+		v := r.Response.Headers[k]
 		fmt.Fprintf(&sb, `
           <div class="http-header-row">
             <span class="header-key">%s</span>
@@ -781,7 +782,11 @@ func formatJSONCompact(s string) string {
 	const maxLen = 2000
 	s = strings.TrimSpace(s)
 	if len(s) > maxLen {
-		return s[:maxLen] + "\n… (truncated)"
+		cut := maxLen
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut-- // 退到字元邊界，避免把多位元組字元切成亂碼
+		}
+		return s[:cut] + "\n… (truncated)"
 	}
 	return s
 }

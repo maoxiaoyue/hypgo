@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 )
@@ -19,16 +20,10 @@ import (
 // 回傳 false 時表示「不要再回報後續錯誤」（用於限制日誌量）。
 type EnricherErrorReporter func(routeKey string, err error) bool
 
-// NewLLMEnricherFromConfig 根據 LLMConfig 建立對應的 LLMEnricher 實作
-// mode=none 時回傳 nil（不使用 LLM）。錯誤訊息會被靜默丟棄；要看錯誤請用
-// NewLLMEnricherFromConfigWithReporter。
-func NewLLMEnricherFromConfig(cfg *config.LLMConfig) (LLMEnricher, error) {
-	return NewLLMEnricherFromConfigWithReporter(cfg, nil)
-}
-
-// NewLLMEnricherFromConfigWithReporter 根據 LLMConfig 建立 enricher 並接受錯誤回報 callback
-// （v0.8.11+）。AutoSync 透過 callback 把錯誤接到 logger，讓使用者看得到「LLM 為什麼沒生效」。
-func NewLLMEnricherFromConfigWithReporter(cfg *config.LLMConfig, reporter EnricherErrorReporter) (LLMEnricher, error) {
+// NewLLMEnricherFromConfig 根據 LLMConfig 建立對應的 LLMEnricher 實作；mode=none 時回傳 nil（不使用 LLM）。
+// reporter 接收 enricher 內部錯誤（AutoSync 用它把錯誤接到 logger，讓使用者看得到「LLM 為什麼沒生效」），
+// 為 nil 時錯誤靜默丟棄
+func NewLLMEnricherFromConfig(cfg *config.LLMConfig, reporter EnricherErrorReporter) (LLMEnricher, error) {
 	if cfg == nil || !cfg.IsEnabled() {
 		return nil, nil
 	}
@@ -94,8 +89,8 @@ func buildEnrichPrompt(route RouteManifest) string {
 	if route.OutputType != "" {
 		sb.WriteString(fmt.Sprintf("  OutputType: %s\n", route.OutputType))
 	}
-	if len(route.HandlerNames) > 0 {
-		sb.WriteString(fmt.Sprintf("  Handler: %s\n", route.HandlerNames[0]))
+	if h := primaryHandler(route.HandlerNames); h != "" {
+		sb.WriteString(fmt.Sprintf("  Handler: %s\n", h))
 	}
 	if len(route.Tags) > 0 {
 		sb.WriteString(fmt.Sprintf("  Tags: %s\n", strings.Join(route.Tags, ", ")))
@@ -156,9 +151,13 @@ func sanitizeResponse(s string) string {
 	// 移除潛在的 HTML/script 標籤
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
-	// 限制長度
+	// 限制長度（退到字元邊界：中文約 166 字就超過 500 bytes，先前會切出不合法的 UTF-8）
 	if len(s) > 500 {
-		s = s[:500]
+		cut := 500
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
 	}
 	return s
 }
@@ -170,7 +169,6 @@ func sanitizeResponse(s string) string {
 type OllamaEnricher struct {
 	url       string
 	model     string
-	timeout   time.Duration
 	maxTokens int
 	client    *http.Client
 	reporter  EnricherErrorReporter
@@ -187,7 +185,6 @@ func newOllamaEnricher(cfg *config.OllamaConfig, reporter EnricherErrorReporter)
 	return &OllamaEnricher{
 		url:       cfg.URL,
 		model:     cfg.Model,
-		timeout:   timeout,
 		maxTokens: cfg.MaxTokens,
 		client:    &http.Client{Timeout: timeout},
 		reporter:  reporter,
@@ -208,49 +205,16 @@ type ollamaResponse struct {
 }
 
 func (e *OllamaEnricher) EnrichRoute(route RouteManifest) RouteManifest {
-	prompt := buildEnrichPrompt(route)
-
-	reqBody := ollamaRequest{
-		Model:  e.model,
-		Prompt: prompt,
-		Stream: false,
-	}
+	req := ollamaRequest{Model: e.model, Prompt: buildEnrichPrompt(route)}
 	if e.maxTokens > 0 {
-		reqBody.Options = map[string]int{"num_predict": e.maxTokens}
+		req.Options = map[string]int{"num_predict": e.maxTokens}
 	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("ollama: marshal request: %w", err))
+	var resp ollamaResponse
+	if err := postJSON(e.client, e.url+"/api/generate", nil, req, &resp); err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("ollama: %w", err))
 		return route
 	}
-
-	resp, err := e.client.Post(e.url+"/api/generate", "application/json", bytes.NewReader(body))
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("ollama POST %s/api/generate: %w", e.url, err))
-		return route
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		reportErr(e.reporter, route, fmt.Errorf("ollama returned %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet))))
-		return route
-	}
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("ollama read response: %w", err))
-		return route
-	}
-
-	var ollamaResp ollamaResponse
-	if err := json.Unmarshal(respBody, &ollamaResp); err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("ollama parse JSON: %w", err))
-		return route
-	}
-
-	return parseEnrichResponse(ollamaResp.Response, route)
+	return parseEnrichResponse(resp.Response, route)
 }
 
 // ============================================================
@@ -262,7 +226,6 @@ type APIEnricher struct {
 	baseURL   string
 	apiKey    string
 	model     string
-	timeout   time.Duration
 	maxTokens int
 	client    *http.Client
 	reporter  EnricherErrorReporter
@@ -285,7 +248,6 @@ func newAPIEnricher(cfg *config.APIConfig, reporter EnricherErrorReporter) (*API
 		baseURL:   cfg.BaseURL,
 		apiKey:    apiKey,
 		model:     cfg.Model,
-		timeout:   timeout,
 		maxTokens: cfg.MaxTokens,
 		client:    &http.Client{Timeout: timeout},
 		reporter:  reporter,
@@ -326,61 +288,23 @@ type openAIChatResponse struct {
 }
 
 func (e *APIEnricher) enrichOpenAI(prompt string, route RouteManifest) RouteManifest {
-	reqBody := openAIChatRequest{
-		Model: e.model,
-		Messages: []openAIMessage{
-			{Role: "user", Content: prompt},
-		},
+	req := openAIChatRequest{
+		Model:       e.model,
+		Messages:    []openAIMessage{{Role: "user", Content: prompt}},
 		MaxTokens:   e.maxTokens,
 		Temperature: 0.3,
 	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: marshal request: %w", err))
+	var resp openAIChatResponse
+	headers := map[string]string{"Authorization": "Bearer " + e.apiKey}
+	if err := postJSON(e.client, e.baseURL+"/chat/completions", headers, req, &resp); err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: %w", err))
 		return route
 	}
-
-	url := e.baseURL + "/chat/completions"
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: build request: %w", err))
+	if len(resp.Choices) == 0 {
+		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: response has no choices"))
 		return route
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+e.apiKey)
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible POST %s: %w", url, err))
-		return route
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(snippet))))
-		return route
-	}
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: read response: %w", err))
-		return route
-	}
-
-	var chatResp openAIChatResponse
-	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: parse JSON: %w (body: %.200s)", err, string(respBody)))
-		return route
-	}
-
-	if len(chatResp.Choices) == 0 {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: response has no choices (body: %.200s)", string(respBody)))
-		return route
-	}
-
-	return parseEnrichResponse(chatResp.Choices[0].Message.Content, route)
+	return parseEnrichResponse(resp.Choices[0].Message.Content, route)
 }
 
 // anthropicRequest Anthropic messages 請求
@@ -402,60 +326,56 @@ type anthropicResponse struct {
 }
 
 func (e *APIEnricher) enrichAnthropic(prompt string, route RouteManifest) RouteManifest {
-	reqBody := anthropicRequest{
-		Model: e.model,
-		Messages: []anthropicMsg{
-			{Role: "user", Content: prompt},
-		},
+	req := anthropicRequest{
+		Model:     e.model,
+		Messages:  []anthropicMsg{{Role: "user", Content: prompt}},
 		MaxTokens: e.maxTokens,
 	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: marshal request: %w", err))
+	var resp anthropicResponse
+	headers := map[string]string{"x-api-key": e.apiKey, "anthropic-version": "2023-06-01"}
+	if err := postJSON(e.client, e.baseURL+"/messages", headers, req, &resp); err != nil {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: %w", err))
 		return route
 	}
-
-	url := e.baseURL + "/messages"
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: build request: %w", err))
+	if len(resp.Content) == 0 {
+		reportErr(e.reporter, route, fmt.Errorf("anthropic: response has no content"))
 		return route
+	}
+	return parseEnrichResponse(resp.Content[0].Text, route)
+}
+
+// postJSON 以 POST 送出 JSON 並把 200 回應解析進 out，三個 enricher 共用。
+// 非 200 時錯誤含 URL、狀態碼與回應前 512 bytes；provider 前綴由呼叫端加上
+func postJSON(client *http.Client, url string, headers map[string]string, in, out interface{}) error {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", e.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
-	resp, err := e.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic POST %s: %w", url, err))
-		return route
+		return fmt.Errorf("POST %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		reportErr(e.reporter, route, fmt.Errorf("anthropic %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(snippet))))
-		return route
+		return fmt.Errorf("%s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
 	if err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: read response: %w", err))
-		return route
+		return fmt.Errorf("read response: %w", err)
 	}
-
-	var anthropicResp anthropicResponse
-	if err := json.Unmarshal(respBody, &anthropicResp); err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: parse JSON: %w", err))
-		return route
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("parse JSON: %w (body: %.200s)", err, data)
 	}
-
-	if len(anthropicResp.Content) == 0 {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: response has no content"))
-		return route
-	}
-
-	return parseEnrichResponse(anthropicResp.Content[0].Text, route)
+	return nil
 }
-

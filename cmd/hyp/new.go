@@ -67,8 +67,8 @@ Generated structure:
   │   ├── commands/      CLI subcommands (Cobra)
   │   │   └── root.go    Root command
   │   ├── models/        Data structures
-  │   ├── services/      Business logic + Error Catalog
-  │   └── config/        config.yaml
+  │   └── services/      Business logic + Error Catalog
+  ├── config/config.yaml Runtime config (loaded in main.go → commands.Cfg)
   ├── main.go            Entry point
   └── go.mod
 
@@ -95,10 +95,9 @@ Generated structure:
   │   ├── views/         GUI views (Fyne widgets + layouts)
   │   │   └── main_view.go
   │   ├── models/        Data structures
-  │   ├── services/      Business logic + Error Catalog
-  │   └── config/
-  │       └── config.yaml
-  ├── main.go            Entry point (Fyne app + window)
+  │   └── services/      Business logic + Error Catalog
+  ├── config/config.yaml Runtime config (loaded in main.go)
+  ├── main.go            Entry point (config → logger → Fyne app + window)
   └── go.mod
 
 After creation:
@@ -129,9 +128,8 @@ Generated structure:
   │   ├── proto/<name>pb/    Protobuf definitions (.proto)
   │   ├── rpc/               gRPC server implementations
   │   ├── models/            Data structures
-  │   ├── services/          Business logic + Error Catalog
-  │   └── config/
-  │       └── config.yaml
+  │   └── services/          Business logic + Error Catalog
+  ├── config/config.yaml     Runtime config: server.addr / server.tls (loaded in main.go)
   ├── main.go                gRPC server entry point
   ├── Makefile               protoc compilation commands
   └── go.mod
@@ -176,9 +174,9 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("   │   │   ├── root.go\n")
 	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol cli）\n")
 	fmt.Printf("   │   ├── models/\n")
-	fmt.Printf("   │   ├── services/\n")
-	fmt.Printf("   │   └── config/\n")
-	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── config/\n")
+	fmt.Printf("   │   └── config.yaml      # runtime 設定（main.go 載入）\n")
 	fmt.Printf("   ├── tools/\n")
 	fmt.Printf("   │   └── genctx/          # 產生 .hyp/context.yaml（go run ./tools/genctx）\n")
 	fmt.Printf("   ├── main.go\n")
@@ -213,9 +211,9 @@ func runNewDesktop(projectName string, installDeps bool) error {
 	fmt.Printf("   │   │   ├── main_view.go\n")
 	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol desktop）\n")
 	fmt.Printf("   │   ├── models/\n")
-	fmt.Printf("   │   ├── services/\n")
-	fmt.Printf("   │   └── config/\n")
-	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── config/\n")
+	fmt.Printf("   │   └── config.yaml      # runtime 設定（main.go 載入）\n")
 	fmt.Printf("   ├── tools/\n")
 	fmt.Printf("   │   └── genctx/          # 產生 .hyp/context.yaml（go run ./tools/genctx）\n")
 	fmt.Printf("   ├── main.go\n")
@@ -254,9 +252,9 @@ func runNewGRPC(projectName string) error {
 	fmt.Printf("   │   │   ├── %s_server.go\n", lowerName)
 	fmt.Printf("   │   │   └── schema.go    # RegisterSchemas（Protocol grpc）\n")
 	fmt.Printf("   │   ├── models/\n")
-	fmt.Printf("   │   ├── services/\n")
-	fmt.Printf("   │   └── config/\n")
-	fmt.Printf("   │       └── config.yaml\n")
+	fmt.Printf("   │   └── services/\n")
+	fmt.Printf("   ├── config/\n")
+	fmt.Printf("   │   └── config.yaml      # runtime 設定（main.go 載入）\n")
 	fmt.Printf("   ├── main.go\n")
 	fmt.Printf("   ├── Makefile\n")
 	fmt.Printf("   └── go.mod\n")
@@ -272,10 +270,6 @@ func runNewGRPC(projectName string) error {
 	fmt.Printf("   go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest\n")
 
 	return nil
-}
-
-func init() {
-	rootCmd.AddCommand(newCmd)
 }
 
 func runNew(cmd *cobra.Command, args []string) error {
@@ -466,51 +460,28 @@ func createHypConfigFile(configDir string) error {
 func createMainFile(projectName string) error {
 	mainContent := "package main\n\n" +
 		"import (\n" +
-		"\t\"context\"\n" +
-		"\t\"log\"\n" +
-		"\t\"os\"\n" +
-		"\t\"os/signal\"\n" +
-		"\t\"syscall\"\n" +
-		"\t\"time\"\n\n" +
-		"\t\"github.com/maoxiaoyue/hypgo/pkg/config\"\n" +
-		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n" +
-		"\t\"github.com/maoxiaoyue/hypgo/pkg/server\"\n\n" +
+		"\t\"fmt\"\n" +
+		"\t\"os\"\n\n" +
+		"\t\"github.com/maoxiaoyue/hypgo\"\n\n" +
 		"\t\"" + projectName + "/routers\"\n" +
 		")\n\n" +
+		"// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）\n" +
+		"const configPath = \"config/config.yaml\"\n\n" +
 		"func main() {\n" +
-		"\t// 載入配置\n" +
-		"\tcfg := &config.Config{}\n" +
-		"\tloader := config.NewConfigLoader(\"config/config.yaml\")\n" +
-		"\tif err := loader.Load(\"config/config.yaml\", cfg); err != nil {\n" +
-		"\t\tlog.Fatal(\"Failed to load config:\", err)\n" +
+		"\t// 嚴格載入設定：檔案不存在或內容無效即結束，不靜默退回預設值起跑；\n" +
+		"\t// logger 與 server 依 config 建立（logger.level / output / colors / rotation 都會生效）\n" +
+		"\tapp, err := hypgo.NewWithConfig(configPath)\n" +
+		"\tif err != nil {\n" +
+		"\t\tfmt.Fprintf(os.Stderr, \"load %s: %v\\n\", configPath, err)\n" +
+		"\t\tos.Exit(1)\n" +
+		"\t}\n\n" +
+		"\t// 所有路由與中間件定義於 routers/router.go\n" +
+		"\trouters.Setup(app.Server().Router())\n\n" +
+		"\t// Run 會阻塞到收到 SIGINT/SIGTERM 並完成優雅關閉（Start() 內建，不必自己處理訊號）\n" +
+		"\tif err := app.Run(); err != nil {\n" +
+		"\t\tapp.Logger().Errorf(\"server error: %v\", err)\n" +
+		"\t\tos.Exit(1)\n" +
 		"\t}\n" +
-		"\tcfg.ApplyDefaults()\n\n" +
-		"\t// 初始化日誌\n" +
-		"\tappLog := logger.NewLogger()\n" +
-		"\tdefer appLog.Close()\n\n" +
-		"\t// 創建服務器\n" +
-		"\tsrv := server.New(cfg, appLog)\n\n" +
-		"\t// 設定所有路由與中間件（定義於 routers/router.go）\n" +
-		"\trouters.Setup(srv.Router())\n\n" +
-		"\t// 啟動服務器\n" +
-		"\tgo func() {\n" +
-		"\t\tappLog.Infof(\"Starting HypGo server on %s\", cfg.Server.Addr)\n" +
-		"\t\tif err := srv.Start(); err != nil {\n" +
-		"\t\t\tappLog.Errorf(\"Server error: %v\", err)\n" +
-		"\t\t\tos.Exit(1)\n" +
-		"\t\t}\n" +
-		"\t}()\n\n" +
-		"\t// 優雅關閉\n" +
-		"\tquit := make(chan os.Signal, 1)\n" +
-		"\tsignal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)\n" +
-		"\t<-quit\n\n" +
-		"\tappLog.Info(\"Shutting down server...\")\n" +
-		"\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n" +
-		"\tdefer cancel()\n\n" +
-		"\tif err := srv.Shutdown(ctx); err != nil {\n" +
-		"\t\tappLog.Errorf(\"Server forced to shutdown: %v\", err)\n" +
-		"\t}\n" +
-		"\tappLog.Info(\"Server exited\")\n" +
 		"}\n"
 
 	filename := filepath.Join(projectName, "main.go")
@@ -560,7 +531,7 @@ func createRouterSetup(projectName, today string) error {
 		"// Setup 註冊所有路由與中間件。\n" +
 		"// 在 main.go 呼叫：routers.Setup(srv.Router())。\n" +
 		"func Setup(r *router.Router) {\n" +
-		"\t// Recovery / Logger / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
+		"\t// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
 		"\t// 不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。\n" +
 		"\t// 額外的全域中間件（CSRF、BodyLimit…）在此加\n\n" +
 		"\t// 靜態資源\n" +

@@ -103,13 +103,12 @@ func GitShortCommit() string {
 }
 
 // AppendHistory 將一筆 EvalRecord append 到預設 history 檔案（DefaultHistoryPath()）
-// 採原子替換（讀取現有內容 → 寫入暫存 .tmp → rename），不會在寫入中途損壞檔案
-// 若 .hyp/ 目錄不存在則自動建立
+// 以 O_APPEND 單次寫入一行，若 .hyp/ 目錄不存在則自動建立
 //
 // @ai purpose: 讓 TestAll 可以在不修改原始碼的情況下持久化測試結果，支援未來的趨勢分析
 // @ai input: EvalRecord（單一測試結果）
 // @ai output: 錯誤（nil 表示成功）
-// @ai sideeffect: 讀寫 .hyp/eval_history.jsonl 與暫存 .tmp 檔案
+// @ai sideeffect: append 寫入 .hyp/eval_history.jsonl
 // date: 2026-05-23
 func AppendHistory(record EvalRecord) error {
 	return AppendHistoryTo(DefaultHistoryPath(), record)
@@ -121,8 +120,12 @@ func AppendHistory(record EvalRecord) error {
 // @ai purpose: 提供可測試版本的 AppendHistory，讓測試可指定路徑而不影響真實 .hyp/ 目錄
 // @ai input: path string（目標 JSONL 路徑）、EvalRecord（資料）
 // @ai output: 錯誤（nil 表示成功）
-// @ai sideeffect: 讀寫指定路徑與暫存 .tmp 檔案
+// @ai sideeffect: append 寫入指定路徑
 // date: 2026-05-23
+//
+// 先前每筆都「讀出整個檔案 → 寫暫存檔 → rename」，成本隨歷史長度線性成長
+// （整個 TestAll 為 O(n²)）；且 historyMu 只擋同一行程，go test ./... 的多個
+// 套件行程同時讀改寫會互相蓋掉紀錄。O_APPEND 單次 Write 兩者皆免。
 func AppendHistoryTo(path string, record EvalRecord) error {
 	historyMu.Lock()
 	defer historyMu.Unlock()
@@ -140,28 +143,25 @@ func AppendHistoryTo(path string, record EvalRecord) error {
 	}
 	line = append(line, '\n')
 
-	// 讀取現有內容（若檔案不存在則視為空）
-	existing, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("eval: read history: %w", err)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("eval: open history %s: %w", path, err)
+	}
+	defer f.Close()
+
+	// 上次寫入若中途中斷，檔尾會留下沒有換行的半行；先補換行，
+	// 否則新紀錄會黏在半行後面一起變成壞行（LoadHistory 會跳過壞行）
+	if info, err := f.Stat(); err == nil && info.Size() > 0 {
+		last := make([]byte, 1)
+		if _, err := f.ReadAt(last, info.Size()-1); err == nil && last[0] != '\n' {
+			line = append([]byte{'\n'}, line...)
+		}
 	}
 
-	// 合併現有內容 + 新紀錄
-	combined := make([]byte, 0, len(existing)+len(line))
-	combined = append(combined, existing...)
-	combined = append(combined, line...)
-
-	// 原子寫入：先寫暫存檔，成功後 rename
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, combined, 0o644); err != nil {
-		return fmt.Errorf("eval: write temp %s: %w", tmp, err)
+	if _, err := f.Write(line); err != nil {
+		return fmt.Errorf("eval: append history %s: %w", path, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp) // 清理暫存檔，忽略錯誤
-		return fmt.Errorf("eval: rename to %s: %w", path, err)
-	}
-
-	return nil
+	return f.Close()
 }
 
 // LoadHistory 從 JSONL 檔案讀取所有 EvalRecord

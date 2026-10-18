@@ -153,30 +153,6 @@ func TestRouter_CatchAllWithParam(t *testing.T) {
 	}
 }
 
-func TestRouter_EnableHTTP3(t *testing.T) {
-	r := New()
-	r.EnableHTTP3(nil) // Default config
-
-	if !r.IsHTTP3Enabled() {
-		t.Errorf("Expected HTTP/3 to be enabled")
-	}
-
-	config := r.GetHTTP3Config()
-	if config == nil || !config.Enabled {
-		t.Errorf("Expected valid HTTP3Config")
-	}
-
-	r.GET("/test", func(c *hypcontext.Context) {})
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/test", nil)
-	r.ServeHTTP(w, req)
-
-	// Check if Alt-Svc header is injected
-	if w.Header().Get("Alt-Svc") == "" {
-		t.Errorf("Expected Alt-Svc header for HTTP/3")
-	}
-}
 
 func TestRouter_Routes(t *testing.T) {
 	r := New()
