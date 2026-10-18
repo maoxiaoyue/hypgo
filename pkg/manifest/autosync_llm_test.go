@@ -14,9 +14,10 @@ type stubEnricher struct {
 	tag string
 }
 
-func (e *stubEnricher) EnrichRoute(route RouteManifest) RouteManifest {
-	route.Summary = route.Summary + " [" + e.tag + "]"
-	return route
+func (e *stubEnricher) EnrichRoutes(routes []RouteManifest) {
+	for i := range routes {
+		routes[i].Summary += " [" + e.tag + "]"
+	}
 }
 
 func TestAutoSync_NoLLMConfig_FallsBackToInference(t *testing.T) {

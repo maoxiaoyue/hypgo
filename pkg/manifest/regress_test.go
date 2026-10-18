@@ -23,11 +23,11 @@ type regressIn struct {
 func regressAuth(c *hypcontext.Context)       { c.Next() }
 func listOrdersHandler(c *hypcontext.Context) {}
 
-// fakeOllama 回傳固定 summary / description 的 Ollama 伺服器；delay 模擬慢速 LLM
+// fakeOllama 回傳固定 summary / description 的 Ollama 伺服器（批次回覆 id 1–3）；delay 模擬慢速 LLM
 func fakeOllama(t *testing.T, delay time.Duration) *config.LLMConfig {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(delay)
-		w.Write([]byte(`{"response":"{\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"}"}`))
+		w.Write([]byte(`{"response":"[{\"id\":1,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"},{\"id\":2,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"},{\"id\":3,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"}]"}`))
 	}))
 	t.Cleanup(srv.Close)
 	return &config.LLMConfig{Mode: config.LLMModeOllama, Ollama: config.OllamaConfig{URL: srv.URL, Model: "m"}}

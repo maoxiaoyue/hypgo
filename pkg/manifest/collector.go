@@ -106,7 +106,7 @@ func (c *Collector) collectRoutes() []RouteManifest {
 				applySchemaDetails(&rm, s)
 			}
 
-			// 智慧推斷回填空白欄位
+			// 補 Tags 與欄位資訊（Summary / Description 於排序後整批處理）
 			enrichRoute(&rm, schemaRoute, c.enrichCfg)
 
 			manifests = append(manifests, rm)
@@ -132,7 +132,7 @@ func (c *Collector) collectRoutes() []RouteManifest {
 
 		applySchemaDetails(&rm, &s)
 
-		// 智慧推斷回填空白欄位
+		// 補 Tags 與欄位資訊（Summary / Description 於排序後整批處理）
 		enrichRoute(&rm, &s, c.enrichCfg)
 
 		manifests = append(manifests, rm)
@@ -159,6 +159,9 @@ func (c *Collector) collectRoutes() []RouteManifest {
 		}
 		return manifests[i].Command < manifests[j].Command
 	})
+
+	// 排序後才送 LLM：同樣的路由集合每次組出相同的批次
+	enrichSummaries(manifests, c.enrichCfg)
 
 	return manifests
 }

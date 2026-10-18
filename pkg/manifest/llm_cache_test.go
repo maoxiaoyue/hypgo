@@ -14,7 +14,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
-// countingOllama 計算請求次數；fail 為 true 時回 500
+// countingOllama 計算請求次數（批次回覆 id 1–3）；fail 為 true 時回 500
 func countingOllama(t *testing.T, fail *atomic.Bool) (*config.LLMConfig, *atomic.Int32) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -23,7 +23,7 @@ func countingOllama(t *testing.T, fail *atomic.Bool) (*config.LLMConfig, *atomic
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		w.Write([]byte(`{"response":"{\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"}"}`))
+		w.Write([]byte(`{"response":"[{\"id\":1,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"},{\"id\":2,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"},{\"id\":3,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"}]"}`))
 	}))
 	t.Cleanup(srv.Close)
 	return &config.LLMConfig{Mode: config.LLMModeOllama, Ollama: config.OllamaConfig{URL: srv.URL, Model: "m1"}}, &calls
@@ -49,14 +49,14 @@ func TestLLMCacheSkipsUnchangedRoutes(t *testing.T) {
 		}
 	}
 
-	sync(llmCfg)
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("first sync made %d LLM requests, want 2", got)
+	sync(llmCfg) // 兩條路由合併成一個請求
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("first sync made %d LLM requests, want 1", got)
 	}
 
 	sync(llmCfg) // 全部命中
-	if got := calls.Load(); got != 2 {
-		t.Errorf("second sync made %d extra LLM requests, want 0", got-2)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("second sync made %d extra LLM requests, want 0", got-1)
 	}
 	if b, _ := os.ReadFile(path); strings.Count(string(b), "LLM SUMMARY") != 2 {
 		t.Errorf("cached results not applied to manifest:\n%s", b)
@@ -65,16 +65,16 @@ func TestLLMCacheSkipsUnchangedRoutes(t *testing.T) {
 	// 新增一條：只請求新路由
 	r.GET("/api/c", listOrdersHandler)
 	sync(llmCfg)
-	if got := calls.Load(); got != 3 {
-		t.Errorf("after adding a route: %d total requests, want 3", got)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("after adding a route: %d total requests, want 2", got)
 	}
 
 	// 換模型：鍵改變，全部重新請求
 	other := *llmCfg
 	other.Ollama.Model = "m2"
 	sync(&other)
-	if got := calls.Load(); got != 6 {
-		t.Errorf("after switching model: %d total requests, want 6", got)
+	if got := calls.Load(); got != 3 {
+		t.Errorf("after switching model: %d total requests, want 3", got)
 	}
 
 	// 快取只留本次用到的條目（m1 的舊條目被淘汰）

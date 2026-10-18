@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -19,7 +20,7 @@ func TestBuildEnrichPrompt(t *testing.T) {
 		Tags:         []string{"users"},
 	}
 
-	prompt := buildEnrichPrompt(route)
+	prompt := buildEnrichPrompt([]RouteManifest{route})
 
 	checks := []string{
 		"Protocol: rest",
@@ -43,7 +44,7 @@ func TestBuildEnrichPromptNonREST(t *testing.T) {
 		Command:  "UserService/CreateUser",
 	}
 
-	prompt := buildEnrichPrompt(route)
+	prompt := buildEnrichPrompt([]RouteManifest{route})
 
 	if !containsStr(prompt, "Protocol: grpc") {
 		t.Error("prompt should contain Protocol: grpc")
@@ -53,67 +54,81 @@ func TestBuildEnrichPromptNonREST(t *testing.T) {
 	}
 }
 
-func TestParseEnrichResponse(t *testing.T) {
-	route := RouteManifest{
-		Method: "GET",
-		Path:   "/api/users",
-	}
+// enrichOne 以單條路由呼叫 EnrichRoutes，回傳回填後的路由
+func enrichOne(e LLMEnricher, route RouteManifest) RouteManifest {
+	routes := []RouteManifest{route}
+	e.EnrichRoutes(routes)
+	return routes[0]
+}
 
-	// 正常 JSON
-	response := `{"summary": "List all users", "description": "Returns paginated list of users"}`
-	result := parseEnrichResponse(response, route)
-
-	if result.Summary != "List all users" {
-		t.Errorf("Summary = %q, want %q", result.Summary, "List all users")
+func TestBuildEnrichPromptNumbersRoutes(t *testing.T) {
+	prompt := buildEnrichPrompt([]RouteManifest{{Method: "GET", Path: "/a"}, {Method: "GET", Path: "/b"}})
+	if !strings.HasPrefix(prompt, enrichInstruction) {
+		t.Error("prompt should start with the fixed instruction")
 	}
-	if result.Description != "Returns paginated list of users" {
-		t.Errorf("Description = %q, want %q", result.Description, "Returns paginated list of users")
+	if !strings.Contains(prompt, "Route 1:\n  Protocol: rest\n  Method: GET\n  Path: /a\n") ||
+		!strings.Contains(prompt, "Route 2:\n  Protocol: rest\n  Method: GET\n  Path: /b\n") {
+		t.Errorf("routes not numbered in order:\n%s", prompt)
 	}
 }
 
-func TestParseEnrichResponseWithSurroundingText(t *testing.T) {
-	route := RouteManifest{}
+func TestApplyEnrichResponse(t *testing.T) {
+	routes := []RouteManifest{{Path: "/a"}, {Path: "/b"}, {Path: "/c", Summary: "Existing summary"}}
 
-	// LLM 回覆常帶前後文字
-	response := `Here is the result: {"summary": "Create user", "description": "Creates a new user"} Hope this helps!`
-	result := parseEnrichResponse(response, route)
-
-	if result.Summary != "Create user" {
-		t.Errorf("Summary = %q, want %q", result.Summary, "Create user")
+	// 帶前後文字與圍欄；id 可為字串；順序不同照 id 對回；不覆蓋已有值；id 超出範圍略過
+	reply := "Here you go:\n```json\n" + `[
+		{"id": "2", "summary": "B", "description": "B desc"},
+		{"id": 1, "summary": "A", "description": "A desc"},
+		{"id": 3, "summary": "C", "description": "C desc"},
+		{"id": 9, "summary": "X"}
+	]` + "\n```"
+	if err := applyEnrichResponse(reply, routes); err != nil {
+		t.Fatal(err)
+	}
+	if routes[0].Summary != "A" || routes[1].Summary != "B" || routes[1].Description != "B desc" {
+		t.Errorf("results not matched by id: %+v", routes)
+	}
+	if routes[2].Summary != "Existing summary" || routes[2].Description != "C desc" {
+		t.Errorf("should fill only blank fields: %+v", routes[2])
 	}
 }
 
-func TestParseEnrichResponseNoOverwrite(t *testing.T) {
-	route := RouteManifest{
-		Summary:     "Existing summary",
-		Description: "Existing description",
+func TestApplyEnrichResponseWithoutIDs(t *testing.T) {
+	routes := []RouteManifest{{Path: "/a"}, {Path: "/b"}}
+	if err := applyEnrichResponse(`[{"summary": "A"}, {"summary": "B"}]`, routes); err != nil {
+		t.Fatal(err)
 	}
-
-	response := `{"summary": "New summary", "description": "New description"}`
-	result := parseEnrichResponse(response, route)
-
-	// 不覆蓋已有值
-	if result.Summary != "Existing summary" {
-		t.Errorf("should not overwrite existing Summary, got %q", result.Summary)
-	}
-	if result.Description != "Existing description" {
-		t.Errorf("should not overwrite existing Description, got %q", result.Description)
+	if routes[0].Summary != "A" || routes[1].Summary != "B" {
+		t.Errorf("items without id should map by order: %+v", routes)
 	}
 }
 
-func TestParseEnrichResponseInvalid(t *testing.T) {
-	route := RouteManifest{Method: "GET", Path: "/test"}
-
-	// 無效 JSON
-	result := parseEnrichResponse("not json at all", route)
-	if result.Method != "GET" || result.Path != "/test" {
-		t.Error("invalid response should return original route unchanged")
+func TestApplyEnrichResponseSingleObject(t *testing.T) {
+	// 只送一條路由時，接受單一物件（description 內含方括號也不影響）
+	one := []RouteManifest{{Path: "/a"}}
+	if err := applyEnrichResponse(`{"summary": "A", "description": "returns [items]"}`, one); err != nil {
+		t.Fatal(err)
+	}
+	if one[0].Summary != "A" || one[0].Description != "returns [items]" {
+		t.Errorf("single object not applied: %+v", one[0])
 	}
 
-	// 空回覆
-	result = parseEnrichResponse("", route)
-	if result.Method != "GET" {
-		t.Error("empty response should return original route unchanged")
+	// 多條路由時單一物件無法對應，回報錯誤且不回填
+	two := []RouteManifest{{Path: "/a"}, {Path: "/b"}}
+	if err := applyEnrichResponse(`{"summary": "A"}`, two); err == nil || two[0].Summary != "" {
+		t.Errorf("err=%v routes=%+v, want error and no change", err, two)
+	}
+}
+
+func TestApplyEnrichResponseInvalid(t *testing.T) {
+	for _, reply := range []string{"not json at all", ""} {
+		routes := []RouteManifest{{Method: "GET", Path: "/test"}}
+		if err := applyEnrichResponse(reply, routes); err == nil {
+			t.Errorf("reply %q: want error", reply)
+		}
+		if routes[0].Summary != "" {
+			t.Errorf("reply %q: route changed: %+v", reply, routes[0])
+		}
 	}
 }
 
@@ -129,10 +144,13 @@ func TestExtractJSON(t *testing.T) {
 		{`}backwards{`, ""},
 	}
 	for _, tt := range tests {
-		got := extractJSON(tt.input)
+		got := extractJSON(tt.input, '{', '}')
 		if got != tt.want {
 			t.Errorf("extractJSON(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+	if got := extractJSON("x [1, 2] y", '[', ']'); got != "[1, 2]" {
+		t.Errorf("array extract = %q", got)
 	}
 }
 
@@ -184,7 +202,7 @@ func TestOllamaEnricherIntegration(t *testing.T) {
 	// 模擬 Ollama server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := ollamaResponse{
-			Response: `{"summary": "Create a new user account", "description": "Creates a user with name and email"}`,
+			Response: `[{"id": 1, "summary": "Create a new user account", "description": "Creates a user with name and email"}]`,
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -210,7 +228,7 @@ func TestOllamaEnricherIntegration(t *testing.T) {
 		InputType: "CreateUserRequest",
 	}
 
-	result := enricher.EnrichRoute(route)
+	result := enrichOne(enricher, route)
 	if result.Summary != "Create a new user account" {
 		t.Errorf("Summary = %q, want %q", result.Summary, "Create a new user account")
 	}
@@ -233,7 +251,7 @@ func TestAPIEnricherOpenAIIntegration(t *testing.T) {
 			}{
 				{Message: struct {
 					Content string `json:"content"`
-				}{Content: `{"summary": "List all products", "description": "Returns product catalog"}`}},
+				}{Content: `[{"id": 1, "summary": "List all products", "description": "Returns product catalog"}]`}},
 			},
 		}
 		json.NewEncoder(w).Encode(resp)
@@ -261,7 +279,7 @@ func TestAPIEnricherOpenAIIntegration(t *testing.T) {
 		Path:   "/api/products",
 	}
 
-	result := enricher.EnrichRoute(route)
+	result := enrichOne(enricher, route)
 	if result.Summary != "List all products" {
 		t.Errorf("Summary = %q, want %q", result.Summary, "List all products")
 	}
@@ -282,7 +300,7 @@ func TestAPIEnricherAnthropicIntegration(t *testing.T) {
 			Content: []struct {
 				Text string `json:"text"`
 			}{
-				{Text: `{"summary": "Delete user", "description": "Removes user account"}`},
+				{Text: `[{"id": 1, "summary": "Delete user", "description": "Removes user account"}]`},
 			},
 		}
 		json.NewEncoder(w).Encode(resp)
@@ -310,7 +328,7 @@ func TestAPIEnricherAnthropicIntegration(t *testing.T) {
 		Path:   "/api/users/:id",
 	}
 
-	result := enricher.EnrichRoute(route)
+	result := enrichOne(enricher, route)
 	if result.Summary != "Delete user" {
 		t.Errorf("Summary = %q, want %q", result.Summary, "Delete user")
 	}
@@ -337,7 +355,7 @@ func TestOllamaEnricherServerError(t *testing.T) {
 	}
 
 	route := RouteManifest{Method: "GET", Path: "/test"}
-	result := enricher.EnrichRoute(route)
+	result := enrichOne(enricher, route)
 
 	// 錯誤時應回傳原始 route 不修改
 	if result.Method != "GET" || result.Path != "/test" {

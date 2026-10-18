@@ -3,10 +3,12 @@ package manifest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,7 +24,8 @@ type EnricherErrorReporter func(routeKey string, err error) bool
 
 // NewLLMEnricherFromConfig 根據 LLMConfig 建立對應的 LLMEnricher 實作；mode=none 時回傳 nil（不使用 LLM）。
 // reporter 接收 enricher 內部錯誤（AutoSync 用它把錯誤接到 logger，讓使用者看得到「LLM 為什麼沒生效」），
-// 為 nil 時錯誤靜默丟棄
+// 為 nil 時錯誤靜默丟棄。
+// 設定中的 max_tokens 與 timeout 是每條路由的額度：一個請求帶 N 條路由時兩者都放大 N 倍
 func NewLLMEnricherFromConfig(cfg *config.LLMConfig, reporter EnricherErrorReporter) (LLMEnricher, error) {
 	if cfg == nil || !cfg.IsEnabled() {
 		return nil, nil
@@ -38,13 +41,12 @@ func NewLLMEnricherFromConfig(cfg *config.LLMConfig, reporter EnricherErrorRepor
 	}
 }
 
-// reportErr 是給各 enricher 用的內部 helper：回報錯誤並依 reporter 回傳決定是否繼續
-// （仍會回傳原 route，呼叫端要照樣 return route）
-func reportErr(reporter EnricherErrorReporter, route RouteManifest, err error) {
+// reportErr 是給各 enricher 用的內部 helper：reporter 為 nil 時靜默丟棄
+func reportErr(reporter EnricherErrorReporter, key string, err error) {
 	if reporter == nil || err == nil {
 		return
 	}
-	reporter(routeKey(route), err)
+	reporter(key, err)
 }
 
 func routeKey(r RouteManifest) string {
@@ -57,88 +59,125 @@ func routeKey(r RouteManifest) string {
 	return r.Protocol
 }
 
+// batchKey 回報錯誤用的批次識別：第一條路由加上其餘數量
+func batchKey(routes []RouteManifest) string {
+	key := routeKey(routes[0])
+	if len(routes) > 1 {
+		key += fmt.Sprintf(" (+%d more)", len(routes)-1)
+	}
+	return key
+}
+
 // --- Prompt Builder ---
 
-// buildEnrichPrompt 將路由資訊組成給 LLM 的 prompt
-func buildEnrichPrompt(route RouteManifest) string {
+// llmBatchSize 一個 LLM 請求最多帶幾條路由。合併請求省掉每條路由重複送出的指令與往返延遲；
+// 太大則單次輸出過長，一次失敗丟掉的結果也多
+const llmBatchSize = 20
+
+// enrichInstruction 批次 prompt 開頭的固定指令，各路由區塊接在後面。
+// 它也是 LLM 結果快取鍵的一部分：改了指令，舊結果自然失效
+const enrichInstruction = "You are a technical API documentation writer. " +
+	"For each route below, write a concise summary and description. " +
+	`Respond with only a JSON array, one object per route: [{"id": 1, "summary": "...", "description": "..."}]` + "\n"
+
+// routePromptBlock 單條路由在 prompt 中的描述（不含編號）。
+// 快取以它為鍵：只取決於路由本身，與同批還有哪些路由無關
+func routePromptBlock(route RouteManifest) string {
 	var sb strings.Builder
-	sb.WriteString("You are a technical API documentation writer. ")
-	sb.WriteString("Based on the following route information, generate a concise summary and description. ")
-	sb.WriteString("Respond in JSON format: {\"summary\": \"...\", \"description\": \"...\"}\n\n")
-
-	sb.WriteString("Route:\n")
-
 	proto := route.Protocol
 	if proto == "" {
 		proto = "rest"
 	}
-	sb.WriteString(fmt.Sprintf("  Protocol: %s\n", proto))
+	fmt.Fprintf(&sb, "  Protocol: %s\n", proto)
 
 	if route.Method != "" {
-		sb.WriteString(fmt.Sprintf("  Method: %s\n", route.Method))
+		fmt.Fprintf(&sb, "  Method: %s\n", route.Method)
 	}
 	if route.Path != "" {
-		sb.WriteString(fmt.Sprintf("  Path: %s\n", route.Path))
+		fmt.Fprintf(&sb, "  Path: %s\n", route.Path)
 	}
 	if route.Command != "" {
-		sb.WriteString(fmt.Sprintf("  Command: %s\n", route.Command))
+		fmt.Fprintf(&sb, "  Command: %s\n", route.Command)
 	}
 	if route.InputType != "" {
-		sb.WriteString(fmt.Sprintf("  InputType: %s\n", route.InputType))
+		fmt.Fprintf(&sb, "  InputType: %s\n", route.InputType)
 	}
 	if route.OutputType != "" {
-		sb.WriteString(fmt.Sprintf("  OutputType: %s\n", route.OutputType))
+		fmt.Fprintf(&sb, "  OutputType: %s\n", route.OutputType)
 	}
 	if h := primaryHandler(route.HandlerNames); h != "" {
-		sb.WriteString(fmt.Sprintf("  Handler: %s\n", h))
+		fmt.Fprintf(&sb, "  Handler: %s\n", h)
 	}
 	if len(route.Tags) > 0 {
-		sb.WriteString(fmt.Sprintf("  Tags: %s\n", strings.Join(route.Tags, ", ")))
+		fmt.Fprintf(&sb, "  Tags: %s\n", strings.Join(route.Tags, ", "))
 	}
 	if route.Summary != "" {
-		sb.WriteString(fmt.Sprintf("  CurrentSummary: %s\n", route.Summary))
+		fmt.Fprintf(&sb, "  CurrentSummary: %s\n", route.Summary)
 	}
-
 	return sb.String()
 }
 
-// llmResponse 是 LLM 回覆的 JSON 結構
+// buildEnrichPrompt 把一批路由組成一個 prompt；路由以 1 起算的 id 編號，回覆依 id 對回
+func buildEnrichPrompt(routes []RouteManifest) string {
+	var sb strings.Builder
+	sb.WriteString(enrichInstruction)
+	for i, r := range routes {
+		fmt.Fprintf(&sb, "\nRoute %d:\n", i+1)
+		sb.WriteString(routePromptBlock(r))
+	}
+	return sb.String()
+}
+
+// llmResponse 是 LLM 回覆中單條路由的 JSON 結構；id 可能是數字或字串
 type llmResponse struct {
-	Summary     string `json:"summary"`
-	Description string `json:"description"`
+	ID          json.RawMessage `json:"id"`
+	Summary     string          `json:"summary"`
+	Description string          `json:"description"`
 }
 
-// parseEnrichResponse 解析 LLM 回覆並回填到 RouteManifest
-func parseEnrichResponse(response string, route RouteManifest) RouteManifest {
-	// 嘗試從回覆中提取 JSON
-	jsonStr := extractJSON(response)
-	if jsonStr == "" {
-		return route
+// applyEnrichResponse 解析 LLM 的批次回覆並依 id 回填 routes（只填空白欄位）。
+// id 超出範圍的項目略過；缺 id 時以陣列順序對應
+func applyEnrichResponse(response string, routes []RouteManifest) error {
+	var items []llmResponse
+	if err := json.Unmarshal([]byte(extractJSON(response, '[', ']')), &items); err != nil {
+		// 只送一條路由時，部分模型回單一物件而非陣列
+		var one llmResponse
+		if len(routes) != 1 || json.Unmarshal([]byte(extractJSON(response, '{', '}')), &one) != nil {
+			return fmt.Errorf("reply is not a JSON array: %.200s", response)
+		}
+		items = []llmResponse{one}
 	}
 
-	var resp llmResponse
-	if err := json.Unmarshal([]byte(jsonStr), &resp); err != nil {
-		return route
+	for i, it := range items {
+		id := i + 1
+		if len(it.ID) > 0 {
+			n, err := strconv.Atoi(strings.Trim(string(it.ID), `"`))
+			if err != nil {
+				continue
+			}
+			id = n
+		}
+		if id < 1 || id > len(routes) {
+			continue
+		}
+		r := &routes[id-1]
+		if r.Summary == "" && it.Summary != "" {
+			r.Summary = sanitizeResponse(it.Summary)
+		}
+		if r.Description == "" && it.Description != "" {
+			r.Description = sanitizeResponse(it.Description)
+		}
 	}
-
-	// 只在空白時回填
-	if route.Summary == "" && resp.Summary != "" {
-		route.Summary = sanitizeResponse(resp.Summary)
-	}
-	if route.Description == "" && resp.Description != "" {
-		route.Description = sanitizeResponse(resp.Description)
-	}
-
-	return route
+	return nil
 }
 
-// extractJSON 從 LLM 回覆中提取 JSON 物件
-func extractJSON(s string) string {
-	start := strings.Index(s, "{")
+// extractJSON 擷取回覆中第一個 open 到最後一個 close 之間的內容（LLM 常在 JSON 前後加說明或 ``` 圍欄）
+func extractJSON(s string, open, close byte) string {
+	start := strings.IndexByte(s, open)
 	if start < 0 {
 		return ""
 	}
-	end := strings.LastIndex(s, "}")
+	end := strings.LastIndexByte(s, close)
 	if end < 0 || end <= start {
 		return ""
 	}
@@ -162,6 +201,32 @@ func sanitizeResponse(s string) string {
 	return s
 }
 
+// completeFunc 送出一個 prompt 並回傳模型的文字回覆；n 為這個 prompt 帶的路由數
+type completeFunc func(prompt string, n int) (string, error)
+
+// enrichInBatches 每 llmBatchSize 條路由送出一個請求並依 id 回填，三個內建 enricher 共用。
+// 一批失敗只回報錯誤，該批路由維持原樣
+func enrichInBatches(routes []RouteManifest, reporter EnricherErrorReporter, provider string, complete completeFunc) {
+	for start := 0; start < len(routes); start += llmBatchSize {
+		batch := routes[start:min(start+llmBatchSize, len(routes))]
+		reply, err := complete(buildEnrichPrompt(batch), len(batch))
+		if err == nil {
+			err = applyEnrichResponse(reply, batch)
+		}
+		if err != nil {
+			reportErr(reporter, batchKey(batch), fmt.Errorf("%s: %w", provider, err))
+		}
+	}
+}
+
+// requestTimeout 未設定逾時時的每條路由預設值
+func requestTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // ============================================================
 // OllamaEnricher — 連接本地 Ollama
 // ============================================================
@@ -170,6 +235,7 @@ type OllamaEnricher struct {
 	url       string
 	model     string
 	maxTokens int
+	timeout   time.Duration
 	client    *http.Client
 	reporter  EnricherErrorReporter
 }
@@ -178,15 +244,12 @@ func newOllamaEnricher(cfg *config.OllamaConfig, reporter EnricherErrorReporter)
 	if cfg.Model == "" {
 		return nil, fmt.Errorf("ollama model is required")
 	}
-	timeout := time.Duration(cfg.Timeout) * time.Second
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
 	return &OllamaEnricher{
 		url:       cfg.URL,
 		model:     cfg.Model,
 		maxTokens: cfg.MaxTokens,
-		client:    &http.Client{Timeout: timeout},
+		timeout:   requestTimeout(cfg.Timeout),
+		client:    &http.Client{},
 		reporter:  reporter,
 	}, nil
 }
@@ -204,17 +267,18 @@ type ollamaResponse struct {
 	Response string `json:"response"`
 }
 
-func (e *OllamaEnricher) EnrichRoute(route RouteManifest) RouteManifest {
-	req := ollamaRequest{Model: e.model, Prompt: buildEnrichPrompt(route)}
-	if e.maxTokens > 0 {
-		req.Options = map[string]int{"num_predict": e.maxTokens}
-	}
-	var resp ollamaResponse
-	if err := postJSON(e.client, e.url+"/api/generate", nil, req, &resp); err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("ollama: %w", err))
-		return route
-	}
-	return parseEnrichResponse(resp.Response, route)
+func (e *OllamaEnricher) EnrichRoutes(routes []RouteManifest) {
+	enrichInBatches(routes, e.reporter, "ollama", func(prompt string, n int) (string, error) {
+		req := ollamaRequest{Model: e.model, Prompt: prompt}
+		if e.maxTokens > 0 {
+			req.Options = map[string]int{"num_predict": e.maxTokens * n}
+		}
+		var resp ollamaResponse
+		if err := postJSON(e.client, e.timeout*time.Duration(n), e.url+"/api/generate", nil, req, &resp); err != nil {
+			return "", err
+		}
+		return resp.Response, nil
+	})
 }
 
 // ============================================================
@@ -227,6 +291,7 @@ type APIEnricher struct {
 	apiKey    string
 	model     string
 	maxTokens int
+	timeout   time.Duration
 	client    *http.Client
 	reporter  EnricherErrorReporter
 }
@@ -239,30 +304,25 @@ func newAPIEnricher(cfg *config.APIConfig, reporter EnricherErrorReporter) (*API
 	if apiKey == "" {
 		return nil, fmt.Errorf("api key is required")
 	}
-	timeout := time.Duration(cfg.Timeout) * time.Second
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
 	return &APIEnricher{
 		provider:  cfg.Provider,
 		baseURL:   cfg.BaseURL,
 		apiKey:    apiKey,
 		model:     cfg.Model,
 		maxTokens: cfg.MaxTokens,
-		client:    &http.Client{Timeout: timeout},
+		timeout:   requestTimeout(cfg.Timeout),
+		client:    &http.Client{},
 		reporter:  reporter,
 	}, nil
 }
 
-func (e *APIEnricher) EnrichRoute(route RouteManifest) RouteManifest {
-	prompt := buildEnrichPrompt(route)
-
+func (e *APIEnricher) EnrichRoutes(routes []RouteManifest) {
 	switch e.provider {
 	case "anthropic":
-		return e.enrichAnthropic(prompt, route)
+		enrichInBatches(routes, e.reporter, "anthropic", e.completeAnthropic)
 	default:
 		// OpenAI / Gemini / Custom 都用 OpenAI-compatible format
-		return e.enrichOpenAI(prompt, route)
+		enrichInBatches(routes, e.reporter, "openai-compatible", e.completeOpenAI)
 	}
 }
 
@@ -287,24 +347,22 @@ type openAIChatResponse struct {
 	} `json:"choices"`
 }
 
-func (e *APIEnricher) enrichOpenAI(prompt string, route RouteManifest) RouteManifest {
+func (e *APIEnricher) completeOpenAI(prompt string, n int) (string, error) {
 	req := openAIChatRequest{
 		Model:       e.model,
 		Messages:    []openAIMessage{{Role: "user", Content: prompt}},
-		MaxTokens:   e.maxTokens,
+		MaxTokens:   e.maxTokens * n,
 		Temperature: 0.3,
 	}
 	var resp openAIChatResponse
 	headers := map[string]string{"Authorization": "Bearer " + e.apiKey}
-	if err := postJSON(e.client, e.baseURL+"/chat/completions", headers, req, &resp); err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: %w", err))
-		return route
+	if err := postJSON(e.client, e.timeout*time.Duration(n), e.baseURL+"/chat/completions", headers, req, &resp); err != nil {
+		return "", err
 	}
 	if len(resp.Choices) == 0 {
-		reportErr(e.reporter, route, fmt.Errorf("openai-compatible: response has no choices"))
-		return route
+		return "", fmt.Errorf("response has no choices")
 	}
-	return parseEnrichResponse(resp.Choices[0].Message.Content, route)
+	return resp.Choices[0].Message.Content, nil
 }
 
 // anthropicRequest Anthropic messages 請求
@@ -325,33 +383,33 @@ type anthropicResponse struct {
 	} `json:"content"`
 }
 
-func (e *APIEnricher) enrichAnthropic(prompt string, route RouteManifest) RouteManifest {
+func (e *APIEnricher) completeAnthropic(prompt string, n int) (string, error) {
 	req := anthropicRequest{
 		Model:     e.model,
 		Messages:  []anthropicMsg{{Role: "user", Content: prompt}},
-		MaxTokens: e.maxTokens,
+		MaxTokens: e.maxTokens * n,
 	}
 	var resp anthropicResponse
 	headers := map[string]string{"x-api-key": e.apiKey, "anthropic-version": "2023-06-01"}
-	if err := postJSON(e.client, e.baseURL+"/messages", headers, req, &resp); err != nil {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: %w", err))
-		return route
+	if err := postJSON(e.client, e.timeout*time.Duration(n), e.baseURL+"/messages", headers, req, &resp); err != nil {
+		return "", err
 	}
 	if len(resp.Content) == 0 {
-		reportErr(e.reporter, route, fmt.Errorf("anthropic: response has no content"))
-		return route
+		return "", fmt.Errorf("response has no content")
 	}
-	return parseEnrichResponse(resp.Content[0].Text, route)
+	return resp.Content[0].Text, nil
 }
 
-// postJSON 以 POST 送出 JSON 並把 200 回應解析進 out，三個 enricher 共用。
+// postJSON 以 POST 送出 JSON 並把 200 回應解析進 out，三個 enricher 共用；timeout 涵蓋連線到讀完回應。
 // 非 200 時錯誤含 URL、狀態碼與回應前 512 bytes；provider 前綴由呼叫端加上
-func postJSON(client *http.Client, url string, headers map[string]string, in, out interface{}) error {
+func postJSON(client *http.Client, timeout time.Duration, url string, headers map[string]string, in, out interface{}) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
