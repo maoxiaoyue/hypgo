@@ -1,7 +1,6 @@
 package schema
 
 import (
-	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -87,62 +86,6 @@ func TestFieldsOfNonStruct(t *testing.T) {
 	}
 	if fields := FieldsOf(nil); fields != nil {
 		t.Error("FieldsOf(nil) should return nil")
-	}
-}
-
-// --- ValidateJSON ---
-
-func TestValidateJSON(t *testing.T) {
-	valid := `{"name":"alice","email":"a@b.com","age":30}`
-	if err := ValidateJSON([]byte(valid), testUser{}); err != nil {
-		t.Errorf("valid JSON failed: %v", err)
-	}
-}
-
-func TestValidateJSONMissingRequired(t *testing.T) {
-	missing := `{"email":"a@b.com"}`
-	err := ValidateJSON([]byte(missing), testUser{})
-	if err == nil {
-		t.Error("expected error for missing required field 'name'")
-	}
-}
-
-func TestValidateJSONOptionalFieldsMissing(t *testing.T) {
-	partial := `{"name":"alice"}`
-	if err := ValidateJSON([]byte(partial), testOptionalUser{}); err != nil {
-		t.Errorf("optional fields missing should pass: %v", err)
-	}
-}
-
-func TestValidateJSONEmpty(t *testing.T) {
-	if err := ValidateJSON([]byte{}, testUser{}); err == nil {
-		t.Error("empty data should fail")
-	}
-}
-
-func TestValidateJSONNilType(t *testing.T) {
-	if err := ValidateJSON([]byte(`{}`), nil); err != nil {
-		t.Errorf("nil type should pass: %v", err)
-	}
-}
-
-// --- GenerateZeroJSON ---
-
-func TestGenerateZeroJSON(t *testing.T) {
-	data := GenerateZeroJSON(testUser{})
-	var u testUser
-	if err := json.Unmarshal(data, &u); err != nil {
-		t.Fatalf("GenerateZeroJSON produced invalid JSON: %v", err)
-	}
-	if u.Name != "" || u.Age != 0 {
-		t.Errorf("expected zero values, got %+v", u)
-	}
-}
-
-func TestGenerateZeroJSONNil(t *testing.T) {
-	data := GenerateZeroJSON(nil)
-	if string(data) != "{}" {
-		t.Errorf("nil type should produce {}, got %s", data)
 	}
 }
 

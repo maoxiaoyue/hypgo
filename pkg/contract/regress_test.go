@@ -271,3 +271,33 @@ func TestObserveParallelKeepsRouteOrder(t *testing.T) {
 		t.Errorf("headers not sorted in report (Alpha=%d Mid=%d Zeta=%d)", a, m, z)
 	}
 }
+
+type notFoundBody struct {
+	Code string `json:"code"`
+}
+
+// TestResponseSchemaChosenByStatus 回歸測試：回應 body 依實際狀態碼選 schema。
+// 歷史 bug：ResponseSchema.Type 宣告了也沒人讀；非 2xx 回應一律拿 Output 驗，
+// 手動 Test 期望 404 並開 ExpectSchema 時必定失敗。
+func TestResponseSchemaChosenByStatus(t *testing.T) {
+	route := schema.Route{
+		Output:    listItem{},
+		Responses: map[int]schema.ResponseSchema{404: {Type: notFoundBody{}, TypeName: "notFoundBody"}},
+	}
+	tc := TestCase{ExpectStatus: 404}
+
+	if _, pass, reason := validateExchange(route, tc, 404, []byte(`{"code":"E404"}`)); !pass {
+		t.Errorf("404 body matching Responses[404].Type rejected: %s", reason)
+	}
+	if _, pass, _ := validateExchange(route, tc, 404, []byte(`{"id":1}`)); pass {
+		t.Error("404 body not matching Responses[404].Type accepted")
+	}
+	// 未宣告型別的錯誤狀態碼不驗 body
+	if _, pass, reason := validateExchange(route, TestCase{ExpectStatus: 500}, 500, []byte(`oops`)); !pass {
+		t.Errorf("undeclared 500 body must not be checked against Output: %s", reason)
+	}
+	// 2xx 仍用 Output
+	if _, pass, _ := validateExchange(route, TestCase{ExpectStatus: 200}, 200, []byte(`{"code":"x"}`)); pass {
+		t.Error("200 body must still be validated against Output")
+	}
+}

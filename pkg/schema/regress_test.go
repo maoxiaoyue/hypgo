@@ -1,7 +1,6 @@
 package schema
 
 import (
-	"encoding/json"
 	"fmt"
 	"testing"
 )
@@ -66,16 +65,6 @@ func TestFieldsOfFollowsEncodingJSON(t *testing.T) {
 		t.Errorf("omitzero FieldsOf = %q, want a optional", got)
 	}
 
-	body, _ := json.Marshal(pOmitzero{B: 1}) // {"b":1}
-	if err := ValidateJSON(body, pOmitzero{}); err != nil {
-		t.Errorf("ValidateJSON(%s) = %v, omitzero field must be optional", body, err)
-	}
-	if err := ValidateJSON([]byte(`{"name":"n","extra":"e"}`), pEmbedded{}); err != nil {
-		t.Errorf("ValidateJSON flattened embedded body: %v", err)
-	}
-	if err := ValidateJSON([]byte(`{"B":1}`), pOmitzero{}); err != nil {
-		t.Errorf("ValidateJSON must match keys case-insensitively like encoding/json: %v", err)
-	}
 }
 
 // TestRegisterNormalizesDerivedFields 回歸測試：直接 Register 也補齊衍生欄位，且不改呼叫端的 map。
@@ -102,7 +91,4 @@ func TestRegisterNormalizesDerivedFields(t *testing.T) {
 		t.Error("NewSchemaRoute modified caller's Responses map")
 	}
 
-	if n := len(r.GetByProtocol("")); n != 1 {
-		t.Errorf("GetByProtocol(\"\") = %d routes, want 1 (empty means rest)", n)
-	}
 }

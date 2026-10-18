@@ -122,7 +122,7 @@ func generateMinimalJSON(typ interface{}) string {
 func structFields(t reflect.Type) map[string]interface{} {
 	fields := make(map[string]interface{})
 	for _, f := range jsonFields(t) {
-		fields[f.name] = generateFieldValue(f.StructField, f.name)
+		fields[f.Name] = generateFieldValue(f.StructField, f.Name)
 	}
 	return fields
 }

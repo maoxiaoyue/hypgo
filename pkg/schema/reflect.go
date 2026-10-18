@@ -2,8 +2,6 @@
 package schema
 
 import (
-	"encoding/json"
-	"fmt"
 	"reflect"
 	"strings"
 )
@@ -33,10 +31,7 @@ func TypeName(v interface{}) string {
 	return name
 }
 
-// FieldsOf 返回 struct 的所有 JSON 欄位資訊（依 encoding/json 規則）：
-//   - 未帶 json 名稱的內嵌 struct（含未匯出型別）展開成上層欄位，而非一個以型別名為鍵的 object
-//   - required = 非指標、無 omitempty / omitzero、且不在內嵌指標之下
-//
+// FieldsOf 返回 struct 的所有 JSON 欄位資訊（規則見 JSONFields）。
 // 結果寫進 manifest 的 InputFields / OutputFields，供 AI 理解 JSON 形狀
 func FieldsOf(v interface{}) []FieldInfo {
 	if v == nil {
@@ -49,12 +44,36 @@ func FieldsOf(v interface{}) []FieldInfo {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
-	return appendFields(make([]FieldInfo, 0, t.NumField()), t, false)
+	fields := JSONFields(t)
+	out := make([]FieldInfo, len(fields))
+	for i, f := range fields {
+		out[i] = FieldInfo{
+			Name:     f.Name,
+			Type:     goTypeToSchemaType(f.Type),
+			JSONTag:  f.Tag.Get("json"),
+			Required: f.Required,
+		}
+	}
+	return out
 }
 
-// appendFields 為 FieldsOf 的遞迴實作；optional 表示位於內嵌指標之下（指標為 nil 時整組欄位不出現）
+// JSONField 為 encoding/json 視角下的單一 struct 欄位（內嵌 struct 已展開）
+type JSONField struct {
+	reflect.StructField
+	Name     string // JSON 鍵名
+	Required bool   // 非指標、無 omitempty / omitzero、且不在內嵌指標之下
+}
+
+// JSONFields 依 encoding/json 的規則列出 struct 型別 t 的 JSON 欄位：
+// 未帶 json 名稱的內嵌 struct（含未匯出型別）展開成上層欄位，而非一個以型別名為鍵的 object；
+// 內嵌指標之下的欄位為選填（指標為 nil 時整組不出現）。
+// FieldsOf 與 pkg/contract（必填檢查、測試資料生成）共用，各處對 JSON 形狀的認知才會一致
+func JSONFields(t reflect.Type) []JSONField {
+	return appendJSONFields(nil, t, false)
+}
+
 // ponytail: 不處理同名欄位的遮蔽規則（較淺層者優先），實務上極少見
-func appendFields(out []FieldInfo, t reflect.Type, optional bool) []FieldInfo {
+func appendJSONFields(out []JSONField, t reflect.Type, optional bool) []JSONField {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		tag := f.Tag.Get("json")
@@ -72,7 +91,7 @@ func appendFields(out []FieldInfo, t reflect.Type, optional bool) []FieldInfo {
 				if isPtr && !f.IsExported() {
 					continue // encoding/json 忽略未匯出型別的內嵌指標
 				}
-				out = appendFields(out, ft, optional || isPtr)
+				out = appendJSONFields(out, ft, optional || isPtr)
 				continue
 			}
 		}
@@ -84,11 +103,10 @@ func appendFields(out []FieldInfo, t reflect.Type, optional bool) []FieldInfo {
 		}
 		// omitzero（Go 1.24）與 omitempty 一樣：零值時根本不會序列化，不能算必填
 		omit := hasTagOpt(opts, "omitempty") || hasTagOpt(opts, "omitzero")
-		out = append(out, FieldInfo{
-			Name:     name,
-			Type:     goTypeToSchemaType(f.Type),
-			JSONTag:  tag,
-			Required: !optional && !omit && f.Type.Kind() != reflect.Ptr,
+		out = append(out, JSONField{
+			StructField: f,
+			Name:        name,
+			Required:    !optional && !omit && f.Type.Kind() != reflect.Ptr,
 		})
 	}
 	return out
@@ -97,73 +115,6 @@ func appendFields(out []FieldInfo, t reflect.Type, optional bool) []FieldInfo {
 // hasTagOpt 回報 json tag 的選項（逗號之後的部分）是否含 opt
 func hasTagOpt(opts, opt string) bool {
 	return strings.Contains(","+opts+",", ","+opt+",")
-}
-
-// ValidateJSON 驗證 JSON 資料是否符合指定的 Go struct 型別
-// 檢查 JSON 能否成功反序列化，並驗證必填欄位是否存在
-func ValidateJSON(data []byte, typ interface{}) error {
-	if typ == nil {
-		return nil
-	}
-	if len(data) == 0 {
-		return fmt.Errorf("empty JSON data")
-	}
-
-	t := reflect.TypeOf(typ)
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	// 建立新實例並嘗試反序列化
-	instance := reflect.New(t).Interface()
-	if err := json.Unmarshal(data, instance); err != nil {
-		return fmt.Errorf("JSON does not match schema %s: %w", t.Name(), err)
-	}
-
-	// 驗證必填欄位
-	return validateRequiredFields(data, t)
-}
-
-// validateRequiredFields 檢查 JSON 中是否包含所有必填欄位
-func validateRequiredFields(data []byte, t reflect.Type) error {
-	if t.Kind() != reflect.Struct {
-		return nil
-	}
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil // 已在上層驗證過
-	}
-	// encoding/json 比對鍵名不分大小寫，必填檢查也要一致
-	present := make(map[string]struct{}, len(raw))
-	for k := range raw {
-		present[strings.ToLower(k)] = struct{}{}
-	}
-
-	for _, f := range appendFields(nil, t, false) {
-		if _, ok := present[strings.ToLower(f.Name)]; f.Required && !ok {
-			return fmt.Errorf("missing required field: %s", f.Name)
-		}
-	}
-	return nil
-}
-
-// GenerateZeroJSON 根據 struct 型別生成零值 JSON
-// 用於 Contract Testing 自動生成測試資料
-func GenerateZeroJSON(typ interface{}) []byte {
-	if typ == nil {
-		return []byte("{}")
-	}
-	t := reflect.TypeOf(typ)
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	instance := reflect.New(t).Interface()
-	data, err := json.Marshal(instance)
-	if err != nil {
-		return []byte("{}")
-	}
-	return data
 }
 
 // goTypeToSchemaType 將 Go 型別轉為 schema 型別字串

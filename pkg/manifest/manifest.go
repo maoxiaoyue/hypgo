@@ -67,6 +67,10 @@ type RouteManifest struct {
 	InputType   string         `json:"input_type,omitempty" yaml:"input_type,omitempty"`
 	OutputType  string         `json:"output_type,omitempty" yaml:"output_type,omitempty"`
 	Responses   map[int]string `json:"responses,omitempty" yaml:"responses,omitempty"`
+	// ResponseTypes 為 Responses 中宣告了 Type 的狀態碼 → 型別名稱
+	ResponseTypes map[int]string        `json:"response_types,omitempty" yaml:"response_types,omitempty"`
+	Params        []schema.ParamSchema  `json:"params,omitempty" yaml:"params,omitempty"`
+	Headers       []schema.HeaderSchema `json:"headers,omitempty" yaml:"headers,omitempty"`
 
 	// 推斷/增強的欄位（IncludeFields 開啟時填入）
 	InputFields  []schema.FieldInfo `json:"input_fields,omitempty" yaml:"input_fields,omitempty"`

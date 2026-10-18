@@ -44,14 +44,11 @@ func (r *Registry) Register(route Route) {
 	r.schemas = append(r.schemas, route)
 }
 
-// Get 根據 method 和 path 查詢 REST schema（向後相容）
+// Get 根據 method 和 path 查詢 REST schema。回傳副本：呼叫端修改不會繞過鎖改到註冊表
+// （Route 內的 slice / map 仍與註冊表共用，勿就地修改）。
+// 其他協議或依協議篩選請走 All()
 func (r *Registry) Get(method, path string) (*Route, bool) {
-	return r.GetByKey("rest|" + strings.ToUpper(method) + " " + path)
-}
-
-// GetByKey 根據完整 key 查詢 schema。回傳副本：呼叫端修改不會繞過鎖改到註冊表
-// （Route 內的 slice / map 仍與註冊表共用，勿就地修改）
-func (r *Registry) GetByKey(key string) (*Route, bool) {
+	key := Route{Method: strings.ToUpper(method), Path: path}.RouteKey()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -61,27 +58,6 @@ func (r *Registry) GetByKey(key string) (*Route, bool) {
 	}
 	route := r.schemas[i]
 	return &route, true
-}
-
-// GetByProtocol 回傳指定協議的所有 schema（"" 視同 "rest"）
-func (r *Registry) GetByProtocol(protocol string) []Route {
-	if protocol == "" {
-		protocol = "rest"
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	var result []Route
-	for _, route := range r.schemas {
-		p := route.Protocol
-		if p == "" {
-			p = "rest"
-		}
-		if p == protocol {
-			result = append(result, route)
-		}
-	}
-	return result
 }
 
 // All 返回所有已註冊的路由 schema（副本）

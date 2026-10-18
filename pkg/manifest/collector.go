@@ -168,12 +168,7 @@ func (c *Collector) collectRoutes() []RouteManifest {
 					rm.HandlerNames = s.HandlerNames
 				}
 
-				if len(s.Responses) > 0 {
-					rm.Responses = make(map[int]string)
-					for code, resp := range s.Responses {
-						rm.Responses[code] = resp.Description
-					}
-				}
+				applySchemaDetails(&rm, s)
 			}
 
 			// 智慧推斷回填空白欄位
@@ -200,12 +195,7 @@ func (c *Collector) collectRoutes() []RouteManifest {
 			OutputType:  s.OutputName,
 		}
 
-		if len(s.Responses) > 0 {
-			rm.Responses = make(map[int]string)
-			for code, resp := range s.Responses {
-				rm.Responses[code] = resp.Description
-			}
-		}
+		applySchemaDetails(&rm, &s)
 
 		// 智慧推斷回填空白欄位
 		sCopy := s
@@ -301,4 +291,23 @@ func structName(model interface{}) string {
 		t = t.Elem()
 	}
 	return t.Name()
+}
+
+// applySchemaDetails 把 schema 宣告的 Params / Headers / Responses（含各狀態碼的型別名稱）寫進 manifest。
+// 先前 Params、Headers 與 Responses 的 Type 宣告了也沒有任何地方讀，AI 從 manifest 看不到
+func applySchemaDetails(rm *RouteManifest, s *schema.Route) {
+	rm.Params = s.Params
+	rm.Headers = s.Headers
+	for code, resp := range s.Responses {
+		if rm.Responses == nil {
+			rm.Responses = make(map[int]string, len(s.Responses))
+		}
+		rm.Responses[code] = resp.Description
+		if resp.TypeName != "" {
+			if rm.ResponseTypes == nil {
+				rm.ResponseTypes = make(map[int]string)
+			}
+			rm.ResponseTypes[code] = resp.TypeName
+		}
+	}
 }

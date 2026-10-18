@@ -29,7 +29,7 @@ type HeaderSchema struct {
 // ResponseSchema 描述特定狀態碼的回應
 type ResponseSchema struct {
 	Description string      `json:"description" yaml:"description"`
-	Type        interface{} `json:"-" yaml:"-"` // Go struct type（用於驗證）
+	Type        interface{} `json:"-" yaml:"-"` // 此狀態碼的回應 body 型別：contract 依實際狀態碼以它驗證（未宣告時 2xx 用 Route.Output）
 	TypeName    string      `json:"type_name,omitempty" yaml:"type_name,omitempty"`
 }
 
@@ -48,11 +48,13 @@ type ResponseSchema struct {
 // 非 REST 使用範例：
 //
 //	schema.RegisterGRPC("UserService/CreateUser", "Create user", Input{}, Output{})
-//	schema.RegisterBot("/start", "Start the bot", nil, WelcomeMsg{})
-//	schema.RegisterMCP("search_repos", "Search repos", Input{}, Output{})
+//	schema.RegisterCLI("process", "Process files", Input{}, Output{})
+//	schema.RegisterDesktop("view/main", "Main window", nil, MainView{})
+//
+// 其他協議（bot / mcp / websocket …）沒有專用 helper，以 Global().Register 直接註冊
 type Route struct {
 	// 通用欄位（所有協議共用）
-	Protocol    string      `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest"(default), "grpc", "bot", "mcp", "websocket", "cli", "desktop"
+	Protocol    string      `json:"protocol,omitempty" yaml:"protocol,omitempty"` // "rest"(default)、"grpc"、"cli"、"desktop"；其他協議（"bot"、"mcp"…）可自訂
 	Command     string      `json:"command,omitempty" yaml:"command,omitempty"`   // 非 REST 的命令標識
 	Platform    string      `json:"platform,omitempty" yaml:"platform,omitempty"` // bot 專用平台："telegram", "line", "discord", "whatsapp"
 	Summary     string      `json:"summary,omitempty" yaml:"summary,omitempty"`

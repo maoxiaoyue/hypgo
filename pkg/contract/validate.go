@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
 	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
@@ -84,79 +85,30 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 	return nil
 }
 
-// jsonField 為 encoding/json 視角下的單一 struct 欄位（內嵌 struct 已展開）
-type jsonField struct {
-	reflect.StructField
-	name      string
-	omitempty bool // omitempty 或 omitzero
-	optional  bool // 位於內嵌指標之下：指標為 nil 時整組欄位都不會出現
-}
-
-// jsonFields 依 encoding/json 的規則列出 t 的 JSON 欄位：未帶 json 名稱的內嵌 struct
-// （含未匯出型別）展開成上層欄位，而不是當成一個名為型別名的鍵。
-// 必填檢查與測試資料生成共用，兩邊對 JSON 形狀的認知才會一致
-func jsonFields(t reflect.Type) []jsonField {
+// jsonFields 回傳 t 的 JSON 欄位（規則見 schema.JSONFields；與 manifest 的 FieldsOf 同一套），
+// 必填檢查與測試資料生成共用
+func jsonFields(t reflect.Type) []schema.JSONField {
 	if v, ok := jsonFieldCache.Load(t); ok {
-		return v.([]jsonField)
+		return v.([]schema.JSONField)
 	}
-	fields := appendJSONFields(nil, t, false)
+	fields := schema.JSONFields(t)
 	jsonFieldCache.Store(t, fields)
 	return fields
 }
 
-// jsonFieldCache reflect.Type → []jsonField。tag 解析結果對同一型別永不改變，
+// jsonFieldCache reflect.Type → []schema.JSONField。tag 解析結果對同一型別永不改變，
 // 先前每次驗證 / 生成都重新走一遍反射
 var jsonFieldCache sync.Map
 
-// requiredJSONNames 回傳必填欄位的 JSON 名稱：非 omitempty、非指標、不在內嵌指標之下
+// requiredJSONNames 回傳必填欄位的 JSON 名稱
 func requiredJSONNames(t reflect.Type) []string {
 	var names []string
 	for _, f := range jsonFields(t) {
-		if !f.omitempty && !f.optional && f.Type.Kind() != reflect.Ptr {
-			names = append(names, f.name)
+		if f.Required {
+			names = append(names, f.Name)
 		}
 	}
 	return names
-}
-
-// ponytail: 不處理同名欄位的遮蔽規則（較淺層者優先），實務上極少見
-func appendJSONFields(out []jsonField, t reflect.Type, optional bool) []jsonField {
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		tag := f.Tag.Get("json")
-		if tag == "-" {
-			continue
-		}
-		name, opts, _ := strings.Cut(tag, ",")
-
-		if f.Anonymous && name == "" {
-			ft, isPtr := f.Type, f.Type.Kind() == reflect.Ptr
-			if isPtr {
-				ft = ft.Elem()
-			}
-			if ft.Kind() == reflect.Struct {
-				if isPtr && !f.IsExported() {
-					continue // encoding/json 忽略未匯出型別的內嵌指標
-				}
-				out = appendJSONFields(out, ft, optional || isPtr)
-				continue
-			}
-		}
-		if !f.IsExported() {
-			continue
-		}
-		if name == "" {
-			name = f.Name
-		}
-		out = append(out, jsonField{
-			StructField: f,
-			name:        name,
-			// omitzero（Go 1.24）與 omitempty 一樣：零值時不會序列化，不能算必填
-			omitempty: strings.Contains(","+opts+",", ",omitempty,") || strings.Contains(","+opts+",", ",omitzero,"),
-			optional:  optional,
-		})
-	}
-	return out
 }
 
 // validateConstraints 以 go-playground/validator 執行 validate: tag 的語意/格式約束檢查

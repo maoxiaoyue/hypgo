@@ -5,37 +5,21 @@ package schema
 // RegisterGRPC 註冊 gRPC 服務方法的 schema
 // command 格式："ServiceName/MethodName"
 func RegisterGRPC(command, summary string, input, output interface{}) {
-	route := Route{
-		Protocol: "grpc",
-		Command:  command,
-		Summary:  summary,
-		Input:    input,
-		Output:   output,
-	}
-	Global().Register(route)
+	registerCommand("grpc", command, summary, input, output)
 }
 
 // RegisterCLI 註冊 CLI 子命令的 schema
 func RegisterCLI(command, summary string, input, output interface{}) {
-	route := Route{
-		Protocol: "cli",
-		Command:  command,
-		Summary:  summary,
-		Input:    input,
-		Output:   output,
-	}
-	Global().Register(route)
+	registerCommand("cli", command, summary, input, output)
 }
 
 // RegisterDesktop 註冊桌面（GUI）視圖的 schema
 // command 慣例："view/<name>"，例如 "view/main"、"view/settings"
 func RegisterDesktop(command, summary string, input, output interface{}) {
-	route := Route{
-		Protocol: "desktop",
-		Command:  command,
-		Summary:  summary,
-		Input:    input,
-		Output:   output,
-	}
-	Global().Register(route)
+	registerCommand("desktop", command, summary, input, output)
+}
+
+// registerCommand 註冊非 REST 的命令型 schema（InputName / OutputName 由 Register 補齊）
+func registerCommand(protocol, command, summary string, input, output interface{}) {
+	Global().Register(Route{Protocol: protocol, Command: command, Summary: summary, Input: input, Output: output})
 }

@@ -139,7 +139,7 @@ func (tc TestCase) request(method, path string) *http.Request {
 	return req
 }
 
-// validateExchange 依序檢查一次 HTTP 交換：狀態碼 → 回應 body 非空 → Input schema → Output schema。
+// validateExchange 依序檢查一次 HTTP 交換：狀態碼 → 回應 body 非空 → Input schema → 回應 schema。
 // runTestOnce（Test / TestAll）與 Observe 共用，兩邊判定才不會分歧；reason 為第一個失敗步驟的原因。
 // route 沒有 Input / Output 時只檢查狀態碼；tc.ExpectStatus 為 0 時不檢查狀態碼
 func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
@@ -163,8 +163,18 @@ func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (s
 		step("Status Code", fmt.Sprintf("got %d, want %d", code, tc.ExpectStatus), err)
 	}
 
+	// 回應 body 的 schema：該狀態碼在 Responses 宣告了 Type 就用它，否則 2xx 用 Output；
+	// 非 2xx 且未宣告時不驗 body——錯誤回應不是 Output 的形狀（先前一律拿 Output 驗，
+	// 手動 Test 期望 404 並開 ExpectSchema 時必定失敗）
+	bodyType, bodyName := route.Output, route.OutputName
+	if rs, ok := route.Responses[code]; ok && rs.Type != nil {
+		bodyType, bodyName = rs.Type, rs.TypeName
+	} else if code < 200 || code >= 300 {
+		bodyType = nil
+	}
+
 	hasBody := len(bytes.TrimSpace(body)) > 0
-	if route.Output != nil {
+	if bodyType != nil {
 		var err error
 		if !hasBody {
 			err = errors.New("response body is empty")
@@ -180,12 +190,12 @@ func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (s
 		step(fmt.Sprintf("Input Schema (%s)", route.InputName), "matches schema", err)
 	}
 
-	if route.Output != nil && hasBody {
+	if bodyType != nil && hasBody {
 		var err error
-		if e := validateResponse(body, route.Output); e != nil {
+		if e := validateResponse(body, bodyType); e != nil {
 			err = fmt.Errorf("response schema validation failed: %w", e)
 		}
-		step(fmt.Sprintf("Output Schema (%s)", route.OutputName), "matches schema", err)
+		step(fmt.Sprintf("Output Schema (%s)", bodyName), "matches schema", err)
 	}
 	return steps, pass, reason
 }
