@@ -336,3 +336,22 @@ func TestEvalRecord_OmitEmptyFields(t *testing.T) {
 		t.Error("scores should be omitted when nil")
 	}
 }
+
+// TestAppendHistory_RecoversFromTruncatedLine 回歸測試：檔尾留有中斷寫入的半行時，新紀錄仍可讀回。
+// 改用 O_APPEND 後若不先補換行，新紀錄會黏在半行後面、一起被 LoadHistory 當壞行跳過。
+func TestAppendHistory_RecoversFromTruncatedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, []byte(`{"ts":"2026-01-01T00:00:00Z","route":"GET /ok","status":"pass"}`+"\n"+`{"route":"GET /cut`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendHistoryTo(path, EvalRecord{Timestamp: time.Now(), Route: "GET /new", Status: "pass"}); err != nil {
+		t.Fatalf("AppendHistoryTo: %v", err)
+	}
+	records, err := LoadHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Route != "GET /ok" || records[1].Route != "GET /new" {
+		t.Errorf("records = %+v, want GET /ok and GET /new (truncated line skipped)", records)
+	}
+}
