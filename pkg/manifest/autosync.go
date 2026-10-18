@@ -28,6 +28,10 @@ const maxEnricherErrorsReported = 5
 // DefaultContextPath 預設的 context 檔案路徑
 const DefaultContextPath = ".hyp/context.yaml"
 
+// ManifestOutEnv 設定此環境變數時，server.Start() 在路由註冊完成後把 manifest（JSON）
+// 寫到該路徑並直接返回、不開始監聽。hyp context 以此執行使用者專案取得真實路由
+const ManifestOutEnv = "HYPGO_MANIFEST_OUT"
+
 // DefaultLLMConfigFilename LLM 設定檔在 .hyp/ 內的固定檔名
 const DefaultLLMConfigFilename = "llm.yaml"
 

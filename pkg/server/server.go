@@ -239,6 +239,14 @@ func (s *Server) Use(middlewares ...hypcontext.HandlerFunc) {
 
 // Start 根據配置啟動伺服器
 func (s *Server) Start() error {
+	// hyp context 以 HYPGO_MANIFEST_OUT 執行專案：此時路由已註冊完，寫出 manifest 後即返回，
+	// 不寫 PID 檔、不開始監聽，也不動 .hyp/context.yaml
+	if out := os.Getenv(manifest.ManifestOutEnv); out != "" {
+		return manifest.NewAutoSync(manifest.AutoSyncConfig{
+			Enabled: true, Path: out, Format: "json", DisableLLMAutoDiscovery: true,
+		}, s.router, s.config, s.logger).Sync()
+	}
+
 	// 保存 PID 檔案
 	if err := s.savePIDFile(); err != nil {
 		s.logger.Warningf("Failed to save PID file: %v", err)

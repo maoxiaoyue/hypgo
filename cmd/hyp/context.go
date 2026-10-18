@@ -2,77 +2,80 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 
-	"github.com/maoxiaoyue/hypgo/pkg/config"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
-	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 var contextCmd = &cobra.Command{
 	Use:   "context",
 	Short: "Generate project manifest for AI collaboration",
 	Long: `Generate a machine-readable project manifest (YAML or JSON) describing
-routes, middleware, configuration, and schema metadata.
+routes, configuration, and schema metadata.
 
 The manifest enables AI tools to understand the project structure with
 minimal tokens (~500 tokens vs ~5,000 for reading source files).
 
+Routes are registered by your own code, so this command runs the project
+(go run <pkg>) with HYPGO_MANIFEST_OUT set: server.Start() writes the manifest
+right after the routes are registered and returns without listening.
+Anything main() does before Start() (loading config, connecting to the
+database) still runs.
+
 Output includes:
   - Server configuration (addr, protocol, TLS)
   - All registered routes with method, path, and handler names
-  - Schema metadata (Input/Output types, summary, tags) if available
+  - Schema metadata (Input/Output types and fields, summary, tags) if available
   - Database configuration (driver, replicas)
 
+CLI / Desktop projects do not call server.Start() (and running a desktop
+app would open its window); when ./tools/genctx exists, this command runs it
+instead and reads the .hyp/context.yaml it writes.
+
 The manifest is also auto-generated on Server.Start() via AutoSync
-and saved to .hyp/context.yaml. This command allows you to generate
-it manually or in a different format.
+and saved to .hyp/context.yaml.
 
 Flags:
   -o, --output   Output file path (default: stdout)
   -f, --format   Output format: yaml or json (default: yaml)
+  -p, --pkg      Main package to run (default: .)
 
 Examples:
   hyp context                              Print YAML to stdout
   hyp context -f json                      Print JSON to stdout
   hyp context -o .hyp/manifest.yaml        Save YAML to file
-  hyp context -o manifest.json -f json     Save JSON to file`,
+  hyp context -p ./cmd/server              Run a main package outside the root`,
 	RunE: runContext,
 }
 
 func init() {
 	contextCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	contextCmd.Flags().StringP("format", "f", "yaml", "Output format: yaml or json")
+	contextCmd.Flags().StringP("pkg", "p", ".", "Main package to run")
 }
 
 func runContext(cmd *cobra.Command, args []string) error {
 	output, _ := cmd.Flags().GetString("output")
 	format, _ := cmd.Flags().GetString("format")
+	pkg, _ := cmd.Flags().GetString("pkg")
 
-	// 載入設定（若存在）：v0.9.2 起 runtime 設定位於專案根目錄 config/，
-	// app/config/ 是舊模板的位置，保留作回退
-	var cfg *config.Config
-	for _, configPath := range []string{"config/config.yaml", "app/config/config.yaml"} {
-		if _, err := os.Stat(configPath); err != nil {
-			continue
-		}
-		c := &config.Config{}
-		if err := config.NewConfigLoader(configPath).Load(configPath, c); err == nil {
-			cfg = c // 載入失敗則不含設定資訊
-		}
-		break
+	// 先前以空的 router.New() 收集，輸出裡沒有任何使用者路由（hyp 與專案是不同行程）。
+	// 改為實際執行專案，由 server.Start() 在路由註冊完成後寫出 manifest
+	collect := collectProjectManifest
+	if st, err := os.Stat("tools/genctx"); pkg == "." && err == nil && st.IsDir() {
+		collect = func(cmd *cobra.Command, _ string) (*manifest.Manifest, error) { return runGenctx(cmd) }
+	}
+	m, err := collect(cmd, pkg)
+	if err != nil {
+		return err
 	}
 
-	// 建立 router（目前無法自動掃描使用者路由，輸出基礎結構）
-	r := router.New()
-
-	// 收集 manifest
-	c := manifest.NewCollector(r, cfg)
-	m := c.Collect()
-
-	// 輸出
 	if output != "" {
 		if err := manifest.SaveToFile(output, m, format); err != nil {
 			return fmt.Errorf("failed to save manifest: %w", err)
@@ -81,11 +84,62 @@ func runContext(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// 輸出到 stdout
 	switch format {
 	case "json":
 		return manifest.WriteJSON(os.Stdout, m)
 	default:
 		return manifest.WriteYAML(os.Stdout, m)
 	}
+}
+
+// collectProjectManifest 以 HYPGO_MANIFEST_OUT 執行 go run <pkg>，讀回 server.Start() 寫出的 manifest。
+// 專案輸出一律導到 stderr，讓 stdout 只有 manifest
+func collectProjectManifest(cmd *cobra.Command, pkg string) (*manifest.Manifest, error) {
+	tmp, err := os.CreateTemp("", "hypgo-manifest-*.json")
+	if err != nil {
+		return nil, err
+	}
+	out := tmp.Name()
+	tmp.Close()
+	os.Remove(out) // 由專案建立；存在與否用來判斷 server.Start() 是否被呼叫
+	defer os.Remove(out)
+
+	run := exec.CommandContext(cmd.Context(), "go", "run", pkg)
+	run.Env = append(os.Environ(), manifest.ManifestOutEnv+"="+out)
+	run.Stdout, run.Stderr = os.Stderr, os.Stderr
+	if err := run.Run(); err != nil {
+		return nil, fmt.Errorf("go run %s: %w", pkg, err)
+	}
+
+	data, err := os.ReadFile(out)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("go run %s finished without calling server.Start(), so no routes were collected; "+
+			"gRPC projects write .hyp/context.yaml when they start", pkg)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var m manifest.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parse manifest from %s: %w", out, err)
+	}
+	return &m, nil
+}
+
+// runGenctx 執行 CLI / Desktop 模板自帶的 tools/genctx（它把 manifest 寫到 .hyp/context.yaml）後讀回
+func runGenctx(cmd *cobra.Command) (*manifest.Manifest, error) {
+	run := exec.CommandContext(cmd.Context(), "go", "run", "./tools/genctx")
+	run.Stdout, run.Stderr = os.Stderr, os.Stderr
+	if err := run.Run(); err != nil {
+		return nil, fmt.Errorf("go run ./tools/genctx: %w", err)
+	}
+	data, err := os.ReadFile(manifest.DefaultContextPath)
+	if err != nil {
+		return nil, err
+	}
+	var m manifest.Manifest
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", manifest.DefaultContextPath, err)
+	}
+	return &m, nil
 }
