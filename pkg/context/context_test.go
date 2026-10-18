@@ -130,9 +130,8 @@ func TestStdContextPreservesValues(t *testing.T) {
 		t.Fatal("expected to find HypGo Context")
 	}
 
-	userID := got.GetInt("user_id")
-	if userID != 42 {
-		t.Errorf("expected user_id=42, got %d", userID)
+	if userID, _ := got.Get("user_id"); userID != 42 {
+		t.Errorf("expected user_id=42, got %v", userID)
 	}
 }
 

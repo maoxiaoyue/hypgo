@@ -5,8 +5,6 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
 // EnrichConfig 控制 Manifest 自動推斷行為
@@ -17,7 +15,7 @@ type EnrichConfig struct {
 	// InferTags 從路徑推斷 Tags（預設 true）
 	InferTags bool
 
-	// IncludeFields 在 manifest 中包含 Input/Output 的欄位資訊（預設 true）
+	// IncludeFields 在 manifest 的 types 區段列出路由引用型別的欄位（預設 true）
 	IncludeFields bool
 
 	// LLMEnricher 可選的 LLM 增強器（nil 表示不使用）
@@ -38,39 +36,51 @@ func DefaultEnrichConfig() EnrichConfig {
 // LLMEnricher 定義 LLM 增強的介面
 // 實作者可以呼叫 OpenAI、Claude、Gemini 等 API
 type LLMEnricher interface {
-	// EnrichRoute 為指定路由生成更精確的描述
-	// 接收現有的 RouteManifest（含推斷結果），回傳增強後的版本
-	EnrichRoute(route RouteManifest) RouteManifest
+	// EnrichRoutes 為一批路由生成更精確的描述，直接回填 routes 的空白欄位（Summary / Description）。
+	// 收到的都是至少缺其中一項的路由（已含 Tags 等推斷結果）；
+	// 一次收到整批，方便把多條路由合併成一個請求
+	EnrichRoutes(routes []RouteManifest)
 }
 
-// enrichRoute 用智慧推斷填補 RouteManifest 的空白欄位。
-// LLM 在 Summary 推斷之前執行：LLM 只回填空白欄位，先前推斷先把 Summary 填滿，
-// LLM 產生的 summary 永遠被丟棄（API 模式白付每條路由一次呼叫）。
-// Summary 推斷改為 LLM 未提供（停用或失敗）時的退路
-func enrichRoute(rm *RouteManifest, schemaRoute *schema.Route, cfg EnrichConfig) {
-	// 推斷 Tags（LLM 不產生 tags，先填好可一併作為 prompt 的上下文）
+// enrichRoute 為單條路由推斷 Tags（LLM 不產生 tags，先填好可一併作為 prompt 的上下文）。
+// Summary / Description 要等全部路由收集完才由 enrichSummaries 處理（LLM 需整批送出）
+func enrichRoute(rm *RouteManifest, cfg EnrichConfig) {
 	if cfg.InferTags && len(rm.Tags) == 0 {
 		rm.Tags = inferTags(rm)
 	}
+}
 
-	// 填入欄位資訊
-	if cfg.IncludeFields && schemaRoute != nil {
-		if schemaRoute.Input != nil {
-			rm.InputFields = schema.FieldsOf(schemaRoute.Input)
-		}
-		if schemaRoute.Output != nil {
-			rm.OutputFields = schema.FieldsOf(schemaRoute.Output)
-		}
-	}
-
-	// LLM 增強（可選）
+// enrichSummaries 在全部路由收集完後填補 Summary / Description。
+// 缺任一項的路由整批交給 LLM；兩項都已宣告的不送：LLM 只回填空白欄位，送了也是白付請求，
+// 而且結果是空的、不會進快取，先前每次同步都重送一次。
+// LLM 在 Summary 推斷之前執行：先推斷會把 Summary 填滿，LLM 產生的 summary 就永遠被丟棄。
+// Summary 推斷是 LLM 未提供（停用或失敗）時的退路
+func enrichSummaries(routes []RouteManifest, cfg EnrichConfig) {
 	if cfg.LLMEnricher != nil {
-		*rm = cfg.LLMEnricher.EnrichRoute(*rm)
+		var idx []int
+		for i := range routes {
+			if routes[i].Summary == "" || routes[i].Description == "" {
+				idx = append(idx, i)
+			}
+		}
+		if len(idx) > 0 {
+			pending := make([]RouteManifest, len(idx))
+			for j, i := range idx {
+				pending[j] = routes[i]
+			}
+			cfg.LLMEnricher.EnrichRoutes(pending)
+			for j, i := range idx {
+				routes[i] = pending[j]
+			}
+		}
 	}
 
-	// 推斷 Summary
-	if cfg.InferSummary && rm.Summary == "" {
-		rm.Summary = inferSummary(rm)
+	if cfg.InferSummary {
+		for i := range routes {
+			if routes[i].Summary == "" {
+				routes[i].Summary = inferSummary(&routes[i])
+			}
+		}
 	}
 }
 

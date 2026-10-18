@@ -19,7 +19,7 @@ import (
 
 // SecurityConfig 安全配置
 type SecurityConfig struct {
-	XSSProtection         string
+	XSSProtection         string // 預設 "0"（見 Security）
 	ContentTypeNosniff    string
 	XFrameOptions         string
 	HSTSMaxAge            int
@@ -31,10 +31,11 @@ type SecurityConfig struct {
 // Security 創建安全頭中間件
 // GC 優化：所有 header 值在初始化時預計算，避免每請求的 fmt.Sprintf 和字串拼接
 func Security(config SecurityConfig) hypcontext.HandlerFunc {
-	// GC 優化：預計算所有 header 值（閉包捕獲不可變值）
+	// X-XSS-Protection 預設 "0"：舊版瀏覽器的 XSS 過濾器本身可被利用來製造漏洞，
+	// 現代瀏覽器已移除該功能，OWASP 建議送 0 並改用 Content-Security-Policy
 	xss := config.XSSProtection
 	if xss == "" {
-		xss = "1; mode=block"
+		xss = "0"
 	}
 
 	nosniff := config.ContentTypeNosniff
@@ -95,54 +96,51 @@ func BasicAuth(config AuthConfig) hypcontext.HandlerFunc {
 	if config.Realm == "" {
 		config.Realm = "Restricted"
 	}
+	challenge := fmt.Sprintf(`Basic realm=%q`, config.Realm)
+
+	// 每個 401 都帶 WWW-Authenticate（RFC 7235）：先前只有沒帶 Authorization 時才帶，
+	// 帳密錯誤時瀏覽器不會再次跳出登入框
+	unauthorized := func(c *hypcontext.Context) {
+		c.Header("WWW-Authenticate", challenge)
+		c.AbortWithStatus(http.StatusUnauthorized)
+	}
 
 	return func(c *hypcontext.Context) {
-		// 獲取認證頭
 		auth := c.GetHeader("Authorization")
-		if auth == "" {
-			c.Header("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, config.Realm))
-			c.AbortWithStatus(http.StatusUnauthorized)
-			return
-		}
-
-		// 解析認證資訊
 		const prefix = "Basic "
-		if !strings.HasPrefix(auth, prefix) {
-			c.AbortWithStatus(http.StatusUnauthorized)
+		if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+			unauthorized(c)
 			return
 		}
 
-		// 解碼認證資訊
 		decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
 		if err != nil {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			unauthorized(c)
 			return
 		}
-
-		// 分離使用者名稱和密碼
 		parts := bytes.SplitN(decoded, []byte(":"), 2)
 		if len(parts) != 2 {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			unauthorized(c)
 			return
 		}
-
 		username := string(parts[0])
 		password := string(parts[1])
 
-		// 驗證認證資訊
 		valid := false
 		if config.Validator != nil {
 			valid = config.Validator(username, password, c)
-		} else if expectedPass, ok := config.Authorized[username]; ok {
-			valid = subtle.ConstantTimeCompare([]byte(password), []byte(expectedPass)) == 1
+		} else {
+			expectedPass, ok := config.Authorized[username]
+			// 帳號不存在時仍做一次比較，不讓回應時間洩漏帳號是否存在
+			match := subtle.ConstantTimeCompare([]byte(password), []byte(expectedPass)) == 1
+			valid = ok && match
 		}
 
 		if !valid {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			unauthorized(c)
 			return
 		}
 
-		// 設置使用者資訊
 		c.Set("user", username)
 		c.Next()
 	}
@@ -152,42 +150,37 @@ func BasicAuth(config AuthConfig) hypcontext.HandlerFunc {
 
 // JWTConfig JWT 配置
 type JWTConfig struct {
-	SigningKey    []byte
-	SigningMethod string
 	ContextKey    string
-	TokenLookup   string // "header:Authorization" or "query:token" or "cookie:token"
-	TokenHeadName string // "Bearer"
-	Claims        interface{}
+	TokenLookup   string                                  // "header:Authorization" or "query:token" or "cookie:token"
+	TokenHeadName string                                  // "Bearer"
 	Validator     func(token string) (interface{}, error) // 必須提供：驗證 token 並回傳 claims
 	ErrorHandler  func(c *hypcontext.Context, err error)
 }
 
-// JWT 創建 JWT 中間件
-// 需要提供 Validator 函式來驗證 token，否則一律拒絕（安全預設）
+// JWT 創建 JWT 中間件。未提供 Validator 時於建立時 panic：
+// 先前要等到第一個請求才發現（每個請求都回 401，原因只在 ErrorHandler 看得到）
 func JWT(config JWTConfig) hypcontext.HandlerFunc {
+	if config.Validator == nil {
+		panic("middleware: JWTConfig.Validator is required (use middleware.HS256Validator(secret) for HS256)")
+	}
 	if config.ContextKey == "" {
 		config.ContextKey = "user"
 	}
-
 	if config.TokenLookup == "" {
 		config.TokenLookup = "header:Authorization"
 	}
-
 	if config.TokenHeadName == "" {
 		config.TokenHeadName = "Bearer"
 	}
+	src := parseValueSource(config.TokenLookup, "header", "query", "cookie")
 
 	return func(c *hypcontext.Context) {
-		// 提取 token
-		token := extractToken(c, config.TokenLookup, config.TokenHeadName)
+		token := src.get(c)
+		if src.kind == "header" {
+			token = stripAuthScheme(token, config.TokenHeadName)
+		}
 		if token == "" {
 			jwtError(c, config, fmt.Errorf("token not found"))
-			return
-		}
-
-		// 使用 Validator 驗證 token（必須由使用者提供）
-		if config.Validator == nil {
-			jwtError(c, config, fmt.Errorf("JWT validator not configured"))
 			return
 		}
 
@@ -216,31 +209,13 @@ func jwtError(c *hypcontext.Context, config JWTConfig, err error) {
 	}
 }
 
-// extractToken 從請求中提取 token
-func extractToken(c *hypcontext.Context, lookup, headName string) string {
-	parts := strings.Split(lookup, ":")
-	if len(parts) != 2 {
-		return ""
+// stripAuthScheme 去掉標頭值開頭的驗證方案名稱（"Bearer xxx" → "xxx"）；
+// 方案名稱不分大小寫（RFC 7235），沒有方案前綴時原樣回傳
+func stripAuthScheme(value, scheme string) string {
+	if s, rest, ok := strings.Cut(value, " "); ok && strings.EqualFold(s, scheme) {
+		return rest
 	}
-
-	switch parts[0] {
-	case "header":
-		token := c.GetHeader(parts[1])
-		if token != "" && headName != "" {
-			parts := strings.SplitN(token, " ", 2)
-			if len(parts) == 2 && parts[0] == headName {
-				return parts[1]
-			}
-		}
-		return token
-	case "query":
-		return c.Query(parts[1])
-	case "cookie":
-		cookie, _ := c.Cookie(parts[1])
-		return cookie
-	}
-
-	return ""
+	return value
 }
 
 // ===== API Key 認證中間件 =====
@@ -258,25 +233,34 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 	if config.KeyLookup == "" {
 		config.KeyLookup = "header:X-API-Key"
 	}
-
 	if config.ContextKey == "" {
 		config.ContextKey = "api_key"
 	}
+	src := parseValueSource(config.KeyLookup, "header", "query", "form")
+	// 以常數時間逐一比對：先前用 map 查找，比對時間隨 key 內容而異
+	keys := make([][]byte, 0, len(config.Keys))
+	for k, enabled := range config.Keys {
+		if enabled {
+			keys = append(keys, []byte(k))
+		}
+	}
 
 	return func(c *hypcontext.Context) {
-		// 提取 API Key
-		key := extractAPIKey(c, config.KeyLookup)
+		key := src.get(c)
 		if key == "" {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
 
-		// 驗證 API Key
 		valid := false
 		if config.Validator != nil {
 			valid = config.Validator(key)
-		} else if config.Keys != nil {
-			valid = config.Keys[key]
+		} else {
+			for _, k := range keys {
+				if subtle.ConstantTimeCompare([]byte(key), k) == 1 {
+					valid = true
+				}
+			}
 		}
 
 		if !valid {
@@ -284,28 +268,8 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 			return
 		}
 
-		// 設置 API Key 到上下文
 		c.Set(config.ContextKey, key)
 		c.Next()
-	}
-}
-
-// extractAPIKey 從請求中提取 API Key
-func extractAPIKey(c *hypcontext.Context, lookup string) string {
-	parts := strings.Split(lookup, ":")
-	if len(parts) != 2 {
-		return ""
-	}
-
-	switch parts[0] {
-	case "header":
-		return c.GetHeader(parts[1])
-	case "query":
-		return c.Query(parts[1])
-	case "form":
-		return c.PostForm(parts[1])
-	default:
-		return ""
 	}
 }
 
@@ -315,45 +279,53 @@ func extractAPIKey(c *hypcontext.Context, lookup string) string {
 type IPWhitelistConfig struct {
 	AllowedIPs   []string
 	AllowedCIDRs []string
+	// TrustProxy 為 false 時一律以實際連線來源（RemoteAddr）判斷；為 true 時用 c.ClientIP()，
+	// 只採信 SetTrustedProxies 設定的代理所帶的轉發標頭。先前此欄位完全未被讀取
 	TrustProxy   bool
 	ErrorHandler func(c *hypcontext.Context)
 }
 
-// IPWhitelist 創建 IP 白名單中間件
+// IPWhitelist 創建 IP 白名單中間件。IP 與 CIDR 於建立時解析，格式錯誤直接 panic：
+// 先前每個請求都重新解析 CIDR，寫錯的項目被靜默忽略
 func IPWhitelist(config IPWhitelistConfig) hypcontext.HandlerFunc {
-	// 預處理允許的 IP
-	allowedIPs := make(map[string]bool)
-	for _, ip := range config.AllowedIPs {
-		allowedIPs[ip] = true
+	nets := make([]*net.IPNet, 0, len(config.AllowedIPs)+len(config.AllowedCIDRs))
+	for _, s := range config.AllowedIPs {
+		ip := net.ParseIP(strings.TrimSpace(s))
+		if ip == nil {
+			panic(fmt.Sprintf("middleware: IPWhitelist: invalid IP %q", s))
+		}
+		bits := 128
+		if ip.To4() != nil {
+			ip, bits = ip.To4(), 32
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	for _, s := range config.AllowedCIDRs {
+		_, n, err := net.ParseCIDR(strings.TrimSpace(s))
+		if err != nil {
+			panic(fmt.Sprintf("middleware: IPWhitelist: invalid CIDR %q: %v", s, err))
+		}
+		nets = append(nets, n)
 	}
 
 	return func(c *hypcontext.Context) {
-		// 獲取客戶端 IP
-		clientIP := c.ClientIP()
-
-		// 檢查是否在白名單中
-		if !allowedIPs[clientIP] {
-			// 檢查 CIDR（stdlib net.ParseCIDR + IPNet.Contains）
-			allowed := false
-			ip := net.ParseIP(clientIP)
-			for _, cidr := range config.AllowedCIDRs {
-				if _, ipNet, err := net.ParseCIDR(cidr); err == nil && ip != nil && ipNet.Contains(ip) {
-					allowed = true
-					break
+		client := c.RemoteIP()
+		if config.TrustProxy {
+			client = c.ClientIP()
+		}
+		if ip := net.ParseIP(client); ip != nil {
+			for _, n := range nets {
+				if n.Contains(ip) {
+					c.Next()
+					return
 				}
-			}
-
-			if !allowed {
-				if config.ErrorHandler != nil {
-					config.ErrorHandler(c)
-				} else {
-					c.AbortWithStatus(http.StatusForbidden)
-				}
-				return
 			}
 		}
 
-		c.Next()
+		if config.ErrorHandler != nil {
+			config.ErrorHandler(c)
+		} else {
+			c.AbortWithStatus(http.StatusForbidden)
+		}
 	}
 }
-

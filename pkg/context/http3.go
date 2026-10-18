@@ -3,92 +3,11 @@ package context
 
 import (
 	stdcontext "context"
-	"fmt"
 	"io"
 	"net/http"
-	"time"
 )
 
-// ===== HTTP/3 QUIC 優化方法 =====
-
-// initQuicConnection 初始化 HTTP/3 請求的 QUIC 資訊（使用 Context 自有物件，零分配）
-func (c *Context) initQuicConnection() {
-	if conn, ok := c.Request.Context().Value("quic_conn").(*QuicConnection); ok {
-		c.quicConn = conn // 連線層共用物件：只參照，reset 不會重置它
-	} else {
-		c.quicConn = &c.ownQuicConn
-	}
-
-	c.streamInfo = &c.ownStreamInfo
-	c.streamInfo.StreamID = c.extractStreamID()
-}
-
-// ensureQuicConn 確保 quicConn 可寫；未設定時指向 Context 自有物件
-func (c *Context) ensureQuicConn() *QuicConnection {
-	if c.quicConn == nil {
-		c.quicConn = &c.ownQuicConn
-	}
-	return c.quicConn
-}
-
-// extractStreamID 提取流 ID
-func (c *Context) extractStreamID() uint64 {
-	// 實現從請求中提取流 ID 的邏輯
-	// 這裡需要根據實際的 QUIC 實現來提取
-	if c.Request.Context() != nil {
-		if streamID, ok := c.Request.Context().Value("stream_id").(uint64); ok {
-			return streamID
-		}
-	}
-	return 0
-}
-
-// GetStreamID 獲取流 ID
-func (c *Context) GetStreamID() uint64 {
-	if c.streamInfo != nil {
-		return c.streamInfo.StreamID
-	}
-	return 0
-}
-
-// GetRTT 獲取往返時間（對 HTTP/3 優化）
-func (c *Context) GetRTT() time.Duration {
-	if c.quicConn != nil {
-		return c.quicConn.rtt
-	}
-	return 0
-}
-
-// SetRTT 設置 RTT（用於測試或手動設置）
-func (c *Context) SetRTT(rtt time.Duration) {
-	c.ensureQuicConn().rtt = rtt
-}
-
-// GetCongestionWindow 獲取擁塞窗口大小
-func (c *Context) GetCongestionWindow() uint32 {
-	if c.quicConn != nil {
-		return c.quicConn.congWin
-	}
-	return 0
-}
-
-// SetCongestionWindow 設置擁塞窗口（用於測試或手動設置）
-func (c *Context) SetCongestionWindow(size uint32) {
-	c.ensureQuicConn().congWin = size
-}
-
-// GetBytesRead 獲取已讀取的字節數
-func (c *Context) GetBytesRead() uint64 {
-	if c.quicConn != nil {
-		return c.quicConn.bytesRead
-	}
-	return 0
-}
-
-// UpdateBytesRead 更新已讀取的字節數
-func (c *Context) UpdateBytesRead(bytes uint64) {
-	c.ensureQuicConn().bytesRead += bytes
-}
+// ===== 協議判斷 =====
 
 // IsHTTP3 檢查是否為 HTTP/3
 func (c *Context) IsHTTP3() bool {
@@ -122,21 +41,6 @@ func (c *Context) Push(target string, opts *http.PushOptions) error {
 func (c *Context) CanPush() bool {
 	_, ok := c.ownWriter.ResponseWriter.(http.Pusher)
 	return ok
-}
-
-// PushResources 推送多個資源
-func (c *Context) PushResources(resources map[string]*http.PushOptions) []error {
-	if !c.CanPush() {
-		return []error{http.ErrNotSupported}
-	}
-
-	var errors []error
-	for target, opts := range resources {
-		if err := c.Push(target, opts); err != nil {
-			errors = append(errors, fmt.Errorf("failed to push %s: %w", target, err))
-		}
-	}
-	return errors
 }
 
 // ===== 0-RTT (Early Data) =====
@@ -212,23 +116,3 @@ func (c *Context) Stream(step func(w io.Writer) bool) bool {
 }
 
 // ===== QUIC 特定功能 =====
-
-// GetQUICConnection 獲取 QUIC 連接資訊
-func (c *Context) GetQUICConnection() *QuicConnection {
-	return c.quicConn
-}
-
-// SetQUICConnection 設置 QUIC 連接資訊
-func (c *Context) SetQUICConnection(conn *QuicConnection) {
-	c.quicConn = conn
-}
-
-// GetStreamInfo 獲取流資訊
-func (c *Context) GetStreamInfo() *StreamInfo {
-	return c.streamInfo
-}
-
-// SetStreamInfo 設置流資訊
-func (c *Context) SetStreamInfo(info *StreamInfo) {
-	c.streamInfo = info
-}

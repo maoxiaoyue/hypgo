@@ -10,7 +10,6 @@ import (
 type FieldInfo struct {
 	Name     string `json:"name" yaml:"name"`
 	Type     string `json:"type" yaml:"type"`
-	JSONTag  string `json:"json_tag,omitempty" yaml:"json_tag,omitempty"`
 	Required bool   `json:"required" yaml:"required"`
 }
 
@@ -32,7 +31,7 @@ func TypeName(v interface{}) string {
 }
 
 // FieldsOf 返回 struct 的所有 JSON 欄位資訊（規則見 JSONFields）。
-// 結果寫進 manifest 的 InputFields / OutputFields，供 AI 理解 JSON 形狀
+// 結果寫進 manifest 的 types 區段，供 AI 理解 JSON 形狀
 func FieldsOf(v interface{}) []FieldInfo {
 	if v == nil {
 		return nil
@@ -50,7 +49,6 @@ func FieldsOf(v interface{}) []FieldInfo {
 		out[i] = FieldInfo{
 			Name:     f.Name,
 			Type:     goTypeToSchemaType(f.Type),
-			JSONTag:  f.Tag.Get("json"),
 			Required: f.Required,
 		}
 	}

@@ -50,10 +50,11 @@ func (c *Collector) Collect() *Manifest {
 		Version:     "1.0",
 		Framework:   "HypGo",
 		GeneratedAt: time.Now(),
-		Routes:      c.collectRoutes(),
 		Models:      c.collectModels(),
 		Lint:        lintRoutes(c.router, c.registry),
 	}
+
+	m.Routes, m.Types = c.collectRoutes()
 
 	if c.config != nil {
 		m.Server = c.collectServer()
@@ -72,25 +73,33 @@ func (c *Collector) collectServer() ServerInfo {
 	}
 }
 
-// collectRoutes 從 Router 收集 REST 路由，並追加 Schema Registry 中的非 REST 路由
-func (c *Collector) collectRoutes() []RouteManifest {
+// collectRoutes 從 Router 收集 REST 路由，並追加 Schema Registry 中的非 REST 路由；
+// IncludeFields 開啟時一併收集路由引用的型別欄位（每個型別一份）
+func (c *Collector) collectRoutes() ([]RouteManifest, map[string]TypeFields) {
 	manifests := make([]RouteManifest, 0)
+	var types map[string]TypeFields
+	addTypes := func(s *schema.Route) {
+		if !c.enrichCfg.IncludeFields {
+			return
+		}
+		if types == nil {
+			types = make(map[string]TypeFields)
+		}
+		collectTypes(types, s)
+	}
 
 	// 1. 收集 HTTP REST 路由（從 Router 的 Radix Tree）
 	if c.router != nil {
 		routeInfos := c.router.Routes()
 		for _, ri := range routeInfos {
-			rm := RouteManifest{
-				Protocol:     "rest",
+			rm := RouteManifest{ // Protocol 留空即 REST（省略輸出）
 				Method:       ri.Method,
 				Path:         ri.Path,
 				HandlerNames: ri.HandlerNames,
 			}
 
 			// 用 schema metadata 豐富路由資訊
-			var schemaRoute *schema.Route
 			if s, ok := c.registry.Get(ri.Method, ri.Path); ok {
-				schemaRoute = s
 				rm.Summary = s.Summary
 				rm.Description = s.Description
 				rm.Tags = s.Tags
@@ -104,10 +113,11 @@ func (c *Collector) collectRoutes() []RouteManifest {
 				}
 
 				applySchemaDetails(&rm, s)
+				addTypes(s)
 			}
 
-			// 智慧推斷回填空白欄位
-			enrichRoute(&rm, schemaRoute, c.enrichCfg)
+			// 補 Tags（Summary / Description 於排序後整批處理）
+			enrichRoute(&rm, c.enrichCfg)
 
 			manifests = append(manifests, rm)
 		}
@@ -131,9 +141,10 @@ func (c *Collector) collectRoutes() []RouteManifest {
 		}
 
 		applySchemaDetails(&rm, &s)
+		addTypes(&s)
 
-		// 智慧推斷回填空白欄位
-		enrichRoute(&rm, &s, c.enrichCfg)
+		// 補 Tags（Summary / Description 於排序後整批處理）
+		enrichRoute(&rm, c.enrichCfg)
 
 		manifests = append(manifests, rm)
 	}
@@ -160,7 +171,10 @@ func (c *Collector) collectRoutes() []RouteManifest {
 		return manifests[i].Command < manifests[j].Command
 	})
 
-	return manifests
+	// 排序後才送 LLM：同樣的路由集合每次組出相同的批次
+	enrichSummaries(manifests, c.enrichCfg)
+
+	return manifests, types
 }
 
 // collectDatabase 收集資料庫配置

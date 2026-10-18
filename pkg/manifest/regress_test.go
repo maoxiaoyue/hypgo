@@ -23,11 +23,11 @@ type regressIn struct {
 func regressAuth(c *hypcontext.Context)       { c.Next() }
 func listOrdersHandler(c *hypcontext.Context) {}
 
-// fakeOllama 回傳固定 summary / description 的 Ollama 伺服器；delay 模擬慢速 LLM
+// fakeOllama 回傳固定 summary / description 的 Ollama 伺服器（批次回覆 id 1–3）；delay 模擬慢速 LLM
 func fakeOllama(t *testing.T, delay time.Duration) *config.LLMConfig {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(delay)
-		w.Write([]byte(`{"response":"{\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"}"}`))
+		w.Write([]byte(`{"response":"[{\"id\":1,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"},{\"id\":2,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"},{\"id\":3,\"summary\":\"LLM SUMMARY\",\"description\":\"LLM DESC\"}]"}`))
 	}))
 	t.Cleanup(srv.Close)
 	return &config.LLMConfig{Mode: config.LLMModeOllama, Ollama: config.OllamaConfig{URL: srv.URL, Model: "m"}}
@@ -50,9 +50,12 @@ func TestDefaultManifestIncludesFields(t *testing.T) {
 	r := router.New()
 	r.Schema(schema.Route{Method: "POST", Path: "/f", Input: regressIn{}}).Handle(listOrdersHandler)
 
-	rm := routeByPath(NewCollector(r, nil).Collect(), "/f")
-	if rm == nil || len(rm.InputFields) != 1 || rm.InputFields[0].Name != "name" {
-		t.Errorf("InputFields = %+v, want [name]", rm)
+	m := NewCollector(r, nil).Collect()
+	if rm := routeByPath(m, "/f"); rm == nil || rm.InputType != "regressIn" {
+		t.Fatalf("route = %+v, want input_type regressIn", rm)
+	}
+	if f := m.Types["regressIn"]; len(f) != 1 || f[0].Name != "name" {
+		t.Errorf("types[regressIn] = %+v, want [name]", f)
 	}
 }
 

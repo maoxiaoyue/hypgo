@@ -104,7 +104,6 @@ func (a *AutoSync) Sync() error {
 	enrichCfg := DefaultEnrichConfig()
 	var errCount int64
 	var cache *cachingEnricher
-	cachePath := filepath.Join(dir, DefaultLLMCacheFilename)
 
 	if llmCfg != nil && llmCfg.IsEnabled() {
 		reporter := a.buildErrorReporter(&errCount)
@@ -121,7 +120,7 @@ func (a *AutoSync) Sync() error {
 			} else if llmCfg.Mode == config.LLMModeOllama {
 				detail = "ollama/" + llmCfg.Ollama.Model
 			}
-			cache = newCachingEnricher(enricher, detail, loadLLMCache(cachePath))
+			cache = newCachingEnricher(enricher, detail, filepath.Join(dir, DefaultLLMCacheFilename))
 			enrichCfg.LLMEnricher = cache
 			if a.logger != nil {
 				a.logger.Infof("AutoSync: LLM enrichment enabled (%s)", detail)
@@ -133,11 +132,11 @@ func (a *AutoSync) Sync() error {
 	m := collector.Collect()
 
 	if cache != nil {
-		if err := cache.save(cachePath); err != nil && a.logger != nil {
-			a.logger.Warningf("AutoSync: save LLM cache %s: %v", cachePath, err)
+		if err := cache.save(); err != nil && a.logger != nil {
+			a.logger.Warningf("AutoSync: save LLM cache %s: %v", cache.path, err)
 		}
 		if hits, misses := cache.stats(); a.logger != nil {
-			a.logger.Infof("AutoSync: LLM enrichment %d cached, %d requested", hits, misses)
+			a.logger.Infof("AutoSync: LLM enrichment %d routes cached, %d sent to LLM", hits, misses)
 		}
 	}
 
@@ -223,7 +222,7 @@ func (a *AutoSync) render(m *Manifest) (data []byte, changed bool, err error) {
 }
 
 // Run 供 server 啟動時呼叫：未設定 LLM 時同步執行（純推斷，毫秒級，啟動時即輸出 Schema lint）；
-// 設定了 LLM 時改在背景執行——LLM 每條路由一次請求（每次最長 timeout 秒），同步執行會卡住啟動。
+// 設定了 LLM 時改在背景執行——LLM 每 20 條路由一次請求（每條路由最長 timeout 秒），同步執行會卡住啟動。
 // 背景同步完成前 .hyp/context.yaml 維持上一版
 func (a *AutoSync) Run() {
 	if !a.config.Enabled {

@@ -796,11 +796,21 @@ func (s *Server) waitForChildAlive(child *os.Process, attempts int, interval tim
 
 // applyDefaultMiddlewares 應用預設中間件
 func (s *Server) applyDefaultMiddlewares() {
+	// 請求日誌與 panic 記錄走 server logger（遵守日誌等級與 JSON 格式），不再直接寫 stdout
+	access, errs := logWriter(s.logger.Info), logWriter(s.logger.Error)
 	if s.config.Server.Protocol == "http3" || s.config.Server.Protocol == "h3" {
-		s.router.Use(middleware.HTTP3Middleware()...)
+		s.router.Use(middleware.HTTP3MiddlewareWithOutput(access, errs)...)
 	} else {
-		s.router.Use(middleware.DefaultMiddleware()...)
+		s.router.Use(middleware.DefaultMiddlewareWithOutput(access, errs)...)
 	}
+}
+
+// logWriter 把中間件寫出的每一行轉成一筆 logger 紀錄
+type logWriter func(msg string, keysAndValues ...interface{})
+
+func (f logWriter) Write(p []byte) (int, error) {
+	f(strings.TrimRight(string(p), "\n"))
+	return len(p), nil
 }
 
 // Health 健康檢查（使用 atomic 讀取避免競態）

@@ -49,11 +49,11 @@ func TestAPIEnricher_ReportsHTTPError(t *testing.T) {
 	}
 
 	route := RouteManifest{Method: "POST", Path: "/api/users"}
-	got := enricher.EnrichRoute(route)
+	got := enrichOne(enricher, route)
 
 	// 失敗時回原 route
 	if got.Summary != route.Summary {
-		t.Error("on failure, EnrichRoute should return original route unchanged")
+		t.Error("on failure, EnrichRoutes should return original route unchanged")
 	}
 
 	mu.Lock()
@@ -94,7 +94,7 @@ func TestAPIEnricher_NilReporterDoesNotPanic(t *testing.T) {
 	}
 
 	route := RouteManifest{Method: "POST", Path: "/api/users"}
-	got := enricher.EnrichRoute(route) // 不應 panic
+	got := enrichOne(enricher, route) // 不應 panic
 	if got.Summary != route.Summary {
 		t.Error("should return unchanged route on failure")
 	}

@@ -147,7 +147,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString(`
 ## AI Collaboration
 
-- **Start here**: Read ` + "`.hyp/context.yaml`" + ` — all routes, types, config in ~500 tokens
+- **Start here**: Read ` + "`.hyp/context.yaml`" + ` — all routes, types and config in one compact file
 - **Authoritative rules**: ` + "`.hyp/AI_CODING_RULES.md`" + ` is the single source of truth — read it before generating code
 - **Before modifying shared packages**: Run ` + "`hyp impact <file>`" + `
 - **After writing code**: Run ` + "`hyp chkcomment <file>`" + ` then ` + "`hyp lint`" + ` (CI gate; non-zero exit blocks merge)
