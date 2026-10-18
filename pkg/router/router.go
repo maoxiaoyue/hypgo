@@ -199,22 +199,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
 }
 
-// EnableMethodOverride 讓 POST 請求以 X-HTTP-Method-Override 標頭或表單欄位 _method
-// 改用 PUT / PATCH / DELETE 路由（HTML 表單只能送 GET / POST）。
+// EnableMethodOverride 讓 POST 請求以 X-HTTP-Method-Override 標頭或查詢參數 _method
+// 改用 PUT / PATCH / DELETE 路由（HTML 表單只能送 GET / POST，方法寫在 action：
+// <form method="post" action="/users/1?_method=DELETE">）。
 // 在路由比對前改寫方法，所以必須在 router 層做：先前的 middleware.MethodOverride 在比對之後
 // 才執行，POST 永遠只對到 POST 路由。只允許改成這三種方法，避免改成 GET / CONNECT 等繞過檢查
 func (r *Router) EnableMethodOverride() {
 	r.methodOverride = true
 }
 
-// overrideMethod 回傳覆寫後的方法；不合法或未指定時回空字串
+// overrideMethod 回傳覆寫後的方法；不合法或未指定時回空字串。
+// 不讀 body：先前讀表單欄位 _method，在路由比對前（也就在 BodyLimit 之前）把整個 body
+// 讀完並解析，chunked 傳送的 multipart 請求可完全繞過 BodyLimit，超出記憶體上限的部分落地成暫存檔
 func overrideMethod(req *http.Request) string {
 	m := req.Header.Get("X-HTTP-Method-Override")
 	if m == "" {
-		ct := req.Header.Get("Content-Type")
-		if strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "multipart/form-data") {
-			m = req.PostFormValue("_method")
-		}
+		m = req.URL.Query().Get("_method")
 	}
 	switch m = strings.ToUpper(strings.TrimSpace(m)); m {
 	case http.MethodPut, http.MethodPatch, http.MethodDelete:

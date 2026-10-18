@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -311,8 +312,10 @@ func TestSmallSecurityFixes(t *testing.T) {
 	r.Use(RequestID(RequestIDConfig{}))
 	r.GET("/id", func(c *hypcontext.Context) {})
 	req := httptest.NewRequest("GET", "/id", nil)
-	req.Header.Set("X-Request-ID", "bad id\twith tab"+strings.Repeat("x", 200))
-	if got := serve(r, req).Header().Get("X-Request-ID"); !validRequestID(got) || strings.Contains(got, "bad") {
+	badID := "bad id\twith tab" + strings.Repeat("x", 200)
+	req.Header.Set("X-Request-ID", badID)
+	// 不斷言新 ID 不含 "bad"：32 字元的隨機 hex 約有 0.7% 機率剛好出現 bad
+	if got := serve(r, req).Header().Get("X-Request-ID"); !validRequestID(got) || got == badID {
 		t.Errorf("invalid request id echoed back: %q", got)
 	}
 	req.Header.Set("X-Request-ID", "trace-123.abc")
@@ -392,5 +395,31 @@ func TestInvalidLookupPanicsAtConstruction(t *testing.T) {
 	req.AddCookie(&http.Cookie{Name: "jwt", Value: tok})
 	if w := serve(r, req); w.Code != 204 {
 		t.Errorf("JWT from cookie = %d, want 204", w.Code)
+	}
+}
+
+// TestMethodOverrideKeepsBodyLimit 迴歸測試：開啟方法覆寫後 BodyLimit 仍有效（chunked 傳送、不帶 Content-Length）。
+// 歷史 bug：router 在比對前以 PostFormValue 讀 _method，整個 multipart body 在 BodyLimit 之前就被讀完並解析，
+// handler 照樣拿到超過上限的表單
+func TestMethodOverrideKeepsBodyLimit(t *testing.T) {
+	r := router.New()
+	r.EnableMethodOverride()
+	r.Use(BodyLimit(BodyLimitConfig{MaxBytes: 1024}))
+	got := -1
+	h := func(c *hypcontext.Context) { got = len(c.PostForm("big")); c.String(200, "ok") }
+	r.POST("/u", h)
+	r.PUT("/u", h)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mw.WriteField("_method", "PUT")
+	mw.WriteField("big", strings.Repeat("x", 2<<20))
+	mw.Close()
+	req := httptest.NewRequest("POST", "/u", io.MultiReader(&buf))
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	serve(r, req)
+	if got != 0 {
+		t.Errorf("handler read %d bytes of a form field past the 1KB BodyLimit", got)
 	}
 }

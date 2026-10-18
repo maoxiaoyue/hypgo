@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -141,8 +142,8 @@ func TestMethodOverrideRoutesBeforeMatching(t *testing.T) {
 	r.PUT("/items/1", func(c *hypcontext.Context) { c.String(200, "put") })
 	r.GET("/items/1", func(c *hypcontext.Context) { c.String(200, "get") })
 
-	send := func(header, form string) string {
-		req := httptest.NewRequest("POST", "/items/1", strings.NewReader(form))
+	send := func(target, header, form string) string {
+		req := httptest.NewRequest("POST", target, strings.NewReader(form))
 		if header != "" {
 			req.Header.Set("X-HTTP-Method-Override", header)
 		}
@@ -153,13 +154,35 @@ func TestMethodOverrideRoutesBeforeMatching(t *testing.T) {
 		r.ServeHTTP(w, req)
 		return w.Body.String()
 	}
-	if got := send("DELETE", ""); got != "delete" {
+	if got := send("/items/1", "DELETE", ""); got != "delete" {
 		t.Errorf("header override DELETE -> %q", got)
 	}
-	if got := send("", "_method=put"); got != "put" {
-		t.Errorf("form override put -> %q", got)
+	if got := send("/items/1?_method=put", "", ""); got != "put" {
+		t.Errorf("query override put -> %q", got)
 	}
-	if got := send("GET", ""); got != "post" {
+	if got := send("/items/1", "GET", ""); got != "post" {
 		t.Errorf("override to GET must be ignored, got %q", got)
+	}
+}
+
+// TestMethodOverrideDoesNotReadBody 迴歸測試：方法覆寫不讀 body，表單欄位 _method 不生效，handler 拿到完整 body。
+// 歷史 bug：比對前呼叫 PostFormValue 把 body 讀完，BodyLimit 包住的是已讀空的 body
+func TestMethodOverrideDoesNotReadBody(t *testing.T) {
+	r := New()
+	r.EnableMethodOverride()
+	var body string
+	r.POST("/items/1", func(c *hypcontext.Context) {
+		b, _ := io.ReadAll(c.Request.Body)
+		body = string(b)
+		c.String(200, "post")
+	})
+	r.PUT("/items/1", func(c *hypcontext.Context) { c.String(200, "put") })
+
+	req := httptest.NewRequest("POST", "/items/1", strings.NewReader("_method=put&x=1"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Body.String() != "post" || body != "_method=put&x=1" {
+		t.Errorf("routed to %q, handler read body %q; want post with the untouched body", w.Body.String(), body)
 	}
 }
