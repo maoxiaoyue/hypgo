@@ -250,6 +250,9 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 	// FailFast 信號：atomic 確保 goroutine 間無鎖可見
 	var aborted atomic.Bool
 
+	// 並行上限：t.Parallel 的並行數由 go test -parallel 決定，這裡再以 MaxWorkers 收斂
+	sem := make(chan struct{}, cfg.MaxWorkers)
+
 	// 速率限制器：由所有子測試 goroutine 共享競爭接收（goroutine-safe）
 	var limiterCh <-chan time.Time
 	if cfg.RateLimit > 0 {
@@ -279,6 +282,8 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 
 				if cfg.Parallel {
 					t.Parallel()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 				}
 
 				// 並行模式下，goroutine 重新啟動後再次檢查
@@ -359,6 +364,8 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				}
 				if cfg.Parallel {
 					t.Parallel()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 				}
 				testSchemaCompleteness(t, route)
 				// FailFast：testSchemaCompleteness 失敗後設定 aborted

@@ -12,6 +12,7 @@ import (
 	"html"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // GenerateObserveHTML 將觀察結果列表轉換為完整的自包含 HTML 報告
@@ -30,7 +31,7 @@ func GenerateObserveHTML(results []ObserveResult, filter string) string {
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	filterDisplay := "（全部路由）"
 	if filter != "" {
-		filterDisplay = fmt.Sprintf("「%s」", filter)
+		filterDisplay = "「" + html.EscapeString(filter) + "」" // 會插進 <title> 與頁面，需跳脫
 	}
 
 	var sb strings.Builder
@@ -781,7 +782,11 @@ func formatJSONCompact(s string) string {
 	const maxLen = 2000
 	s = strings.TrimSpace(s)
 	if len(s) > maxLen {
-		return s[:maxLen] + "\n… (truncated)"
+		cut := maxLen
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut-- // 退到字元邊界，避免把多位元組字元切成亂碼
+		}
+		return s[:cut] + "\n… (truncated)"
 	}
 	return s
 }

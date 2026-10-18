@@ -238,9 +238,10 @@ func TestObserve_FailFast_StopsEarly(t *testing.T) {
 	r.Schema(schema.Route{Method: "GET", Path: "/c-ok", Summary: "ok2"}).
 		Handle(makeHandler(200))
 
-	results := ObserveAll(t, r, ObserveOptions{
-		Silent: true,
-		Run:    RunConfig{FailFast: true},
+	// 傳 nil t：本測試刻意含失敗路由，只檢查回傳結果（ObserveAll 對非 nil t 會 Errorf 失敗路由）
+	results := ObserveAll(nil, r, ObserveOptions{
+		OutputPath: filepath.Join(t.TempDir(), "observe.html"),
+		Run:        RunConfig{FailFast: true},
 	})
 
 	// FailFast 應在第一個失敗後停止，results 數量應少於 3

@@ -88,7 +88,8 @@ type ObserveResult struct {
 }
 
 // ObserveAll 以觀察模式執行所有 schema-registered REST 路由的 contract 測試
-// 捕捉每條路由的完整 HTTP 交換並生成 HTML 報告
+// 捕捉每條路由的完整 HTTP 交換並生成 HTML 報告。
+// 失敗的路由以 t.Errorf 回報（與 TestAll 相同）；只想產生報告、自行判讀結果時傳 nil t
 //
 // 用法：
 //
@@ -306,24 +307,41 @@ func writeObserveReport(t *testing.T, results []ObserveResult, filter string, op
 
 	outPath := opt.OutputPath
 	if outPath == "" {
-		if err := os.MkdirAll(".hyp", 0o755); err == nil {
-			ts := time.Now().Format("20060102_150405")
-			outPath = filepath.Join(".hyp", fmt.Sprintf("observe_%s.html", ts))
-		}
+		outPath = filepath.Join(".hyp", "observe_"+time.Now().Format("20060102_150405")+".html")
 	}
-	if outPath != "" {
-		htmlContent := GenerateObserveHTML(results, filter)
-		if err := os.WriteFile(outPath, []byte(htmlContent), 0o644); err == nil {
-			if t != nil && !opt.Silent {
-				t.Logf("[observe] report → %s", outPath)
-			}
-			if opt.OpenBrowser {
-				openObserveBrowser(outPath)
-			}
+	// 先前目錄或檔案寫入失敗時完全無訊息，使用者只會發現報告不見了
+	err := os.MkdirAll(filepath.Dir(outPath), 0o755)
+	if err == nil {
+		err = os.WriteFile(outPath, []byte(GenerateObserveHTML(results, filter)), 0o644)
+	}
+	switch {
+	case err != nil:
+		if t != nil {
+			t.Errorf("[observe] write report %s: %v", outPath, err)
+		}
+	default:
+		if t != nil && !opt.Silent {
+			t.Logf("[observe] report → %s", outPath)
+		}
+		if opt.OpenBrowser {
+			openObserveBrowser(outPath)
 		}
 	}
 
+	if t != nil {
+		reportObserveFailures(t.Errorf, results)
+	}
 	return results
+}
+
+// reportObserveFailures 以 errorf 回報每條失敗路由：與 TestAll 一致，觀察到失敗即讓測試失敗。
+// 先前 Observe 從不呼叫 t.Errorf，路由失敗時測試仍是綠的
+func reportObserveFailures(errorf func(format string, args ...interface{}), results []ObserveResult) {
+	for _, r := range results {
+		if !r.Pass {
+			errorf("observe: [%s %s] %s", r.Route.Method, r.Route.Path, r.FailReason)
+		}
+	}
 }
 
 // captureRouteExchange 執行一條路由的測試並捕捉完整的 HTTP 交換記錄
@@ -484,6 +502,10 @@ func runObserveValidation(route schema.Route, tc TestCase, code int, body []byte
 			Pass:   inputOK,
 			Detail: inputDetail,
 		})
+		if !inputOK && pass { // 與 runTestOnce 一致：請求不符 Input schema 即失敗
+			pass = false
+			reason = "request schema validation failed: " + inputDetail
+		}
 	}
 
 	// Step 4：Output schema 驗證

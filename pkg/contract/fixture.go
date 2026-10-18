@@ -15,6 +15,7 @@ package contract
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -31,6 +32,7 @@ type RequestBuilder struct {
 	headers      map[string]string
 	query        map[string]string
 	expectStatus int
+	err          error // 建構階段的錯誤（如 WithJSON 序列化失敗），於 Run 時回報
 }
 
 // Request 建立新的 RequestBuilder
@@ -82,10 +84,10 @@ func (b *RequestBuilder) PATCH(path string) *RequestBuilder {
 func (b *RequestBuilder) WithJSON(v interface{}) *RequestBuilder {
 	data, err := json.Marshal(v)
 	if err != nil {
-		b.body = "{}"
-	} else {
-		b.body = string(data)
+		// 先前靜默改送 "{}"，測試會在離原因很遠的地方失敗
+		b.err = fmt.Errorf("WithJSON: %w", err)
 	}
+	b.body = string(data)
 	b.headers["Content-Type"] = "application/json"
 	return b
 }
@@ -117,6 +119,9 @@ func (b *RequestBuilder) Expect(status int) *RequestBuilder {
 // Run 執行測試請求並回傳結果
 func (b *RequestBuilder) Run(t *testing.T) *TestResult {
 	t.Helper()
+	if b.err != nil {
+		t.Fatalf("%s %s: %v", b.method, b.path, b.err)
+	}
 
 	// 建立請求
 	bodyReader := strings.NewReader(b.body)

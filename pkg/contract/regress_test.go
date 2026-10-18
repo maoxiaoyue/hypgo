@@ -2,7 +2,14 @@ package contract
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
@@ -113,5 +120,89 @@ func TestManualTestFindsSchemaForParamRoute(t *testing.T) {
 		if got := pathMatches(c.pattern, c.path); got != c.want {
 			t.Errorf("pathMatches(%q, %q) = %v, want %v", c.pattern, c.path, got, c.want)
 		}
+	}
+}
+
+// TestObserveReportsFailuresToT 回歸測試：ObserveAll 對失敗路由呼叫 t.Errorf，且 Input schema 不符即判失敗。
+// 歷史 bug：Observe 從不呼叫 t.Errorf，路由失敗測試仍是綠的；Input schema 步驟失敗也不影響 Pass，
+// 與 runTestOnce 的判定不一致。
+func TestObserveReportsFailuresToT(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	r.Schema(schema.Route{Method: "GET", Path: "/boom", Summary: "boom"}).
+		Handle(func(c *hypcontext.Context) { c.Status(500) })
+
+	results := ObserveAll(nil, r, ObserveOptions{OutputPath: filepath.Join(t.TempDir(), "o.html")})
+	var reported []string
+	reportObserveFailures(func(f string, a ...interface{}) { reported = append(reported, fmt.Sprintf(f, a...)) }, results)
+	if len(reported) != 1 || !strings.Contains(reported[0], "GET /boom") {
+		t.Errorf("reported = %q, want one failure for GET /boom", reported)
+	}
+
+	type in struct {
+		N int `json:"n" validate:"min=5"`
+	}
+	tc := TestCase{ExpectStatus: 200, Input: `{"n":1}`}
+	_, pass, reason := runObserveValidation(schema.Route{Input: in{}}, tc, 200, nil)
+	if pass {
+		t.Error("Input schema violation must fail the observe result")
+	} else if !strings.Contains(reason, "request schema") {
+		t.Errorf("reason = %q, want request schema failure", reason)
+	}
+}
+
+// TestTestAllRespectsMaxWorkers 回歸測試：TestAll 並行模式同時執行的路由數不超過 MaxWorkers。
+// 歷史 bug：TestAll 從不讀 MaxWorkers，實際並行數只受 go test -parallel 限制。
+func TestTestAllRespectsMaxWorkers(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	var cur, peak atomic.Int32
+	h := func(c *hypcontext.Context) {
+		n := cur.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		cur.Add(-1)
+		c.Status(http.StatusOK)
+	}
+	for _, p := range []string{"/w1", "/w2", "/w3", "/w4", "/w5", "/w6"} {
+		r.Schema(schema.Route{Method: "GET", Path: p, Summary: p}).Handle(h)
+	}
+
+	t.Run("all", func(t *testing.T) {
+		TestAll(t, r, RunConfig{Parallel: true, MaxWorkers: 2})
+	})
+	if got := peak.Load(); got > 2 {
+		t.Errorf("peak concurrency = %d, want <= MaxWorkers 2", got)
+	}
+}
+
+// TestFixtureAndReportEdgeCases 回歸測試：A10 的幾個小問題。
+func TestFixtureAndReportEdgeCases(t *testing.T) {
+	// HasHeader：值為空字串的標頭也算存在
+	res := &TestResult{Headers: http.Header{"X-Empty": {""}}}
+	if !res.HasHeader("X-Empty") {
+		t.Error("HasHeader must report a present header with an empty value")
+	}
+
+	// WithJSON 序列化失敗要記錄錯誤，不可靜默改送 {}
+	if b := Request(router.New()).POST("/x").WithJSON(make(chan int)); b.err == nil {
+		t.Error("WithJSON(chan) must record the marshal error")
+	}
+
+	// 截斷不得切在多位元組字元中間
+	out := formatJSONCompact(strings.Repeat("a", 1999) + "中文")
+	if body := strings.TrimSuffix(out, "\n… (truncated)"); !utf8.ValidString(body) || body != strings.Repeat("a", 1999) {
+		t.Errorf("truncation broke a rune: %q", out[len(out)-20:])
+	}
+
+	// filter 需 HTML 跳脫
+	html := GenerateObserveHTML([]ObserveResult{{Route: schema.Route{Method: "GET", Path: "/"}, Pass: true}}, "<script>")
+	if strings.Contains(html, "<script>」") {
+		t.Error("filter is inserted into the report without HTML escaping")
 	}
 }
