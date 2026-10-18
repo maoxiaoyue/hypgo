@@ -54,11 +54,6 @@ func AcquireContext(w http.ResponseWriter, r *http.Request) *Context {
 	// 檢測並設置協議
 	c.detectProtocol()
 
-	// 如果是 HTTP/3，初始化 QUIC 相關資訊
-	if c.protocol == HTTP3 {
-		c.initQuicConnection()
-	}
-
 	return c
 }
 
@@ -84,15 +79,6 @@ func (c *Context) reset() {
 	// Response 換成包裝器（如 Compression 的 gzipWriter），斷言會 panic
 	c.ownWriter.reset()
 	c.metrics = RequestMetrics{}
-
-	// QUIC 資訊：自有的重置；quicConn / streamInfo 可能指向外部物件
-	// （SetQUICConnection / SetStreamInfo / request context 帶入的連線層物件），
-	// 只解除參照、不動其內容。先前 release 會把它們 reset 後 Put 進共用池，
-	// 使用者仍持有的物件會被清空、再被另一個並行請求拿去寫
-	c.quicConn = nil
-	c.streamInfo = nil
-	c.ownQuicConn.reset()
-	c.ownStreamInfo.reset()
 
 	// Params 一律指回自帶緩衝：router 直接在上面 search，帶參數路由零分配。
 	// 不沿用 c.Params 的底層陣列——它是 exported 欄位，可能被設成外部 slice，
@@ -141,25 +127,6 @@ func (w *responseWriter) reset() {
 	w.size = 0
 	w.written = false
 	w.streamID = 0
-}
-
-// reset 重置 StreamInfo（保留 Dependencies 容量）
-func (s *StreamInfo) reset() {
-	s.StreamID = 0
-	s.Priority = 0
-	s.Dependencies = s.Dependencies[:0]
-	s.Weight = 0
-	s.Exclusive = false
-}
-
-// reset 重置 QuicConnection
-func (q *QuicConnection) reset() {
-	q.conn = nil
-	q.streamID = 0
-	q.priority = 0
-	q.rtt = 0
-	q.congWin = 0
-	q.bytesRead = 0
 }
 
 // ===== 緩衝區池操作 =====

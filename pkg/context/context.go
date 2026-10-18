@@ -8,8 +8,6 @@ import (
 	"net/url"
 	"sync"
 	"time"
-
-	"github.com/quic-go/quic-go/http3"
 )
 
 // ===== 標準 context.Context 橋接 =====
@@ -60,14 +58,6 @@ type Context struct {
 	// double-release，導致同一物件被 Put 進池兩次、被兩個並行請求共用。
 	released bool
 
-	// HTTP/3 QUIC 特定支援。指標可能指向下方自有的 ownQuicConn / ownStreamInfo，
-	// 也可能是外部物件（SetQUICConnection / SetStreamInfo 或 request context
-	// 帶入）；reset 只重置自有的，外部物件只解除參照
-	quicConn      *QuicConnection
-	streamInfo    *StreamInfo
-	ownQuicConn   QuicConnection
-	ownStreamInfo StreamInfo
-
 	// 路由參數。paramsBuf 為本 Context 自帶的參數緩衝，reset 時 Params
 	// 一律指回它，router 直接在上面 search（見 pool.go paramsBufCap）
 	Params      Params
@@ -111,25 +101,6 @@ type Context struct {
 	schemaInput     interface{} // 該路由宣告的 Input 零值實例（nil 表示無 schema）
 	schemaRouteKey  string      // schema RouteKey，用於型別不符回報
 	bindInputCalled bool        // 本請求是否呼叫過 BindInput（供啟動 lint runtime 偵測）
-}
-
-// QuicConnection 封裝 QUIC 連接資訊
-type QuicConnection struct {
-	conn      http3.HTTPStreamer
-	streamID  uint64
-	priority  uint8
-	rtt       time.Duration
-	congWin   uint32
-	bytesRead uint64
-}
-
-// StreamInfo 包含 HTTP/3 流資訊
-type StreamInfo struct {
-	StreamID     uint64
-	Priority     uint8
-	Dependencies []uint64
-	Weight       uint8
-	Exclusive    bool
 }
 
 // HandlerFunc 定義處理函數類型
