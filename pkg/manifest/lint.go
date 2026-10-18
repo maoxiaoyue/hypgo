@@ -34,6 +34,15 @@ func isLintIgnored(path string) bool {
 	return false
 }
 
+// isStaticRoute 判斷路由是否由 Static / StaticFS / StaticFile 註冊——框架產生的檔案服務，
+// 本來就沒有 Schema（先前 /static/*filepath 會被報 no_schema）。
+// 三者的 handler 都是各自方法內的閉包，名稱為 "router.(*Group).Static…"；
+// 取鏈上最後一個 handler 判斷，因為 group 中介層會排在它前面
+func isStaticRoute(handlerNames []string) bool {
+	return len(handlerNames) > 0 &&
+		strings.HasPrefix(handlerNames[len(handlerNames)-1], "router.(*Group).Static")
+}
+
 // isWritableMethod 判斷是否為通常帶請求 body 的方法
 func isWritableMethod(method string) bool {
 	switch method {
@@ -58,7 +67,7 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 		if ri.Method == "HEAD" {
 			continue // HEAD 自動回應，不需 schema
 		}
-		if isLintIgnored(ri.Path) {
+		if isLintIgnored(ri.Path) || isStaticRoute(ri.HandlerNames) {
 			continue
 		}
 		key := ri.Method + " " + ri.Path
