@@ -83,35 +83,11 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 	}
 
 	var missing []string
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-
-		jsonTag := f.Tag.Get("json")
-		if jsonTag == "-" {
-			continue
-		}
-
-		jsonName := f.Name
-		omitempty := false
-		if jsonTag != "" {
-			parts := strings.Split(jsonTag, ",")
-			if parts[0] != "" {
-				jsonName = parts[0]
-			}
-			for _, opt := range parts[1:] {
-				if opt == "omitempty" {
-					omitempty = true
-				}
-			}
-		}
-
-		required := !omitempty && f.Type.Kind() != reflect.Ptr
+	for _, f := range jsonFields(t) {
+		required := !f.omitempty && !f.optional && f.Type.Kind() != reflect.Ptr
 		if required {
-			if _, exists := raw[jsonName]; !exists {
-				missing = append(missing, jsonName)
+			if _, exists := raw[f.name]; !exists {
+				missing = append(missing, f.name)
 			}
 		}
 	}
@@ -120,6 +96,60 @@ func validateRequiredFields(body []byte, t reflect.Type) error {
 		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// jsonField 為 encoding/json 視角下的單一 struct 欄位（內嵌 struct 已展開）
+type jsonField struct {
+	reflect.StructField
+	name      string
+	omitempty bool
+	optional  bool // 位於內嵌指標之下：指標為 nil 時整組欄位都不會出現
+}
+
+// jsonFields 依 encoding/json 的規則列出 t 的 JSON 欄位：未帶 json 名稱的內嵌 struct
+// （含未匯出型別）展開成上層欄位，而不是當成一個名為型別名的鍵。
+// 必填檢查與測試資料生成共用，兩邊對 JSON 形狀的認知才會一致
+func jsonFields(t reflect.Type) []jsonField {
+	return appendJSONFields(nil, t, false)
+}
+
+// ponytail: 不處理同名欄位的遮蔽規則（較淺層者優先），實務上極少見
+func appendJSONFields(out []jsonField, t reflect.Type, optional bool) []jsonField {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, opts, _ := strings.Cut(tag, ",")
+
+		if f.Anonymous && name == "" {
+			ft, isPtr := f.Type, f.Type.Kind() == reflect.Ptr
+			if isPtr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				if isPtr && !f.IsExported() {
+					continue // encoding/json 忽略未匯出型別的內嵌指標
+				}
+				out = appendJSONFields(out, ft, optional || isPtr)
+				continue
+			}
+		}
+		if !f.IsExported() {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		out = append(out, jsonField{
+			StructField: f,
+			name:        name,
+			omitempty:   strings.Contains(","+opts+",", ",omitempty,"),
+			optional:    optional,
+		})
+	}
+	return out
 }
 
 // validateConstraints 以 go-playground/validator 執行 validate: tag 的語意/格式約束檢查

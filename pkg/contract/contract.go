@@ -121,13 +121,15 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 		return false, fmt.Sprintf("[%s] status = %d, want %d", tc.Route, w.Code, tc.ExpectStatus), nil
 	}
 
-	// 驗證 schema（使用 schemaPath 或 URL path 查找）
+	// 驗證 schema（TestAll 帶 schemaPath；手動 Test 以實際路徑比對路由樣式）
 	if tc.ExpectSchema {
-		lookupPath := path
+		var s *schema.Route
+		var ok bool
 		if tc.schemaPath != "" {
-			lookupPath = tc.schemaPath
+			s, ok = schema.Global().Get(method, tc.schemaPath)
+		} else {
+			s, ok = lookupSchema(method, req.URL.Path)
 		}
-		s, ok := schema.Global().Get(method, lookupPath)
 		if !ok {
 			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
 		}
@@ -414,6 +416,41 @@ func TestRoute(t *testing.T, r *router.Router, method, path string, expectStatus
 	if w.Code != expectStatus {
 		t.Errorf("%s %s: status = %d, want %d", method, path, w.Code, expectStatus)
 	}
+}
+
+// lookupSchema 依實際請求路徑找 REST schema：先精確查表（靜態路由），再比對 :param / *wildcard 樣式。
+// 先前只精確查表，手動 Test 傳 "GET /api/users/1" 永遠找不到 "/api/users/:id" 的 schema
+func lookupSchema(method, path string) (*schema.Route, bool) {
+	if s, ok := schema.Global().Get(method, path); ok {
+		return s, true
+	}
+	for _, rt := range schema.Global().All() {
+		if rt.IsREST() && rt.Method == method && pathMatches(rt.Path, path) {
+			return &rt, true
+		}
+	}
+	return nil, false
+}
+
+// pathMatches 回報 path 是否符合路由樣式（:name 吃一個非空區段，*name 吃剩餘全部）
+func pathMatches(pattern, path string) bool {
+	ps, xs := strings.Split(pattern, "/"), strings.Split(path, "/")
+	for i, p := range ps {
+		if strings.HasPrefix(p, "*") {
+			return true
+		}
+		if i >= len(xs) {
+			return false
+		}
+		if strings.HasPrefix(p, ":") {
+			if xs[i] == "" {
+				return false
+			}
+		} else if p != xs[i] {
+			return false
+		}
+	}
+	return len(ps) == len(xs)
 }
 
 // parseRoute 解析 "METHOD /path" 格式

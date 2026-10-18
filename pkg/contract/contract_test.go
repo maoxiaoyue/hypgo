@@ -341,6 +341,7 @@ func TestGuessExpectedStatus(t *testing.T) {
 		{schema.Route{Method: "GET"}, 200},
 		{schema.Route{Method: "POST"}, 201},
 		{schema.Route{Method: "DELETE"}, 204},
+		{schema.Route{Method: "DELETE", Output: userResp{}}, 200}, // 有 Output 就不可能是 204
 		{schema.Route{Method: "PUT"}, 200},
 		{schema.Route{Method: "POST", Responses: map[int]schema.ResponseSchema{
 			200: {Description: "OK"},
