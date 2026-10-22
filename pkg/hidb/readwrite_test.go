@@ -173,7 +173,6 @@ func TestReadHypDBFallback(t *testing.T) {
 	db := &Database{
 		hypDB:       masterDB,
 		replicaPool: nil,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 無副本：應回退到主庫
@@ -199,7 +198,6 @@ func TestReadHypDBWithReplicas(t *testing.T) {
 	db := &Database{
 		hypDB:       masterDB,
 		replicaPool: pool,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 有副本：應返回副本
@@ -219,7 +217,6 @@ func TestReadSQLFallback(t *testing.T) {
 	db := &Database{
 		sqlDB:       nil,
 		replicaPool: nil,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 無任何連接：返回 nil
@@ -239,7 +236,6 @@ func TestHasReplicas(t *testing.T) {
 	// 無副本池
 	db := &Database{
 		replicaPool: nil,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 	if db.HasReplicas() {
 		t.Error("HasReplicas should return false when replicaPool is nil")

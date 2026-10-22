@@ -865,44 +865,6 @@ func TestConnectAfterCloseRejected(t *testing.T) {
 	}
 }
 
-func TestInitMapHostsInterfaceSlice(t *testing.T) {
-	c := &CassandraDB{}
-	err := c.Init(map[string]interface{}{
-		"hosts":              []interface{}{"1.1.1.1", "2.2.2.2"},
-		"keyspace":           "ks",
-		"consistency":        "local_quorum",
-		"connect_timeout":    "3s",
-		"timeout":            int64(5_000_000_000), // 5s
-		"num_retries":        2,
-		"reconnect_interval": "500ms",
-		"strict_consistency": false,
-		"tls": map[string]interface{}{
-			"enabled":              true,
-			"cert_file":            "/c.pem",
-			"key_file":             "/c.key",
-			"insecure_skip_verify": true,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(c.config.Hosts) != 2 || c.config.Hosts[0] != "1.1.1.1" {
-		t.Errorf("hosts not parsed: %v", c.config.Hosts)
-	}
-	if c.config.ConnectTimeout != 3*time.Second {
-		t.Errorf("connect_timeout: %v", c.config.ConnectTimeout)
-	}
-	if c.config.Timeout != 5*time.Second {
-		t.Errorf("timeout: %v", c.config.Timeout)
-	}
-	if c.config.NumRetries != 2 {
-		t.Errorf("num_retries: %d", c.config.NumRetries)
-	}
-	if !c.config.TLS.Enabled || c.config.TLS.CertFile != "/c.pem" {
-		t.Errorf("tls block: %+v", c.config.TLS)
-	}
-}
-
 func TestVectorMarshalRoundTrip(t *testing.T) {
 	v := []float32{0.1, -0.5, 1.5, 0, 3.14159}
 	blob, err := MarshalVectorFloat32(v, len(v))

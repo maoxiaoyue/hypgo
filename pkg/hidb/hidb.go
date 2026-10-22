@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -61,15 +60,6 @@ func WithRedis(d RedisDriver) Option {
 	}
 }
 
-// DatabasePlugin 數據庫插件接口
-type DatabasePlugin interface {
-	Name() string
-	Init(config map[string]interface{}) error
-	Connect() error
-	Close() error
-	Ping(ctx context.Context) error
-}
-
 // Database 數據庫管理器
 type Database struct {
 	config      config.DatabaseConfigInterface
@@ -81,10 +71,6 @@ type Database struct {
 
 	// 讀寫分離
 	replicaPool *ReplicaPool // 讀取副本池
-
-	// 插件系統
-	plugins map[string]DatabasePlugin
-	mu      sync.RWMutex
 }
 
 // NewWithInterface 使用接口創建數據庫實例
@@ -93,10 +79,7 @@ func NewWithInterface(cfg config.DatabaseConfigInterface, opts ...Option) (*Data
 		return nil, fmt.Errorf("database config is nil")
 	}
 
-	db := &Database{
-		config:  cfg,
-		plugins: make(map[string]DatabasePlugin),
-	}
+	db := &Database{config: cfg}
 
 	// 應用選項
 	for _, opt := range opts {
@@ -131,14 +114,11 @@ func NewWithInterface(cfg config.DatabaseConfigInterface, opts ...Option) (*Data
 		return db, nil
 	}
 
-	// 嘗試作為插件加載
-	if plugin, exists := db.GetPlugin(driver); exists {
-		if err := plugin.Connect(); err != nil {
-			return nil, fmt.Errorf("failed to connect to %s: %w", driver, err)
-		}
-		return db, nil
+	// Cassandra 不經過 hidb：以 cassandra.New 直接建立並自行 Close。
+	// 先前的插件系統在建構時沒有任何插件可用（driver: cassandra 必定落到此錯誤），且全專案零使用，已移除
+	if driver == "cassandra" {
+		return nil, fmt.Errorf("driver cassandra is not managed by hidb; use cassandra.New from pkg/hidb/cassandra")
 	}
-
 	return nil, fmt.Errorf("unsupported database driver: %s (did you forget to use WithDialect / WithRedis?)", driver)
 }
 
@@ -259,47 +239,6 @@ func (d *Database) initRedis() (*Database, error) {
 	return d, nil
 }
 
-// RegisterPlugin 註冊數據庫插件
-func (d *Database) RegisterPlugin(plugin DatabasePlugin) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	name := plugin.Name()
-	if _, exists := d.plugins[name]; exists {
-		return fmt.Errorf("plugin %s already registered", name)
-	}
-
-	d.plugins[name] = plugin
-	return nil
-}
-
-// GetPlugin 獲取插件
-func (d *Database) GetPlugin(name string) (DatabasePlugin, bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	plugin, exists := d.plugins[name]
-	return plugin, exists
-}
-
-// LoadPlugin 動態加載插件
-func (d *Database) LoadPlugin(name string, config map[string]interface{}) error {
-	plugin, exists := d.GetPlugin(name)
-	if !exists {
-		return fmt.Errorf("plugin %s not found", name)
-	}
-
-	if err := plugin.Init(config); err != nil {
-		return fmt.Errorf("failed to init plugin %s: %w", name, err)
-	}
-
-	if err := plugin.Connect(); err != nil {
-		return fmt.Errorf("failed to connect plugin %s: %w", name, err)
-	}
-
-	return nil
-}
-
 // HypDB 獲取主庫的 HypDB ORM 數據庫實例（始終返回主庫，保持向後兼容）
 // 如需讀寫分離，請使用 ReadHypDB() / WriteHypDB()
 func (d *Database) HypDB() *bun.DB {
@@ -367,7 +306,7 @@ func (d *Database) ReplicaCount() int {
 
 // Close 關閉數據庫連接
 // 注意：hypDB.Close() 會關閉底層 sql.DB（兩者一定同時設定），因此不需要重複關閉
-// 關閉順序：讀取副本 → 主庫 → Redis → 插件
+// 關閉順序：讀取副本 → 主庫 → Redis
 func (d *Database) Close() error {
 	var errs []error
 
@@ -393,15 +332,6 @@ func (d *Database) Close() error {
 		}
 	}
 
-	// 關閉所有插件
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	for name, plugin := range d.plugins {
-		if err := plugin.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close plugin %s: %w", name, err))
-		}
-	}
-
 	if len(errs) > 0 {
 		return fmt.Errorf("errors closing database connections: %v", errs)
 	}
@@ -419,16 +349,6 @@ func (d *Database) IsConnected() bool {
 	if d.redisDB != nil {
 		return d.redisDB.Ping(ctx).Err() == nil
 	}
-
-	// 檢查插件連接狀態
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	for _, plugin := range d.plugins {
-		if err := plugin.Ping(ctx); err == nil {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -493,7 +413,7 @@ func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context
 	return d.hypDB.RunInTx(ctx, nil, fn)
 }
 
-// HealthCheck 健康檢查（主庫 + 讀取副本 + Redis + 插件）
+// HealthCheck 健康檢查（主庫 + 讀取副本 + Redis）
 // 接受任何 context.Context，包括 HypGo *context.Context
 func (d *Database) HealthCheck(ctx context.Context) error {
 	if ctx == nil {
@@ -518,15 +438,6 @@ func (d *Database) HealthCheck(ctx context.Context) error {
 	if d.redisDB != nil {
 		if err := d.redisDB.Ping(ctx).Err(); err != nil {
 			return fmt.Errorf("Redis unhealthy: %w", err)
-		}
-	}
-
-	// 檢查插件健康狀態
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	for name, plugin := range d.plugins {
-		if err := plugin.Ping(ctx); err != nil {
-			return fmt.Errorf("plugin %s unhealthy: %w", name, err)
 		}
 	}
 

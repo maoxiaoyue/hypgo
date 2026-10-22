@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -114,5 +115,14 @@ func TestRedisIsNilWrapped(t *testing.T) {
 	}
 	if RedisIsNil(errors.New("other")) || RedisIsNil(nil) {
 		t.Error("non-Nil errors must not match")
+	}
+}
+
+// TestCassandraDriverPointsToPackage driver: cassandra 回明確錯誤，指向 cassandra.New。
+// 先前的插件分支在建構時沒有任何插件可用，只會回令人困惑的 unsupported database driver
+func TestCassandraDriverPointsToPackage(t *testing.T) {
+	_, err := NewWithInterface(&config.DatabaseConfig{Driver: "cassandra"})
+	if err == nil || !strings.Contains(err.Error(), "cassandra.New") {
+		t.Errorf("err = %v, want a hint to use cassandra.New", err)
 	}
 }
