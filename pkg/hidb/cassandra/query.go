@@ -124,13 +124,6 @@ func (s *SelectBuilder) PageState(state []byte) *SelectBuilder {
 	return s
 }
 
-func (s *SelectBuilder) tableRef() string {
-	if s.keyspace != "" {
-		return quoteIdent(s.keyspace) + "." + quoteIdent(s.table)
-	}
-	return quoteIdent(s.table)
-}
-
 // CQL renders the SELECT statement and its ordered bind arguments.
 func (s *SelectBuilder) CQL() (string, []interface{}) {
 	var sb strings.Builder
@@ -141,15 +134,17 @@ func (s *SelectBuilder) CQL() (string, []interface{}) {
 	}
 	parts := make([]string, 0, len(s.columns))
 	for _, c := range s.columns {
-		if c == "*" {
-			parts = append(parts, "*")
+		// COUNT(*) is an expression, not a column: quoting it made Count()
+		// send SELECT "COUNT(*)" and fail with "Undefined column name"
+		if c == "*" || c == countColumn {
+			parts = append(parts, c)
 		} else {
 			parts = append(parts, quoteIdent(c))
 		}
 	}
 	sb.WriteString(strings.Join(parts, ", "))
 	sb.WriteString(" FROM ")
-	sb.WriteString(s.tableRef())
+	sb.WriteString(qualifiedName(s.keyspace, s.table))
 	if len(s.wheres) > 0 {
 		sb.WriteString(" WHERE ")
 		exprs := make([]string, 0, len(s.wheres))
@@ -202,11 +197,11 @@ func formatVectorLiteral(v []float32) string {
 }
 
 // query returns a gocql.Query configured with the builder state.
-func (s *SelectBuilder) query(ctx context.Context) *gocql.Query {
+func (s *SelectBuilder) query(ctx context.Context) (*gocql.Query, error) {
 	stmt, args := s.CQL()
-	q := s.db.session.Query(stmt, args...).WithContext(ctx)
-	if s.consistency != nil {
-		q = q.Consistency(*s.consistency)
+	q, err := s.db.newQuery(ctx, stmt, args, s.consistency)
+	if err != nil {
+		return nil, err
 	}
 	if s.pageSize > 0 {
 		q = q.PageSize(s.pageSize)
@@ -214,12 +209,44 @@ func (s *SelectBuilder) query(ctx context.Context) *gocql.Query {
 	if len(s.pageState) > 0 {
 		q = q.PageState(s.pageState)
 	}
-	return q
+	return q, nil
 }
 
-// Iter returns a gocql.Iter for manual row consumption.
-func (s *SelectBuilder) Iter(ctx context.Context) *gocql.Iter {
-	return s.query(ctx).Iter()
+// Iter returns a gocql.Iter for manual row consumption. Call iter.PageState()
+// after a page for cursor-style pagination.
+func (s *SelectBuilder) Iter(ctx context.Context) (*gocql.Iter, error) {
+	q, err := s.query(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return q.Iter(), nil
+}
+
+// fieldIndexes maps each result column to its struct field index path
+// (nil for columns the model does not map). Built once per query instead of
+// a linear FieldByColumn lookup for every cell of every row.
+func fieldIndexes(info *ModelInfo, columns []gocql.ColumnInfo) [][]int {
+	byName := make(map[string][]int, len(info.Fields))
+	for _, f := range info.Fields {
+		byName[f.Name] = f.Index
+	}
+	out := make([][]int, len(columns))
+	for i, col := range columns {
+		out[i] = byName[col.Name]
+	}
+	return out
+}
+
+// scanTargets points dest at the fields of row (a discard slot for unmapped columns).
+func scanTargets(row reflect.Value, idx [][]int, dest []interface{}) {
+	for i, path := range idx {
+		if path == nil {
+			var discard interface{}
+			dest[i] = &discard
+			continue
+		}
+		dest[i] = row.FieldByIndex(path).Addr().Interface()
+	}
 }
 
 // All scans every row into dest, which must be a pointer to a slice of
@@ -243,25 +270,17 @@ func (s *SelectBuilder) All(ctx context.Context, dest interface{}) error {
 	if err != nil {
 		return err
 	}
-	iter := s.Iter(ctx)
-	columns := iter.Columns()
+	iter, err := s.Iter(ctx)
+	if err != nil {
+		return err
+	}
 	defer iter.Close()
+	idx := fieldIndexes(info, iter.Columns())
+	ptrs := make([]interface{}, len(idx))
 
 	for {
-		ptrs := make([]interface{}, len(columns))
-		values := make([]reflect.Value, len(columns))
 		row := reflect.New(structType).Elem()
-		for i, col := range columns {
-			f, ok := info.FieldByColumn(col.Name)
-			if !ok {
-				var discard interface{}
-				ptrs[i] = &discard
-				continue
-			}
-			fv := row.FieldByIndex(f.Index)
-			values[i] = fv
-			ptrs[i] = fv.Addr().Interface()
-		}
+		scanTargets(row, idx, ptrs)
 		if !iter.Scan(ptrs...) {
 			break
 		}
@@ -276,7 +295,9 @@ func (s *SelectBuilder) All(ctx context.Context, dest interface{}) error {
 	return iter.Close()
 }
 
-// One scans a single row into dest (pointer to struct).
+// One scans a single row into dest (pointer to struct). The LIMIT 1 is
+// applied to a copy: previously One changed the builder itself, so a later
+// All on the same builder returned a single row.
 func (s *SelectBuilder) One(ctx context.Context, dest interface{}) error {
 	dv := reflect.ValueOf(dest)
 	if dv.Kind() != reflect.Ptr || dv.IsNil() {
@@ -290,20 +311,16 @@ func (s *SelectBuilder) One(ctx context.Context, dest interface{}) error {
 	if err != nil {
 		return err
 	}
-	s.Limit(1)
-	iter := s.Iter(ctx)
-	defer iter.Close()
-	columns := iter.Columns()
-	ptrs := make([]interface{}, len(columns))
-	for i, col := range columns {
-		f, ok := info.FieldByColumn(col.Name)
-		if !ok {
-			var discard interface{}
-			ptrs[i] = &discard
-			continue
-		}
-		ptrs[i] = elem.FieldByIndex(f.Index).Addr().Interface()
+	one := *s
+	one.limit = 1
+	iter, err := one.Iter(ctx)
+	if err != nil {
+		return err
 	}
+	defer iter.Close()
+	idx := fieldIndexes(info, iter.Columns())
+	ptrs := make([]interface{}, len(idx))
+	scanTargets(elem, idx, ptrs)
 	if !iter.Scan(ptrs...) {
 		if err := iter.Close(); err != nil {
 			return err
@@ -313,24 +330,26 @@ func (s *SelectBuilder) One(ctx context.Context, dest interface{}) error {
 	return iter.Close()
 }
 
-// Count returns the COUNT(*) result.
-func (s *SelectBuilder) Count(ctx context.Context) (int64, error) {
+// countColumn is the one select expression CQL() emits unquoted besides "*".
+const countColumn = "COUNT(*)"
+
+// countBuilder is the COUNT(*) form of the query (ordering, ANN and limit dropped).
+func (s *SelectBuilder) countBuilder() *SelectBuilder {
 	clone := *s
-	clone.columns = []string{"COUNT(*)"}
+	clone.columns = []string{countColumn}
 	clone.orderBy = nil
 	clone.ann = nil
 	clone.limit = 0
-	stmt, args := clone.CQL()
-	var n int64
-	err := s.db.session.Query(stmt, args...).WithContext(ctx).Scan(&n)
-	return n, err
+	return &clone
 }
 
-// PageStateOut returns the paging state after the last Iter/All call for
-// cursor-style pagination. Must be called after fetching a page.
-func (s *SelectBuilder) PageStateOut(iter *gocql.Iter) []byte {
-	if iter == nil {
-		return nil
+// Count returns the COUNT(*) result.
+func (s *SelectBuilder) Count(ctx context.Context) (int64, error) {
+	q, err := s.countBuilder().query(ctx)
+	if err != nil {
+		return 0, err
 	}
-	return iter.PageState()
+	var n int64
+	err = q.Scan(&n)
+	return n, err
 }

@@ -32,7 +32,6 @@ type ModelField struct {
 	Index     []int // reflect FieldByIndex path
 	OmitEmpty bool
 	Counter   bool
-	IsStatic  bool
 }
 
 // ModelInfo is the parsed schema of a struct.
@@ -43,7 +42,6 @@ type ModelInfo struct {
 	Fields       []ModelField
 	PartitionKey []string // ordered column names
 	Clustering   []string // ordered column names
-	Options      TableOptions
 	// OrderBy mirrors CLUSTERING ORDER BY entries from struct tag hints.
 	OrderBy []Column
 }
@@ -122,7 +120,9 @@ func ParseModel(v interface{}) (*ModelInfo, error) {
 	if info.Table == "" {
 		info.Table = toSnake(t.Name())
 	}
-	resolveKeyOrdering(info)
+	if err := resolveKeyOrdering(info); err != nil {
+		return nil, fmt.Errorf("cassandra: %s: %w", t.Name(), err)
+	}
 	modelCache.Store(t, info)
 	return info, nil
 }
@@ -197,7 +197,6 @@ func parseFieldTag(f reflect.StructField, tag string) (ModelField, error) {
 			field.Kind = ColumnClustering
 		case "static":
 			field.Kind = ColumnStatic
-			field.IsStatic = true
 		case "counter":
 			field.Counter = true
 		case "omitempty":
@@ -230,7 +229,7 @@ type keyEntry struct {
 	name string
 }
 
-func resolveKeyOrdering(info *ModelInfo) {
+func resolveKeyOrdering(info *ModelInfo) error {
 	var part, clust []keyEntry
 	for _, f := range info.Fields {
 		switch f.Kind {
@@ -243,8 +242,12 @@ func resolveKeyOrdering(info *ModelInfo) {
 			info.OrderBy = append(info.OrderBy, Column{Name: f.Name, Order: f.Order})
 		}
 	}
-	sortByPosition(part)
-	sortByPosition(clust)
+	if err := sortByPosition(part, "partition key"); err != nil {
+		return err
+	}
+	if err := sortByPosition(clust, "clustering key"); err != nil {
+		return err
+	}
 	info.PartitionKey = make([]string, len(part))
 	for i, p := range part {
 		info.PartitionKey[i] = p.name
@@ -253,18 +256,28 @@ func resolveKeyOrdering(info *ModelInfo) {
 	for i, c := range clust {
 		info.Clustering[i] = c.name
 	}
+	return nil
 }
 
-// sortByPosition performs a stable sort that only reorders entries with
-// explicit non-zero position values. Zero positions preserve their original
-// ordering, matching the struct field declaration order.
-func sortByPosition(items []keyEntry) {
-	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].pos == 0 || items[j].pos == 0 {
-			return false
+// sortByPosition orders key fields by their position= tag. Either every field
+// of the key sets a position or none does (declaration order). Mixing is
+// rejected: the previous less-func treated 0 as incomparable with everything,
+// which is not a valid ordering, so e.g. A(2), B(-), C(1) stayed [A B C].
+func sortByPosition(items []keyEntry, what string) error {
+	positioned := 0
+	for _, it := range items {
+		if it.pos != 0 {
+			positioned++
 		}
-		return items[i].pos < items[j].pos
-	})
+	}
+	if positioned == 0 {
+		return nil
+	}
+	if positioned != len(items) {
+		return fmt.Errorf("%s fields must all set position= or none of them", what)
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].pos < items[j].pos })
+	return nil
 }
 
 // inferType maps Go types to CQL types. Collections, tuples, UDTs and vectors

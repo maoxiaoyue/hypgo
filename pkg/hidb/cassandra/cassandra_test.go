@@ -34,7 +34,7 @@ func TestTableDefaultsApplied(t *testing.T) {
 		PartitionKey("id").
 		CreateCQL()
 	for _, c := range []string{
-		"'class': 'UnifiedCompactionStrategy'",
+		"'class': 'SizeTieredCompactionStrategy'",
 		"'sstable_compression': 'LZ4Compressor'",
 		"'keys': 'ALL'",
 		"gc_grace_seconds = 864000",
@@ -398,8 +398,8 @@ func TestParseConsistency(t *testing.T) {
 		"": gocql.LocalOne,
 	}
 	for in, want := range cases {
-		if got := parseConsistency(in); got != want {
-			t.Errorf("parseConsistency(%q) = %v, want %v", in, got, want)
+		if got, err := parseConsistencyStrict(in); err != nil || got != want {
+			t.Errorf("parseConsistencyStrict(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
 }
@@ -750,8 +750,12 @@ func TestParseConsistencyStrict(t *testing.T) {
 }
 
 func TestParseConsistencyFallbackLocalOne(t *testing.T) {
-	// 舊 API：拼錯不再回 Quorum，改回 LocalOne
-	if got := parseConsistency("typo"); got != gocql.LocalOne {
+	// 非嚴格模式：拼錯不回 Quorum，cluster 設為 LocalOne
+	c := &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}, Consistency: "typo"}}
+	if err := c.init(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.cluster.Consistency; got != gocql.LocalOne {
 		t.Errorf("expected LocalOne fallback, got %v", got)
 	}
 }

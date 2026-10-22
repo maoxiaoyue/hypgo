@@ -2,9 +2,9 @@
 package cassandra
 
 // Defaults applied to keyspace and table builders when callers do not
-// specify values. Values aim to align with Cassandra 5.0 server defaults
-// so emitting them changes syntax only (not semantics), making generated
-// CQL reproducible and diff-friendly.
+// specify values. Values match the Cassandra 4.x / 5.0 server defaults so
+// emitting them changes syntax only (not semantics), making generated CQL
+// reproducible and diff-friendly.
 //
 // Each default is a package-level variable so callers can override them
 // globally (e.g. in init()) before building schema DDL.
@@ -17,9 +17,12 @@ var (
 	// Cassandra's own default is true; we emit it explicitly for clarity.
 	DefaultDurableWrites = true
 
-	// DefaultCompaction — UnifiedCompactionStrategy is the Cassandra 5.0
-	// recommended general-purpose strategy.
-	DefaultCompaction = CompactionOptions{Class: CompactionUnified}
+	// DefaultCompaction — SizeTieredCompactionStrategy, the server default on
+	// 4.x and 5.0 (unless 5.0's default_compaction is configured). It used to
+	// be UnifiedCompactionStrategy, which does not exist before 5.0 (CREATE
+	// TABLE failed on 4.x) and changed behaviour on 5.0. Set it to
+	// CompactionOptions{Class: CompactionUnified} to opt into UCS.
+	DefaultCompaction = CompactionOptions{Class: CompactionSTCS}
 
 	// DefaultCompression — LZ4 with 16 KB chunks matches Cassandra defaults.
 	DefaultCompression = CompressionOptions{

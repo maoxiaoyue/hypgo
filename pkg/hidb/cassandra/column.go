@@ -3,6 +3,8 @@ package cassandra
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -112,9 +114,20 @@ func joinQuoted(parts []string, sep string) string {
 	return strings.Join(quoted, sep)
 }
 
-// cqlLiteral renders a Go value as a CQL literal, used for constant option
-// values such as default_time_to_live. Only primitive scalars are supported;
-// complex values should be passed via the ? placeholder path.
+// qualifiedName renders [ks.]name with each part quoted as needed. Every
+// builder uses it for its table / view / type reference.
+func qualifiedName(ks, name string) string {
+	if ks != "" {
+		return quoteIdent(ks) + "." + quoteIdent(name)
+	}
+	return quoteIdent(name)
+}
+
+// cqlLiteral renders a Go value as a CQL literal: strings are single-quoted
+// with embedded quotes doubled, maps become {'k': v} with sorted keys. Every
+// option value, class name and map key in generated DDL goes through it, so a
+// quote in developer-supplied input cannot break out of the literal.
+// Complex bind values should use the ? placeholder path instead.
 func cqlLiteral(v interface{}) string {
 	switch x := v.(type) {
 	case nil:
@@ -130,6 +143,12 @@ func cqlLiteral(v interface{}) string {
 		return fmt.Sprintf("%d", x)
 	case float32, float64:
 		return fmt.Sprintf("%g", x)
+	case map[string]interface{}:
+		parts := make([]string, 0, len(x))
+		for _, k := range slices.Sorted(maps.Keys(x)) {
+			parts = append(parts, cqlLiteral(k)+": "+cqlLiteral(x[k]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
 	default:
 		return fmt.Sprintf("%v", x)
 	}

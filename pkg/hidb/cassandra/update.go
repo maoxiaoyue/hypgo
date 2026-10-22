@@ -109,19 +109,12 @@ func (u *UpdateBuilder) Consistency(cl gocql.Consistency) *UpdateBuilder {
 	return u
 }
 
-func (u *UpdateBuilder) tableRef() string {
-	if u.keyspace != "" {
-		return quoteIdent(u.keyspace) + "." + quoteIdent(u.table)
-	}
-	return quoteIdent(u.table)
-}
-
 // CQL renders the UPDATE statement.
 func (u *UpdateBuilder) CQL() (string, []interface{}) {
 	var sb strings.Builder
 	var args []interface{}
 	sb.WriteString("UPDATE ")
-	sb.WriteString(u.tableRef())
+	sb.WriteString(qualifiedName(u.keyspace, u.table))
 	using := make([]string, 0, 2)
 	if u.ttl > 0 {
 		using = append(using, fmt.Sprintf("TTL %d", u.ttl))
@@ -163,29 +156,50 @@ func (u *UpdateBuilder) CQL() (string, []interface{}) {
 	return sb.String(), args
 }
 
-// Exec runs the UPDATE.
-func (u *UpdateBuilder) Exec(ctx context.Context) error {
-	stmt, args := u.CQL()
-	q := u.db.session.Query(stmt, args...).WithContext(ctx)
-	if u.consistency != nil {
-		q = q.Consistency(*u.consistency)
+// validate rejects statements Cassandra would refuse: no SET assignments
+// (rendered as "SET  WHERE", a syntax error) and IF EXISTS combined with IF
+// conditions (CQL() silently dropped the conditions).
+func (u *UpdateBuilder) validate() error {
+	if len(u.assignments) == 0 {
+		return fmt.Errorf("cassandra: UPDATE %s has no SET assignments", qualifiedName(u.keyspace, u.table))
 	}
-	return q.Exec()
+	if u.ifExists && len(u.ifCond) > 0 {
+		return errIfExistsWithIf
+	}
+	return nil
+}
+
+// Exec runs the UPDATE. With IfExists / If it returns ErrNotApplied when the
+// condition did not hold.
+func (u *UpdateBuilder) Exec(ctx context.Context) error {
+	if err := u.validate(); err != nil {
+		return err
+	}
+	stmt, args := u.CQL()
+	q, err := u.db.newQuery(ctx, stmt, args, u.consistency)
+	if err != nil {
+		return err
+	}
+	return execQuery(q, u.ifExists || len(u.ifCond) > 0)
 }
 
 // ExecCAS executes as lightweight transaction.
 func (u *UpdateBuilder) ExecCAS(ctx context.Context, dest ...interface{}) (bool, error) {
+	if err := u.validate(); err != nil {
+		return false, err
+	}
 	stmt, args := u.CQL()
-	q := u.db.session.Query(stmt, args...).WithContext(ctx)
-	if u.consistency != nil {
-		q = q.Consistency(*u.consistency)
+	q, err := u.db.newQuery(ctx, stmt, args, u.consistency)
+	if err != nil {
+		return false, err
 	}
 	return q.ScanCAS(dest...)
 }
 
 // UpdateModel generates an UPDATE from a model using its primary key fields
 // as the WHERE clause. Non-key non-counter fields are written to the SET
-// clause (respecting omitempty).
+// clause (respecting omitempty). Returns an error when no field is left to
+// set, and ErrNotApplied when UpdateIfExists finds no row.
 func (c *CassandraDB) UpdateModel(ctx context.Context, model interface{}, opts ...UpdateOption) error {
 	info, err := ParseModel(model)
 	if err != nil {
@@ -195,11 +209,7 @@ func (c *CassandraDB) UpdateModel(ctx context.Context, model interface{}, opts .
 	for rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
-	name := info.Table
-	if info.Keyspace != "" {
-		name = info.Keyspace + "." + info.Table
-	}
-	ub := c.Update(name)
+	ub := &UpdateBuilder{db: c, keyspace: info.Keyspace, table: info.Table}
 	for _, f := range info.Fields {
 		v := rv.FieldByIndex(f.Index).Interface()
 		switch f.Kind {

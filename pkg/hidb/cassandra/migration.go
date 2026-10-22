@@ -3,11 +3,14 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gocql/gocql"
 )
 
 // Migration describes a single versioned schema change.
@@ -18,8 +21,18 @@ type Migration struct {
 	Down    func(ctx context.Context, db *CassandraDB) error
 }
 
+// ErrMigrationLocked is returned by Up / Down while another process holds the
+// migration lock.
+var ErrMigrationLocked = errors.New("cassandra: migrations are locked by another process")
+
+// migrationLockTTL is how long (seconds) the migration lock lives; it bounds
+// how long a crashed holder blocks others.
+const migrationLockTTL = 600
+
 // Migrator tracks and applies migrations. It stores applied versions in a
-// tracking table inside the session keyspace.
+// tracking table inside the session keyspace. Up and Down take a cluster-wide
+// lock (an LWT row in <tracking>_lock with a TTL), so replicas starting
+// together do not run the same migration twice.
 type Migrator struct {
 	db            *CassandraDB
 	trackingTable string
@@ -47,13 +60,14 @@ func (m *Migrator) Register(migrations ...Migration) *Migrator {
 }
 
 func (m *Migrator) trackingRef() string {
-	if m.trackKeyspace != "" {
-		return quoteIdent(m.trackKeyspace) + "." + quoteIdent(m.trackingTable)
-	}
-	return quoteIdent(m.trackingTable)
+	return qualifiedName(m.trackKeyspace, m.trackingTable)
 }
 
-// Init creates the tracking table if it does not exist.
+func (m *Migrator) lockRef() string {
+	return qualifiedName(m.trackKeyspace, m.trackingTable+"_lock")
+}
+
+// Init creates the tracking and lock tables if they do not exist.
 func (m *Migrator) Init(ctx context.Context) error {
 	stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   version bigint,
@@ -61,13 +75,45 @@ func (m *Migrator) Init(ctx context.Context) error {
   applied_at timestamp,
   PRIMARY KEY (version)
 )`, m.trackingRef())
-	return m.db.Exec(ctx, stmt)
+	if err := m.db.Exec(ctx, stmt); err != nil {
+		return err
+	}
+	return m.db.Exec(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id text PRIMARY KEY, owner timeuuid)", m.lockRef()))
+}
+
+// lock takes the migration lock; release frees it. Previously Up had no lock:
+// two replicas starting together both read the same applied set and both ran
+// every pending migration.
+func (m *Migrator) lock(ctx context.Context) (release func(), err error) {
+	owner := gocql.TimeUUID()
+	q, err := m.db.newQuery(ctx, fmt.Sprintf("INSERT INTO %s (id, owner) VALUES ('lock', ?) IF NOT EXISTS USING TTL %d",
+		m.lockRef(), migrationLockTTL), []interface{}{owner}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := execQuery(q, true); err != nil {
+		if errors.Is(err, ErrNotApplied) {
+			return nil, ErrMigrationLocked
+		}
+		return nil, err
+	}
+	return func() {
+		// best effort: if the release fails the TTL frees the lock
+		ctx := context.WithoutCancel(ctx)
+		if q, err := m.db.newQuery(ctx, fmt.Sprintf("DELETE FROM %s WHERE id = 'lock' IF owner = ?", m.lockRef()),
+			[]interface{}{owner}, nil); err == nil {
+			_ = execQuery(q, true)
+		}
+	}, nil
 }
 
 // applied returns the set of already-applied versions.
 func (m *Migrator) applied(ctx context.Context) (map[int64]bool, error) {
-	stmt := fmt.Sprintf("SELECT version FROM %s", m.trackingRef())
-	iter := m.db.session.Query(stmt).WithContext(ctx).Iter()
+	q, err := m.db.newQuery(ctx, fmt.Sprintf("SELECT version FROM %s", m.trackingRef()), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	iter := q.Iter()
 	defer iter.Close()
 	var v int64
 	out := make(map[int64]bool)
@@ -80,11 +126,17 @@ func (m *Migrator) applied(ctx context.Context) (map[int64]bool, error) {
 	return out, nil
 }
 
-// Up applies all pending migrations in version order.
+// Up applies all pending migrations in version order. It returns
+// ErrMigrationLocked while another process is migrating.
 func (m *Migrator) Up(ctx context.Context) error {
 	if err := m.Init(ctx); err != nil {
 		return err
 	}
+	release, err := m.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	applied, err := m.applied(ctx)
 	if err != nil {
 		return err
@@ -107,15 +159,24 @@ func (m *Migrator) Up(ctx context.Context) error {
 			return fmt.Errorf("cassandra: migration %d (%s) failed: %w", mig.Version, mig.Name, err)
 		}
 		stmt := fmt.Sprintf("INSERT INTO %s (version, name, applied_at) VALUES (?, ?, ?)", m.trackingRef())
-		if err := m.db.session.Query(stmt, mig.Version, mig.Name, time.Now()).WithContext(ctx).Exec(); err != nil {
+		if err := m.db.newExec(ctx, stmt, mig.Version, mig.Name, time.Now()); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// Down rolls back the most recent migration.
+// Down rolls back the most recent migration. It returns ErrMigrationLocked
+// while another process is migrating.
 func (m *Migrator) Down(ctx context.Context) error {
+	if err := m.Init(ctx); err != nil {
+		return err
+	}
+	release, err := m.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	applied, err := m.applied(ctx)
 	if err != nil {
 		return err
@@ -151,8 +212,7 @@ func (m *Migrator) Down(ctx context.Context) error {
 	if err := target.Down(ctx, m.db); err != nil {
 		return err
 	}
-	stmt := fmt.Sprintf("DELETE FROM %s WHERE version = ?", m.trackingRef())
-	return m.db.session.Query(stmt, latest).WithContext(ctx).Exec()
+	return m.db.newExec(ctx, fmt.Sprintf("DELETE FROM %s WHERE version = ?", m.trackingRef()), latest)
 }
 
 // Status returns one line per migration (applied or pending).

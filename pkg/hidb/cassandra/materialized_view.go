@@ -87,20 +87,6 @@ func (m *MaterializedViewBuilder) Options(opts TableOptions) *MaterializedViewBu
 	return m
 }
 
-func (m *MaterializedViewBuilder) viewRef() string {
-	if m.keyspace != "" {
-		return quoteIdent(m.keyspace) + "." + quoteIdent(m.name)
-	}
-	return quoteIdent(m.name)
-}
-
-func (m *MaterializedViewBuilder) baseRef() string {
-	if m.baseKeyspace != "" {
-		return quoteIdent(m.baseKeyspace) + "." + quoteIdent(m.baseTable)
-	}
-	return quoteIdent(m.baseTable)
-}
-
 // CreateCQL renders CREATE MATERIALIZED VIEW.
 func (m *MaterializedViewBuilder) CreateCQL() string {
 	var sb strings.Builder
@@ -108,7 +94,7 @@ func (m *MaterializedViewBuilder) CreateCQL() string {
 	if m.ifNotExist {
 		sb.WriteString("IF NOT EXISTS ")
 	}
-	sb.WriteString(m.viewRef())
+	sb.WriteString(qualifiedName(m.keyspace, m.name))
 	sb.WriteString(" AS\nSELECT ")
 	if len(m.columns) == 0 {
 		sb.WriteString("*")
@@ -124,7 +110,7 @@ func (m *MaterializedViewBuilder) CreateCQL() string {
 		sb.WriteString(strings.Join(quoted, ", "))
 	}
 	sb.WriteString("\nFROM ")
-	sb.WriteString(m.baseRef())
+	sb.WriteString(qualifiedName(m.baseKeyspace, m.baseTable))
 	if len(m.where) > 0 {
 		sb.WriteString("\nWHERE ")
 		sb.WriteString(strings.Join(m.where, " AND "))
@@ -133,9 +119,7 @@ func (m *MaterializedViewBuilder) CreateCQL() string {
 		sb.WriteString("\n")
 		sb.WriteString(pk)
 	}
-	tb := &TableBuilder{options: m.options, orderBy: m.orderBy}
-	parts := tb.buildWithParts()
-	if len(parts) > 0 {
+	if parts := buildWithParts(m.orderBy, m.options); len(parts) > 0 {
 		sb.WriteString("\n WITH ")
 		sb.WriteString(strings.Join(parts, "\n  AND "))
 	}
@@ -145,9 +129,9 @@ func (m *MaterializedViewBuilder) CreateCQL() string {
 // DropCQL renders DROP MATERIALIZED VIEW IF EXISTS.
 func (m *MaterializedViewBuilder) DropCQL(ifExists bool) string {
 	if ifExists {
-		return fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %s", m.viewRef())
+		return fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %s", qualifiedName(m.keyspace, m.name))
 	}
-	return fmt.Sprintf("DROP MATERIALIZED VIEW %s", m.viewRef())
+	return fmt.Sprintf("DROP MATERIALIZED VIEW %s", qualifiedName(m.keyspace, m.name))
 }
 
 // Create executes the CREATE MATERIALIZED VIEW statement.

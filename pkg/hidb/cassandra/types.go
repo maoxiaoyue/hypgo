@@ -82,12 +82,6 @@ func Frozen(inner DataType) DataType {
 	return DataType(fmt.Sprintf("frozen<%s>", inner))
 }
 
-// UDT returns a user-defined type reference.
-// Pass a bare name ("address") or a qualified name ("ks.address").
-func UDT(name string) DataType {
-	return DataType(name)
-}
-
 // Vector returns a Cassandra 5.0 vector<T, N> type.
 // The element type is usually TypeFloat; dimension must be >= 1.
 func Vector(element DataType, dimension int) DataType {

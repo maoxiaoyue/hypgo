@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"time"
+
+	"github.com/gocql/gocql"
 )
 
 // Schema is a full snapshot of a Cassandra cluster's user-defined schema
@@ -135,43 +139,44 @@ type IntrospectOptions struct {
 // Introspect reads system_schema.* and returns a full Schema snapshot.
 // Useful for migration diff, AI context export, or documentation generation.
 func (c *CassandraDB) Introspect(ctx context.Context, opts IntrospectOptions) (*Schema, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 
-	keyspaces, err := c.introspectKeyspaces(ctx, opts)
+	keyspaces, err := introspectKeyspaces(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("keyspaces: %w", err)
 	}
-	tables, err := c.introspectTables(ctx, opts)
+	tables, err := introspectTables(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("tables: %w", err)
 	}
-	columns, err := c.introspectColumns(ctx, opts)
+	columns, err := introspectColumns(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("columns: %w", err)
 	}
-	types, err := c.introspectTypes(ctx, opts)
+	types, err := introspectTypes(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("types: %w", err)
 	}
-	views, err := c.introspectViews(ctx, opts)
+	views, err := introspectViews(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("views: %w", err)
 	}
-	indexes, err := c.introspectIndexes(ctx, opts)
+	indexes, err := introspectIndexes(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("indexes: %w", err)
 	}
-	funcs, err := c.introspectFunctions(ctx, opts)
+	funcs, err := introspectFunctions(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("functions: %w", err)
 	}
-	aggs, err := c.introspectAggregates(ctx, opts)
+	aggs, err := introspectAggregates(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("aggregates: %w", err)
 	}
-	triggers, err := c.introspectTriggers(ctx, opts)
+	triggers, err := introspectTriggers(ctx, sess, opts)
 	if err != nil {
 		return nil, fmt.Errorf("triggers: %w", err)
 	}
@@ -275,52 +280,48 @@ func (s *Schema) MarshalJSON() ([]byte, error) {
 
 // ===== row fetchers =====
 
-// keyspaces
-func (c *CassandraDB) introspectKeyspaces(ctx context.Context, opts IntrospectOptions) ([]KeyspaceSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, replication, durable_writes FROM system_schema.keyspaces`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
-	var out []KeyspaceSchema
-	var name string
-	var repl map[string]string
-	var durable bool
-	for iter.Scan(&name, &repl, &durable) {
-		if !opts.IncludeSystem && systemKeyspaces[name] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && name != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, KeyspaceSchema{Name: name, Replication: repl, DurableWrites: durable})
+// scanSchemaTable reads system_schema.<table>, scanning keyspace_name plus the
+// given columns into dest and calling add once per kept row (dest holds that
+// row's values). keyspace_name is the partition key of every system_schema
+// table, so OnlyKeyspace becomes a single-partition read on the server;
+// previously all nine tables were read in full and filtered in Go.
+// gocql allocates fresh maps / slices per row, so dest values can be kept as-is.
+func scanSchemaTable(ctx context.Context, sess *gocql.Session, opts IntrospectOptions,
+	table, columns string, dest []interface{}, add func(ks string)) error {
+	stmt := "SELECT keyspace_name, " + columns + " FROM system_schema." + table
+	var args []interface{}
+	if opts.OnlyKeyspace != "" {
+		stmt += " WHERE keyspace_name = ?"
+		args = append(args, opts.OnlyKeyspace)
 	}
-	return out, iter.Close()
-}
-
-// tables
-func (c *CassandraDB) introspectTables(ctx context.Context, opts IntrospectOptions) ([]TableSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, table_name, comment, flags, id FROM system_schema.tables`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
-	var out []TableSchema
-	var ks, tn, comment, id string
-	var flags []string
-	for iter.Scan(&ks, &tn, &comment, &flags, &id) {
+	iter := sess.Query(stmt, args...).WithContext(ctx).Iter()
+	var ks string
+	targets := append([]interface{}{&ks}, dest...)
+	for iter.Scan(targets...) {
 		if !opts.IncludeSystem && systemKeyspaces[ks] {
 			continue
 		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, TableSchema{
-			Keyspace: ks, Name: tn, Comment: comment,
-			Flags: append([]string(nil), flags...), ID: id,
-		})
+		add(ks)
 	}
-	return out, iter.Close()
+	return iter.Close()
+}
+
+func introspectKeyspaces(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]KeyspaceSchema, error) {
+	var out []KeyspaceSchema
+	var r KeyspaceSchema
+	err := scanSchemaTable(ctx, sess, opts, "keyspaces", "replication, durable_writes",
+		[]interface{}{&r.Replication, &r.DurableWrites},
+		func(ks string) { r.Name = ks; out = append(out, r) })
+	return out, err
+}
+
+func introspectTables(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]TableSchema, error) {
+	var out []TableSchema
+	var r TableSchema
+	err := scanSchemaTable(ctx, sess, opts, "tables", "table_name, comment, flags, id",
+		[]interface{}{&r.Name, &r.Comment, &r.Flags, &r.ID},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
 // columns (grouped later)
@@ -329,192 +330,70 @@ type columnRow struct {
 	col     ColumnSchema
 }
 
-func (c *CassandraDB) introspectColumns(ctx context.Context, opts IntrospectOptions) ([]columnRow, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, table_name, column_name, kind, position, type, clustering_order
-		 FROM system_schema.columns`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectColumns(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]columnRow, error) {
 	var out []columnRow
-	var ks, tn, cn, kind, typ, order string
-	var pos int
-	for iter.Scan(&ks, &tn, &cn, &kind, &pos, &typ, &order) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, columnRow{
-			ksTable: ks + "." + tn,
-			col: ColumnSchema{
-				Name: cn, Kind: kind, Position: pos,
-				Type: typ, ClusteringOrder: order,
-			},
-		})
-	}
-	return out, iter.Close()
+	var tn string
+	var r ColumnSchema
+	err := scanSchemaTable(ctx, sess, opts, "columns", "table_name, column_name, kind, position, type, clustering_order",
+		[]interface{}{&tn, &r.Name, &r.Kind, &r.Position, &r.Type, &r.ClusteringOrder},
+		func(ks string) { out = append(out, columnRow{ksTable: ks + "." + tn, col: r}) })
+	return out, err
 }
 
-// types
-func (c *CassandraDB) introspectTypes(ctx context.Context, opts IntrospectOptions) ([]TypeSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, type_name, field_names, field_types FROM system_schema.types`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectTypes(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]TypeSchema, error) {
 	var out []TypeSchema
-	var ks, name string
-	var fnames, ftypes []string
-	for iter.Scan(&ks, &name, &fnames, &ftypes) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, TypeSchema{
-			Keyspace: ks, Name: name,
-			FieldNames: append([]string(nil), fnames...),
-			FieldTypes: append([]string(nil), ftypes...),
-		})
-	}
-	return out, iter.Close()
+	var r TypeSchema
+	err := scanSchemaTable(ctx, sess, opts, "types", "type_name, field_names, field_types",
+		[]interface{}{&r.Name, &r.FieldNames, &r.FieldTypes},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
-// views
-func (c *CassandraDB) introspectViews(ctx context.Context, opts IntrospectOptions) ([]ViewSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, view_name, base_table_name, include_all_columns, where_clause
-		 FROM system_schema.views`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectViews(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]ViewSchema, error) {
 	var out []ViewSchema
-	var ks, name, base, where string
-	var includeAll bool
-	for iter.Scan(&ks, &name, &base, &includeAll, &where) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, ViewSchema{
-			Keyspace: ks, Name: name, BaseTable: base,
-			IncludeAll: includeAll, WhereClause: where,
-		})
-	}
-	return out, iter.Close()
+	var r ViewSchema
+	err := scanSchemaTable(ctx, sess, opts, "views", "view_name, base_table_name, include_all_columns, where_clause",
+		[]interface{}{&r.Name, &r.BaseTable, &r.IncludeAll, &r.WhereClause},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
-// indexes
-func (c *CassandraDB) introspectIndexes(ctx context.Context, opts IntrospectOptions) ([]IndexSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, table_name, index_name, kind, options FROM system_schema.indexes`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectIndexes(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]IndexSchema, error) {
 	var out []IndexSchema
-	var ks, tn, name, kind string
-	var options map[string]string
-	for iter.Scan(&ks, &tn, &name, &kind, &options) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, IndexSchema{
-			Keyspace: ks, Table: tn, Name: name, Kind: kind,
-			Options: copyStringMap(options),
-		})
-	}
-	return out, iter.Close()
+	var r IndexSchema
+	err := scanSchemaTable(ctx, sess, opts, "indexes", "table_name, index_name, kind, options",
+		[]interface{}{&r.Table, &r.Name, &r.Kind, &r.Options},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
-// functions
-func (c *CassandraDB) introspectFunctions(ctx context.Context, opts IntrospectOptions) ([]FunctionSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, function_name, argument_names, argument_types, return_type,
-		        language, body, called_on_null_input FROM system_schema.functions`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectFunctions(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]FunctionSchema, error) {
 	var out []FunctionSchema
-	var ks, name, rt, lang, body string
-	var argn, argt []string
-	var calledOnNull bool
-	for iter.Scan(&ks, &name, &argn, &argt, &rt, &lang, &body, &calledOnNull) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, FunctionSchema{
-			Keyspace: ks, Name: name,
-			ArgumentNames: append([]string(nil), argn...),
-			ArgumentTypes: append([]string(nil), argt...),
-			ReturnType:    rt, Language: lang, Body: body,
-			CalledOnNullInput: calledOnNull,
-		})
-	}
-	return out, iter.Close()
+	var r FunctionSchema
+	err := scanSchemaTable(ctx, sess, opts, "functions",
+		"function_name, argument_names, argument_types, return_type, language, body, called_on_null_input",
+		[]interface{}{&r.Name, &r.ArgumentNames, &r.ArgumentTypes, &r.ReturnType, &r.Language, &r.Body, &r.CalledOnNullInput},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
-// aggregates
-func (c *CassandraDB) introspectAggregates(ctx context.Context, opts IntrospectOptions) ([]AggregateSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, aggregate_name, argument_types, state_func, state_type,
-		        final_func, initcond, return_type FROM system_schema.aggregates`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectAggregates(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]AggregateSchema, error) {
 	var out []AggregateSchema
-	var ks, name, sfunc, stype, ffunc, initcond, rt string
-	var argt []string
-	for iter.Scan(&ks, &name, &argt, &sfunc, &stype, &ffunc, &initcond, &rt) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, AggregateSchema{
-			Keyspace: ks, Name: name,
-			ArgumentTypes: append([]string(nil), argt...),
-			StateFunc:     sfunc, StateType: stype,
-			FinalFunc: ffunc, InitCond: initcond, ReturnType: rt,
-		})
-	}
-	return out, iter.Close()
+	var r AggregateSchema
+	err := scanSchemaTable(ctx, sess, opts, "aggregates",
+		"aggregate_name, argument_types, state_func, state_type, final_func, initcond, return_type",
+		[]interface{}{&r.Name, &r.ArgumentTypes, &r.StateFunc, &r.StateType, &r.FinalFunc, &r.InitCond, &r.ReturnType},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
-// triggers
-func (c *CassandraDB) introspectTriggers(ctx context.Context, opts IntrospectOptions) ([]TriggerSchema, error) {
-	iter := c.session.Query(
-		`SELECT keyspace_name, table_name, trigger_name, options FROM system_schema.triggers`,
-	).WithContext(ctx).Iter()
-	defer iter.Close()
-
+func introspectTriggers(ctx context.Context, sess *gocql.Session, opts IntrospectOptions) ([]TriggerSchema, error) {
 	var out []TriggerSchema
-	var ks, tn, name string
-	var options map[string]string
-	for iter.Scan(&ks, &tn, &name, &options) {
-		if !opts.IncludeSystem && systemKeyspaces[ks] {
-			continue
-		}
-		if opts.OnlyKeyspace != "" && ks != opts.OnlyKeyspace {
-			continue
-		}
-		out = append(out, TriggerSchema{
-			Keyspace: ks, Table: tn, Name: name,
-			Options: copyStringMap(options),
-		})
-	}
-	return out, iter.Close()
+	var r TriggerSchema
+	err := scanSchemaTable(ctx, sess, opts, "triggers", "table_name, trigger_name, options",
+		[]interface{}{&r.Table, &r.Name, &r.Options},
+		func(ks string) { r.Keyspace = ks; out = append(out, r) })
+	return out, err
 }
 
 // ===== sorting helpers =====
@@ -550,17 +429,6 @@ func sortByName[T any](xs []T, key func(T) string) {
 	sort.Slice(xs, func(i, j int) bool { return key(xs[i]) < key(xs[j]) })
 }
 
-func copyStringMap(m map[string]string) map[string]string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
-
 // ===== Diff =====
 
 // SchemaChangeKind classifies the kind of change.
@@ -572,7 +440,6 @@ const (
 	ChangeAlterKeyspace SchemaChangeKind = "alter_keyspace"
 	ChangeAddTable      SchemaChangeKind = "add_table"
 	ChangeDropTable     SchemaChangeKind = "drop_table"
-	ChangeAlterTable    SchemaChangeKind = "alter_table"
 	ChangeAddColumn     SchemaChangeKind = "add_column"
 	ChangeDropColumn    SchemaChangeKind = "drop_column"
 	ChangeAlterColumn   SchemaChangeKind = "alter_column"
@@ -588,34 +455,41 @@ type SchemaChange struct {
 }
 
 // SchemaDiff returns the list of changes that would transform `old` into `new`.
-// Suitable for migration preview or AI-assisted schema review.
+// Suitable for migration preview or AI-assisted schema review. The output is
+// in a fixed order (keyspace, then table, then column name; drops / alters
+// before adds at each level): it used to follow map iteration order and
+// changed from run to run.
 func SchemaDiff(old, new *Schema) []SchemaChange {
 	var out []SchemaChange
 	oldKS := indexKeyspaces(old)
 	newKS := indexKeyspaces(new)
 
 	// dropped / altered keyspaces
-	for name, o := range oldKS {
+	for _, name := range slices.Sorted(maps.Keys(oldKS)) {
+		o := oldKS[name]
 		n, exists := newKS[name]
 		if !exists {
 			out = append(out, SchemaChange{Kind: ChangeDropKeyspace, Keyspace: name})
 			continue
 		}
-		if !replicationEqual(o.Replication, n.Replication) || o.DurableWrites != n.DurableWrites {
+		if !maps.Equal(o.Replication, n.Replication) || o.DurableWrites != n.DurableWrites {
 			out = append(out, SchemaChange{
 				Kind: ChangeAlterKeyspace, Keyspace: name,
-				Detail: fmt.Sprintf("replication/durable_writes changed"),
+				Detail: "replication/durable_writes changed",
 			})
 		}
 		out = append(out, tableDiff(o, n)...)
 	}
 	// added keyspaces
-	for name, n := range newKS {
-		if _, exists := oldKS[name]; !exists {
-			out = append(out, SchemaChange{Kind: ChangeAddKeyspace, Keyspace: name})
-			for _, t := range n.Tables {
-				out = append(out, SchemaChange{Kind: ChangeAddTable, Keyspace: name, Table: t.Name})
-			}
+	for _, name := range slices.Sorted(maps.Keys(newKS)) {
+		if _, exists := oldKS[name]; exists {
+			continue
+		}
+		out = append(out, SchemaChange{Kind: ChangeAddKeyspace, Keyspace: name})
+		tables := slices.Clone(newKS[name].Tables)
+		sortTables(tables)
+		for _, t := range tables {
+			out = append(out, SchemaChange{Kind: ChangeAddTable, Keyspace: name, Table: t.Name})
 		}
 	}
 	return out
@@ -631,15 +505,15 @@ func tableDiff(old, new *KeyspaceSchema) []SchemaChange {
 	for _, t := range new.Tables {
 		newT[t.Name] = t
 	}
-	for name, o := range oldT {
+	for _, name := range slices.Sorted(maps.Keys(oldT)) {
 		n, exists := newT[name]
 		if !exists {
 			out = append(out, SchemaChange{Kind: ChangeDropTable, Keyspace: old.Name, Table: name})
 			continue
 		}
-		out = append(out, columnDiff(old.Name, name, o.Columns, n.Columns)...)
+		out = append(out, columnDiff(old.Name, name, oldT[name].Columns, n.Columns)...)
 	}
-	for name := range newT {
+	for _, name := range slices.Sorted(maps.Keys(newT)) {
 		if _, exists := oldT[name]; !exists {
 			out = append(out, SchemaChange{Kind: ChangeAddTable, Keyspace: new.Name, Table: name})
 		}
@@ -657,7 +531,8 @@ func columnDiff(ks, table string, old, new []ColumnSchema) []SchemaChange {
 	for _, c := range new {
 		newC[c.Name] = c
 	}
-	for name, o := range oldC {
+	for _, name := range slices.Sorted(maps.Keys(oldC)) {
+		o := oldC[name]
 		n, exists := newC[name]
 		if !exists {
 			out = append(out, SchemaChange{Kind: ChangeDropColumn, Keyspace: ks, Table: table, Column: name})
@@ -670,7 +545,7 @@ func columnDiff(ks, table string, old, new []ColumnSchema) []SchemaChange {
 			})
 		}
 	}
-	for name := range newC {
+	for _, name := range slices.Sorted(maps.Keys(newC)) {
 		if _, exists := oldC[name]; !exists {
 			out = append(out, SchemaChange{Kind: ChangeAddColumn, Keyspace: ks, Table: table, Column: name})
 		}
@@ -687,16 +562,4 @@ func indexKeyspaces(s *Schema) map[string]*KeyspaceSchema {
 		out[s.Keyspaces[i].Name] = &s.Keyspaces[i]
 	}
 	return out
-}
-
-func replicationEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
 }

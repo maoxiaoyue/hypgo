@@ -4,7 +4,6 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // Permission represents a single Cassandra permission verb.
@@ -59,10 +58,7 @@ func (r Resource) cql() (string, error) {
 		if r.Name == "" {
 			return "", fmt.Errorf("cassandra: TABLE resource requires Name")
 		}
-		if r.Keyspace != "" {
-			return "TABLE " + quoteIdent(r.Keyspace) + "." + quoteIdent(r.Name), nil
-		}
-		return "TABLE " + quoteIdent(r.Name), nil
+		return "TABLE " + qualifiedName(r.Keyspace, r.Name), nil
 	case ResRole:
 		if r.Name == "" {
 			return "", fmt.Errorf("cassandra: ROLE resource requires Name")
@@ -80,7 +76,7 @@ func (r Resource) cql() (string, error) {
 		if r.Name == "" {
 			return "", fmt.Errorf("cassandra: MBEAN resource requires Name")
 		}
-		return "MBEAN '" + strings.ReplaceAll(r.Name, "'", "''") + "'", nil
+		return "MBEAN " + cqlLiteral(r.Name), nil
 	default:
 		return "", fmt.Errorf("cassandra: unknown resource kind %q", r.Kind)
 	}
