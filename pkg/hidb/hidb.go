@@ -15,6 +15,18 @@ import (
 	"github.com/uptrace/bun/schema"
 )
 
+// connectTimeout 啟動時主庫與副本 ping 的逾時。先前用不帶期限的 Ping()：資料庫主機不回應
+// （封包被丟棄而非連線被拒）時，啟動會卡到作業系統的 TCP 連線逾時（Linux 約 2 分鐘；
+// lib/pq 的 connect_timeout 預設 0 為無限等待）。變數而非常數，供測試縮短
+var connectTimeout = 10 * time.Second
+
+// pingWithTimeout 在 connectTimeout 內 ping 一次
+func pingWithTimeout(db *sql.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+	return db.PingContext(ctx)
+}
+
 // Dialect SQL 方言介面（類似 bun 的 dialect 模式）
 // 由 hidb/mysql 和 hidb/pg 子套件實現
 type Dialect interface {
@@ -158,7 +170,7 @@ func (d *Database) initSQL() (*Database, error) {
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// 測試連接
-	if err := db.Ping(); err != nil {
+	if err := pingWithTimeout(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping %s: %w", d.dialect.DriverName(), err)
 	}
@@ -166,8 +178,11 @@ func (d *Database) initSQL() (*Database, error) {
 	d.sqlDB = db
 	d.hypDB = bun.NewDB(db, d.dialect.BunDialect())
 
-	// 初始化讀取副本
+	// 初始化讀取副本；失敗時一併關閉主庫：NewWithInterface 只回 error，
+	// 呼叫端拿不到可 Close 的實例，先前主庫連線池就此洩漏
 	if err := d.initReplicas(); err != nil {
+		d.hypDB.Close()
+		d.hypDB, d.sqlDB = nil, nil
 		return nil, err
 	}
 
@@ -351,7 +366,7 @@ func (d *Database) ReplicaCount() int {
 }
 
 // Close 關閉數據庫連接
-// 注意：hypDB.Close() 會關閉底層 sql.DB，因此不需要重複關閉
+// 注意：hypDB.Close() 會關閉底層 sql.DB（兩者一定同時設定），因此不需要重複關閉
 // 關閉順序：讀取副本 → 主庫 → Redis → 插件
 func (d *Database) Close() error {
 	var errs []error
@@ -368,11 +383,6 @@ func (d *Database) Close() error {
 	if d.hypDB != nil {
 		if err := d.hypDB.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close HypDB database: %w", err))
-		}
-	} else if d.sqlDB != nil {
-		// 僅在沒有 hypDB 時直接關閉 sqlDB（例如 Redis-only 模式）
-		if err := d.sqlDB.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close SQL database: %w", err))
 		}
 	}
 
@@ -480,9 +490,7 @@ func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context
 		ctx = context.Background()
 	}
 
-	return d.hypDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		return fn(ctx, tx)
-	})
+	return d.hypDB.RunInTx(ctx, nil, fn)
 }
 
 // HealthCheck 健康檢查（主庫 + 讀取副本 + Redis + 插件）
@@ -501,7 +509,7 @@ func (d *Database) HealthCheck(ctx context.Context) error {
 
 	// 檢查讀取副本
 	if d.replicaPool != nil {
-		if replicaErrs := d.replicaPool.PingAll(); len(replicaErrs) > 0 {
+		if replicaErrs := d.replicaPool.PingAll(ctx); len(replicaErrs) > 0 {
 			return fmt.Errorf("read replicas unhealthy: %v", replicaErrs)
 		}
 	}

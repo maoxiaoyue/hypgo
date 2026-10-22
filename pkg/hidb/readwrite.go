@@ -77,9 +77,9 @@ func (rp *ReplicaPool) Add(replica ReadReplica) {
 	rp.replicas.Store(&newSlice)
 }
 
-// Next 獲取下一個健康的讀取副本 HypDB ORM 實例（輪詢，跳過 down 副本）
-// GC 優化：讀路徑完全無鎖。全部不健康時回傳 nil（呼叫端回退主庫）
-func (rp *ReplicaPool) Next() *bun.DB {
+// next 輪詢下一個健康的副本，跳過 down 副本；全部不健康或無副本時回傳 nil。
+// GC 優化：讀路徑完全無鎖
+func (rp *ReplicaPool) next() *ReadReplica {
 	replicas := *rp.replicas.Load()
 	n := uint64(len(replicas))
 	if n == 0 {
@@ -87,28 +87,27 @@ func (rp *ReplicaPool) Next() *bun.DB {
 	}
 	start := rp.counter.Add(1) - 1
 	for i := uint64(0); i < n; i++ {
-		r := replicas[(start+i)%n]
-		if !r.health.down.Load() {
-			return r.hypDB
+		if r := &replicas[(start+i)%n]; !r.health.down.Load() {
+			return r
 		}
 	}
 	return nil
 }
 
-// NextSQL 獲取下一個健康的讀取副本原始 SQL 連接（輪詢，跳過 down 副本）
-// GC 優化：讀路徑完全無鎖。全部不健康時回傳 nil（呼叫端回退主庫）
-func (rp *ReplicaPool) NextSQL() *sql.DB {
-	replicas := *rp.replicas.Load()
-	n := uint64(len(replicas))
-	if n == 0 {
-		return nil
+// Next 獲取下一個健康的讀取副本 HypDB ORM 實例（輪詢，跳過 down 副本）
+// 全部不健康時回傳 nil（呼叫端回退主庫）
+func (rp *ReplicaPool) Next() *bun.DB {
+	if r := rp.next(); r != nil {
+		return r.hypDB
 	}
-	start := rp.counter.Add(1) - 1
-	for i := uint64(0); i < n; i++ {
-		r := replicas[(start+i)%n]
-		if !r.health.down.Load() {
-			return r.sqlDB
-		}
+	return nil
+}
+
+// NextSQL 獲取下一個健康的讀取副本原始 SQL 連接（輪詢，跳過 down 副本）
+// 全部不健康時回傳 nil（呼叫端回退主庫）
+func (rp *ReplicaPool) NextSQL() *sql.DB {
+	if r := rp.next(); r != nil {
+		return r.sqlDB
 	}
 	return nil
 }
@@ -201,13 +200,14 @@ func (rp *ReplicaPool) Close() []error {
 	return errs
 }
 
-// PingAll 對所有讀取副本進行健康檢查
-func (rp *ReplicaPool) PingAll() []error {
+// PingAll 對所有讀取副本進行健康檢查，遵守 ctx 的期限。
+// 先前用不帶 ctx 的 Ping()：一個卡住的副本讓 HealthCheck 超過呼叫端給的期限
+func (rp *ReplicaPool) PingAll(ctx context.Context) []error {
 	replicas := *rp.replicas.Load()
 	var errs []error
 	for i, replica := range replicas {
 		if replica.sqlDB != nil {
-			if err := replica.sqlDB.Ping(); err != nil {
+			if err := replica.sqlDB.PingContext(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("read replica %d unhealthy: %w", i, err))
 			}
 		}
@@ -238,7 +238,7 @@ func initReplica(dialect Dialect, replicaCfg config.ReplicaConfig) (ReadReplica,
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// 測試連接
-	if err := db.Ping(); err != nil {
+	if err := pingWithTimeout(db); err != nil {
 		db.Close()
 		return ReadReplica{}, fmt.Errorf("failed to ping read replica: %w", err)
 	}
