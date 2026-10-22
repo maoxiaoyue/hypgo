@@ -1,11 +1,15 @@
 package testgen
 
 import (
+	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -111,5 +115,138 @@ func TestSkipsGeneratedFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "msg.pb_test.go")); err == nil {
 		t.Error("test file created for a generated file")
+	}
+}
+
+// typecheck 以 go/types 檢查目錄內同一套件的原始檔與測試檔（僅支援標準庫 import）
+func typecheck(t *testing.T, dir, pkg string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []*ast.File
+	for _, f := range pkgs[pkg].Files {
+		files = append(files, f)
+	}
+	conf := types.Config{Importer: importer.ForCompiler(fset, "source", nil)}
+	if _, err := conf.Check(pkg, fset, files, nil); err != nil {
+		t.Errorf("generated tests do not compile: %v", err)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestTableDrivenSkeleton 依簽名產生 table-driven 骨架：參數成為欄位、error 成為 wantErr、
+// variadic 以 ... 展開；func 型別的回傳值不比對。產出可通過型別檢查
+func TestTableDrivenSkeleton(t *testing.T) {
+	dir := writePkg(t, map[string]string{"calc.go": `package p
+
+import (
+	"context"
+	tm "time"
+)
+
+func Sum(base int, nums ...int) int                      { return base }
+func Split(s string) (head, tail string, err error)       { return s, "", nil }
+func Wait(ctx context.Context, d tm.Duration) error       { return nil }
+func Handler() func(string) error                         { return nil }
+func Map[T any](xs []T) []T                               { return xs }
+`})
+	added(t, dir)
+	got := readFile(t, filepath.Join(dir, "calc_test.go"))
+	for _, want := range []string{
+		"got := Sum(tt.base, tt.nums...)",
+		"got, got1, err := Split(tt.s)",
+		"if (err != nil) != tt.wantErr {",
+		"err := Wait(tt.ctx, tt.d)",
+		"_ = got // TODO: func value",
+		`tm "time"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated tests missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "tt.xs") {
+		t.Error("generic func should fall back to a plain stub")
+	}
+	typecheck(t, dir, "p")
+}
+
+// TestAppendAddsMissingImports 追加到既有測試檔時補上缺少的 import，不動其餘內容；
+// 既有檔案是 package x_test 時退回一般空殼（骨架無法以未限定名稱呼叫目標）
+func TestAppendAddsMissingImports(t *testing.T) {
+	dir := writePkg(t, map[string]string{
+		"calc.go":      "package p\n\nimport \"time\"\n\nfunc After(d time.Duration) time.Duration { return d }\n",
+		"calc_test.go": "package p\n\nfunc helper() int { return 1 }\n",
+	})
+	added(t, dir)
+	got := readFile(t, filepath.Join(dir, "calc_test.go"))
+	if !strings.Contains(got, "func helper() int { return 1 }") || !strings.Contains(got, "got := After(tt.d)") {
+		t.Errorf("unexpected test file:\n%s", got)
+	}
+	typecheck(t, dir, "p")
+
+	ext := writePkg(t, map[string]string{
+		"ext.go":      "package q\n\nfunc Double(x int) int { return x * 2 }\n",
+		"ext_test.go": "package q_test\n\nimport \"testing\"\n\nfunc TestOther(t *testing.T) {}\n",
+	})
+	added(t, ext)
+	if got := readFile(t, filepath.Join(ext, "ext_test.go")); strings.Contains(got, "Double(tt.x)") {
+		t.Errorf("table skeleton written into an external test package:\n%s", got)
+	}
+}
+
+// TestHandlersDelegatedToContract HypGo handler 與非根路由註冊函式不補單元測試；
+// 根註冊函式（未被同套件其他註冊函式呼叫）產生 contract.TestAll 測試，重跑不重複
+func TestHandlersDelegatedToContract(t *testing.T) {
+	dir := writePkg(t, map[string]string{"routes.go": `package routers
+
+import (
+	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/router"
+)
+
+type UserCtl struct{}
+
+func (u *UserCtl) Get(c *hypcontext.Context) {}
+func Ping(c *hypcontext.Context)             {}
+func RegisterUsers(r *router.Router)          {}
+func Setup(r *router.Router)                  { RegisterUsers(r) }
+`})
+	reports, err := GenerateForDir(dir, DefaultOptions())
+	if err != nil || len(reports) != 1 {
+		t.Fatalf("reports = %+v, err = %v", reports, err)
+	}
+	rep := reports[0]
+	if !slices.Equal(rep.Added, []string{"TestSetup_Contracts"}) {
+		t.Errorf("Added = %v, want [TestSetup_Contracts]", rep.Added)
+	}
+	slices.Sort(rep.Contract)
+	if !slices.Equal(rep.Contract, []string{"Get", "Ping", "RegisterUsers"}) {
+		t.Errorf("Contract = %v, want [Get Ping RegisterUsers]", rep.Contract)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "routes_test.go")); err == nil {
+		t.Error("no unit test file should be created for handlers / registrars")
+	}
+	got := readFile(t, filepath.Join(dir, "routes_contract_test.go"))
+	for _, want := range []string{"r := router.New()", "Setup(r)", "contract.TestAll(t, r)", "t.Skip("} {
+		if !strings.Contains(got, want) {
+			t.Errorf("contract test missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "", got, 0); err != nil {
+		t.Errorf("contract test does not parse: %v", err)
+	}
+	if again := added(t, dir); len(again) != 0 {
+		t.Errorf("second run added %v, want nothing", again)
 	}
 }

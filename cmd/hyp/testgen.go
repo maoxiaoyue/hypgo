@@ -103,7 +103,7 @@ func printSingleReport(rep *testgen.Report, dryRun bool) {
 	if dryRun {
 		prefix = "[dry-run] "
 	}
-	if len(rep.Added) == 0 && len(rep.Skipped) == 0 && len(rep.NoTestNeed) == 0 {
+	if len(rep.Added) == 0 && len(rep.Skipped) == 0 && len(rep.NoTestNeed) == 0 && len(rep.Contract) == 0 {
 		fmt.Fprintf(os.Stdout, "%sNo eligible funcs in %s\n", prefix, rep.SourceFile)
 		return
 	}
@@ -111,7 +111,11 @@ func printSingleReport(rep *testgen.Report, dryRun bool) {
 	if rep.Created {
 		mark = "+"
 	}
-	fmt.Fprintf(os.Stdout, "%s %s%s → %s\n", mark, prefix, rep.SourceFile, rep.TestFile)
+	if rep.TestFile == "" {
+		fmt.Fprintf(os.Stdout, "· %s%s\n", prefix, rep.SourceFile)
+	} else {
+		fmt.Fprintf(os.Stdout, "%s %s%s → %s\n", mark, prefix, rep.SourceFile, rep.TestFile)
+	}
 	if len(rep.Added) > 0 {
 		fmt.Fprintf(os.Stdout, "    added:  %v\n", rep.Added)
 	}
@@ -120,5 +124,11 @@ func printSingleReport(rep *testgen.Report, dryRun bool) {
 	}
 	if len(rep.NoTestNeed) > 0 {
 		fmt.Fprintf(os.Stdout, "    notest: %v\n", rep.NoTestNeed)
+	}
+	if len(rep.Contract) > 0 {
+		fmt.Fprintf(os.Stdout, "    contract: %v\n", rep.Contract)
+	}
+	if rep.ContractFile != "" {
+		fmt.Fprintf(os.Stdout, "    contract test → %s\n", rep.ContractFile)
 	}
 }
