@@ -7,7 +7,9 @@
 //   - 不覆蓋既有 Test*（即使是空殼也保留）
 //   - 不假裝有測試 → 骨架預設 t.Skip("auto-generated stub")，CI 看得到
 //   - 純 AST 分析，不執行程式碼
-//   - 跳過明確標記 //hyp:notest 的函式
+//   - 跳過明確標記 //hyp:notest 的函式與自動產生的檔案（// Code generated ... DO NOT EDIT.）
+//   - 以整個套件判斷是否已有測試：同目錄所有 *_test.go（含 package x_test）
+//     中 Test<名稱> 開頭、且其後不是小寫字母的測試都算（TestAddWorks、TestAdd_Overflow）
 package testgen
 
 import (
@@ -20,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Report 描述單一檔案的處理結果
@@ -55,7 +59,7 @@ func DefaultOptions() Options {
 }
 
 // GenerateForFile 為單一 .go 檔生成缺少的測試骨架
-// 已存在的 Test* 不會被覆蓋。
+// 已存在的 Test* 不會被覆蓋；是否已有測試以整個套件（同目錄）判斷。
 func GenerateForFile(filename string, opts Options) (*Report, error) {
 	if !strings.HasSuffix(filename, ".go") {
 		return nil, fmt.Errorf("not a .go file: %s", filename)
@@ -63,7 +67,16 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 	if strings.HasSuffix(filename, "_test.go") {
 		return nil, fmt.Errorf("cannot process *_test.go directly: %s", filename)
 	}
+	pkg, err := loadPkgContext(filepath.Dir(filename), opts)
+	if err != nil {
+		return nil, err
+	}
+	return generateFile(filename, pkg, opts)
+}
 
+// generateFile 依套件現況為單一原始檔補上缺少的測試骨架；新增的名稱記回 pkg，
+// 同套件後續的檔案不會再產生同名測試
+func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, error) {
 	srcContent, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("read source: %w", err)
@@ -75,14 +88,17 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 		return nil, fmt.Errorf("parse source: %w", err)
 	}
 
-	pkgName := srcAST.Name.Name
-
-	// 收集本檔案中需要被測試的函式
-	candidates := collectCandidates(srcAST, srcContent, fset, opts)
-
 	// 推導 test 檔案路徑：foo.go → foo_test.go（同目錄）
 	testPath := strings.TrimSuffix(filename, ".go") + "_test.go"
 	report := &Report{SourceFile: filename, TestFile: testPath}
+
+	// 自動產生的檔案（protoc、stringer…）不補測試：先前 .pb.go 的 getter 也會各得一個空殼
+	if ast.IsGenerated(srcAST) {
+		return report, nil
+	}
+
+	// 收集本檔案中需要被測試的函式
+	candidates := collectCandidates(srcAST, opts)
 
 	// 把標記 notest 的函式也記錄
 	for _, c := range candidates {
@@ -95,30 +111,29 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 		return report, nil
 	}
 
-	existingTests, testFileExists, err := loadExistingTestNames(testPath)
-	if err != nil {
-		return nil, err
-	}
-	report.Created = !testFileExists
+	_, statErr := os.Stat(testPath)
+	testFileExists := statErr == nil
 
 	var toAdd []candidate
 	for _, c := range candidates {
-		if existingTests[c.testName] {
+		if pkg.covered(c.testName) {
 			report.Skipped = append(report.Skipped, c.testName)
 			continue
 		}
 		toAdd = append(toAdd, c)
 		report.Added = append(report.Added, c.testName)
+		pkg.tests[c.testName] = true
 	}
 
 	if len(toAdd) == 0 {
 		return report, nil
 	}
+	report.Created = !testFileExists // 有東西要寫才算建立（先前全部已覆蓋時也回報 created）
 	if opts.DryRun {
 		return report, nil
 	}
 
-	if err := writeTestFile(testPath, pkgName, testFileExists, toAdd, opts); err != nil {
+	if err := writeTestFile(testPath, srcAST.Name.Name, testFileExists, toAdd, opts); err != nil {
 		return nil, fmt.Errorf("write %s: %w", testPath, err)
 	}
 	return report, nil
@@ -127,6 +142,7 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 // GenerateForDir 遞迴處理 rootDir 下的所有 .go 檔（跳過 vendor / .git / node_modules / .hyp / testdata）
 func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 	var reports []Report
+	pkgs := map[string]*pkgContext{} // 每個目錄的套件現況只讀一次
 	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -142,7 +158,20 @@ func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		rep, genErr := GenerateForFile(path, opts)
+		dir := filepath.Dir(path)
+		pkg, ok := pkgs[dir]
+		if !ok {
+			var loadErr error
+			if pkg, loadErr = loadPkgContext(dir, opts); loadErr != nil {
+				fmt.Fprintf(os.Stderr, "  ! %s: %v\n", dir, loadErr)
+				pkg = nil
+			}
+			pkgs[dir] = pkg
+		}
+		if pkg == nil {
+			return nil // 該目錄的測試檔無法解析：不猜，整個目錄跳過
+		}
+		rep, genErr := generateFile(path, pkg, opts)
 		if genErr != nil {
 			fmt.Fprintf(os.Stderr, "  ! %s: %v\n", path, genErr)
 			return nil
@@ -153,6 +182,85 @@ func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 		return nil
 	})
 	return reports, err
+}
+
+// pkgContext 一個目錄（Go 套件）的測試現況。先前只看成對的 foo_test.go 裡有沒有
+// 完全同名的 Test：測試寫在其他測試檔就重複產生（TestAdd redeclared，整個套件編不過），
+// 換個名字的測試（TestAddWorks）也認不得
+type pkgContext struct {
+	tests      map[string]bool // 目錄下所有 *_test.go 的 Test*（含 package x_test）與本次新增的
+	candidates []string        // 目錄下所有原始檔候選的 Test 名稱，用來把 TestAddUser 歸給 AddUser 而非 Add
+}
+
+// loadPkgContext 讀取目錄下所有 .go 檔：測試檔收集 Test*，原始檔收集候選名稱。
+// 測試檔語法錯誤時回傳錯誤（無法得知已有哪些測試，寧可不產生）
+func loadPkgContext(dir string, opts Options) (*pkgContext, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	pkg := &pkgContext{tests: map[string]bool{}}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if strings.HasSuffix(name, "_test.go") {
+			f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+			if err != nil {
+				return nil, fmt.Errorf("parse existing test file %s: %w", path, err)
+			}
+			for _, decl := range f.Decls {
+				if fd, ok := decl.(*ast.FuncDecl); ok && fd.Recv == nil && strings.HasPrefix(fd.Name.Name, "Test") {
+					pkg.tests[fd.Name.Name] = true
+				}
+			}
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil || ast.IsGenerated(f) {
+			continue // 原始檔錯誤由 generateFile 回報
+		}
+		for _, c := range collectCandidates(f, opts) {
+			pkg.candidates = append(pkg.candidates, c.testName)
+		}
+	}
+	return pkg, nil
+}
+
+// covers 回報測試 test 是否以 target 命名：完全相同，或其後接的不是小寫字母
+// （TestAddWorks、TestAdd_Overflow、TestAdd2 都算 TestAdd；TestAddress 不算）
+func covers(test, target string) bool {
+	if !strings.HasPrefix(test, target) {
+		return false
+	}
+	if len(test) == len(target) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(test[len(target):])
+	return !unicode.IsLower(r)
+}
+
+// covered 回報套件內是否已有測試在測 target。一個測試同時符合多個候選時歸給名稱最長者：
+// 有 AddUser 時 TestAddUserWorks 算 AddUser 的測試，不算 Add 的
+func (p *pkgContext) covered(target string) bool {
+	for test := range p.tests {
+		if !covers(test, target) {
+			continue
+		}
+		owner := target
+		for _, c := range p.candidates {
+			if len(c) > len(owner) && covers(test, c) {
+				owner = c
+			}
+		}
+		if owner == target {
+			return true
+		}
+	}
+	return false
 }
 
 // --- internal ---
@@ -166,7 +274,7 @@ type candidate struct {
 }
 
 // collectCandidates 從 AST 抽出所有要產測試的 func / method
-func collectCandidates(f *ast.File, src []byte, fset *token.FileSet, opts Options) []candidate {
+func collectCandidates(f *ast.File, opts Options) []candidate {
 	var out []candidate
 
 	for _, decl := range f.Decls {
@@ -186,9 +294,9 @@ func collectCandidates(f *ast.File, src []byte, fset *token.FileSet, opts Option
 		c := candidate{funcName: name}
 		if fd.Recv != nil && len(fd.Recv.List) > 0 {
 			c.isMethod = true
-			c.receiverStr = exprString(fd.Recv.List[0].Type)
-			recvBase := strings.TrimPrefix(c.receiverStr, "*")
-			c.testName = "Test" + recvBase + "_" + name
+			recv := fd.Recv.List[0].Type
+			c.receiverStr = exprString(recv)
+			c.testName = "Test" + recvBaseName(recv) + "_" + name
 		} else {
 			c.testName = "Test" + name
 		}
@@ -205,8 +313,6 @@ func collectCandidates(f *ast.File, src []byte, fset *token.FileSet, opts Option
 
 		out = append(out, c)
 	}
-	_ = fset
-	_ = src
 	return out
 }
 
@@ -232,6 +338,7 @@ func isReservedTestPrefix(name string) bool {
 	return false
 }
 
+// exprString 把 receiver 型別還原成原始碼寫法（僅用於註解），如 *List[T]
 func exprString(e ast.Expr) string {
 	switch v := e.(type) {
 	case *ast.Ident:
@@ -240,42 +347,40 @@ func exprString(e ast.Expr) string {
 		return "*" + exprString(v.X)
 	case *ast.SelectorExpr:
 		return exprString(v.X) + "." + v.Sel.Name
+	case *ast.ParenExpr:
+		return "(" + exprString(v.X) + ")"
+	case *ast.IndexExpr:
+		return exprString(v.X) + "[" + exprString(v.Index) + "]"
+	case *ast.IndexListExpr:
+		params := make([]string, len(v.Indices))
+		for i, ix := range v.Indices {
+			params[i] = exprString(ix)
+		}
+		return exprString(v.X) + "[" + strings.Join(params, ", ") + "]"
 	default:
 		return fmt.Sprintf("%T", e)
 	}
 }
 
-// loadExistingTestNames 從目標 _test.go（若存在）抽出已定義的 Test* 名稱
-// 回傳：testName→true 對照表、檔案是否存在、錯誤
-func loadExistingTestNames(testPath string) (map[string]bool, bool, error) {
-	out := map[string]bool{}
-	info, err := os.Stat(testPath)
-	if os.IsNotExist(err) {
-		return out, false, nil
-	}
-	if err != nil {
-		return out, false, fmt.Errorf("stat test file: %w", err)
-	}
-	if info.IsDir() {
-		return out, false, fmt.Errorf("%s is a directory", testPath)
-	}
-
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, testPath, nil, parser.SkipObjectResolution)
-	if err != nil {
-		// 既有檔案語法錯誤 → 視為「不知道有什麼」並警告呼叫端
-		return out, true, fmt.Errorf("parse existing test file %s: %w", testPath, err)
-	}
-	for _, decl := range f.Decls {
-		fd, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if strings.HasPrefix(fd.Name.Name, "Test") {
-			out[fd.Name.Name] = true
+// recvBaseName 取 receiver 的型別名稱（去掉 *、括號與型別參數），用於組 Test 名稱。
+// 先前泛型 receiver（*List[T]）落到 %T，產生 Test*ast.IndexExpr_Push 這種無法編譯的名稱
+func recvBaseName(e ast.Expr) string {
+	for {
+		switch v := e.(type) {
+		case *ast.StarExpr:
+			e = v.X
+		case *ast.ParenExpr:
+			e = v.X
+		case *ast.IndexExpr:
+			e = v.X
+		case *ast.IndexListExpr:
+			e = v.X
+		case *ast.Ident:
+			return v.Name
+		default:
+			return "Recv"
 		}
 	}
-	return out, true, nil
 }
 
 // writeTestFile 把新測試骨架寫進 testPath。
