@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,10 +32,14 @@ var apiCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(apiCmd)
+	apiCmd.Flags().Bool("force", false, "Generate into an existing non-empty directory (existing files are never overwritten)")
 }
 
 func runAPI(cmd *cobra.Command, args []string) error {
 	projectName := args[0]
+	if err := checkNewProject(cmd, projectName); err != nil {
+		return err
+	}
 
 	// 創建 API 項目目錄結構
 	// 與 hyp new 同構（app/{controllers,models,services} + routers/），
@@ -91,7 +96,8 @@ func runAPI(cmd *cobra.Command, args []string) error {
 
 	// 模板數據
 	data := map[string]string{
-		"ProjectName": projectName,
+		"ProjectName":  projectName,
+		"HypgoVersion": "v" + Version,
 	}
 
 	// 創建所有檔案
@@ -177,7 +183,7 @@ func createAPIRouterSetup(projectName, today string) error {
 		"}\n"
 
 	filename := filepath.Join(projectName, "routers", "router.go")
-	return os.WriteFile(filename, []byte(content), 0644)
+	return writeNewFile(filename, []byte(content), 0644)
 }
 
 // createAPIAuth 生成 JWT 認證層：以框架的 middleware.JWT + HS256 簽發／驗證，
@@ -213,7 +219,7 @@ func createAPIAuth(projectName, today string) error {
 		"type AdminStatsResp struct {\n" +
 		"\tAccounts int `json:\"accounts\"`\n" +
 		"}\n"
-	if err := os.WriteFile(filepath.Join(projectName, "app", "models", "auth.go"), []byte(model), 0644); err != nil {
+	if err := writeNewFile(filepath.Join(projectName, "app", "models", "auth.go"), []byte(model), 0644); err != nil {
 		return err
 	}
 
@@ -344,7 +350,7 @@ func createAPIAuth(projectName, today string) error {
 		"}\n\n" +
 		"// dummyHash 供「帳號不存在」路徑做等時間比對\n" +
 		"var dummyHash, _ = bcrypt.GenerateFromPassword([]byte(\"hypgo-dummy-password\"), bcrypt.DefaultCost)\n"
-	if err := os.WriteFile(filepath.Join(projectName, "app", "services", "auth_service.go"), []byte(service), 0644); err != nil {
+	if err := writeNewFile(filepath.Join(projectName, "app", "services", "auth_service.go"), []byte(service), 0644); err != nil {
 		return err
 	}
 
@@ -407,7 +413,7 @@ func createAPIAuth(projectName, today string) error {
 		"\t}\n" +
 		"\treturn s\n" +
 		"}\n"
-	if err := os.WriteFile(filepath.Join(projectName, "app", "controllers", "auth_controller.go"), []byte(controller), 0644); err != nil {
+	if err := writeNewFile(filepath.Join(projectName, "app", "controllers", "auth_controller.go"), []byte(controller), 0644); err != nil {
 		return err
 	}
 
@@ -508,7 +514,7 @@ func createAPIAuth(projectName, today string) error {
 		"\tfmt.Fprintln(os.Stderr, \"WARN: JWT_SECRET not set; using a random per-process secret (tokens won't survive restarts)\")\n" +
 		"\treturn buf\n" +
 		"}\n"
-	return os.WriteFile(filepath.Join(projectName, "routers", "auth.go"), []byte(routes), 0644)
+	return writeNewFile(filepath.Join(projectName, "routers", "auth.go"), []byte(routes), 0644)
 }
 
 // createAPIHealth 生成健康檢查的 Schema Output DTO 與 handler
@@ -523,7 +529,7 @@ func createAPIHealth(projectName, today string) error {
 		"\tProtocol  string `json:\"protocol\"`\n" +
 		"\tTimestamp int64  `json:\"timestamp\"`\n" +
 		"}\n"
-	if err := os.WriteFile(filepath.Join(projectName, "app", "models", "health.go"), []byte(model), 0644); err != nil {
+	if err := writeNewFile(filepath.Join(projectName, "app", "models", "health.go"), []byte(model), 0644); err != nil {
 		return err
 	}
 
@@ -544,7 +550,7 @@ func createAPIHealth(projectName, today string) error {
 		"\t\tTimestamp: time.Now().Unix(),\n" +
 		"\t})\n" +
 		"}\n"
-	return os.WriteFile(filepath.Join(projectName, "app", "controllers", "health.go"), []byte(ctrl), 0644)
+	return writeNewFile(filepath.Join(projectName, "app", "controllers", "health.go"), []byte(ctrl), 0644)
 }
 
 // createAPIMainFile 生成 main.go：以根 hypgo facade 一行式啟動，
@@ -607,7 +613,7 @@ func createAPIMainFile(projectName string) error {
 		"\treturn db\n" +
 		"}\n"
 
-	return os.WriteFile(filepath.Join(projectName, "main.go"), []byte(content), 0644)
+	return writeNewFile(filepath.Join(projectName, "main.go"), []byte(content), 0644)
 }
 
 type fileTemplate struct {
@@ -621,13 +627,12 @@ func createTemplateFile(filepath, content string, data interface{}) error {
 		return err
 	}
 
-	file, err := os.Create(filepath)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return err
 	}
-	defer file.Close()
-
-	return tmpl.Execute(file, data)
+	// 先前 os.Create 會截斷既有檔案（對既有專案重跑 hyp api 即覆寫 go.mod / config.yaml）
+	return writeNewFile(filepath, buf.Bytes(), 0644)
 }
 
 func printSuccessMessage(projectName string) {
@@ -714,7 +719,7 @@ DB_DSN=postgres://hypgo:password@localhost:5432/hypgo_db?sslmode=disable
 `
 
 const dockerfileContent = `# Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 RUN apk add --no-cache git make
 
@@ -1129,7 +1134,7 @@ const goModContent = `module {{.ProjectName}}
 go 1.24
 
 require (
-	github.com/maoxiaoyue/hypgo v0.9.2
+	github.com/maoxiaoyue/hypgo {{.HypgoVersion}}
 	golang.org/x/crypto v0.47.0 // bcrypt（auth_service.go）
 )
 `

@@ -250,13 +250,20 @@ func WebMiddleware() []hypcontext.HandlerFunc {
 `
 
 // modelTemplate — bun ORM 模型 + Request/Response struct
+// 以 init() 註冊到 migrate.GlobalRegistry（先前未註冊，hyp migrate diff 永遠找不到任何 model）
 const modelTemplate = `package models
 
 import (
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/uptrace/bun"
 )
+
+// 註冊到 migrate 全域 registry：hyp migrate diff / snapshot 執行專案時據此產生 SQL
+func init() {
+	migrate.GlobalRegistry().Register((*{{.Name}})(nil))
+}
 
 // {{.Name}} 資料模型（DB schema）
 type {{.Name}} struct {

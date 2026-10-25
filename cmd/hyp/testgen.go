@@ -43,7 +43,7 @@ Integration with go test:
 }
 
 func init() {
-	testgenCmd.Flags().String("file", "", "Target single .go file (default: recursive scan from target dir)")
+	testgenCmd.Flags().StringP("file", "f", "", "Target single .go file (default: recursive scan from target dir)")
 	testgenCmd.Flags().Bool("include-unexported", false, "Also generate stubs for unexported funcs/methods")
 	testgenCmd.Flags().Bool("dry-run", false, "Show what would be generated without writing files")
 	testgenCmd.Flags().String("stub-message", "", "Custom t.Skip message (default: 'auto-generated stub; replace with real assertions')")

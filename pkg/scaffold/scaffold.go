@@ -402,6 +402,12 @@ func GenerateService(dir, name string) error {
 	return generateFile(dir, strings.ToLower(name)+"_service.go", serviceTemplate, data)
 }
 
+// ValidateName 驗證資源／專案名稱（字母開頭，只含字母、數字、底線，最長 64 字元）；
+// 供 CLI 在取用名稱前先行檢查（hyp generate 先前對空名稱直接 panic）
+func ValidateName(name string) error {
+	return validateName(name)
+}
+
 // validateName 驗證名稱安全性
 func validateName(name string) error {
 	if name == "" {

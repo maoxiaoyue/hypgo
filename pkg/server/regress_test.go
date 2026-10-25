@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,6 +25,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -430,5 +432,51 @@ func TestHTTP3ModeFailsWithoutUDP(t *testing.T) {
 	if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
 		c.Close()
 		t.Error("TCP still accepting after Start() failed")
+	}
+}
+
+// regressWidget 供 TestStartMigrateOutWritesSchema 註冊到 migrate.GlobalRegistry
+type regressWidget struct {
+	ID   int64  `bun:"id,pk,autoincrement"`
+	Name string `bun:"name,notnull"`
+}
+
+// TestStartMigrateOutWritesSchema 迴歸測試（CLI A5）：設定 HYPGO_MIGRATE_OUT 時 Start 寫出已註冊 model 的 schema 後立即返回、不監聽。
+// 歷史 bug：hyp migrate 讀 hyp 自己行程的 GlobalRegistry（永遠是空的），使用者專案沒有任何方式把 model 交給它
+func TestStartMigrateOutWritesSchema(t *testing.T) {
+	t.Chdir(t.TempDir())
+	migrate.GlobalRegistry().Register((*regressWidget)(nil))
+	out := filepath.Join(t.TempDir(), "schema.json")
+	t.Setenv("HYPGO_MIGRATE_OUT", out)
+
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := busy.Addr().String()
+	busy.Close()
+	s := New(regressCfg(addr), logger.NewLogger())
+
+	done := make(chan error, 1)
+	go func() { done <- s.Start() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		s.Shutdown(context.Background())
+		t.Fatal("Start did not return: it started serving instead of writing the model schema")
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"name":"regress_widget"`) {
+		t.Errorf("schema output missing registered model: %s", data)
+	}
+	if _, err := os.Stat(pidFilePath); err == nil {
+		t.Error("PID file written in migrate-out mode")
 	}
 }

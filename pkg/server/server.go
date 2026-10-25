@@ -27,6 +27,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/middleware"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -241,6 +242,11 @@ func (s *Server) Use(middlewares ...hypcontext.HandlerFunc) {
 
 // Start 根據配置啟動伺服器
 func (s *Server) Start() error {
+	// hyp migrate diff / snapshot 以 HYPGO_MIGRATE_OUT 執行專案：此時 models 已在 init 註冊完，
+	// 寫出 GlobalRegistry 的 schema 後即返回，不寫 PID 檔、不開始監聽
+	if out := os.Getenv(migrate.SchemaOutEnv); out != "" {
+		return migrate.WriteSchemaFile(out)
+	}
 	// hyp context 以 HYPGO_MANIFEST_OUT 執行專案：此時路由已註冊完，寫出 manifest 後即返回，
 	// 不寫 PID 檔、不開始監聽，也不動 .hyp/context.yaml
 	if out := os.Getenv(manifest.ManifestOutEnv); out != "" {

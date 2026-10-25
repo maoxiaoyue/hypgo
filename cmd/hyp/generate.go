@@ -8,6 +8,7 @@ import (
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/module"
 )
 
 var generateCmd = &cobra.Command{
@@ -49,9 +50,17 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	genType := args[0]
 	name := args[1]
 
+	// 先驗證名稱：各 generate* 會先取 name[:1]，先前空字串直接 panic（驗證在 scaffold 內、太晚）
+	if err := scaffold.ValidateName(name); err != nil {
+		return err
+	}
+
 	moduleName, _ := cmd.Flags().GetString("module")
 	if moduleName == "" {
 		moduleName = detectModuleName()
+	} else if err := module.CheckImportPath(moduleName); err != nil {
+		// --module 會原樣寫進生成程式碼的 import 字串
+		return fmt.Errorf("invalid --module %q: %w", moduleName, err)
 	}
 
 	switch genType {

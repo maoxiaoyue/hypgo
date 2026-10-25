@@ -4,16 +4,13 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/module"
 )
 
 var newCmd = &cobra.Command{
@@ -34,6 +31,9 @@ Examples:
   hyp new grpc userservice     gRPC microservice`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := checkNewProject(cmd, args[len(args)-1]); err != nil {
+			return err
+		}
 		if len(args) == 1 {
 			// hyp new <name> → web 專案（預設）
 			return runNew(cmd, args)
@@ -80,6 +80,9 @@ Add subcommands:
   hyp generate command export`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := checkNewProject(cmd, args[0]); err != nil {
+			return err
+		}
 		return runNewCLI(args[0])
 	},
 }
@@ -113,6 +116,9 @@ run the platform's install command (winget / xcode-select / apt-get / dnf / pacm
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		installDeps, _ := cmd.Flags().GetBool("install-deps")
+		if err := checkNewProject(cmd, args[0]); err != nil {
+			return err
+		}
 		return runNewDesktop(args[0], installDeps)
 	},
 }
@@ -145,6 +151,9 @@ Add more services:
 Requires: protoc + protoc-gen-go + protoc-gen-go-grpc`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := checkNewProject(cmd, args[0]); err != nil {
+			return err
+		}
 		return runNewGRPC(args[0])
 	},
 }
@@ -156,6 +165,63 @@ func init() {
 	newCmd.AddCommand(newGRPCCmd)
 
 	newDesktopCmd.Flags().Bool("install-deps", false, "Install the C toolchain Fyne needs via the platform package manager")
+	newCmd.PersistentFlags().Bool("force", false, "Generate into an existing non-empty directory (existing files are never overwritten)")
+}
+
+// checkNewProject 建立專案前的共用檢查（hyp new 各類型與 hyp api）：名稱合法、目標目錄可用。
+// 先前完全不檢查：hyp new ../escaped 寫到 CWD 之外並產生 module ../escaped，"my app" 產生 module my app；
+// 對既有專案重跑 hyp new / hyp api 會截斷 go.mod、config.yaml 等既有檔案後才在半途失敗
+func checkNewProject(cmd *cobra.Command, name string) error {
+	if err := validateProjectName(name); err != nil {
+		return err
+	}
+	force, _ := cmd.Flags().GetBool("force")
+	fi, err := os.Stat(name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s already exists and is not a directory", name)
+	}
+	entries, err := os.ReadDir(name)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 && !force {
+		return fmt.Errorf("directory %s already exists and is not empty; choose another name or pass --force (existing files are never overwritten)", name)
+	}
+	return nil
+}
+
+// validateProjectName 專案名稱同時是目錄名稱與 go.mod 的 module 路徑：
+// 必須是單一路徑元素，且是合法的 Go import path（不含空白、不以 . 開頭等）
+func validateProjectName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid project name %q: must be a single directory name without path separators", name)
+	}
+	if err := module.CheckImportPath(name); err != nil {
+		return fmt.Errorf("invalid project name %q: not a valid Go module path: %w", name, err)
+	}
+	return nil
+}
+
+// writeNewFile 建立新檔案；檔案已存在時回錯，不截斷（hyp new / hyp api --force 不覆寫既有檔案）
+func writeNewFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("file already exists: %s", path)
+		}
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // runNewCLI 生成 CLI 專案
@@ -433,28 +499,28 @@ logger:
 `
 
 	filename := filepath.Join(projectName, "config", "config.yaml")
-	return os.WriteFile(filename, []byte(configContent), 0644)
+	return writeNewFile(filename, []byte(configContent), 0644)
 }
 
 // createLLMConfigFile 寫入 llm.yaml 到指定目錄（預期為 .hyp/）。
 // 內容來自 scaffold.LLMYamlTemplate，預設 mode=none（不啟用 LLM）。
 func createLLMConfigFile(configDir string) error {
 	filename := filepath.Join(configDir, "llm.yaml")
-	return os.WriteFile(filename, []byte(scaffold.LLMYamlTemplate), 0644)
+	return writeNewFile(filename, []byte(scaffold.LLMYamlTemplate), 0644)
 }
 
 // createCommentConfigFile 寫入 comment.yaml 到指定目錄（預期為 .hyp/）。
 // 內容來自 scaffold.CommentYamlTemplate，預設只開啟 normal_comment。
 func createCommentConfigFile(configDir string) error {
 	filename := filepath.Join(configDir, "comment.yaml")
-	return os.WriteFile(filename, []byte(scaffold.CommentYamlTemplate), 0644)
+	return writeNewFile(filename, []byte(scaffold.CommentYamlTemplate), 0644)
 }
 
 // createHypConfigFile 寫入 .hyp/config.yaml 到指定目錄（預期為 .hyp/）。
 // 內容來自 scaffold.HypConfigYamlTemplate，預設 language=en / debug_level=debug / environment=local。
 func createHypConfigFile(configDir string) error {
 	filename := filepath.Join(configDir, "config.yaml")
-	return os.WriteFile(filename, []byte(scaffold.HypConfigYamlTemplate), 0644)
+	return writeNewFile(filename, []byte(scaffold.HypConfigYamlTemplate), 0644)
 }
 
 func createMainFile(projectName string) error {
@@ -485,7 +551,7 @@ func createMainFile(projectName string) error {
 		"}\n"
 
 	filename := filepath.Join(projectName, "main.go")
-	return os.WriteFile(filename, []byte(mainContent), 0644)
+	return writeNewFile(filename, []byte(mainContent), 0644)
 }
 
 // createHomeModel 生成 app/models/home.go，定義 Schema Input/Output 用的 DTO。
@@ -512,7 +578,7 @@ func createHomeModel(projectName, today string) error {
 		"}\n"
 
 	filename := filepath.Join(projectName, "app", "models", "home.go")
-	return os.WriteFile(filename, []byte(content), 0644)
+	return writeNewFile(filename, []byte(content), 0644)
 }
 
 // createRouterSetup 生成 routers/router.go（專案根目錄）：引入 router + schema，
@@ -538,8 +604,15 @@ func createRouterSetup(projectName, today string) error {
 		"\tr.Static(\"/static\", \"./static\")\n\n" +
 		"\t// Controller 實例（薄控制器；業務邏輯置於 app/services）\n" +
 		"\thome := &controllers.HomeController{}\n\n" +
-		"\t// 首頁\n" +
-		"\tr.GET(\"/\", home.Home)\n\n" +
+		// 先前首頁以 r.GET 註冊、沒有 Schema：全新專案的 hyp lint 即因 no_schema 失敗
+		"\t// 首頁（回傳 HTML 檔案：沒有 JSON Output 型別，以 OutputName 標示內容型態，contract 測試不驗 body）\n" +
+		"\tr.Schema(schema.Route{\n" +
+		"\t\tMethod:     \"GET\",\n" +
+		"\t\tPath:       \"/\",\n" +
+		"\t\tSummary:    \"Welcome page\",\n" +
+		"\t\tTags:       []string{\"web\"},\n" +
+		"\t\tOutputName: \"text/html\",\n" +
+		"\t}).Handle(home.Home)\n\n" +
 		"\t// API（Schema-first：宣告 Input/Output 型別，供 c.BindInput 與 contract 測試對齊）\n" +
 		"\tr.Schema(schema.Route{\n" +
 		"\t\tMethod:  \"GET\",\n" +
@@ -560,12 +633,12 @@ func createRouterSetup(projectName, today string) error {
 		"}\n"
 
 	filename := filepath.Join(projectName, "routers", "router.go")
-	return os.WriteFile(filename, []byte(content), 0644)
+	return writeNewFile(filename, []byte(content), 0644)
 }
 
 // createGitKeep 在空目錄放 .gitkeep，讓該目錄能被 git 追蹤（hyp new / hyp api 共用）
 func createGitKeep(dir string) error {
-	return os.WriteFile(filepath.Join(dir, ".gitkeep"), nil, 0644)
+	return writeNewFile(filepath.Join(dir, ".gitkeep"), nil, 0644)
 }
 
 func createFullStackController(projectName, today string) error {
@@ -603,7 +676,7 @@ func createFullStackController(projectName, today string) error {
 		"}\n"
 
 	filename := filepath.Join(projectName, "app", "controllers", "home.go")
-	return os.WriteFile(filename, []byte(controllerContent), 0644)
+	return writeNewFile(filename, []byte(controllerContent), 0644)
 }
 
 func createWelcomeTemplate(projectName string) error {
@@ -664,7 +737,7 @@ func createWelcomeTemplate(projectName string) error {
 `
 
 	filename := filepath.Join(projectName, "templates", "welcome.html")
-	return os.WriteFile(filename, []byte(templateContent), 0644)
+	return writeNewFile(filename, []byte(templateContent), 0644)
 }
 
 func createStaticAssets(projectName string) error {
@@ -816,7 +889,7 @@ body {
 `
 
 	cssFile := filepath.Join(projectName, "static", "css", "style.css")
-	if err := os.WriteFile(cssFile, []byte(cssContent), 0644); err != nil {
+	if err := writeNewFile(cssFile, []byte(cssContent), 0644); err != nil {
 		return err
 	}
 
@@ -884,78 +957,20 @@ body {
 `
 
 	jsFile := filepath.Join(projectName, "static", "js", "app.js")
-	return os.WriteFile(jsFile, []byte(jsContent), 0644)
+	return writeNewFile(jsFile, []byte(jsContent), 0644)
 }
 
 func createGoMod(projectName string) error {
-	latestTag, err := getLatestGitTag("github.com/maoxiaoyue/hypgo")
-	if err != nil {
-		// 如果無法獲取標籤，使用目前版本
-		latestTag = "v0.8.5"
-		fmt.Fprintf(os.Stderr, "Warning: Failed to get latest tag, using %s: %v\n", latestTag, err)
-	}
-
+	// 版本取自 hyp 本身（version.go），postScaffoldUpgrade 再嘗試升到 @latest。
+	// 先前以 git ls-remote git@github.com:...（SSH，沒有金鑰即失敗）查最新 tag，失敗時退回 v0.8.5——
+	// 該版本沒有根 hypgo 套件，離線或 proxy 失敗時產生的專案永遠編不過
 	content := fmt.Sprintf(`module %s
 
 go 1.24
 
-require github.com/maoxiaoyue/hypgo %s
-`, projectName, latestTag)
+require github.com/maoxiaoyue/hypgo v%s
+`, projectName, Version)
 
 	filename := filepath.Join(projectName, "go.mod")
-	return os.WriteFile(filename, []byte(content), 0644)
-}
-
-// getLatestGitTag 獲取指定儲存庫的最新標籤
-func getLatestGitTag(repo string) (string, error) {
-	cmd := exec.Command("git", "ls-remote", "--tags", fmt.Sprintf("git@%s.git", repo))
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to run git ls-remote: %w", err)
-	}
-
-	// 解析 git ls-remote 字串，提取標籤
-	tags := []string{}
-	tagRegex := regexp.MustCompile(`refs/tags/(.+)$`)
-	for _, line := range strings.Split(string(output), "\n") {
-		if matches := tagRegex.FindStringSubmatch(line); len(matches) > 1 {
-			tag := strings.TrimSuffix(matches[1], "^{}") // 移除 ^{} 後綴
-			if isValidSemver(tag) {
-				tags = append(tags, tag)
-			}
-		}
-	}
-
-	if len(tags) == 0 {
-		return "", fmt.Errorf("no valid semantic version tags found")
-	}
-
-	// 按語義版本排序，選擇最新版本
-	sort.Slice(tags, func(i, j int) bool {
-		return compareSemver(tags[i], tags[j]) > 0
-	})
-
-	return tags[0], nil
-}
-
-// isValidSemver 簡單檢查是否為語義版本（vX.Y.Z）
-func isValidSemver(tag string) bool {
-	semverRegex := regexp.MustCompile(`^v\d+\.\d+\.\d+(-.*)?$`)
-	return semverRegex.MatchString(tag)
-}
-
-// compareSemver 比較兩個語義版本
-func compareSemver(v1, v2 string) int {
-	// 簡單實現：移除 "v" 前綴並比較
-	v1Parts := strings.Split(strings.TrimPrefix(v1, "v"), ".")
-	v2Parts := strings.Split(strings.TrimPrefix(v2, "v"), ".")
-
-	for i := 0; i < len(v1Parts) && i < len(v2Parts); i++ {
-		v1Num, _ := strconv.Atoi(strings.Split(v1Parts[i], "-")[0])
-		v2Num, _ := strconv.Atoi(strings.Split(v2Parts[i], "-")[0])
-		if v1Num != v2Num {
-			return v1Num - v2Num
-		}
-	}
-	return len(v1Parts) - len(v2Parts)
+	return writeNewFile(filename, []byte(content), 0644)
 }

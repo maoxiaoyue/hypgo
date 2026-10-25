@@ -97,7 +97,7 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 	}
 
 	opts := airules.Options{
-		DiffLogEnabled: IsDiffLogEnabled(),
+		DiffLogEnabled: IsDiffLogEnabled(dir), // 先前讀 CWD 的 .hyp/config.json，忽略 --dir
 		Comment:        loadCommentToggles(dir),
 	}
 	results, err := airules.GenerateAll(dir, targets, m, opts, dryRun)
@@ -105,6 +105,7 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	errored := 0
 	for _, r := range results {
 		rel, _ := filepath.Rel(dir, r.Path)
 		if rel == "" {
@@ -121,6 +122,7 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 			fmt.Println("---")
 		case airules.StatusError:
 			fmt.Fprintf(os.Stderr, "  ! %s: %s\n", rel, r.Message)
+			errored++
 		}
 	}
 
@@ -134,6 +136,10 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%d file(s) generated.\n", created)
 	}
 
+	// 先前寫檔失敗只印到 stderr，仍 exit 0
+	if errored > 0 {
+		return fmt.Errorf("%d file(s) could not be written", errored)
+	}
 	return nil
 }
 
@@ -187,6 +193,9 @@ func runAIRulesClean(cmd *cobra.Command, args []string) error {
 		fmt.Printf(", %d errored", errored)
 	}
 	fmt.Println(".")
+	if errored > 0 {
+		return fmt.Errorf("%d file(s) could not be removed", errored)
+	}
 	return nil
 }
 
