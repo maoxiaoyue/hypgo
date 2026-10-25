@@ -4,7 +4,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/annotation"
@@ -13,65 +16,134 @@ import (
 )
 
 var chkcommentCmd = &cobra.Command{
-	Use:   "chkcomment [file.go]",
+	Use:   "chkcomment [file.go | dir | dir/...]...",
 	Short: "Check and add standardized comments to Go source files",
-	Long: `Scan a Go source file for exported blocks (package, type, func, method,
+	Long: `Scan Go source files for exported blocks (package, type, func, method,
 const, var) and check whether each has a standardized documentation comment.
 
-Missing comments will be reported with suggested text. Use --fix to
-automatically add the suggested comments to the file. When an LLM config
-is supplied (or auto-detected at .hyp/llm.yaml), --fix will additionally
-insert structured @ai: annotations produced by the LLM (or by built-in
-heuristics when mode=none).
+Arguments may be .go files, directories (that directory only) or dir/...
+(recursive, e.g. ./...). When expanding directories, vendor/, testdata/,
+hidden directories and _test.go files are skipped.
+
+Which comments are required follows .hyp/comment.yaml (searched upward from
+each file, falling back to the current directory; missing file = defaults):
+  normal_comment (default true)  exported blocks need a doc comment
+  ai_comment     (default false) also require @ai:generated/purpose/... fields
+  think_comment  (default false) enable the //@ai:think checks (--unintent/--fixintent)
+
+Missing comments are reported with suggested text, and the command exits
+non-zero when any violation remains (CI gate). Use --fix to add the
+suggested comments (exit 0 when everything got fixed). When an LLM config is
+supplied (or auto-detected at .hyp/llm.yaml), --fix asks the LLM for the doc
+text (built-in heuristics when mode=none).
 
 Examples:
   hyp chkcomment controllers/user.go
+  hyp chkcomment ./...
   hyp chkcomment --fix models/order.go
   hyp chkcomment --fix --llm .hyp/llm.yaml controllers/user.go`,
-	Args: cobra.ExactArgs(1),
-	RunE: runChkComment,
+	Args:         cobra.MinimumNArgs(1),
+	SilenceUsage: true,
+	RunE:         runChkComment,
 }
 
 func init() {
 	chkcommentCmd.Flags().Bool("fix", false, "Automatically add suggested comments to the file")
 	chkcommentCmd.Flags().String("llm", "", "Path to LLM config YAML (default: auto-detect .hyp/llm.yaml)")
-	chkcommentCmd.Flags().Bool("unintent", false, "Check AI-generated funcs for missing //@ai:think and write report to .hyp/lostintent.md (warning only)")
-	chkcommentCmd.Flags().Bool("fixintent", false, "Auto-insert //@ai:think into AI-generated funcs using LLM or heuristics (creates .bak backup)")
+	chkcommentCmd.Flags().Bool("unintent", false, "Check AI-generated funcs for missing //@ai:think and write report to .hyp/lostintent.md (warning only; requires think_comment: true)")
+	chkcommentCmd.Flags().Bool("fixintent", false, "Auto-insert //@ai:think into AI-generated funcs using LLM or heuristics (creates .bak backup; requires think_comment: true)")
 	chkcommentCmd.Flags().Bool("all", false, "(with --unintent/--fixintent) Apply to ALL funcs, not just those with @ai:generated. --fixintent --all emits @ai:think lines tagged retroactive=true (post-hoc analysis, not design intent)")
 }
 
-func runChkComment(cmd *cobra.Command, args []string) error {
-	filename := args[0]
-	fix, _ := cmd.Flags().GetBool("fix")
-	llmPath, _ := cmd.Flags().GetString("llm")
-	unintent, _ := cmd.Flags().GetBool("unintent")
-	fixintent, _ := cmd.Flags().GetBool("fixintent")
-	all, _ := cmd.Flags().GetBool("all")
+// chkcommentOpts 為單次 hyp chkcomment 執行的旗標
+type chkcommentOpts struct {
+	fix, unintent, fixintent, all bool
+	llmPath                       string
+}
 
-	report, err := annotation.CheckFile(filename)
+func runChkComment(cmd *cobra.Command, args []string) error {
+	var o chkcommentOpts
+	o.fix, _ = cmd.Flags().GetBool("fix")
+	o.llmPath, _ = cmd.Flags().GetString("llm")
+	o.unintent, _ = cmd.Flags().GetBool("unintent")
+	o.fixintent, _ = cmd.Flags().GetBool("fixintent")
+	o.all, _ = cmd.Flags().GetBool("all")
+
+	files, err := collectChkCommentFiles(args)
 	if err != nil {
-		return fmt.Errorf("check failed: %w", err)
+		return err
+	}
+	if len(files) == 0 {
+		fmt.Println("No .go files found.")
+		return nil
+	}
+
+	llm := &chkcommentLLM{explicitPath: o.llmPath}
+	toggles := map[string]commentToggleSet{}
+	violations, badFiles, errored := 0, 0, 0
+	for _, f := range files {
+		n, err := chkcommentFile(f, o, llm, toggles)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s: %v\n", f, err)
+			errored++
+			continue
+		}
+		if n > 0 {
+			violations += n
+			badFiles++
+		}
+	}
+
+	if len(files) > 1 {
+		fmt.Printf("\nChecked %d file(s): %d violation(s) in %d file(s)", len(files), violations, badFiles)
+		if errored > 0 {
+			fmt.Printf(", %d file(s) errored", errored)
+		}
+		fmt.Println(".")
+	}
+	// CI gate：先前不論結果都 exit 0
+	if errored > 0 || violations > 0 {
+		return fmt.Errorf("chkcomment: %d violation(s) in %d file(s), %d file(s) errored", violations, badFiles, errored)
+	}
+	return nil
+}
+
+// chkcommentFile 檢查（並依旗標修補）單一檔案，回傳最後仍未通過的區塊數。
+func chkcommentFile(filename string, o chkcommentOpts, llm *chkcommentLLM, cache map[string]commentToggleSet) (int, error) {
+	toggles := commentTogglesFor(filename, cache)
+	checkOpts := annotation.CheckOpts{RequireDoc: toggles.cfg.NormalComment, RequireAI: toggles.cfg.AIComment}
+
+	report, err := annotation.CheckFileWithOpts(filename, checkOpts)
+	if err != nil {
+		return 0, fmt.Errorf("check failed: %w", err)
 	}
 
 	fmt.Print(annotation.FormatReport(report))
 
-	if unintent || fixintent {
-		thinkOpts := annotation.CheckThinkOpts{IncludeAll: all}
+	if (o.unintent || o.fixintent) && !toggles.cfg.ThinkComment {
+		fmt.Fprintf(os.Stdout, "\n[unintent] skipped: think_comment is false in %s (set think_comment: true to check //@ai:think)\n", toggles.path)
+	} else if o.unintent || o.fixintent {
+		thinkOpts := annotation.CheckThinkOpts{IncludeAll: o.all}
 		thinkReport, thinkErr := annotation.CheckThinkWithOpts(filename, thinkOpts)
 		if thinkErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: @ai:think check failed: %v\n", thinkErr)
 		} else {
 			fmt.Print(annotation.FormatThinkReport(thinkReport))
-			if all {
+			if o.all {
 				fmt.Fprintf(os.Stdout, "[--all] Scanning ALL funcs (not just @ai:generated). Retroactive mode is active.\n")
 			}
 
-			if fixintent && len(thinkReport.Missing) > 0 {
-				if fixErr := runFixIntent(cmd, filename, llmPath, thinkReport, all); fixErr != nil {
-					return fixErr
+			if o.fixintent && len(thinkReport.Missing) > 0 {
+				if fixErr := runFixIntent(filename, thinkReport, o.all, llm); fixErr != nil {
+					return 0, fixErr
 				}
 				// 修復後重新檢查，寫入乾淨的報告
 				thinkReport, _ = annotation.CheckThinkWithOpts(filename, thinkOpts)
+				// --fixintent 插入了新行：先前沿用插入前的 report，後續 Enrich / --fix
+				// 依舊行號寫入，會把 doc 插進前一個函式的函式體或蓋掉 `}`
+				if report, err = annotation.CheckFileWithOpts(filename, checkOpts); err != nil {
+					return 0, fmt.Errorf("re-check failed: %w", err)
+				}
 			}
 
 			if writeErr := annotation.WriteLostIntentReport(".hyp", thinkReport); writeErr != nil {
@@ -82,97 +154,225 @@ func runChkComment(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if !fix {
-		return nil
+	if !o.fix {
+		return report.Total - report.Passed, nil
 	}
 
-	resolvedPath := resolveLLMConfigPath(llmPath)
-	llmCfg, err := config.LoadLLMConfig(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("load llm config: %w", err)
-	}
-
-	suggester, err := annotation.NewSuggester(llmCfg)
-	if err != nil {
-		return fmt.Errorf("init suggester: %w", err)
-	}
-
-	source := "heuristic"
-	if llmCfg.Mode != "" && llmCfg.Mode != config.LLMModeNone {
-		source = string(llmCfg.Mode)
-	}
-	if resolvedPath != "" {
-		fmt.Fprintf(os.Stdout, "\nUsing LLM config: %s (mode=%s)\n", resolvedPath, source)
-	} else {
-		fmt.Fprintf(os.Stdout, "\nNo LLM config found — using built-in heuristics\n")
+	if err := llm.load(); err != nil {
+		return 0, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Git headline enrichment：只在 LLM 模式下執行（heuristic 不需要 git 脈絡）
-	if llmCfg.Mode != "" && llmCfg.Mode != config.LLMModeNone {
-		enriched, enrichErr := annotation.EnrichMissingHeadlines(ctx, filename, report.Results, suggester)
+	if llm.enabled() {
+		enriched, enrichErr := annotation.EnrichMissingHeadlines(ctx, filename, report.Results, llm.suggester)
 		if enrichErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: headline enrichment failed: %v\n", enrichErr)
 		} else if enriched > 0 {
 			fmt.Fprintf(os.Stdout, "Enriched %d placeholder headline(s) using git history.\n", enriched)
+			// 每個寫入步驟後都以檔案現況重新檢查，避免下一步用到過期的行號
+			if report, err = annotation.CheckFileWithOpts(filename, checkOpts); err != nil {
+				return 0, fmt.Errorf("re-check failed: %w", err)
+			}
 		}
 	}
 
-	// 補齊缺少的 @ai: 欄位（若全部已通過則跳過）
+	// 補齊缺少的註解（若全部已通過則跳過）
 	if report.Passed >= report.Total {
-		return nil
+		return 0, nil
 	}
 
-	if err := annotation.FixFileWithSuggester(ctx, filename, report.Results, suggester); err != nil {
-		return fmt.Errorf("fix failed: %w", err)
+	if err := annotation.FixFileWithSuggester(ctx, filename, report.Results, llm.suggester); err != nil {
+		return 0, fmt.Errorf("fix failed: %w", err)
 	}
 	fmt.Fprintf(os.Stdout, "Fixed: comments added to %s (backup: %s.bak)\n", filename, filename)
-	return nil
+
+	after, err := annotation.CheckFileWithOpts(filename, checkOpts)
+	if err != nil {
+		return 0, fmt.Errorf("re-check failed: %w", err)
+	}
+	return after.Total - after.Passed, nil
 }
 
-// runFixIntent 使用 LLM 為缺少 @ai:think 的函式插入意圖註解；無 LLM 設定時僅警告
+// runFixIntent 為缺少 @ai:think 的函式插入意圖註解；未設定 LLM（mode=none）時改用內建啟發式。
 // retroactive=true 時切換 LLM 為事後反推模式並在每行 @ai:think 加上 retroactive=true 標籤
-func runFixIntent(_ *cobra.Command, filename, llmPath string, thinkReport *annotation.ThinkReport, retroactive bool) error {
-	resolvedPath := resolveLLMConfigPath(llmPath)
-	llmCfg, err := config.LoadLLMConfig(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("load llm config: %w", err)
+func runFixIntent(filename string, thinkReport *annotation.ThinkReport, retroactive bool, llm *chkcommentLLM) error {
+	if err := llm.load(); err != nil {
+		return err
 	}
 
-	if llmCfg == nil || llmCfg.Mode == "" || llmCfg.Mode == config.LLMModeNone {
-		fmt.Fprintf(os.Stderr, "\n[fixintent] Warning: no LLM configured (mode=none). "+
-			"--fixintent requires model support to auto-insert @ai:think.\n"+
-			"  → Please provide a valid LLM config via --llm or place one at .hyp/llm.yaml\n"+
-			"  → See: hyp chkcomment --unintent %s  (to list missing funcs only)\n", filename)
-		return nil
-	}
-
-	thinkSuggester, err := annotation.NewThinkSuggester(llmCfg)
-	if err != nil {
-		return fmt.Errorf("init think suggester: %w", err)
-	}
-
-	modelName := thinkSuggester.ModelName()
 	mode := "design-intent"
 	if retroactive {
 		mode = "retroactive"
 	}
-	fmt.Fprintf(os.Stdout, "\n[fixintent] Using LLM config: %s (mode=%s, model=%s, prompt=%s)\n",
-		resolvedPath, string(llmCfg.Mode), modelName, mode)
+	var thinkSuggester annotation.ThinkSuggester
+	if llm.enabled() {
+		ts, err := annotation.NewThinkSuggester(llm.cfg)
+		if err != nil {
+			return fmt.Errorf("init think suggester: %w", err)
+		}
+		thinkSuggester = ts
+		fmt.Fprintf(os.Stdout, "\n[fixintent] Using LLM config: %s (mode=%s, model=%s, prompt=%s)\n",
+			llm.path, llm.cfg.Mode, ts.ModelName(), mode)
+	} else {
+		// 先前 mode=none 只印警告、什麼都不做，與說明「LLM or heuristics」不符
+		thinkSuggester = annotation.NewHeuristicThinkSuggester()
+		fmt.Fprintf(os.Stdout, "\n[fixintent] No LLM configured (mode=none) — using built-in heuristics (prompt=%s)\n", mode)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	fixed, fixErr := annotation.FixThinkFileWithOpts(ctx, filename, thinkReport, thinkSuggester,
+	res, fixErr := annotation.FixThinkFileDetailed(ctx, filename, thinkReport, thinkSuggester,
 		annotation.FixThinkOpts{Retroactive: retroactive})
 	if fixErr != nil {
 		return fmt.Errorf("fixintent failed: %w", fixErr)
 	}
-	fmt.Fprintf(os.Stdout, "[fixintent] Inserted @ai:think into %d func(s) in %s (backup: %s.bak, model=%s)\n",
-		fixed, filename, filename, modelName)
+	for _, s := range res.Skipped {
+		fmt.Fprintf(os.Stdout, "[fixintent] Skipped %s %s (line %d): code follows `{` on the same line — add //@ai:think manually\n",
+			s.Kind, s.Name, s.Line)
+	}
+	if res.Fixed > 0 {
+		fmt.Fprintf(os.Stdout, "[fixintent] Inserted @ai:think into %d func(s) in %s (backup: %s.bak, model=%s)\n",
+			res.Fixed, filename, filename, strings.Join(res.Models, ","))
+	}
 	return nil
+}
+
+// chkcommentLLM 延遲載入、整次執行共用的 LLM 設定與 Suggester
+type chkcommentLLM struct {
+	explicitPath string
+	loaded       bool
+	path         string
+	cfg          *config.LLMConfig
+	suggester    annotation.Suggester
+}
+
+func (l *chkcommentLLM) load() error {
+	if l.loaded {
+		return nil
+	}
+	l.path = resolveLLMConfigPath(l.explicitPath)
+	cfg, err := config.LoadLLMConfig(l.path)
+	if err != nil {
+		return fmt.Errorf("load llm config: %w", err)
+	}
+	s, err := annotation.NewSuggester(cfg)
+	if err != nil {
+		return fmt.Errorf("init suggester: %w", err)
+	}
+	l.cfg, l.suggester, l.loaded = cfg, s, true
+	if l.enabled() {
+		fmt.Fprintf(os.Stdout, "\nUsing LLM config: %s (mode=%s)\n", l.path, cfg.Mode)
+	} else {
+		fmt.Fprintf(os.Stdout, "\nNo LLM config found — using built-in heuristics\n")
+	}
+	return nil
+}
+
+func (l *chkcommentLLM) enabled() bool {
+	return l.cfg != nil && l.cfg.Mode != "" && l.cfg.Mode != config.LLMModeNone
+}
+
+// commentToggleSet 為某個專案根目錄的 .hyp/comment.yaml 設定與其路徑
+type commentToggleSet struct {
+	path string
+	cfg  *config.CommentConfig
+}
+
+// commentTogglesFor 從 filename 所在目錄往上找含 .hyp/ 的目錄，讀其 .hyp/comment.yaml；
+// 找不到 .hyp/ 時退回 CWD。檔案不存在用預設值，解析失敗時警告並用預設值。
+func commentTogglesFor(filename string, cache map[string]commentToggleSet) commentToggleSet {
+	root := ""
+	if abs, err := filepath.Abs(filepath.Dir(filename)); err == nil {
+		for dir := abs; ; {
+			if info, err := os.Stat(filepath.Join(dir, ".hyp")); err == nil && info.IsDir() {
+				root = dir
+				break
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	if root == "" {
+		root, _ = os.Getwd()
+	}
+	if t, ok := cache[root]; ok {
+		return t
+	}
+	path := filepath.Join(root, ".hyp", "comment.yaml")
+	cfg, err := config.LoadCommentConfig(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to load %s: %v — using defaults\n", path, err)
+		cfg = config.DefaultCommentConfig()
+	}
+	t := commentToggleSet{path: path, cfg: cfg}
+	cache[root] = t
+	return t
+}
+
+// collectChkCommentFiles 把參數展開為 .go 檔清單：檔案原樣保留；目錄只取該層；
+// `dir/...`（含 `./...`）遞迴。展開目錄時跳過 vendor/、testdata/、隱藏目錄與 _test.go。
+func collectChkCommentFiles(args []string) ([]string, error) {
+	var files []string
+	seen := map[string]bool{}
+	for _, arg := range args {
+		root, recursive := arg, false
+		if arg == "..." || strings.HasSuffix(arg, "/...") || strings.HasSuffix(arg, `\...`) {
+			recursive = true
+			root = strings.TrimRight(strings.TrimSuffix(arg, "..."), `/\`)
+			if root == "" {
+				root = "."
+			}
+		}
+		info, err := os.Stat(root)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", arg, err)
+		}
+		if !info.IsDir() {
+			if recursive {
+				return nil, fmt.Errorf("%s: not a directory", root)
+			}
+			if !seen[root] {
+				seen[root] = true
+				files = append(files, root)
+			}
+			continue
+		}
+		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			name := d.Name()
+			if d.IsDir() {
+				if path == root {
+					return nil
+				}
+				if !recursive || name == "vendor" || name == "testdata" || strings.HasPrefix(name, ".") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Type()&fs.ModeSymlink != 0 || strings.HasPrefix(name, ".") ||
+				!strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				return nil
+			}
+			if !seen[path] {
+				seen[path] = true
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return files, nil
 }
 
 // resolveLLMConfigPath 處理 --llm 參數及預設探測順序

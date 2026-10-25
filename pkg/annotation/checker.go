@@ -25,6 +25,7 @@ type CheckResult struct {
 	DocHeadline     string                    // 第一個非 @ai:、非空白的 godoc 說明行（空字串 = 缺失或佔位符待補）
 	HasRequired     bool                      // 是否具備所有必填 @ai 欄位
 	HumanAuthor     string                    // 人類作者標記 // @<author> 的作者代號（非空 = 人類撰寫，免 @ai 必填）
+	DocOnly         bool                      // 只要求普通 doc（comment.yaml ai_comment=false）：不要求、也不補 @ai 欄位
 	ExistingTypes   []AnnotationType          // 既有的 @ai 標註類型
 	MissingRequired []AnnotationType          // 缺少的必填 @ai 標註類型
 	Suggested       string                    // 建議的註解文字（無 doc 時用）
@@ -55,6 +56,22 @@ const defaultProvider = "unknown"
 // @ai:output CheckReport 指標與錯誤
 // @ai:sideeffect 讀取檔案（僅讀不寫）
 func CheckFile(filename string) (*CheckReport, error) {
+	return CheckFileWithOpts(filename, CheckOpts{RequireDoc: true, RequireAI: true})
+}
+
+// CheckOpts 控制 CheckFileWithOpts 要求哪些註解（對應 .hyp/comment.yaml 的開關）。
+type CheckOpts struct {
+	// RequireDoc 要求 exported 區塊具備普通 godoc 註解（normal_comment）。
+	RequireDoc bool
+	// RequireAI 要求 @ai 必填欄位（ai_comment）。為 false 時缺 @ai 不算違規，
+	// 結果標為 DocOnly，FixFile 只補普通 doc 標題、不插入 @ai 骨架。
+	RequireAI bool
+}
+
+// CheckFileWithOpts 同 CheckFile，但依 opts 決定違規標準。
+// RequireAI=false 時只檢查 exported 區塊（package 除外：Go 慣例每個 package 只需一個檔案寫 package doc）
+// 是否有普通 doc；RequireDoc 也為 false 時任何區塊都不算違規。
+func CheckFileWithOpts(filename string, opts CheckOpts) (*CheckReport, error) {
 	// 安全檢查：只接受 .go 檔案
 	if filepath.Ext(filename) != ".go" {
 		return nil, fmt.Errorf("only .go files are supported: %s", filename)
@@ -113,6 +130,18 @@ func CheckFile(filename string) (*CheckReport, error) {
 	// 此時各區塊若未「自行」宣告 @ai:generated，便繼承免除 @ai 必填檢查；
 	// 自帶 @ai:generated 的區塊仍依 AI 標準檢查（混合作者檔案中後加的部分不會被誤免除）。
 	pkgAuthored := pkgResult.HumanAuthor != "" || containsAnnotationType(pkgResult.ExistingTypes, Generated)
+	if !opts.RequireAI {
+		// ai_comment=false：@ai 欄位不是必填，也不建議補；只剩「exported 區塊要有普通 doc」。
+		pkgAuthored = false
+		for i := range report.Results {
+			r := &report.Results[i]
+			r.DocOnly = true
+			r.MissingRequired = nil
+			r.SuggestedTags = nil
+			r.Suggested, _, _ = strings.Cut(r.Suggested, "\n") // 只留 `// <headline>`
+			r.HasRequired = r.HasDoc || !opts.RequireDoc || r.Kind == "package"
+		}
+	}
 	if pkgAuthored {
 		for i := range report.Results {
 			r := &report.Results[i]
@@ -257,11 +286,10 @@ func (r *CheckReport) checkFuncDecl(fset *token.FileSet, d *ast.FuncDecl) {
 		name = recvType + "." + name
 	}
 
-	// 未 exported 的 func 若沒有 doc，則跳過（AI_CODING_RULES v1.0 只嚴格檢查 exported）
+	// 未 exported 的 func 一律跳過（AI_CODING_RULES v1.0 只檢查 exported）。
+	// 先前有 doc 的 unexported func 仍會被要求 @ai:generated，--fix 還替它插入 by=unknown。
 	if !exported {
-		if d.Doc == nil || strings.TrimSpace(d.Doc.Text()) == "" {
-			return
-		}
+		return
 	}
 
 	res := CheckResult{
@@ -367,13 +395,9 @@ func FixFile(filename string, results []CheckResult) error {
 		return fmt.Errorf("cannot read file: %w", err)
 	}
 
-	// 建立備份
-	backupPath := filename + ".bak"
-	if err := os.WriteFile(backupPath, content, 0644); err != nil {
-		return fmt.Errorf("cannot create backup: %w", err)
-	}
-
-	lines := strings.Split(string(content), "\n")
+	// 先去掉檔首 BOM：先前 package doc 會被插在 BOM 之前，BOM 落到檔案中間使檔案無法編譯
+	src, _ := splitSource(content)
+	lines := src.lines
 
 	// 收集操作：分為「在 line 之前插入整塊註解」與「在某行之後插入若干 @ai 行」
 	type op struct {
@@ -429,6 +453,47 @@ func FixFile(filename string, results []CheckResult) error {
 		})
 	}
 
+	// 同一目標行的操作合併：先前群組 doc 下的每個 spec 各自在同一 doc 行後追加一份 @ai 欄位，
+	// `var X, Y int` 也會在同一行前插入兩段 doc。insertBefore 只保留第一段；appendAfter 合併並去除重複行。
+	type opKey struct {
+		line int
+		mode string
+	}
+	merged := make(map[opKey]int, len(ops))
+	deduped := ops[:0]
+	for _, o := range ops {
+		k := opKey{o.line, o.mode}
+		idx, seen := merged[k]
+		if !seen {
+			merged[k] = len(deduped)
+			deduped = append(deduped, o)
+			continue
+		}
+		if o.mode != "appendAfter" {
+			continue
+		}
+		for _, tl := range o.textLines {
+			dup := false
+			for _, have := range deduped[idx].textLines {
+				if have == tl {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				deduped[idx].textLines = append(deduped[idx].textLines, tl)
+			}
+		}
+	}
+	ops = deduped
+	if len(ops) == 0 {
+		return nil
+	}
+
+	if _, err := backupOnce(filename, content); err != nil {
+		return fmt.Errorf("cannot create backup: %w", err)
+	}
+
 	// 由下往上套用，避免行號偏移
 	sort.Slice(ops, func(i, j int) bool {
 		if ops[i].line != ops[j].line {
@@ -464,7 +529,7 @@ func FixFile(filename string, results []CheckResult) error {
 
 		newLines := make([]string, len(o.textLines))
 		for i, cl := range o.textLines {
-			newLines[i] = indent + cl
+			newLines[i] = indent + cl + src.eolCR
 		}
 
 		switch o.mode {
@@ -483,7 +548,8 @@ func FixFile(filename string, results []CheckResult) error {
 		}
 	}
 
-	return os.WriteFile(filename, []byte(strings.Join(lines, "\n")), 0644)
+	src.lines = lines
+	return os.WriteFile(filename, src.bytes(), 0644)
 }
 
 // FormatReport 格式化檢查報告為人類可讀字串
@@ -549,6 +615,15 @@ func exprToString(expr ast.Expr) string {
 		return e.Name
 	case *ast.StarExpr:
 		return "*" + exprToString(e.X)
+	// 泛型 receiver：先前不認得 IndexExpr / IndexListExpr，`(s *Stack[T]) Push` 顯示成 `*?.Push`
+	case *ast.IndexExpr:
+		return exprToString(e.X) + "[" + exprToString(e.Index) + "]"
+	case *ast.IndexListExpr:
+		params := make([]string, len(e.Indices))
+		for i, idx := range e.Indices {
+			params[i] = exprToString(idx)
+		}
+		return exprToString(e.X) + "[" + strings.Join(params, ", ") + "]"
 	default:
 		return "?"
 	}
@@ -590,6 +665,22 @@ func FixFileWithSuggester(ctx context.Context, filename string, results []CheckR
 			continue
 		}
 
+		// ai_comment=false：只把 Suggester 的一行說明當成普通 doc 標題，不寫任何 @ai 欄位
+		if r.DocOnly {
+			if r.HasRequired {
+				continue
+			}
+			name := strings.TrimPrefix(r.Name, r.Kind+" ")
+			req := SuggestRequest{Kind: r.Kind, Name: name, File: filename}
+			if r.Kind == "package" {
+				req.PkgName = name
+			}
+			if out, err := s.Suggest(ctx, req); err == nil && out.Doc != "" {
+				r.Suggested = "// " + out.Doc
+			}
+			continue
+		}
+
 		// 一律以真實 provider 取代 @ai:generated by=<unknown> 預設
 		if r.SuggestedTags == nil {
 			r.SuggestedTags = make(map[AnnotationType]string)
@@ -611,6 +702,14 @@ func FixFileWithSuggester(ctx context.Context, filename string, results []CheckR
 		out, err := s.Suggest(ctx, req)
 		if err != nil {
 			continue
+		}
+
+		// 以實際產生此建議的 provider 標示（fallback 時為備援者）；
+		// 先前一律用 s.ProviderName()，LLM 失敗改用 heuristic 時仍寫 by=<LLM 名稱>
+		if out.Provider != "" && out.Provider != provider {
+			gv := fmt.Sprintf("by=%s date=%s", out.Provider, date)
+			r.SuggestedTags[Generated] = gv
+			r.Suggested = replaceGeneratedProvider(r.Suggested, gv)
 		}
 
 		// 用 Suggester 產出的 doc 替換 r.Suggested 的 headline
@@ -762,7 +861,12 @@ func findHeadlineLineIdx(lines []string, docStart, docEnd int) int {
 		if i < 0 {
 			continue
 		}
-		text := strings.TrimSpace(strings.TrimPrefix(lines[i], "//"))
+		// 先去縮排再去 `//`：先前順序相反，縮排的 `\t// @ai:generated` 被當成 headline 覆寫掉
+		trimmed := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		text := strings.TrimSpace(strings.TrimPrefix(trimmed, "//"))
 		if text != "" && !strings.HasPrefix(text, "@ai:") {
 			return i
 		}
@@ -778,7 +882,7 @@ func findHeadlineLineIdx(lines []string, docStart, docEnd int) int {
 // @ai:purpose 補充 placeholder headline：在 LLM 有 git 脈絡時產生真實語意說明
 // @ai:input ctx context；filename 目標 .go 路徑；results CheckFile 的輸出；s Suggester
 // @ai:output 已替換的區塊數量，以及任何 IO / Suggest 錯誤
-// @ai:sideeffect 讀寫 filename（直接替換，不建立備份）
+// @ai:sideeffect 讀寫 filename（改寫前建立 <filename>.bak，同一次執行只備份一次）
 func EnrichMissingHeadlines(ctx context.Context, filename string, results []CheckResult, s Suggester) (int, error) {
 	if s == nil {
 		return 0, nil
@@ -788,7 +892,8 @@ func EnrichMissingHeadlines(ctx context.Context, filename string, results []Chec
 	if err != nil {
 		return 0, fmt.Errorf("enrich read: %w", err)
 	}
-	lines := strings.Split(string(content), "\n")
+	src, _ := splitSource(content)
+	lines := src.lines
 
 	count := 0
 	for _, r := range results {
@@ -832,14 +937,23 @@ func EnrichMissingHeadlines(ctx context.Context, filename string, results []Chec
 				break
 			}
 		}
-		lines[idx] = indent + "// " + out.Doc
+		eol := ""
+		if strings.HasSuffix(origLine, "\r") {
+			eol = "\r"
+		}
+		lines[idx] = indent + "// " + out.Doc + eol
 		count++
 	}
 
 	if count == 0 {
 		return 0, nil
 	}
-	if writeErr := os.WriteFile(filename, []byte(strings.Join(lines, "\n")), 0644); writeErr != nil {
+	// 先前直接覆寫、不建立備份
+	if _, err := backupOnce(filename, content); err != nil {
+		return 0, fmt.Errorf("enrich backup: %w", err)
+	}
+	src.lines = lines
+	if writeErr := os.WriteFile(filename, src.bytes(), 0644); writeErr != nil {
 		return count, fmt.Errorf("enrich write: %w", writeErr)
 	}
 	return count, nil

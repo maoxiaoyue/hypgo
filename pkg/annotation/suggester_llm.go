@@ -22,8 +22,8 @@ const (
 請只以 JSON 物件回覆，格式為：
 {"doc":"...", "annotations":[{"type":"security","value":"requires_auth"}]}
 不要附加任何其他文字。`
-	maxDocRunes   = 200
-	maxValueRunes = 120
+	maxDocRunes    = 200
+	maxValueRunes  = 120
 	maxAnnotations = 3
 )
 
@@ -141,9 +141,30 @@ func buildPrompt(req SuggestRequest) string {
 // ---------- Ollama ----------
 
 type ollamaRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model   string         `json:"model"`
+	Prompt  string         `json:"prompt"`
+	Stream  bool           `json:"stream"`
+	Options *ollamaOptions `json:"options,omitempty"`
+}
+
+type ollamaOptions struct {
+	NumPredict int `json:"num_predict,omitempty"`
+}
+
+// maxLLMResponseBytes 為 LLM 回應本文的讀取上限；先前 io.ReadAll 無上限，
+// 異常或惡意的伺服器可讓 hyp 吃光記憶體。
+const maxLLMResponseBytes = 4 << 20
+
+// readLimited 讀取至多 maxLLMResponseBytes；超過上限回傳 error。
+func readLimited(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxLLMResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxLLMResponseBytes {
+		return nil, fmt.Errorf("llm response exceeds %d bytes", maxLLMResponseBytes)
+	}
+	return data, nil
 }
 
 type ollamaResponse struct {
@@ -151,11 +172,16 @@ type ollamaResponse struct {
 }
 
 func (l *LLMSuggester) callOllama(ctx context.Context, prompt string) (string, error) {
-	body, _ := json.Marshal(ollamaRequest{
+	req := ollamaRequest{
 		Model:  l.cfg.Ollama.Model,
 		Prompt: prompt,
 		Stream: false,
-	})
+	}
+	// 先前不送任何上限，設定檔的 ollama.max_tokens 無效
+	if l.cfg.Ollama.MaxTokens > 0 {
+		req.Options = &ollamaOptions{NumPredict: l.cfg.Ollama.MaxTokens}
+	}
+	body, _ := json.Marshal(req)
 	url := strings.TrimRight(l.cfg.Ollama.URL, "/") + "/api/generate"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -171,7 +197,7 @@ func (l *LLMSuggester) callOllama(ctx context.Context, prompt string) (string, e
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("ollama: status %d", resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := readLimited(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -183,6 +209,9 @@ func (l *LLMSuggester) callOllama(ctx context.Context, prompt string) (string, e
 }
 
 // ---------- 雲端 API（OpenAI / Anthropic / OpenAI-compatible） ----------
+
+// geminiDefaultBaseURL 為 config.ApplyDefaults 為 provider=gemini 填入的預設 base URL
+const geminiDefaultBaseURL = "https://generativelanguage.googleapis.com/v1beta"
 
 func (l *LLMSuggester) callAPI(ctx context.Context, prompt string) (string, error) {
 	// 對齊 pkg/manifest/llm_enricher.go：只把 anthropic 視為特殊形狀，
@@ -214,17 +243,27 @@ func (l *LLMSuggester) callOpenAI(ctx context.Context, prompt string) (string, e
 		Model:    l.cfg.API.Model,
 		Messages: []openAIMessage{{Role: "user", Content: prompt}},
 	})
-	base := l.cfg.API.BaseURL
-	if base == "" {
+	base := strings.TrimRight(l.cfg.API.BaseURL, "/")
+	isGemini := strings.EqualFold(l.cfg.API.Provider, "gemini")
+	switch {
+	case base == "" && isGemini:
+		base = geminiDefaultBaseURL
+	case base == "":
 		base = "https://api.openai.com/v1"
 	}
-	url := strings.TrimRight(base, "/") + "/chat/completions"
+	// Gemini 的 OpenAI 相容端點位於 .../v1beta/openai/chat/completions；
+	// 先前預設 base URL（.../v1beta）直接接 /chat/completions，少了 /openai 段，請求必定失敗。
+	if isGemini && base == geminiDefaultBaseURL {
+		base += "/openai"
+	}
+	url := base + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+l.cfg.API.APIKey)
+	// 先前送 cfg.API.APIKey 原值，`${ENV}` 形式的 key 被原樣送出 → 401 → 靜默退回 heuristic
+	httpReq.Header.Set("Authorization", "Bearer "+l.cfg.API.ResolvedAPIKey())
 
 	resp, err := l.client.Do(httpReq)
 	if err != nil {
@@ -235,7 +274,7 @@ func (l *LLMSuggester) callOpenAI(ctx context.Context, prompt string) (string, e
 		return "", fmt.Errorf("openai: status %d", resp.StatusCode)
 	}
 	var out openAIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLLMResponseBytes)).Decode(&out); err != nil {
 		return "", err
 	}
 	if len(out.Choices) == 0 {
@@ -263,9 +302,14 @@ type anthropicResponse struct {
 }
 
 func (l *LLMSuggester) callAnthropic(ctx context.Context, prompt string) (string, error) {
+	// 先前固定送 512，設定檔的 api.max_tokens 無效；未設定（0）時維持 512
+	maxTokens := l.cfg.API.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 512
+	}
 	body, _ := json.Marshal(anthropicRequest{
 		Model:     l.cfg.API.Model,
-		MaxTokens: 512,
+		MaxTokens: maxTokens,
 		Messages:  []anthropicMessage{{Role: "user", Content: prompt}},
 	})
 	base := l.cfg.API.BaseURL
@@ -278,7 +322,7 @@ func (l *LLMSuggester) callAnthropic(ctx context.Context, prompt string) (string
 		return "", err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", l.cfg.API.APIKey)
+	httpReq.Header.Set("x-api-key", l.cfg.API.ResolvedAPIKey())
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := l.client.Do(httpReq)
@@ -290,7 +334,7 @@ func (l *LLMSuggester) callAnthropic(ctx context.Context, prompt string) (string
 		return "", fmt.Errorf("anthropic: status %d", resp.StatusCode)
 	}
 	var out anthropicResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLLMResponseBytes)).Decode(&out); err != nil {
 		return "", err
 	}
 	for _, c := range out.Content {

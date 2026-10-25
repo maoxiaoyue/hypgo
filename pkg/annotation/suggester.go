@@ -9,12 +9,12 @@ import (
 
 // SuggestRequest 描述一個待補註解的 Go 宣告，供 Suggester 產生 doc 與 @ai 標註
 type SuggestRequest struct {
-	Kind       string     // "package", "type", "func", "method", "const", "var"
-	Name       string     // "Create" 或 "UserController.Delete"
-	Receiver   string     // method receiver type；func 為空
-	Params     []string   // 參數名稱列表
-	PkgName    string     // 所屬 package 名稱
-	File       string     // 檔案路徑
+	Kind       string      // "package", "type", "func", "method", "const", "var"
+	Name       string      // "Create" 或 "UserController.Delete"
+	Receiver   string      // method receiver type；func 為空
+	Params     []string    // 參數名稱列表
+	PkgName    string      // 所屬 package 名稱
+	File       string      // 檔案路徑
 	GitContext *GitContext // git 歷史脈絡（nil = 無 git 資訊）
 }
 
@@ -22,6 +22,8 @@ type SuggestRequest struct {
 type Suggestion struct {
 	Doc         string       // 一行 godoc 風格說明（不含 // 前綴）
 	Annotations []Annotation // 附加的 @ai 標註
+	// Provider 為實際產生此建議者的名稱（fallback 時為備援者）；空字串 = 沿用 Suggester.ProviderName()
+	Provider string
 }
 
 // Suggester 抽象出「為宣告產生 doc 與 @ai 標註」的能力
@@ -57,13 +59,21 @@ type fallbackSuggester struct {
 func (s *fallbackSuggester) Suggest(ctx context.Context, req SuggestRequest) (Suggestion, error) {
 	if s.primary != nil {
 		if out, err := s.primary.Suggest(ctx, req); err == nil {
+			if out.Provider == "" {
+				out.Provider = s.primary.ProviderName()
+			}
 			return out, nil
 		}
 	}
-	return s.fallback.Suggest(ctx, req)
+	// 標示實際產生者：先前只能從 ProviderName() 得知 primary 名稱，heuristic 的輸出也被標成 by=<LLM 名稱>
+	out, err := s.fallback.Suggest(ctx, req)
+	if err == nil && out.Provider == "" {
+		out.Provider = s.fallback.ProviderName()
+	}
+	return out, err
 }
 
-// ProviderName 偏好 primary 的名稱，fallback 時仍可標示真實使用的 provider
+// ProviderName 回傳 primary 的名稱；單次建議實際由誰產生請看 Suggestion.Provider
 func (s *fallbackSuggester) ProviderName() string {
 	if s.primary != nil {
 		return s.primary.ProviderName()

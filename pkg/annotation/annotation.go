@@ -140,6 +140,15 @@ func HumanAuthor(text string) (string, bool) {
 		if isReservedAnnotationName(handle) {
 			continue
 		}
+		// 作者標記只允許 `@<author>` 或 `@<author> <時間戳>`；並排除 swag / godoc 慣用標註。
+		// 先前任何 `// @Word ...`（如 swagger 的 `// @Summary`、`// @Router`）都被當成作者，
+		// handler 因此被標為 [HUMAN] 並免除 @ai 必填檢查。
+		if rest := strings.TrimSpace(line[i:]); rest != "" && (rest[0] < '0' || rest[0] > '9') {
+			continue
+		}
+		if isDocToolKeyword(handle) {
+			continue
+		}
 		return handle, true
 	}
 	return "", false
@@ -161,6 +170,19 @@ func isReservedAnnotationName(name string) bool {
 		return true
 	}
 	return strings.ToLower(name) == "ai"
+}
+
+// isDocToolKeyword 判斷代號是否為 swag（swaggo）/ godoc / JSDoc 風格工具的標註關鍵字。
+// 這些關鍵字後面可能直接接數字（如 `// @Success 200 {object} User`），無法單靠格式排除。
+func isDocToolKeyword(name string) bool {
+	switch strings.ToLower(name) {
+	case "summary", "description", "tags", "tag", "accept", "produce", "param", "success",
+		"failure", "response", "header", "router", "id", "title", "version", "host", "basepath",
+		"schemes", "contact", "license", "termsofservice", "securitydefinitions", "externaldocs",
+		"query", "return", "returns", "see", "since", "todo", "fixme", "note":
+		return true
+	}
+	return false
 }
 
 // FormatAnnotation 將 Annotation 格式化為 Go 註解字串

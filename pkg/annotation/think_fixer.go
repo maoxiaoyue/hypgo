@@ -20,6 +20,8 @@ import (
 type ThinkSuggestion struct {
 	Intent  string
 	Special string
+	// Model 為實際產生此建議者的名稱（fallback 時為備援者）；空字串 = 沿用 ThinkSuggester.ModelName()
+	Model string
 }
 
 // ThinkSuggestRequest 描述一個待補 @ai:think 的函式
@@ -80,6 +82,12 @@ func resolveModelName(cfg *config.LLMConfig) string {
 	return "unknown"
 }
 
+// NewHeuristicThinkSuggester 建立不需 LLM 的啟發式 ThinkSuggester（依函式名稱前綴推斷意圖）。
+// 供 LLM mode=none 時的 --fixintent 使用。
+func NewHeuristicThinkSuggester() ThinkSuggester {
+	return &heuristicThinkSuggester{}
+}
+
 // --- fallback ---
 
 type fallbackThinkSuggester struct {
@@ -93,10 +101,18 @@ func (f *fallbackThinkSuggester) SuggestThink(ctx context.Context, req ThinkSugg
 		// 「沒 error 但回傳空」也視為失敗 → 走 fallback
 		// （某些 LLM 在 prompt 過長或不熟悉的格式時會回傳空字串而非 error）
 		if err == nil && (out.Intent != "" || out.Special != "") {
+			if out.Model == "" {
+				out.Model = f.primary.ModelName()
+			}
 			return out, nil
 		}
 	}
-	return f.fallback.SuggestThink(ctx, req)
+	// 標示實際產生者：先前 ModelName() 一律回報 primary，heuristic 的輸出也被標成 model=<LLM 名稱>
+	out, err := f.fallback.SuggestThink(ctx, req)
+	if err == nil && out.Model == "" {
+		out.Model = f.fallback.ModelName()
+	}
+	return out, err
 }
 
 func (f *fallbackThinkSuggester) ModelName() string {
@@ -336,7 +352,7 @@ type FixThinkOpts struct {
 }
 
 // FixThinkFile 在缺少 //@ai:think 的函式體中插入意圖註解。
-// 回傳修補的函式數量。修改前會建立 .bak 備份。
+// 回傳修補的函式數量。修改前會建立 .bak 備份（同一次執行只備份一次）。
 // 等同 FixThinkFileWithOpts(ctx, filename, report, s, FixThinkOpts{}).
 func FixThinkFile(ctx context.Context, filename string, report *ThinkReport, s ThinkSuggester) (int, error) {
 	return FixThinkFileWithOpts(ctx, filename, report, s, FixThinkOpts{})
@@ -345,28 +361,37 @@ func FixThinkFile(ctx context.Context, filename string, report *ThinkReport, s T
 // FixThinkFileWithOpts 同 FixThinkFile，但接受 opts 控制行為。
 // opts.Retroactive=true 時切換為事後反推模式（搭配 --fixintent --all）。
 func FixThinkFileWithOpts(ctx context.Context, filename string, report *ThinkReport, s ThinkSuggester, opts FixThinkOpts) (int, error) {
+	res, err := FixThinkFileDetailed(ctx, filename, report, s, opts)
+	return res.Fixed, err
+}
+
+// FixThinkResult 為 FixThinkFileDetailed 的結果
+type FixThinkResult struct {
+	Fixed   int           // 實際插入 //@ai:think 的函式數
+	Skipped []ThinkResult // `{` 同一行還有程式碼、無法安全插入而略過的函式
+	Models  []string      // 實際產生內容的 model 名稱（去重，依出現順序）
+}
+
+// FixThinkFileDetailed 同 FixThinkFileWithOpts，另回傳被略過的函式與實際使用的 model。
+func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkReport, s ThinkSuggester, opts FixThinkOpts) (FixThinkResult, error) {
+	var res FixThinkResult
 	if report == nil || len(report.Missing) == 0 {
-		return 0, nil
+		return res, nil
 	}
 
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		return 0, fmt.Errorf("read: %w", err)
+		return res, fmt.Errorf("read: %w", err)
 	}
 
-	backupPath := filename + ".bak"
-	if err := os.WriteFile(backupPath, content, 0644); err != nil {
-		return 0, fmt.Errorf("backup: %w", err)
-	}
-
+	src, body := splitSource(content)
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
+	f, err := parser.ParseFile(fset, filename, body, parser.ParseComments)
 	if err != nil {
-		return 0, fmt.Errorf("parse: %w", err)
+		return res, fmt.Errorf("parse: %w", err)
 	}
 
-	lines := strings.Split(string(content), "\n")
-	modelName := s.ModelName()
+	lines := src.lines
 
 	type insertOp struct {
 		braceLineIdx int
@@ -391,7 +416,16 @@ func FixThinkFileWithOpts(ctx context.Context, filename string, report *ThinkRep
 			continue
 		}
 
-		braceIdx := fset.Position(fd.Body.Lbrace).Line - 1
+		lbrace := fset.Position(fd.Body.Lbrace)
+		braceIdx := lbrace.Line - 1
+
+		// 先前一律插在 `{` 的下一行：單行函式體（func A() { return }）的 think 行落到函式之外、
+		// 變成下一個函式的 doc；`{` 同行開始的多行 raw string 則被插進字串內容；且每次重跑都再插一次。
+		// `{` 之後同一行還有程式碼（含 `}`）時無法安全插入，略過並回報。
+		if braceIdx < len(lines) && hasCodeAfterBrace(lines[braceIdx], lbrace.Column) {
+			res.Skipped = append(res.Skipped, m)
+			continue
+		}
 
 		bodyEnd := fset.Position(fd.Body.Rbrace).Line
 		srcStart := declLine - 1
@@ -417,8 +451,14 @@ func FixThinkFileWithOpts(ctx context.Context, filename string, report *ThinkRep
 			File:        filename,
 			Retroactive: opts.Retroactive,
 		})
+		modelName := suggestion.Model
+		if modelName == "" {
+			modelName = s.ModelName()
+		}
 		if sugErr != nil {
+			// 固定的 TODO 文字不是任何 model 產生的
 			suggestion = ThinkSuggestion{Intent: fallbackIntent(opts.Retroactive)}
+			modelName = "heuristic"
 		}
 
 		suffix := fmt.Sprintf("model=%s", modelName)
@@ -438,6 +478,9 @@ func FixThinkFileWithOpts(ctx context.Context, filename string, report *ThinkRep
 		}
 
 		ops = append(ops, insertOp{braceLineIdx: braceIdx, thinkLines: thinkLines})
+		if !containsString(res.Models, modelName) {
+			res.Models = append(res.Models, modelName)
+		}
 	}
 
 	sort.Slice(ops, func(i, j int) bool {
@@ -455,14 +498,14 @@ func FixThinkFileWithOpts(ctx context.Context, filename string, report *ThinkRep
 		if insertAt < len(lines) {
 			nextLine := lines[insertAt]
 			trimmed := strings.TrimLeft(nextLine, " \t")
-			if trimmed != "" && trimmed != "}" {
+			if t := strings.TrimSpace(trimmed); t != "" && t != "}" {
 				indent = nextLine[:len(nextLine)-len(trimmed)]
 			}
 		}
 
 		newLines := make([]string, len(op.thinkLines))
 		for i, tl := range op.thinkLines {
-			newLines[i] = indent + tl
+			newLines[i] = indent + tl + src.eolCR
 		}
 
 		before := append([]string{}, lines[:insertAt]...)
@@ -472,8 +515,35 @@ func FixThinkFileWithOpts(ctx context.Context, filename string, report *ThinkRep
 	}
 
 	if count == 0 {
-		return 0, nil
+		return res, nil
 	}
 
-	return count, os.WriteFile(filename, []byte(strings.Join(lines, "\n")), 0644)
+	if _, err := backupOnce(filename, content); err != nil {
+		return res, fmt.Errorf("backup: %w", err)
+	}
+	src.lines = lines
+	if err := os.WriteFile(filename, src.bytes(), 0644); err != nil {
+		return res, err
+	}
+	res.Fixed = count
+	return res, nil
+}
+
+// hasCodeAfterBrace 回傳函式體 `{`（位於 line 的第 col 欄，1-based）之後同一行是否還有程式碼；
+// 只有 `//` 行尾註解不算。
+func hasCodeAfterBrace(line string, col int) bool {
+	if col < 1 || col > len(line) {
+		return false
+	}
+	rest := strings.TrimSpace(line[col:])
+	return rest != "" && !strings.HasPrefix(rest, "//")
+}
+
+func containsString(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

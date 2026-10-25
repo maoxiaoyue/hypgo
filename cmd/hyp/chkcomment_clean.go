@@ -18,7 +18,9 @@ var chkcommentCleanCmd = &cobra.Command{
 With --file, only that file is cleaned. Without --file, every .go file
 under the current working directory (recursively) is cleaned. Common
 directories like vendor/, .git/, node_modules/, .hyp/ and testdata/
-are skipped.
+are skipped, as are _test.go files. Only real comments are removed
+(text inside string literals is never touched) and compiler directives
+such as //go:embed or //export are always kept.
 
 --level controls which @ai tags to remove:
   1 (default) — remove ALL @ai annotations (doc block + func body)
@@ -29,7 +31,8 @@ Special rule: if removing @ai:generated leaves a doc comment without a
 human author marker (// @<name>), the descriptive text below is also
 removed (since it was AI-authored).
 
-Each modified file gets a .bak backup before being rewritten.
+Each modified file gets a .bak backup before being rewritten (holding the
+content from before this run).
 
 Examples:
   hyp chkcomment clean                              # clean every .go file (level 1)

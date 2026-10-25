@@ -40,10 +40,11 @@ func ParseCleanLevel(n int) (CleanLevel, error) {
 
 // CleanReport 描述單一檔案的清理結果
 type CleanReport struct {
-	Filename     string
-	Removed      int  // 移除的行數（含 @ai 行與被連帶移除的描述行）
-	Modified     bool // 檔案是否實際被修改
-	BackupPath   string
+	Filename   string
+	Removed    int  // 移除的行數（含 @ai 行與被連帶移除的描述行）
+	Modified   bool // 檔案是否實際被修改
+	BackupPath string
+	Err        error // CleanDir 中個別檔案失敗（如無法解析）時的錯誤；失敗檔不算已清理
 }
 
 // CleanFile 清除單一 Go 原始檔的 //@ai 註釋
@@ -58,13 +59,15 @@ func CleanFile(filename string, level CleanLevel) (*CleanReport, error) {
 		return nil, fmt.Errorf("read %s: %w", filename, err)
 	}
 
+	// 去掉檔首 BOM 再解析，讓註解的欄位與 lines 一致；寫回時補回
+	src, body := splitSource(content)
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
+	f, err := parser.ParseFile(fset, filename, body, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", filename, err)
 	}
 
-	lines := strings.Split(string(content), "\n")
+	lines := src.lines
 	toRemove := make(map[int]bool) // 0-indexed lines to remove
 
 	// 處理 package doc 與所有 declaration 的 doc / body
@@ -76,7 +79,7 @@ func CleanFile(filename string, level CleanLevel) (*CleanReport, error) {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
 			processDocForClean(lines, fset, d.Doc, level, toRemove)
-			processBodyForClean(lines, fset, d, level, toRemove)
+			processBodyForClean(lines, fset, f.Comments, d, toRemove)
 		case *ast.GenDecl:
 			processDocForClean(lines, fset, d.Doc, level, toRemove)
 			for _, spec := range d.Specs {
@@ -95,8 +98,8 @@ func CleanFile(filename string, level CleanLevel) (*CleanReport, error) {
 	}
 
 	// 寫 .bak（僅在實際要改檔時建立）
-	backupPath := filename + ".bak"
-	if err := os.WriteFile(backupPath, content, 0644); err != nil {
+	backupPath, err := backupOnce(filename, content)
+	if err != nil {
 		return nil, fmt.Errorf("write backup: %w", err)
 	}
 
@@ -109,7 +112,8 @@ func CleanFile(filename string, level CleanLevel) (*CleanReport, error) {
 		out = append(out, line)
 	}
 
-	if err := os.WriteFile(filename, []byte(strings.Join(out, "\n")), 0644); err != nil {
+	src.lines = out
+	if err := os.WriteFile(filename, src.bytes(), 0644); err != nil {
 		return nil, fmt.Errorf("write %s: %w", filename, err)
 	}
 
@@ -122,7 +126,7 @@ func CleanFile(filename string, level CleanLevel) (*CleanReport, error) {
 }
 
 // CleanDir 遞迴清理 rootDir 下所有 .go 檔
-// 自動跳過 vendor / .git / node_modules / .hyp / *_test.go 中的 testdata
+// 自動跳過 vendor / .git / node_modules / .hyp / testdata 目錄與 *_test.go 檔
 func CleanDir(rootDir string, level CleanLevel) ([]CleanReport, error) {
 	var reports []CleanReport
 
@@ -139,8 +143,8 @@ func CleanDir(rootDir string, level CleanLevel) ([]CleanReport, error) {
 			}
 			return nil
 		}
-		// 只處理 .go，跳過 .bak / 隱藏檔
-		if !strings.HasSuffix(path, ".go") {
+		// 只處理 .go，跳過 .bak / 隱藏檔；_test.go 也跳過（先前註解宣稱會跳過，實際照樣改寫測試檔）
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		report, cleanErr := CleanFile(path, level)
@@ -150,6 +154,7 @@ func CleanDir(rootDir string, level CleanLevel) ([]CleanReport, error) {
 				Filename: path,
 				Removed:  0,
 				Modified: false,
+				Err:      cleanErr,
 			})
 			fmt.Fprintf(os.Stderr, "  ! %s: %v\n", path, cleanErr)
 			return nil
@@ -170,70 +175,112 @@ func CleanDir(rootDir string, level CleanLevel) ([]CleanReport, error) {
 // processDocForClean 處理單一 doc comment cgroup：
 //  1. 依 level 標記要移除的 @ai 行
 //  2. 若移除了 @ai:generated 且無 @<human> 標記，連描述行一起移除
+//
+// 只刪除「整行就是該註解」的行；`//go:embed`、`//go:noinline`、`//export`、`//line` 等編譯指示一律保留
+// （先前清描述時把它們當成 AI 描述一起刪掉，改變了編譯行為）。
 func processDocForClean(lines []string, fset *token.FileSet, doc *ast.CommentGroup, level CleanLevel, toRemove map[int]bool) {
 	if doc == nil {
 		return
 	}
 
-	startLine := fset.Position(doc.Pos()).Line - 1
-	endLine := fset.Position(doc.End()).Line - 1
-	if startLine < 0 || endLine >= len(lines) {
-		return
-	}
-
 	// 先檢查整個 doc 文字是否有 human marker（不會被移除）
-	docText := strings.Join(lines[startLine:endLine+1], "\n")
-	_, hasHuman := HumanAuthor(docText)
+	var sb strings.Builder
+	for _, c := range doc.List {
+		sb.WriteString(c.Text)
+		sb.WriteString("\n")
+	}
+	_, hasHuman := HumanAuthor(sb.String())
 
 	removedGenerated := false
-	for i := startLine; i <= endLine; i++ {
-		tag, ok := extractAITag(lines[i])
-		if !ok {
+	for _, c := range doc.List {
+		tag, ok := extractAITag(c.Text)
+		if !ok || !shouldRemoveByLevel(tag, level) {
 			continue
 		}
-		if shouldRemoveByLevel(tag, level) {
-			toRemove[i] = true
-			if tag == string(Generated) {
-				removedGenerated = true
-			}
+		if markCommentLines(lines, fset, c, toRemove) && tag == string(Generated) {
+			removedGenerated = true
 		}
 	}
 
-	// 「移除 generated 且無 human marker」→ 連描述一起清
+	// 「移除 generated 且無 human marker」→ 連描述一起清（純 `//` 空白註釋行也算描述的一部分）
 	// 此規則只在「會移除 generated」的 level（1, 3）下會觸發
 	if removedGenerated && !hasHuman {
-		for i := startLine; i <= endLine; i++ {
-			if toRemove[i] {
+		for _, c := range doc.List {
+			if isAITagLine(c.Text) || isCompilerDirective(c.Text) || isToolAnnotation(c.Text) {
 				continue
 			}
-			s := strings.TrimSpace(lines[i])
-			// 純空白註釋行（`//`）也算描述的一部分
-			if s == "" {
-				continue // 空行不處理
-			}
-			if !isAITagLine(lines[i]) {
-				toRemove[i] = true
+			markCommentLines(lines, fset, c, toRemove)
+		}
+	}
+}
+
+// processBodyForClean 移除 func body 內的 //@ai:think 註解行（所有 level 都會清）。
+// 以 AST 的註解位置判斷：先前逐行比對文字，raw string 內容裡的 `//@ai:think` 也被刪掉。
+func processBodyForClean(lines []string, fset *token.FileSet, comments []*ast.CommentGroup, fd *ast.FuncDecl, toRemove map[int]bool) {
+	if fd.Body == nil {
+		return
+	}
+	for _, cg := range comments {
+		if cg.End() <= fd.Body.Lbrace || cg.Pos() >= fd.Body.Rbrace {
+			continue
+		}
+		for _, c := range cg.List {
+			if tag, ok := extractAITag(c.Text); ok && tag == "think" {
+				markCommentLines(lines, fset, c, toRemove)
 			}
 		}
 	}
 }
 
-// processBodyForClean 移除 func body 內的 //@ai:think 行（所有 level 都會清）
-func processBodyForClean(lines []string, fset *token.FileSet, fd *ast.FuncDecl, _ CleanLevel, toRemove map[int]bool) {
-	if fd.Body == nil {
-		return
+// markCommentLines 把註解 c 所佔的行標記為待刪並回傳 true；註解前後同一行還有其他內容
+// （如 `x := 1 // @ai:think`）時不刪、回傳 false。
+func markCommentLines(lines []string, fset *token.FileSet, c *ast.Comment, toRemove map[int]bool) bool {
+	start := fset.Position(c.Pos())
+	end := fset.Position(c.End())
+	si, ei := start.Line-1, end.Line-1
+	if si < 0 || ei >= len(lines) || start.Column-1 > len(lines[si]) || end.Column-1 > len(lines[ei]) {
+		return false
 	}
-	bodyStart := fset.Position(fd.Body.Lbrace).Line - 1
-	bodyEnd := fset.Position(fd.Body.Rbrace).Line - 1
-	if bodyStart < 0 || bodyEnd >= len(lines) {
-		return
+	if strings.TrimSpace(lines[si][:start.Column-1]) != "" || strings.TrimSpace(lines[ei][end.Column-1:]) != "" {
+		return false
 	}
-	for i := bodyStart + 1; i < bodyEnd; i++ {
-		tag, ok := extractAITag(lines[i])
-		if ok && tag == "think" {
-			toRemove[i] = true
+	for i := si; i <= ei; i++ {
+		toRemove[i] = true
+	}
+	return true
+}
+
+// isToolAnnotation 判斷註解是否為 `// @Word ...` 形式的工具標註（如 swag 的 `// @Summary`、`// @Router`）。
+// HumanAuthor 不再把它們視為人類作者標記，清描述時也不能把它們當成 AI 散文刪掉，否則 swagger 文件會消失。
+func isToolAnnotation(text string) bool {
+	s := strings.TrimSpace(strings.TrimPrefix(text, "//"))
+	return strings.HasPrefix(text, "//") && strings.HasPrefix(s, "@") && !strings.HasPrefix(s, "@ai:")
+}
+
+// isCompilerDirective 判斷註解是否為編譯器 / 工具指示，規則同 go/ast：`//line `、`//extern `、`//export `，
+// 或 `//[a-z0-9]+:[a-z0-9]` 形式（如 `//go:embed`、`//go:noinline`、`//go:linkname`、`//nolint:xxx`）。
+func isCompilerDirective(text string) bool {
+	if !strings.HasPrefix(text, "//") {
+		return false
+	}
+	c := text[2:]
+	if strings.HasPrefix(c, "line ") || strings.HasPrefix(c, "extern ") || strings.HasPrefix(c, "export ") {
+		return true
+	}
+	colon := strings.Index(c, ":")
+	if colon <= 0 || colon+1 >= len(c) {
+		return false
+	}
+	for i := 0; i <= colon+1; i++ {
+		if i == colon {
+			continue
+		}
+		b := c[i]
+		if !('a' <= b && b <= 'z' || '0' <= b && b <= '9') {
+			return false
 		}
 	}
+	return true
 }
 
 // extractAITag 從一行（可能含縮排與 // 前綴）抽出 @ai: 之後的 tag 名稱
@@ -279,14 +326,23 @@ func shouldRemoveByLevel(tag string, level CleanLevel) bool {
 // FormatCleanReports 把 CleanDir 的結果整理成終端報告
 func FormatCleanReports(reports []CleanReport) string {
 	var sb strings.Builder
-	totalLines := 0
+	totalLines, cleaned, failed := 0, 0, 0
 	for _, r := range reports {
+		if r.Err != nil {
+			failed++
+			continue
+		}
 		if !r.Modified {
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("  ~ %s (removed %d line(s), backup: %s)\n", r.Filename, r.Removed, r.BackupPath))
 		totalLines += r.Removed
+		cleaned++
 	}
-	sb.WriteString(fmt.Sprintf("\nCleaned %d file(s), removed %d line(s) total.\n", len(reports), totalLines))
+	// 先前用 len(reports) 計數，無法解析的失敗檔也被算成已清理
+	sb.WriteString(fmt.Sprintf("\nCleaned %d file(s), removed %d line(s) total.\n", cleaned, totalLines))
+	if failed > 0 {
+		sb.WriteString(fmt.Sprintf("%d file(s) failed (see errors above).\n", failed))
+	}
 	return sb.String()
 }
