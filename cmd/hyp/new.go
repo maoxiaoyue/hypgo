@@ -440,7 +440,8 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Printf("   │   ├── js/\n")
 	fmt.Printf("   │   └── images/\n")
 	fmt.Printf("   ├── templates/\n")
-	fmt.Printf("   │   └── welcome.html\n")
+	fmt.Printf("   │   ├── welcome.html\n")
+	fmt.Printf("   │   └── templates.go   # embed 打包，routers.Setup 設定為樣板集\n")
 	fmt.Printf("   ├── go.mod\n")
 	fmt.Printf("   └── main.go\n")
 	fmt.Printf("\n🚀 Get started:\n")
@@ -593,6 +594,7 @@ func createRouterSetup(projectName, today string) error {
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/schema\"\n\n" +
 		"\t\"" + projectName + "/app/controllers\"\n" +
 		"\t\"" + projectName + "/app/models\"\n" +
+		"\t\"" + projectName + "/templates\"\n" +
 		")\n\n" +
 		"// Setup 註冊所有路由與中間件。\n" +
 		"// 在 main.go 呼叫：routers.Setup(srv.Router())。\n" +
@@ -602,6 +604,8 @@ func createRouterSetup(projectName, today string) error {
 		"\t// 額外的全域中間件（CSRF、BodyLimit…）在此加\n\n" +
 		"\t// 靜態資源\n" +
 		"\tr.Static(\"/static\", \"./static\")\n\n" +
+		"\t// HTML 樣板（embed 打包，c.HTML 以檔名渲染）\n" +
+		"\tr.SetHTMLTemplate(templates.HTML)\n\n" +
 		"\t// Controller 實例（薄控制器；業務邏輯置於 app/services）\n" +
 		"\thome := &controllers.HomeController{}\n\n" +
 		// 先前首頁以 r.GET 註冊、沒有 Schema：全新專案的 hyp lint 即因 no_schema 失敗
@@ -652,9 +656,12 @@ func createFullStackController(projectName, today string) error {
 		")\n\n" +
 		"// HomeController 處理首頁與系統狀態相關路由。\n" +
 		"type HomeController struct{}\n\n" +
-		"// Home 回傳歡迎頁面。\n" +
+		"// Home 回傳歡迎頁面（templates/welcome.html，經 routers.Setup 設定的樣板集渲染）。\n" +
 		"func (ctrl *HomeController) Home(c *hypcontext.Context) {\n" +
-		"\tc.File(\"templates/welcome.html\")\n" +
+		"\tc.HTML(200, \"welcome.html\", map[string]string{\n" +
+		"\t\t\"Title\":    \"Welcome to HypGo\",\n" +
+		"\t\t\"Protocol\": c.Request.Proto,\n" +
+		"\t})\n" +
 		"}\n\n" +
 		"// Health 回傳服務健康狀態。\n" +
 		"func (ctrl *HomeController) Health(c *hypcontext.Context) {\n" +
@@ -737,8 +744,29 @@ func createWelcomeTemplate(projectName string) error {
 `
 
 	filename := filepath.Join(projectName, "templates", "welcome.html")
-	return writeNewFile(filename, []byte(templateContent), 0644)
+	if err := writeNewFile(filename, []byte(templateContent), 0644); err != nil {
+		return err
+	}
+	return writeNewFile(filepath.Join(projectName, "templates", "templates.go"), []byte(templatesPackage), 0644)
 }
+
+// templatesPackage 以 embed 打包 templates/*.html。先前首頁以相對路徑 c.File("templates/welcome.html")
+// 送出：工作目錄不是專案根目錄時（從 routers/ 執行的 contract 測試、從別處啟動的伺服器）一律 404，
+// 且 welcome.html 的 {{.Title}} / {{.Protocol}} 從未經過樣板渲染、原樣送出
+const templatesPackage = `// Package templates 以 embed 打包 HTML 樣板，渲染不依賴執行時的工作目錄。
+package templates
+
+import (
+	"embed"
+	"html/template"
+)
+
+//go:embed *.html
+var files embed.FS
+
+// HTML 為已解析的樣板集，由 routers.Setup 交給 r.SetHTMLTemplate
+var HTML = template.Must(template.ParseFS(files, "*.html"))
+`
 
 func createStaticAssets(projectName string) error {
 	// CSS 文件

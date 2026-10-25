@@ -464,3 +464,26 @@ func TestTestgenFileShorthand(t *testing.T) {
 		t.Errorf("-f should be the shorthand of --file, got %v", f)
 	}
 }
+
+// TestNewHomePageUsesEmbeddedTemplate 迴歸測試（scaffold 首頁 404）：首頁以 embed 打包的樣板渲染。
+// 歷史 bug：以相對路徑 c.File("templates/welcome.html") 送出，工作目錄不是專案根目錄時
+// （從 routers/ 執行的 contract 測試、從別處啟動的伺服器）一律 404，{{.Title}} 也從未渲染
+func TestNewHomePageUsesEmbeddedTemplate(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "new", "webapp"); err != nil {
+		t.Fatal(err)
+	}
+	home, _ := os.ReadFile(filepath.Join("webapp", "app", "controllers", "home.go"))
+	if strings.Contains(string(home), "c.File(") || !strings.Contains(string(home), `c.HTML(200, "welcome.html"`) {
+		t.Errorf("home controller should render the embedded template:\n%s", home)
+	}
+	tmpl, err := os.ReadFile(filepath.Join("webapp", "templates", "templates.go"))
+	if err != nil || !strings.Contains(string(tmpl), "//go:embed *.html") {
+		t.Errorf("templates/templates.go missing or not embedding: %v", err)
+	}
+	router, _ := os.ReadFile(filepath.Join("webapp", "routers", "router.go"))
+	if !strings.Contains(string(router), "r.SetHTMLTemplate(templates.HTML)") {
+		t.Error("router.go should install the embedded template set")
+	}
+}

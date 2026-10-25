@@ -58,8 +58,10 @@ func LoadCommentConfig(path string) (*CommentConfig, error) {
 const DefaultCommentYAML = `# HypGo 註釋開關設定
 # 放置於 .hyp/comment.yaml
 #
-# 這三個開關控制 hyp ai-rules 生成的規則檔（AGENTS.md/CLAUDE.md/CURSOR…）
-# 會要求 AI 寫哪些類型的註釋。打開 = 規則檔包含該規範；關閉 = 該規範不出現。
+# 這三個開關決定：
+#   - hyp ai-rules 生成的規則檔（AGENTS.md/CLAUDE.md/CURSOR…）要求 AI 寫哪些類型的註釋
+#   - hyp chkcomment 檢查哪些註釋（關閉的類型缺漏不算違規，--fix 也不補）
+#   - hyp generate 生成的程式碼是否附 @ai 區塊（ai_comment）
 #
 # 預設只啟用「普通註釋」，符合最低噪音原則；
 # 想開啟完整 AI 協作鏈時把另外兩個改為 true，再重新 hyp ai-rules 即可。

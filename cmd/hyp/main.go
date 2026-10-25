@@ -4,6 +4,7 @@ package main
 import (
 	"os"
 
+	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
 )
 
@@ -52,6 +53,8 @@ func init() {
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
 AI-Human Collaborative Go Framework — Web (HTTP/1.1 + HTTP/2 + HTTP/3) / CLI / Desktop / gRPC
 `)
+	// 生成專案的 go.mod 一律 require 與 CLI 相同的 hypgo 版本
+	scaffold.HypgoVersion = "v" + Version
 	registerCommands()
 }
 
