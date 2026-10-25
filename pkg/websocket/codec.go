@@ -69,8 +69,20 @@ type JSONCodec struct{}
 func (JSONCodec) Name() string { return "json" }
 func (JSONCodec) Index() int   { return 0 }
 
+// Marshal 序列化為 JSON。Data 不是合法 JSON 時（protobuf / msgpack / flatbuffers 客戶端
+// 送出的二進位內容，或 Hub.Broadcast 的原始位元組）改以 base64 字串輸出：
+// 先前 json.Marshal 對無效的 json.RawMessage 回錯誤，跨協議廣播時 JSON 客戶端靜默收不到
 func (JSONCodec) Marshal(msg *Message) ([]byte, error) {
-	return json.Marshal(msg)
+	if len(msg.Data) == 0 || json.Valid(msg.Data) {
+		return json.Marshal(msg)
+	}
+	return json.Marshal(struct {
+		Type      string `json:"type"`
+		Channel   string `json:"channel,omitempty"`
+		Data      []byte `json:"data"`
+		Timestamp int64  `json:"timestamp,omitempty"`
+		ClientID  string `json:"client_id,omitempty"`
+	}{msg.Type, msg.Channel, msg.Data, msg.Timestamp, msg.ClientID})
 }
 
 func (JSONCodec) Unmarshal(data []byte, msg *Message) error {
@@ -173,32 +185,25 @@ func marshalForClients(msg *Message, clients []*Client, security *SecurityConfig
 
 		// 安全管線
 		if security != nil {
-			if hasKeyOverride(client) {
+			gcm, hmacKey, override, err := clientKeys(client, security)
+			if err != nil {
+				continue
+			}
+			switch {
+			case override:
 				// per-client 金鑰：逐 client 運算
-				var err error
-				data, err = applySecurityOut(data, client, security)
-				if err != nil {
-					continue
-				}
-			} else if secured[idx] != nil {
+				data = applySecurityOutKeys(data, gcm, hmacKey, security.SignThenEncrypt)
+			case secured[idx] != nil:
 				data = secured[idx]
-			} else {
-				s, err := applySecurityOutKeys(data, security.AESKey, security.HMACKey, security.SignThenEncrypt)
-				if err != nil {
-					continue
-				}
-				secured[idx] = s
-				data = s
+			default:
+				data = applySecurityOutKeys(data, gcm, hmacKey, security.SignThenEncrypt)
+				secured[idx] = data
 			}
 		}
 
-		select {
-		case client.Send <- data:
-			if onSent != nil {
-				onSent(int64(len(data)))
-			}
-		default:
-			// 緩衝區滿，跳過
+		// 已斷線或緩衝區滿時跳過
+		if client.trySend(data) && onSent != nil {
+			onSent(int64(len(data)))
 		}
 	}
 }
