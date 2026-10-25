@@ -62,8 +62,8 @@ func TestUpgrader_Upgrade(t *testing.T) {
 		}
 
 		// Connect to the Hub (Simulate ServeHTTP)
-		client := AcquireClient("test-client", conn, hub, codecJSON)
-		hub.register <- client
+		client := newClient("test-client", conn, hub, codecJSON)
+		hub.handleRegister(client)
 
 		// Immediately close the connection for test
 		conn.Close()
@@ -135,7 +135,7 @@ func TestSubprotocolNegotiation(t *testing.T) {
 		defer conn.Close()
 
 		codec := CodecByName(conn.Subprotocol())
-		client := AcquireClient("test-sub", conn, hub, codec)
+		client := newClient("test-sub", conn, hub, codec)
 
 		if client.codec.Name() != "json" {
 			t.Errorf("Expected JSON codec, got %q", client.codec.Name())
@@ -177,7 +177,7 @@ func TestProtobufSubprotocolNegotiation(t *testing.T) {
 		defer conn.Close()
 
 		codec := CodecByName(conn.Subprotocol())
-		client := AcquireClient("test-pb", conn, hub, codec)
+		client := newClient("test-pb", conn, hub, codec)
 
 		if client.codec.Name() != "protobuf" {
 			t.Errorf("Expected Protobuf codec, got %q", client.codec.Name())
@@ -227,7 +227,7 @@ func TestDefaultCodecIsJSON(t *testing.T) {
 
 		// 不指定子協議時 Subprotocol() 返回空字串
 		codec := CodecByName(conn.Subprotocol())
-		client := AcquireClient("test-default", conn, hub, codec)
+		client := newClient("test-default", conn, hub, codec)
 
 		if client.codec.Name() != "json" {
 			t.Errorf("Default client codec should be JSON, got %q", client.codec.Name())
@@ -252,23 +252,15 @@ func TestClientCodecGetter(t *testing.T) {
 	hub := NewHub(log, DefaultConfig)
 
 	// JSON client
-	jsonClient := AcquireClient("json-1", nil, hub, codecJSON)
+	jsonClient := newClient("json-1", nil, hub, codecJSON)
 	if jsonClient.Codec().Name() != "json" {
 		t.Errorf("Expected 'json', got %q", jsonClient.Codec().Name())
 	}
 
 	// Protobuf client
-	pbClient := AcquireClient("pb-1", nil, hub, codecProtobuf)
+	pbClient := newClient("pb-1", nil, hub, codecProtobuf)
 	if pbClient.Codec().Name() != "protobuf" {
 		t.Errorf("Expected 'protobuf', got %q", pbClient.Codec().Name())
 	}
 
-	// Reset 後 codec 應為 nil
-	pbClient.reset()
-	if pbClient.codec != nil {
-		t.Error("codec should be nil after reset")
-	}
-	if pbClient.wsFrameType != 0 {
-		t.Error("wsFrameType should be 0 after reset")
-	}
 }

@@ -158,9 +158,9 @@ func gitOutput(args ...string) string {
 	return string(out)
 }
 
-// IsDiffLogEnabled 供 airules 模板使用
-func IsDiffLogEnabled() bool {
-	return isDiffLogEnabled()
+// IsDiffLogEnabled 供 airules 模板使用：讀取專案目錄 dir 下的 .hyp/config.json
+func IsDiffLogEnabled(dir string) bool {
+	return loadHypConfigFrom(filepath.Join(dir, hypConfigPath)).DiffLog
 }
 
 func isDiffLogEnabled() bool {
@@ -169,7 +169,11 @@ func isDiffLogEnabled() bool {
 }
 
 func loadHypConfig() hypConfig {
-	data, err := os.ReadFile(hypConfigPath)
+	return loadHypConfigFrom(hypConfigPath)
+}
+
+func loadHypConfigFrom(path string) hypConfig {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return hypConfig{}
 	}

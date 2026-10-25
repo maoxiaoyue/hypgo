@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+
+	"golang.org/x/mod/modfile"
 )
 
 // postScaffoldUpgrade 在 scaffold 完成後嘗試把專案的 hypgo 依賴升到 @latest
 // 並執行 go mod tidy。執行失敗（沒有 go / 沒網路 / 私有 module）時印警告但不中斷
-// 整個 hyp new 流程；產生的 go.mod 已有 v0.9.2 作為後備版本。
+// 整個 hyp new 流程；產生的 go.mod 已寫入與 hyp 本身相同的版本（version.go）作為後備。
 func postScaffoldUpgrade(projectDir string) {
 	// 確認 go 在 PATH 中
 	if _, err := exec.LookPath("go"); err != nil {
@@ -27,7 +30,8 @@ func postScaffoldUpgrade(projectDir string) {
 	get.Stderr = os.Stderr
 	if err := get.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: `go get @latest` failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "  Project still uses the bundled v0.9.2 baseline (see go.mod).\n")
+		// 先前固定宣稱「v0.9.2 baseline」，實際 go.mod 卻可能是 git ls-remote 失敗後的 v0.8.5
+		fmt.Fprintf(os.Stderr, "  Project keeps the hypgo version written by hyp: %s (see go.mod).\n", requiredHypgoVersion(projectDir))
 		fmt.Fprintf(os.Stderr, "  Retry manually: cd %s && go get github.com/maoxiaoyue/hypgo@latest\n", projectDir)
 		return
 	}
@@ -42,4 +46,22 @@ func postScaffoldUpgrade(projectDir string) {
 	}
 
 	fmt.Printf("✓ hypgo upgraded to latest; go.sum populated.\n")
+}
+
+// requiredHypgoVersion 回傳專案 go.mod require 的 hypgo 版本；讀不到時回 "unknown"
+func requiredHypgoVersion(projectDir string) string {
+	data, err := os.ReadFile(filepath.Join(projectDir, "go.mod"))
+	if err != nil {
+		return "unknown"
+	}
+	f, err := modfile.ParseLax("go.mod", data, nil)
+	if err != nil {
+		return "unknown"
+	}
+	for _, r := range f.Require {
+		if r.Mod.Path == "github.com/maoxiaoyue/hypgo" {
+			return r.Mod.Version
+		}
+	}
+	return "unknown"
 }

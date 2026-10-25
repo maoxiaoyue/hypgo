@@ -65,6 +65,11 @@ func runContext(cmd *cobra.Command, args []string) error {
 	format, _ := cmd.Flags().GetString("format")
 	pkg, _ := cmd.Flags().GetString("pkg")
 
+	// 先前未知的 -f 值靜默改輸出 YAML；在執行專案前就擋下
+	if format != "yaml" && format != "json" {
+		return fmt.Errorf("unknown format %q (use yaml or json)", format)
+	}
+
 	// 先前以空的 router.New() 收集，輸出裡沒有任何使用者路由（hyp 與專案是不同行程）。
 	// 改為實際執行專案，由 server.Start() 在路由註冊完成後寫出 manifest
 	collect := collectProjectManifest
@@ -84,12 +89,10 @@ func runContext(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	switch format {
-	case "json":
+	if format == "json" {
 		return manifest.WriteJSON(os.Stdout, m)
-	default:
-		return manifest.WriteYAML(os.Stdout, m)
 	}
+	return manifest.WriteYAML(os.Stdout, m)
 }
 
 // collectProjectManifest 以 HYPGO_MANIFEST_OUT 執行 go run <pkg>，讀回 server.Start() 寫出的 manifest。

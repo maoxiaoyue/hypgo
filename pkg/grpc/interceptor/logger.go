@@ -10,24 +10,34 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Logger 記錄每個 gRPC 呼叫的方法、耗時、狀態碼
+// Logger 記錄每個 unary 呼叫的方法、耗時、狀態碼
 func Logger(log *logger.Logger) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		start := time.Now()
-
 		resp, err := handler(ctx, req)
-
-		duration := time.Since(start)
-		st, _ := status.FromError(err)
-
-		if log != nil {
-			if err != nil {
-				log.Warningf("gRPC %s [%s] %v (%s)", info.FullMethod, st.Code(), err, duration)
-			} else {
-				log.Infof("gRPC %s [%s] (%s)", info.FullMethod, st.Code(), duration)
-			}
-		}
-
+		logCall(log, info.FullMethod, err, time.Since(start))
 		return resp, err
+	}
+}
+
+// StreamLogger 記錄每個 stream 呼叫的方法、持續時間、狀態碼（stream 結束時記一筆）
+func StreamLogger(log *logger.Logger) grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		start := time.Now()
+		err := handler(srv, ss)
+		logCall(log, info.FullMethod, err, time.Since(start))
+		return err
+	}
+}
+
+func logCall(log *logger.Logger, method string, err error, duration time.Duration) {
+	if log == nil {
+		return
+	}
+	st, _ := status.FromError(err)
+	if err != nil {
+		log.Warningf("gRPC %s [%s] %v (%s)", method, st.Code(), err, duration)
+	} else {
+		log.Infof("gRPC %s [%s] (%s)", method, st.Code(), duration)
 	}
 }

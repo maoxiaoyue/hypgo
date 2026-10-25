@@ -27,7 +27,7 @@ Testing:
 Project Management:
   new / api      Create full-stack or API-only project
   run            Start with hot reload + AutoSync (.hyp/context.yaml)
-  restart        Zero-downtime hot restart (Unix SIGUSR2)
+  restart        Zero-downtime hot restart (Unix SIGUSR2 via hypgo.pid)
   generate       Generate controller / model / service with Schema + Error Catalog
 
 Database:
@@ -35,7 +35,6 @@ Database:
   migrate snapshot  Save current schema as baseline
 
 Deployment:
-  docker         Build Docker image
   health         Check running application health
 
 Use "hyp [command] --help" for detailed information about each command.`,
@@ -65,43 +64,11 @@ func registerCommands() {
 	// version.go → versionCmd
 	// health.go → healthCmd
 
-	// 以下命令定義在 registerCommands 中（尚無獨立 .go 檔案）
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "run",
-		Short: "Run the HypGo application",
-		Long: `Start the HypGo application in development mode with hot reload.
-
-On startup, AutoSync automatically generates .hyp/context.yaml with the
-current project manifest for AI tool consumption.
-
-Examples:
-  hyp run`,
-		Run: func(cmd *cobra.Command, args []string) {},
-	})
-
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "restart",
-		Short: "Hot restart the application",
-		Long: `Perform a zero-downtime hot restart of the running HypGo application.
-Sends SIGUSR2 signal, forks a new process, then gracefully shuts down.
-Note: NOT supported on Windows.
-
-Examples:
-  hyp restart`,
-		Run: func(cmd *cobra.Command, args []string) {},
-	})
-
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "docker",
-		Short: "Build Docker image for the project",
-		Long: `Build a Docker image for the current HypGo project using a
-multi-stage Dockerfile based on config.yaml settings.
-
-Examples:
-  hyp docker`,
-		Run: func(cmd *cobra.Command, args []string) {},
-	})
-
+	// run / restart 定義於 run.go、restart.go（Unix）/ restart_windows.go。
+	// 先前這裡註冊的是空的 Run stub：hyp run / restart / docker 什麼都不做就 exit 0，
+	// 真正的實作從未被註冊；docker 已移除（hyp api 會產生 Dockerfile）
+	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(restartCmd)
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)

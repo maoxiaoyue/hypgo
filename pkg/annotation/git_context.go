@@ -1,9 +1,12 @@
 package annotation
 
 import (
+	"context"
 	"fmt"
+	"go/token"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // GitCommit git 提交記錄摘要
@@ -68,8 +71,8 @@ func GatherGitContext(filepath, declName, kind string, maxCommits int) *GitConte
 
 	// 函式/方法層級歷史：git log -L :<name>:<file>
 	// 此功能在部分 git 版本或 binary 模式下可能失敗，靜默退回
-	if (kind == "func" || kind == "method") && declName != "" {
-		lspec := fmt.Sprintf(":%s:%s", declName, filepath)
+	if (kind == "func" || kind == "method") && token.IsIdentifier(declName) {
+		lspec := fmt.Sprintf(":%s:%s", declFuncnameRegex(declName, kind), filepath)
 		declOut, declErr := runGitLog(
 			"-L", lspec,
 			fmt.Sprintf("-n%d", maxCommits),
@@ -113,10 +116,27 @@ func parseGitLog(output string) []GitCommit {
 	return commits
 }
 
+// declFuncnameRegex 回傳 `git log -L :<funcname>:<file>` 用的 funcname regex，錨定到宣告行。
+// 先前直接把名稱當 regex，`Get` 會先匹配到上方的 `func GetAll`，回傳別的函式的歷史。
+// git 以 POSIX BRE 解析此 regex，且 `-L` 參數中未跳脫的 `:` 會結束 funcname，
+// 因此空白類別用「空白 + tab」的 bracket，而不用 `[[:space:]]`。
+func declFuncnameRegex(declName, kind string) string {
+	const ws = "[ \t]"
+	if kind == "method" {
+		return "^func" + ws + "*([^)]*)" + ws + "*" + declName + ws + "*[[(]"
+	}
+	return "^func" + ws + ws + "*" + declName + ws + "*[[(]"
+}
+
+// gitLogTimeout 為單次 git log 的執行上限；先前沒有逾時，大型 repo 或卡住的 git 會讓 chkcomment 永遠不返回。
+const gitLogTimeout = 10 * time.Second
+
 // runGitLog 執行 git log <args...> 並回傳 stdout。
 // 使用 cmd.Output()，stderr 靜默丟棄。
 func runGitLog(args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"log"}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitLogTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"log"}, args...)...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

@@ -17,8 +17,29 @@ func GenerateSQL(changes []Change, dialect string) (up, down string) {
 	gen := &sqlGenerator{dialect: dialect}
 	var upLines, downLines []string
 
+	// 新增的表：其 AddColumn 併入 CREATE TABLE，不另外產生 ALTER TABLE。
+	// 先前 AddTable 只產出 down 的 DROP TABLE，up 只有一串 ALTER TABLE ... ADD COLUMN——
+	// 對不存在的表執行必定失敗
+	newCols := make(map[string][]*ColumnSchema)
 	for _, c := range changes {
+		if c.Type == AddTable {
+			newCols[c.Table] = []*ColumnSchema{}
+		}
+	}
+	for _, c := range changes {
+		if cols, ok := newCols[c.Table]; ok && c.Type == AddColumn && c.Column != nil {
+			newCols[c.Table] = append(cols, c.Column)
+		}
+	}
+
+	for _, c := range changes {
+		if _, ok := newCols[c.Table]; ok && c.Type == AddColumn {
+			continue
+		}
 		u, d := gen.generate(c)
+		if c.Type == AddTable {
+			u = gen.createTable(c.Table, newCols[c.Table])
+		}
 		if u != "" {
 			upLines = append(upLines, u)
 		}
@@ -27,7 +48,21 @@ func GenerateSQL(changes []Change, dialect string) (up, down string) {
 		}
 	}
 
+	// down 依相反順序回滾
+	for i, j := 0, len(downLines)-1; i < j; i, j = i+1, j-1 {
+		downLines[i], downLines[j] = downLines[j], downLines[i]
+	}
+
 	return strings.Join(upLines, "\n"), strings.Join(downLines, "\n")
+}
+
+// createTable 產生含所有欄位的 CREATE TABLE
+func (g *sqlGenerator) createTable(table string, cols []*ColumnSchema) string {
+	defs := make([]string, 0, len(cols))
+	for _, col := range cols {
+		defs = append(defs, "    "+g.quote(col.Name)+" "+g.columnDefinition(col))
+	}
+	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n%s\n);", g.quote(table), strings.Join(defs, ",\n"))
 }
 
 // MigrationFiles 回傳建議的檔案名稱
@@ -44,9 +79,7 @@ type sqlGenerator struct {
 func (g *sqlGenerator) generate(c Change) (up, down string) {
 	switch c.Type {
 	case AddTable:
-		// AddTable 只產出 CREATE/DROP，欄位由後續 AddColumn 處理
-		// 但為了產出完整 CREATE TABLE，需收集所有 AddColumn
-		// 這裡只回傳空，由 GenerateCreateTable 處理
+		// up 的 CREATE TABLE 需要該表全部的 AddColumn，由 GenerateSQL 呼叫 createTable 產生
 		return "", fmt.Sprintf("DROP TABLE IF EXISTS %s;", g.quote(c.Table))
 
 	case DropTable:

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
@@ -94,11 +95,17 @@ func (f *TypeFields) UnmarshalJSON(data []byte) error {
 }
 
 // collectTypes 收集 schema 宣告的 Input / Output / Responses 型別欄位，以型別名稱為鍵。
+// slice / map 型別登錄其元素型別：list 回應的 output_type 是 "[]UserResp"，types 要有 UserResp
+// （先前 FieldsOf(slice) 為 nil，list 回應在 types 區段沒有任何定義）。
 // ponytail: 以短型別名為鍵，不同套件的同名型別只留第一個（路由的 input_type 等本來就只有短名稱）
 func collectTypes(types map[string]TypeFields, s *schema.Route) {
 	add := func(name string, v interface{}) {
 		if name == "" || v == nil {
 			return
+		}
+		if t := elemType(reflect.TypeOf(v)); t != nil {
+			v = reflect.Zero(t).Interface()
+			name = schema.TypeName(v)
 		}
 		if _, ok := types[name]; ok {
 			return
@@ -111,5 +118,23 @@ func collectTypes(types map[string]TypeFields, s *schema.Route) {
 	add(s.OutputName, s.Output)
 	for _, resp := range s.Responses {
 		add(resp.TypeName, resp.Type)
+	}
+}
+
+// elemType 回傳 slice / array / map（可巢狀、可為指標）最內層的元素型別；t 不是這些型別時回 nil
+func elemType(t reflect.Type) reflect.Type {
+	unwrapped := false
+	for {
+		switch t.Kind() {
+		case reflect.Ptr:
+			t = t.Elem()
+		case reflect.Slice, reflect.Array, reflect.Map:
+			t, unwrapped = t.Elem(), true
+		default:
+			if unwrapped {
+				return t
+			}
+			return nil
+		}
 	}
 }

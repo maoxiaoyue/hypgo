@@ -5,102 +5,102 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
+
+// restartPIDFile server.Start() 寫入 CWD 的 PID 檔（pkg/server pidFilePath）
+const restartPIDFile = "hypgo.pid"
 
 var restartCmd = &cobra.Command{
 	Use:   "restart",
-	Short: "Restart the HypGo application gracefully",
-	Long:  `Restart the application with zero downtime using graceful shutdown`,
-	RunE:  runRestart,
+	Short: "Restart the HypGo application gracefully (Unix only)",
+	Long: `Restart the running application with zero downtime.
+
+Reads the PID from hypgo.pid (written by server.Start() in the app's working
+directory, so run this command from that directory) and sends SIGUSR2 to that
+process only. The server forks a new process that inherits the listener, then
+the old process shuts down gracefully.
+
+Requires server.enable_graceful_restart: true in config/config.yaml.
+Not supported on Windows.`,
+	RunE:         runRestart,
+	SilenceUsage: true,
 }
 
 func runRestart(cmd *cobra.Command, args []string) error {
-	// 查找正在運行的 HypGo 進程
-	pid, err := findHypGoProcess()
+	// 先前 PID 檔不存在時改以 pgrep -f main.go 找行程：會比對到編輯器等無關行程，
+	// 再送 SIGUSR2（預設動作是結束行程）把它們殺掉。現在只認 hypgo.pid
+	pid, err := readPIDFile(restartPIDFile)
 	if err != nil {
-		return fmt.Errorf("failed to find HypGo process: %w", err)
+		return err
+	}
+	if !isProcessRunning(pid) {
+		return fmt.Errorf("process %d from %s is not running (stale PID file); start the app first", pid, restartPIDFile)
 	}
 
-	if pid == 0 {
-		fmt.Println("❌ No HypGo process found running")
-		fmt.Println("💡 Use 'hyp run' to start the application")
-		return nil
+	// 未啟用 graceful restart 時 server 不處理 SIGUSR2，訊號的預設動作會直接結束行程
+	if enabled, ok := gracefulRestartConfigured("config/config.yaml"); ok && !enabled {
+		return fmt.Errorf("server.enable_graceful_restart is false in config/config.yaml; SIGUSR2 would terminate PID %d instead of restarting it", pid)
 	}
 
-	fmt.Printf("🔄 Found HypGo process with PID: %d\n", pid)
-
-	// 發送 SIGUSR2 信號進行熱重啟
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process: %w", err)
+	fmt.Printf("🔄 Sending graceful restart signal (SIGUSR2) to PID %d...\n", pid)
+	if err := syscall.Kill(pid, syscall.SIGUSR2); err != nil {
+		return fmt.Errorf("failed to send signal to PID %d: %w", pid, err)
 	}
 
-	fmt.Println("📤 Sending graceful restart signal...")
-	if err := process.Signal(syscall.SIGUSR2); err != nil {
-		return fmt.Errorf("failed to send signal: %w", err)
+	// 新行程啟動時（server.Start()）會覆寫 PID 檔
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		if newPid, err := readPIDFile(restartPIDFile); err == nil && newPid != pid && isProcessRunning(newPid) {
+			fmt.Printf("✅ Application restarted successfully! New PID: %d\n", newPid)
+			return nil
+		}
 	}
-
-	// 等待新進程啟動
-	fmt.Println("⏳ Waiting for new process to start...")
-	time.Sleep(2 * time.Second)
-
-	// 檢查新進程是否啟動成功
-	newPid, err := findHypGoProcess()
-	if err != nil {
-		return fmt.Errorf("failed to check new process: %w", err)
-	}
-
-	if newPid != 0 && newPid != pid {
-		fmt.Printf("✅ Application restarted successfully! New PID: %d\n", newPid)
-	} else {
-		fmt.Println("⚠️  Application may not have restarted properly")
-	}
-
-	return nil
+	return fmt.Errorf("no new process recorded in %s within 10s; check the application logs", restartPIDFile)
 }
 
-func findHypGoProcess() (int, error) {
-	// 查找 PID 文件
-	pidFile := "hypgo.pid"
-	if data, err := ioutil.ReadFile(pidFile); err == nil {
-		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-		if err == nil && isProcessRunning(pid) {
-			return pid, nil
-		}
-	}
-
-	// 如果 PID 文件不存在或無效，嘗試通過進程列表查找
-	output, err := exec.Command("pgrep", "-f", "main.go").Output()
+// readPIDFile 讀取 PID 檔
+func readPIDFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, nil
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for _, line := range lines {
-		if pid, err := strconv.Atoi(line); err == nil {
-			return pid, nil
+		if os.IsNotExist(err) {
+			return 0, fmt.Errorf("%s not found in the current directory: start the app (hyp run / go run .) from here first", path)
 		}
+		return 0, err
 	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("invalid PID in %s: %q", path, strings.TrimSpace(string(data)))
+	}
+	return pid, nil
+}
 
-	return 0, nil
+// gracefulRestartConfigured 讀取設定檔的 server.enable_graceful_restart；ok 為 false 表示無法判斷
+func gracefulRestartConfigured(path string) (enabled, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, false
+	}
+	var cfg struct {
+		Server struct {
+			EnableGracefulRestart *bool `yaml:"enable_graceful_restart"`
+		} `yaml:"server"`
+	}
+	if yaml.Unmarshal(data, &cfg) != nil || cfg.Server.EnableGracefulRestart == nil {
+		return false, false
+	}
+	return *cfg.Server.EnableGracefulRestart, true
 }
 
 func isProcessRunning(pid int) bool {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-
-	// 發送信號 0 來檢查進程是否存在
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
+	// 送訊號 0 檢查行程是否存在
+	return syscall.Kill(pid, syscall.Signal(0)) == nil
 }

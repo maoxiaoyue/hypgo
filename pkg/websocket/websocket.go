@@ -5,10 +5,14 @@ package websocket
 
 import (
 	"context"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,33 +23,16 @@ import (
 )
 
 // ===== 物件池 =====
+//
+// Client 與 Room 不池化：兩者的存活期與連線相同，且有 readPump / writePump 等 goroutine
+// 持有指標。先前斷線時把 Client 重設後放回池，仍在執行的 goroutine 隨即讀寫到被重設、
+// 甚至已分配給下一條連線的同一個物件（data race、對新連線並發寫入、Shutdown 時 nil Conn panic）
 
 var (
 	// Message 物件池
 	messagePool = &sync.Pool{
 		New: func() interface{} {
 			return &Message{}
-		},
-	}
-
-	// Client 物件池
-	// GC 優化：預分配 metadata map，避免延遲初始化的額外分配
-	clientPool = &sync.Pool{
-		New: func() interface{} {
-			return &Client{
-				Send:     make(chan []byte, 256),
-				Channels: make(map[string]bool, 4),
-				metadata: make(map[string]interface{}, 4),
-			}
-		},
-	}
-
-	// Room 物件池
-	roomPool = &sync.Pool{
-		New: func() interface{} {
-			return &Room{
-				Clients: make(map[*Client]bool),
-			}
 		},
 	}
 
@@ -81,15 +68,31 @@ type Config struct {
 	WriteBufferSize   int
 	HandshakeTimeout  time.Duration
 	EnableCompression bool // 向後兼容：Compression 為 nil 時使用此欄位
-	CheckOrigin       func(*http.Request) bool
-	MaxMessageSize    int64
-	PingInterval      time.Duration
-	PongTimeout       time.Duration
-	WriteTimeout      time.Duration
-	Subprotocols      []string           // 支援的子協議（JSON/Protobuf/FlatBuffers/MessagePack）
-	TLS               *TLSConfig         // nil = ws://，non-nil = wss://（獨立模式）
-	Security          *SecurityConfig    // nil = 無安全層（AES + HMAC）
-	Compression       *CompressionConfig // nil 時回退 EnableCompression
+	// CheckOrigin 自訂 Origin 檢查。未設定時依 AllowedOrigins；兩者都未設定時採 gorilla 的
+	// 同源檢查。先前未設定即放行任何來源：惡意網站能帶著使用者的 cookie 連線（跨站 WebSocket 劫持）
+	CheckOrigin func(*http.Request) bool
+	// AllowedOrigins 允許的 Origin（如 "https://app.example.com"，大小寫不分；"*" 允許全部）
+	AllowedOrigins []string
+	MaxMessageSize int64
+	PingInterval   time.Duration
+	PongTimeout    time.Duration
+	WriteTimeout   time.Duration
+	Subprotocols   []string           // 支援的子協議（JSON/Protobuf/FlatBuffers/MessagePack）
+	TLS            *TLSConfig         // nil = ws://，non-nil = wss://（獨立模式）
+	Security       *SecurityConfig    // nil = 無安全層（AES + HMAC）
+	Compression    *CompressionConfig // nil 時回退 EnableCompression
+
+	// ClientID 由升級請求決定客戶端 ID（例如取自 JWT 驗證後的使用者）；nil 或回傳空字串時產生隨機 ID。
+	// 同一 ID 再次連線時，舊連線會被關閉（後連者優先）。
+	// 先前直接採用客戶端送來的 X-Client-ID / ?client_id=（任何人都能冒用他人 ID 收取
+	// SendToClient 的訊息），預設 ID 為 client-<UnixNano>（時鐘解析度粗時大量重複）
+	ClientID func(c *hypcontext.Context) string
+
+	// Authorize 對每則入站訊息授權；回傳 false 時丟棄該訊息（不觸發 onMessage，也不執行內建指令）。
+	// 內建指令的目標已解析進 msg.Channel：subscribe / unsubscribe / publish 為頻道名稱，
+	// join_room / leave_room 為房間 ID；broadcast 會送給全部連線。
+	// nil 表示全部允許——任何已連線的客戶端都能廣播、發布到任何頻道、加入任何房間
+	Authorize func(client *Client, msg *Message) bool
 }
 
 // DefaultConfig 預設配置
@@ -105,22 +108,41 @@ var DefaultConfig = Config{
 	Subprotocols:      []string{"json", "protobuf", "flatbuffers", "msgpack"},
 }
 
+// withDefaults 以 DefaultConfig 補上未設定的時間與大小：PingInterval 為 0 時 writePump 的
+// time.NewTicker 會 panic，PongTimeout 為 0 則每條連線一建立就逾時
+func (c Config) withDefaults() Config {
+	if c.HandshakeTimeout <= 0 {
+		c.HandshakeTimeout = DefaultConfig.HandshakeTimeout
+	}
+	if c.MaxMessageSize <= 0 {
+		c.MaxMessageSize = DefaultConfig.MaxMessageSize
+	}
+	if c.PingInterval <= 0 {
+		c.PingInterval = DefaultConfig.PingInterval
+	}
+	if c.PongTimeout <= 0 {
+		c.PongTimeout = DefaultConfig.PongTimeout
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = DefaultConfig.WriteTimeout
+	}
+	return c
+}
+
 // ===== Upgrader =====
 
 // Upgrader WebSocket 升級器
 type Upgrader struct {
 	upgrader websocket.Upgrader
-	config   Config
 }
 
 // NewUpgrader 創建新的 Upgrader
 func NewUpgrader(config Config) *Upgrader {
-	if config.CheckOrigin == nil {
-		config.CheckOrigin = func(r *http.Request) bool {
-			// 生產環境應該驗證 Origin
-			return true
-		}
+	checkOrigin := config.CheckOrigin
+	if checkOrigin == nil && len(config.AllowedOrigins) > 0 {
+		checkOrigin = originChecker(config.AllowedOrigins)
 	}
+	// 仍為 nil 時交給 gorilla：Origin 須與 Host 相同（沒有 Origin 標頭的非瀏覽器客戶端放行）
 
 	subprotocols := config.Subprotocols
 	if len(subprotocols) == 0 {
@@ -139,10 +161,25 @@ func NewUpgrader(config Config) *Upgrader {
 			WriteBufferSize:   config.WriteBufferSize,
 			HandshakeTimeout:  config.HandshakeTimeout,
 			EnableCompression: enableCompression,
-			CheckOrigin:       config.CheckOrigin,
+			CheckOrigin:       checkOrigin,
 			Subprotocols:      subprotocols,
 		},
-		config: config,
+	}
+}
+
+// originChecker 依允許清單檢查 Origin；沒有 Origin 標頭（非瀏覽器客戶端）時放行
+func originChecker(allowed []string) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		for _, a := range allowed {
+			if a == "*" || strings.EqualFold(a, origin) {
+				return true
+			}
+		}
+		return false
 	}
 }
 
@@ -153,7 +190,7 @@ type Message struct {
 	Type      string          `json:"type"`
 	Channel   string          `json:"channel,omitempty"`
 	Data      json.RawMessage `json:"data"`
-	Timestamp int64           `json:"timestamp,omitempty"`
+	Timestamp int64           `json:"timestamp,omitempty"` // UnixNano
 	ClientID  string          `json:"client_id,omitempty"`
 }
 
@@ -184,33 +221,55 @@ func (m *Message) reset() {
 
 // Client WebSocket 客戶端
 type Client struct {
-	ID           string
-	Conn         *websocket.Conn
-	Send         chan []byte
-	Hub          *Hub
-	Channels     map[string]bool
-	Context      *hypcontext.Context // 整合 HypGo Context
-	codec        Codec               // 協商的序列化 codec（JSON/Protobuf/FlatBuffers/MessagePack）
-	wsFrameType  int                 // websocket.TextMessage 或 BinaryMessage（快取）
-	mu           sync.RWMutex
-	pingTicker   *time.Ticker
-	isClosing    bool
-	lastActivity time.Time
-	metadata     map[string]interface{} // 客戶端元數據
+	ID   string
+	Conn *websocket.Conn
+	// Send 出站訊息佇列。不會被關閉：斷線以 done 通知 writePump。
+	// 先前斷線時 close(Send)，其他 goroutine（頻道發布、SendToClient）仍可能送入而 panic
+	Send     chan []byte
+	Hub      *Hub
+	Channels map[string]bool // mu 保護
+	// Context 升級請求的 Context 副本（c.Copy()，不屬於物件池），連線期間可安全讀取 Keys（如 JWT
+	// claims、角色）與 Request。先前保留原 Context：handler 返回即被放回池並由其他請求重用
+	Context     *hypcontext.Context
+	codec       Codec // 協商的序列化 codec（JSON/Protobuf/FlatBuffers/MessagePack）
+	wsFrameType int   // websocket.TextMessage 或 BinaryMessage（快取）
+	mu          sync.RWMutex
+	// lastActivity 最後活動時間（UnixNano）：readPump 與 pong handler 寫入、hub 清理時讀取
+	lastActivity atomic.Int64
+	metadata     map[string]interface{} // 客戶端元數據（mu 保護）
 	rooms        map[string]bool        // 已加入的房間 ID（mu 保護；斷線時只走訪所屬房間）
+
+	// per-client 安全金鑰（mu 保護；覆寫 hub 層預設）
+	aead    cipher.AEAD
+	hmacKey []byte
+
+	done      chan struct{} // 斷線、被同 ID 新連線取代或 Hub 關閉時關閉
+	closeOnce sync.Once
+	gone      bool // 已完成注銷（Hub.mu 保護）
 }
 
-// AcquireClient 從池中獲取 Client
-func AcquireClient(id string, conn *websocket.Conn, hub *Hub, codec Codec) *Client {
-	client := clientPool.Get().(*Client)
-	client.reset()
-	client.ID = id
-	client.Conn = conn
-	client.Hub = hub
-	client.codec = codec
-	client.wsFrameType = codec.WebSocketMessageType()
-	client.lastActivity = time.Now()
-	return client
+// newClient 建立連線的 Client
+func newClient(id string, conn *websocket.Conn, hub *Hub, codec Codec) *Client {
+	c := &Client{
+		ID:          id,
+		Conn:        conn,
+		Hub:         hub,
+		codec:       codec,
+		wsFrameType: codec.WebSocketMessageType(),
+		Send:        make(chan []byte, 256),
+		Channels:    make(map[string]bool, 4),
+		metadata:    make(map[string]interface{}, 4),
+		done:        make(chan struct{}),
+	}
+	c.lastActivity.Store(time.Now().UnixNano())
+	return c
+}
+
+// randomClientID 產生不可預測的客戶端 ID
+func randomClientID() string {
+	b := make([]byte, 16)
+	rand.Read(b) // Go 1.24 起 crypto/rand.Read 不會回傳錯誤
+	return "client-" + hex.EncodeToString(b)
 }
 
 // Codec 獲取客戶端使用的序列化 Codec
@@ -218,41 +277,45 @@ func (c *Client) Codec() Codec {
 	return c.codec
 }
 
-// Release 釋放 Client 回池中
-func (c *Client) Release() {
-	c.reset()
-	clientPool.Put(c)
+// shutdown 通知 writePump 送出 close frame 並關閉連線；可重複呼叫
+func (c *Client) shutdown() {
+	c.closeOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
+	})
 }
 
-// reset 重置 Client
-// GC 優化：map 重建替代逐一 delete，channel 非阻塞 drain
-func (c *Client) reset() {
-	c.ID = ""
-	c.Conn = nil
-	c.Hub = nil
-	c.Context = nil
-	c.codec = nil
-	c.wsFrameType = 0
-	c.isClosing = false
+// isClosed 回報連線是否已關閉或正在關閉
+func (c *Client) isClosed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
 
-	// GC 優化：重建 map 替代逐一 delete
-	c.Channels = make(map[string]bool, 4)
-	c.metadata = make(map[string]interface{}, 4)
-	c.rooms = nil // 延遲初始化：多數 client 不用房間
-
-	// 重建 Send channel 而非 drain：handleUnregister 會先 close(Send) 再
-	// Release，而 closed channel 的接收永不阻塞——舊的「非阻塞 drain」
-	// （for { select { case <-c.Send: default: return } }）在 closed
-	// channel 上 default 分支永遠走不到，每次斷線都讓 hub goroutine
-	// 無限迴圈。重建同時解掉殘留的 []byte 引用，效果與 drain 相同
-	c.Send = make(chan []byte, 256)
+// trySend 非阻塞地送入出站佇列；已斷線或佇列滿時回傳 false
+func (c *Client) trySend(data []byte) bool {
+	if c.isClosed() {
+		return false
+	}
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetMetadata 設置客戶端元數據
-// metadata 已在 pool New() 中預分配，無需延遲初始化
 func (c *Client) SetMetadata(key string, value interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.metadata == nil {
+		c.metadata = make(map[string]interface{})
+	}
 	c.metadata[key] = value
 }
 
@@ -264,35 +327,47 @@ func (c *Client) GetMetadata(key string) (interface{}, bool) {
 	return val, ok
 }
 
-// SetEncryptionKey 設置 per-client AES 加密金鑰（覆寫 hub 層預設）
-func (c *Client) SetEncryptionKey(key []byte) {
-	c.SetMetadata("_aes_key", key)
+// SetEncryptionKey 設置 per-client AES-256 加密金鑰（覆寫 hub 層預設；須為 32 bytes）
+func (c *Client) SetEncryptionKey(key []byte) error {
+	gcm, err := newAEAD(key)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.aead = gcm
+	c.mu.Unlock()
+	return nil
 }
 
 // SetHMACKey 設置 per-client HMAC 簽名金鑰（覆寫 hub 層預設）
 func (c *Client) SetHMACKey(key []byte) {
-	c.SetMetadata("_hmac_key", key)
+	c.mu.Lock()
+	c.hmacKey = append([]byte(nil), key...)
+	c.mu.Unlock()
 }
 
 // ===== Hub =====
 
-// Hub WebSocket 中心
+// Hub WebSocket 中心。連線的註冊 / 注銷直接在 mu 內完成；Run goroutine 只負責廣播佇列與
+// 不活躍連線清理。onConnect / onDisconnect 在該連線自己的 readPump goroutine 執行：
+// 先前在 Hub 唯一的 goroutine 上執行，任一 callback 慢下來，全部連線的註冊與廣播都被卡住
 type Hub struct {
-	clients    map[string]*Client
-	broadcast  chan *Message
-	register   chan *Client
-	unregister chan *Client
-	channels   map[string]map[*Client]bool
-	rooms      map[string]*Room
-	logger     *logger.Logger
-	config     Config
-	upgrader   *Upgrader
-	security   *SecurityConfig // AES + HMAC 安全管線配置
-	mu         sync.RWMutex
+	clients   map[string]*Client
+	broadcast chan *Message
+	channels  map[string]map[*Client]bool
+	rooms     map[string]*Room
+	logger    *logger.Logger
+	config    Config
+	upgrader  *Upgrader
+	security  *SecurityConfig // AES + HMAC 安全管線配置
+	mu        sync.RWMutex
+
+	started  atomic.Bool
+	done     chan struct{} // Run 結束（Shutdown）時關閉
+	stopOnce sync.Once
 
 	// 統計資訊。atomic：MessagesReceived/BytesReceived 由每條連線的
-	// readPump 並發遞增、MessagesSent/BytesSent 由多個發送路徑遞增，
-	// 曾用裸 int64 ++（宣告了 mutex 但無任何寫入方持有）——data race
+	// readPump 並發遞增、MessagesSent/BytesSent 由多個發送路徑遞增
 	stats struct {
 		TotalConnections  atomic.Int64
 		ActiveConnections atomic.Int64
@@ -308,23 +383,30 @@ type Hub struct {
 	onMessage    func(*Client, *Message)
 }
 
-// NewHub 創建新的 Hub
+// NewHub 創建新的 Hub。Security.AESKey 不是 32 bytes 時 panic（設定錯誤應在啟動時發現）
 func NewHub(logger *logger.Logger, config Config) *Hub {
+	config = config.withDefaults()
+	if config.Security != nil {
+		if _, err := config.Security.cipher(); err != nil {
+			panic(fmt.Sprintf("websocket: SecurityConfig.AESKey: %v", err))
+		}
+	}
 	return &Hub{
-		clients:    make(map[string]*Client),
-		broadcast:  make(chan *Message, 256),
-		register:   make(chan *Client, 16),
-		unregister: make(chan *Client, 16),
-		channels:   make(map[string]map[*Client]bool),
-		rooms:      make(map[string]*Room),
-		logger:     logger,
-		config:     config,
-		upgrader:   NewUpgrader(config),
-		security:   config.Security,
+		clients:   make(map[string]*Client),
+		broadcast: make(chan *Message, 256),
+		channels:  make(map[string]map[*Client]bool),
+		rooms:     make(map[string]*Room),
+		logger:    logger,
+		config:    config,
+		upgrader:  NewUpgrader(config),
+		security:  config.Security,
+		done:      make(chan struct{}),
 	}
 }
 
-// SetCallbacks 設置回調函數
+// SetCallbacks 設置回調函數（須在開始接受連線前設定）。三者都在該連線的 readPump goroutine 執行：
+// onConnect 早於該連線的任何 onMessage，且此時已註冊（可直接 SendToClient）；
+// onDisconnect 每條連線恰好一次，不論斷線原因（客戶端關閉、清理不活躍連線、同 ID 取代、Shutdown）
 func (h *Hub) SetCallbacks(
 	onConnect func(*Client),
 	onDisconnect func(*Client),
@@ -335,8 +417,9 @@ func (h *Hub) SetCallbacks(
 	h.onMessage = onMessage
 }
 
-// Run 運行 Hub
+// Run 運行 Hub，直到 ctx 結束或呼叫 Shutdown
 func (h *Hub) Run(ctx context.Context) {
+	h.started.Store(true)
 	// 定期清理不活躍的連接
 	cleanupTicker := time.NewTicker(30 * time.Second)
 	defer cleanupTicker.Stop()
@@ -347,11 +430,8 @@ func (h *Hub) Run(ctx context.Context) {
 			h.Shutdown()
 			return
 
-		case client := <-h.register:
-			h.handleRegister(client)
-
-		case client := <-h.unregister:
-			h.handleUnregister(client)
+		case <-h.done:
+			return
 
 		case message := <-h.broadcast:
 			h.handleBroadcast(message)
@@ -363,75 +443,72 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// handleRegister 處理客戶端註冊
-func (h *Hub) handleRegister(client *Client) {
-	h.mu.Lock()
-	h.clients[client.ID] = client
-	h.mu.Unlock()
-	h.stats.TotalConnections.Add(1)
-	h.stats.ActiveConnections.Add(1)
-
-	if h.onConnect != nil {
-		h.onConnect(client)
+// stopped 回報 Hub 是否已關閉
+func (h *Hub) stopped() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
 	}
-
-	h.logger.Infof("Client %s connected", client.ID)
 }
 
-// handleUnregister 處理客戶端註銷
-// 安全設計：即使同一 client 被多次 unregister（快速重連/斷線），也不會 panic
-func (h *Hub) handleUnregister(client *Client) {
+// handleRegister 註冊客戶端；Hub 已關閉時回傳 false
+func (h *Hub) handleRegister(client *Client) bool {
 	h.mu.Lock()
-	_, exists := h.clients[client.ID]
-	if exists {
-		delete(h.clients, client.ID)
-		h.stats.ActiveConnections.Add(-1)
-
-		// 從所有頻道移除
-		for channel := range client.Channels {
-			if clients, ok := h.channels[channel]; ok {
-				delete(clients, client)
-				if len(clients) == 0 {
-					delete(h.channels, channel)
-				}
-			}
-		}
-
-		// 只走訪 client 實際加入的房間。原實作掃描 hub 全部房間
-		// 並各拿一次房間鎖，全程持有 h.mu 寫鎖——斷線風暴 × 大量
-		// 房間時拉長所有廣播/註冊被擋的窗口
-		client.mu.RLock()
-		roomIDs := make([]string, 0, len(client.rooms))
-		for id := range client.rooms {
-			roomIDs = append(roomIDs, id)
-		}
-		client.mu.RUnlock()
-		for _, id := range roomIDs {
-			if room, ok := h.rooms[id]; ok {
-				room.RemoveClient(client)
-			}
-		}
+	if h.stopped() {
+		h.mu.Unlock()
+		return false
+	}
+	old := h.clients[client.ID]
+	h.clients[client.ID] = client
+	if old != nil && old != client {
+		// 同一 ID 再次連線（多開分頁 / 重連）：後連者優先，關閉舊連線。
+		// 舊連線的注銷以指標比對，不會刪掉新連線的項目
+		old.shutdown()
+	} else {
+		h.stats.ActiveConnections.Add(1)
 	}
 	h.mu.Unlock()
+	h.stats.TotalConnections.Add(1)
+	return true
+}
 
-	// 只有第一次 unregister 才執行 close 和 callback
-	// 防止重複 close(client.Send) 導致 panic
-	if !exists {
+// handleUnregister 自 Hub 移除客戶端並通知其連線關閉（重複呼叫無作用；不呼叫 callback）。
+// 先前以 ID 查 map：同一 ID 的第二條連線會被第一條的斷線一併刪除，留下收不到任何訊息的連線
+func (h *Hub) handleUnregister(client *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if client.gone {
 		return
 	}
-
-	if h.onDisconnect != nil {
-		h.onDisconnect(client)
+	client.gone = true
+	// 在 h.mu 內關閉：之後的 Subscribe / JoinRoom 看到已關閉即不再加入
+	client.shutdown()
+	if cur, ok := h.clients[client.ID]; ok && cur == client {
+		delete(h.clients, client.ID)
+		h.stats.ActiveConnections.Add(-1)
 	}
 
-	// 安全 close：使用 recover 防止極端 race condition 下的 double close
-	func() {
-		defer func() { recover() }()
-		close(client.Send)
-	}()
-
-	client.Release() // 返回池中
-	h.logger.Infof("Client %s disconnected", client.ID)
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	for channel := range client.Channels {
+		if clients, ok := h.channels[channel]; ok {
+			delete(clients, client)
+			if len(clients) == 0 {
+				delete(h.channels, channel)
+			}
+		}
+	}
+	// 只走訪 client 實際加入的房間；清空的房間一併刪除（先前留在 map 中無限累積）
+	for id := range client.rooms {
+		if room, ok := h.rooms[id]; ok {
+			room.RemoveClient(client)
+			if room.Len() == 0 {
+				delete(h.rooms, id)
+			}
+		}
+	}
 }
 
 // handleBroadcast 處理廣播（支持跨協議序列化 + 安全管線）
@@ -447,10 +524,7 @@ func (h *Hub) handleBroadcast(msg *Message) {
 	}
 	h.mu.RUnlock()
 
-	marshalForClients(msg, clients, h.security, func(n int64) {
-		h.stats.MessagesSent.Add(1)
-		h.stats.BytesSent.Add(n)
-	})
+	marshalForClients(msg, clients, h.security, h.countSent)
 
 	// 清除引用防止 client 被 pool 持有而無法 GC
 	for i := range clients {
@@ -461,54 +535,60 @@ func (h *Hub) handleBroadcast(msg *Message) {
 	clientSlicePool.Put(slicePtr)
 }
 
+// countSent 累計一則送出的訊息
+func (h *Hub) countSent(n int64) {
+	h.stats.MessagesSent.Add(1)
+	h.stats.BytesSent.Add(n)
+}
+
 // cleanupInactiveClients 清理不活躍的客戶端
 func (h *Hub) cleanupInactiveClients() {
 	h.mu.RLock()
-	now := time.Now()
-	timeout := 2 * h.config.PongTimeout
+	cutoff := time.Now().Add(-2 * h.config.PongTimeout).UnixNano()
 
 	var inactiveClients []*Client
 	for _, client := range h.clients {
-		if now.Sub(client.lastActivity) > timeout {
+		if client.lastActivity.Load() < cutoff {
 			inactiveClients = append(inactiveClients, client)
 		}
 	}
 	h.mu.RUnlock()
 
-	// 直接呼叫 handleUnregister 而非送進 h.unregister channel：
-	// 本函式在 Hub 的 Run goroutine 內執行，而該 channel 的唯一消費者
-	// 就是 Run 自己——一次清掃超過 channel 容量的不活躍連線時，
-	// 發送方（Run）會永久阻塞，整個 Hub 凍結
+	// 只移除並通知關閉，onDisconnect 由該連線的 readPump 結束時呼叫（不在 Run goroutine 上執行）。
+	// 先前改為送進 unregister channel，而其唯一消費者就是執行本函式的 Run 自己——一次清掃超過
+	// channel 容量的不活躍連線時永久阻塞，整個 Hub 凍結
 	for _, client := range inactiveClients {
 		h.logger.Debugf("Cleaning up inactive client: %s", client.ID)
 		h.handleUnregister(client)
 	}
 }
 
-// ServeHTTP 處理 WebSocket 升級（整合 HypGo Context）
+// ServeHTTP 處理 WebSocket 升級（整合 HypGo Context）。Hub 尚未 Run 或已關閉時回 503
 func (h *Hub) ServeHTTP(c *hypcontext.Context) {
+	if !h.started.Load() || h.stopped() {
+		// 先前送進 register channel 後永久阻塞，HTTP handler 一直掛著
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+		return
+	}
 	conn, err := h.upgrader.upgrader.Upgrade(c.Response, c.Request, nil)
 	if err != nil {
+		// Upgrade 已寫出錯誤回應（如 Origin 不符時的 403），不再重複寫
 		h.logger.Warningf("WebSocket upgrade failed: %v", err)
-		c.AbortWithStatus(http.StatusBadRequest)
+		c.Abort()
 		return
 	}
 
-	// 生成或獲取客戶端 ID
-	clientID := c.GetHeader("X-Client-ID")
+	clientID := ""
+	if h.config.ClientID != nil {
+		clientID = h.config.ClientID(c)
+	}
 	if clientID == "" {
-		clientID = c.Query("client_id")
-		if clientID == "" {
-			clientID = fmt.Sprintf("client-%d", time.Now().UnixNano())
-		}
+		clientID = randomClientID()
 	}
 
 	// 根據協商的子協議選擇 Codec
-	codec := CodecByName(conn.Subprotocol())
-
-	// 從池中獲取客戶端
-	client := AcquireClient(clientID, conn, h, codec)
-	client.Context = c // 關聯 HypGo Context
+	client := newClient(clientID, conn, h, CodecByName(conn.Subprotocol()))
+	client.Context = c.Copy()
 
 	// 套用 permessage-deflate 壓縮配置
 	if h.config.Compression != nil {
@@ -522,65 +602,97 @@ func (h *Hub) ServeHTTP(c *hypcontext.Context) {
 	conn.SetReadLimit(h.config.MaxMessageSize)
 	conn.SetReadDeadline(time.Now().Add(h.config.PongTimeout))
 	conn.SetPongHandler(func(string) error {
-		client.lastActivity = time.Now()
+		client.lastActivity.Store(time.Now().UnixNano())
 		conn.SetReadDeadline(time.Now().Add(h.config.PongTimeout))
 		return nil
 	})
 
-	// 註冊客戶端
-	h.register <- client
-
-	// 啟動讀寫循環
+	// 先註冊再啟動讀寫循環：onConnect（於 readPump 開頭執行）時已可 SendToClient
+	if !h.handleRegister(client) {
+		conn.Close()
+		return
+	}
 	go client.writePump(h.config)
-	go client.readPump(h.config)
+	go client.readPump()
 }
 
 // ===== Client 讀寫方法 =====
 
-// readPump 讀取循環
-func (c *Client) readPump(config Config) {
+// readPump 讀取循環；連線的 onConnect / onDisconnect 也在這裡執行
+func (c *Client) readPump() {
+	hub := c.Hub
 	defer func() {
-		c.Hub.unregister <- c
+		// 處理訊息或 callback 時的 panic 只關閉這條連線：
+		// readPump 是獨立 goroutine，Recovery 中介層管不到，先前會讓整個行程崩潰
+		if r := recover(); r != nil {
+			hub.logger.Errorf("websocket: panic while serving client %s: %v", c.ID, r)
+		}
+		hub.handleUnregister(c)
 		c.Conn.Close()
+		if hub.onDisconnect != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						hub.logger.Errorf("websocket: panic in onDisconnect for client %s: %v", c.ID, r)
+					}
+				}()
+				hub.onDisconnect(c)
+			}()
+		}
+		hub.logger.Infof("Client %s disconnected", c.ID)
 	}()
+
+	hub.logger.Infof("Client %s connected", c.ID)
+	if hub.onConnect != nil {
+		hub.onConnect(c)
+	}
 
 	for {
 		_, data, err := c.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				c.Hub.logger.Warningf("WebSocket error for client %s: %v", c.ID, err)
+				hub.logger.Warningf("WebSocket error for client %s: %v", c.ID, err)
 			}
-			break
+			return
 		}
 
-		c.lastActivity = time.Now()
-		c.Hub.stats.MessagesReceived.Add(1)
-		c.Hub.stats.BytesReceived.Add(int64(len(data)))
+		c.lastActivity.Store(time.Now().UnixNano())
+		hub.stats.MessagesReceived.Add(1)
+		hub.stats.BytesReceived.Add(int64(len(data)))
 
 		// 安全管線：解密 + 驗證簽名
-		if c.Hub.security != nil {
+		if hub.security != nil {
 			var secErr error
-			data, secErr = applySecurityIn(data, c, c.Hub.security)
+			data, secErr = applySecurityIn(data, c, hub.security)
 			if secErr != nil {
-				c.Hub.logger.Warningf("Security verification failed for client %s: %v", c.ID, secErr)
+				hub.logger.Warningf("Security verification failed for client %s: %v", c.ID, secErr)
 				continue
 			}
 		}
 
-		// 從池中獲取 Message
 		msg := AcquireMessage()
-
 		if err := c.codec.Unmarshal(data, msg); err != nil {
-			c.Hub.logger.Warningf("Invalid message format from client %s: %v", c.ID, err)
+			hub.logger.Warningf("Invalid message format from client %s: %v", c.ID, err)
+			msg.Release()
+			continue
+		}
+		if !withinSkew(hub.security, msg.Timestamp) {
+			hub.logger.Warningf("Message from client %s rejected: timestamp outside MaxClockSkew", c.ID)
 			msg.Release()
 			continue
 		}
 
 		msg.ClientID = c.ID
+		c.resolveTarget(msg)
+		if auth := hub.config.Authorize; auth != nil && !auth(c, msg) {
+			hub.logger.Debugf("Message %q from client %s denied by Authorize", msg.Type, c.ID)
+			msg.Release()
+			continue
+		}
 
 		// 觸發回調
-		if c.Hub.onMessage != nil {
-			c.Hub.onMessage(c, msg)
+		if hub.onMessage != nil {
+			hub.onMessage(c, msg)
 		}
 
 		c.handleMessage(msg)
@@ -588,38 +700,31 @@ func (c *Client) readPump(config Config) {
 	}
 }
 
-// writePump 寫入循環
+// writePump 寫入循環；結束時關閉連線（readPump 隨之結束並注銷）
 func (c *Client) writePump(config Config) {
 	ticker := time.NewTicker(config.PingInterval)
 	defer func() {
-		if r := recover(); r != nil {
-			// 防止 nil Conn 導致 panic 崩潰整個程式
-		}
 		ticker.Stop()
-		if c.Conn != nil {
-			c.Conn.Close()
-		}
+		c.Conn.Close()
 	}()
 
 	for {
 		select {
-		case message, ok := <-c.Send:
-			if c.Conn == nil {
-				return
-			}
+		case <-c.done:
 			c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
-			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+			c.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			return
+
+		case message := <-c.Send:
+			c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
+			if err := c.Conn.WriteMessage(c.wsFrameType, message); err != nil {
 				return
 			}
-
-			// 批量發送優化（使用協商的 frame 類型）
-			c.Conn.WriteMessage(c.wsFrameType, message)
-
-			// 檢查是否有更多消息可以批量發送
-			n := len(c.Send)
-			for i := 0; i < n; i++ {
-				c.Conn.WriteMessage(c.wsFrameType, <-c.Send)
+			// 批量發送佇列中已有的訊息（只有本 goroutine 讀取 Send，長度不會縮減）
+			for n := len(c.Send); n > 0; n-- {
+				if err := c.Conn.WriteMessage(c.wsFrameType, <-c.Send); err != nil {
+					return
+				}
 			}
 
 		case <-ticker.C:
@@ -661,17 +766,27 @@ func (c *Client) extractRoomID(data []byte) string {
 	return ""
 }
 
-// handleMessage 處理訊息
+// resolveTarget 把內建控制訊息的目標解析進 msg.Channel，讓 Authorize 不必自行解碼 Data
+func (c *Client) resolveTarget(msg *Message) {
+	switch msg.Type {
+	case "subscribe", "unsubscribe":
+		msg.Channel = c.extractChannel(msg.Data)
+	case "join_room", "leave_room":
+		msg.Channel = c.extractRoomID(msg.Data)
+	}
+}
+
+// handleMessage 處理內建控制訊息（目標已由 resolveTarget 解析進 msg.Channel）
 func (c *Client) handleMessage(msg *Message) {
 	switch msg.Type {
 	case "subscribe":
-		if ch := c.extractChannel(msg.Data); ch != "" {
-			c.Subscribe(ch)
+		if msg.Channel != "" {
+			c.Subscribe(msg.Channel)
 		}
 
 	case "unsubscribe":
-		if ch := c.extractChannel(msg.Data); ch != "" {
-			c.Unsubscribe(ch)
+		if msg.Channel != "" {
+			c.Unsubscribe(msg.Channel)
 		}
 
 	case "publish":
@@ -681,90 +796,85 @@ func (c *Client) handleMessage(msg *Message) {
 		c.Hub.BroadcastMessage(msg)
 
 	case "join_room":
-		if roomID := c.extractRoomID(msg.Data); roomID != "" {
-			c.JoinRoom(roomID)
+		if msg.Channel != "" {
+			c.JoinRoom(msg.Channel)
 		}
 
 	case "leave_room":
-		if roomID := c.extractRoomID(msg.Data); roomID != "" {
-			c.LeaveRoom(roomID)
+		if msg.Channel != "" {
+			c.LeaveRoom(msg.Channel)
 		}
 	}
 }
 
 // ===== 頻道管理 =====
 
-// Subscribe 訂閱頻道
+// Subscribe 訂閱頻道（已斷線的客戶端不會被加入）
 func (c *Client) Subscribe(channel string) {
+	h := c.Hub
+	h.mu.Lock()
+	// 與 handleUnregister 同在 h.mu 內：先前斷線後抵達的訂閱會把客戶端重新加回頻道
+	if c.isClosed() {
+		h.mu.Unlock()
+		return
+	}
+	if h.channels[channel] == nil {
+		h.channels[channel] = make(map[*Client]bool)
+	}
+	h.channels[channel][c] = true
 	c.mu.Lock()
 	c.Channels[channel] = true
 	c.mu.Unlock()
+	h.mu.Unlock()
 
-	c.Hub.mu.Lock()
-	if c.Hub.channels[channel] == nil {
-		c.Hub.channels[channel] = make(map[*Client]bool)
-	}
-	c.Hub.channels[channel][c] = true
-	c.Hub.mu.Unlock()
-
-	c.Hub.logger.Debugf("Client %s subscribed to channel %s", c.ID, channel)
+	h.logger.Debugf("Client %s subscribed to channel %s", c.ID, channel)
 }
 
 // Unsubscribe 取消訂閱頻道
 func (c *Client) Unsubscribe(channel string) {
+	h := c.Hub
+	h.mu.Lock()
+	if clients, ok := h.channels[channel]; ok {
+		delete(clients, c)
+		if len(clients) == 0 {
+			delete(h.channels, channel)
+		}
+	}
 	c.mu.Lock()
 	delete(c.Channels, channel)
 	c.mu.Unlock()
+	h.mu.Unlock()
 
-	c.Hub.mu.Lock()
-	if clients, ok := c.Hub.channels[channel]; ok {
-		delete(clients, c)
-		if len(clients) == 0 {
-			delete(c.Hub.channels, channel)
-		}
-	}
-	c.Hub.mu.Unlock()
-
-	c.Hub.logger.Debugf("Client %s unsubscribed from channel %s", c.ID, channel)
+	h.logger.Debugf("Client %s unsubscribed from channel %s", c.ID, channel)
 }
 
 // ===== Room 管理 =====
 
-// Room WebSocket 房間
+// Room WebSocket 房間。成員增減與房間建立 / 刪除都在 Hub.mu 內進行：
+// 先前 JoinRoom 與 LeaveRoom 各自取鎖，可能把客戶端加進剛被刪除、放回池並分配給
+// 其他房間 ID 的 Room
 type Room struct {
-	ID           string
-	Clients      map[*Client]bool
-	Metadata     map[string]interface{}
-	mu           sync.RWMutex
-	created      time.Time
-	lastActivity time.Time
+	ID       string
+	Clients  map[*Client]bool // mu 保護
+	Metadata map[string]interface{}
+	mu       sync.RWMutex
+	hub      *Hub
 }
 
-// AcquireRoom 從池中獲取 Room
-func AcquireRoom(id string) *Room {
-	room := roomPool.Get().(*Room)
-	room.reset()
-	room.ID = id
-	room.created = time.Now()
-	room.lastActivity = time.Now()
-	return room
-}
-
-// Release 釋放 Room 回池中
-func (r *Room) Release() {
-	r.reset()
-	roomPool.Put(r)
-}
-
-// reset 重置 Room
-func (r *Room) reset() {
-	r.ID = ""
-	for client := range r.Clients {
-		delete(r.Clients, client)
+func newRoom(id string, hub *Hub) *Room {
+	return &Room{
+		ID:       id,
+		Clients:  make(map[*Client]bool),
+		Metadata: make(map[string]interface{}),
+		hub:      hub,
 	}
-	for k := range r.Metadata {
-		delete(r.Metadata, k)
-	}
+}
+
+// Len 回傳房間內的客戶端數
+func (r *Room) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.Clients)
 }
 
 // AddClient 添加客戶端到房間
@@ -772,7 +882,6 @@ func (r *Room) AddClient(client *Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.Clients[client] = true
-	r.lastActivity = time.Now()
 }
 
 // RemoveClient 從房間移除客戶端
@@ -780,29 +889,16 @@ func (r *Room) RemoveClient(client *Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.Clients, client)
-	r.lastActivity = time.Now()
 }
 
-// Broadcast 房間廣播（原始位元組，向後兼容）
+// Broadcast 房間廣播原始位元組：包成 Type 為 "broadcast" 的 Message，
+// 依各客戶端的 codec 序列化並經過安全管線。先前直接送出原始位元組，
+// 設定了 AES / HMAC 時仍以明文送出
 func (r *Room) Broadcast(data []byte) {
-	r.mu.RLock()
-	clients := make([]*Client, 0, len(r.Clients))
-	for client := range r.Clients {
-		clients = append(clients, client)
-	}
-	r.mu.RUnlock()
-
-	for _, client := range clients {
-		select {
-		case client.Send <- data:
-		default:
-			// 緩衝區滿，跳過
-		}
-	}
+	r.BroadcastMessage(&Message{Type: "broadcast", Data: data, Timestamp: time.Now().UnixNano()})
 }
 
 // BroadcastMessage 房間廣播（結構化 Message，支持跨協議序列化 + 安全管線）
-// 透過客戶端的 Hub 取得安全配置
 func (r *Room) BroadcastMessage(msg *Message) {
 	r.mu.RLock()
 	clients := make([]*Client, 0, len(r.Clients))
@@ -811,63 +907,71 @@ func (r *Room) BroadcastMessage(msg *Message) {
 	}
 	r.mu.RUnlock()
 
-	// 從第一個客戶端取得 Hub 的安全配置
 	var security *SecurityConfig
-	if len(clients) > 0 && clients[0].Hub != nil {
-		security = clients[0].Hub.security
+	var onSent func(int64)
+	if r.hub != nil {
+		security = r.hub.security
+		onSent = r.hub.countSent
 	}
-
-	marshalForClients(msg, clients, security, nil)
+	marshalForClients(msg, clients, security, onSent)
 }
 
-// JoinRoom 加入房間
+// JoinRoom 加入房間（已斷線的客戶端不會被加入）
 func (c *Client) JoinRoom(roomID string) {
-	c.Hub.mu.Lock()
-	room, exists := c.Hub.rooms[roomID]
-	if !exists {
-		room = AcquireRoom(roomID)
-		c.Hub.rooms[roomID] = room
+	h := c.Hub
+	h.mu.Lock()
+	if c.isClosed() {
+		h.mu.Unlock()
+		return
 	}
-	c.Hub.mu.Unlock()
-
+	room, exists := h.rooms[roomID]
+	if !exists {
+		room = newRoom(roomID, h)
+		h.rooms[roomID] = room
+	}
 	room.AddClient(c)
-
 	c.mu.Lock()
 	if c.rooms == nil {
 		c.rooms = make(map[string]bool, 2)
 	}
 	c.rooms[roomID] = true
 	c.mu.Unlock()
+	h.mu.Unlock()
 
-	c.Hub.logger.Debugf("Client %s joined room %s", c.ID, roomID)
+	h.logger.Debugf("Client %s joined room %s", c.ID, roomID)
 }
 
-// LeaveRoom 離開房間
+// LeaveRoom 離開房間；房間清空時刪除
 func (c *Client) LeaveRoom(roomID string) {
-	c.Hub.mu.RLock()
-	room, exists := c.Hub.rooms[roomID]
-	c.Hub.mu.RUnlock()
-
+	h := c.Hub
+	h.mu.Lock()
+	room, exists := h.rooms[roomID]
 	if exists {
 		room.RemoveClient(c)
-
-		c.mu.Lock()
-		delete(c.rooms, roomID)
-		c.mu.Unlock()
-
-		c.Hub.logger.Debugf("Client %s left room %s", c.ID, roomID)
-
-		// 如果房間為空，刪除房間
-		if len(room.Clients) == 0 {
-			c.Hub.mu.Lock()
-			delete(c.Hub.rooms, roomID)
-			c.Hub.mu.Unlock()
-			room.Release() // 返回池中
+		if room.Len() == 0 {
+			delete(h.rooms, roomID)
 		}
+	}
+	c.mu.Lock()
+	delete(c.rooms, roomID)
+	c.mu.Unlock()
+	h.mu.Unlock()
+
+	if exists {
+		h.logger.Debugf("Client %s left room %s", c.ID, roomID)
 	}
 }
 
 // ===== Hub 便利方法 =====
+
+// enqueueBroadcast 送進廣播佇列；Hub 已關閉時丟棄（先前永久阻塞）
+func (h *Hub) enqueueBroadcast(msg *Message) {
+	select {
+	case h.broadcast <- msg:
+	case <-h.done:
+		msg.Release()
+	}
+}
 
 // Broadcast 廣播訊息（原始位元組，向後兼容）
 // 將 data 包裝為 Message 後發送到廣播通道
@@ -875,7 +979,7 @@ func (h *Hub) Broadcast(data []byte) {
 	msg := AcquireMessage()
 	msg.Type = "broadcast"
 	msg.Data = data
-	h.broadcast <- msg
+	h.enqueueBroadcast(msg)
 }
 
 // BroadcastMessage 廣播結構化 Message（支持跨協議序列化）
@@ -888,17 +992,15 @@ func (h *Hub) BroadcastMessage(msg *Message) {
 	copy(clone.Data, msg.Data)
 	clone.Timestamp = msg.Timestamp
 	clone.ClientID = msg.ClientID
-	h.broadcast <- clone
+	h.enqueueBroadcast(clone)
 }
 
 // PublishToChannel 發布結構化 Message 到頻道（支持跨協議序列化）
 func (h *Hub) PublishToChannel(channel string, msg *Message) {
 	h.mu.RLock()
-	clients := make([]*Client, 0)
-	if channelClients, ok := h.channels[channel]; ok {
-		for client := range channelClients {
-			clients = append(clients, client)
-		}
+	clients := make([]*Client, 0, len(h.channels[channel]))
+	for client := range h.channels[channel] {
+		clients = append(clients, client)
 	}
 	h.mu.RUnlock()
 
@@ -916,10 +1018,7 @@ func (h *Hub) PublishToChannel(channel string, msg *Message) {
 	pubMsg.Timestamp = msg.Timestamp
 	pubMsg.ClientID = msg.ClientID
 
-	marshalForClients(pubMsg, clients, h.security, func(n int64) {
-		h.stats.MessagesSent.Add(1)
-		h.stats.BytesSent.Add(n)
-	})
+	marshalForClients(pubMsg, clients, h.security, h.countSent)
 }
 
 // PublishToChannelRaw 發布原始位元組到頻道（向後兼容）
@@ -964,14 +1063,11 @@ func (h *Hub) SendToClient(clientID string, data interface{}) error {
 		}
 	}
 
-	select {
-	case client.Send <- msgBytes:
-		h.stats.MessagesSent.Add(1)
-		h.stats.BytesSent.Add(int64(len(msgBytes)))
-		return nil
-	default:
-		return fmt.Errorf("client %s send buffer full", clientID)
+	if !client.trySend(msgBytes) {
+		return fmt.Errorf("client %s disconnected or send buffer full", clientID)
 	}
+	h.countSent(int64(len(msgBytes)))
+	return nil
 }
 
 // GetStats 獲取統計資訊
@@ -986,7 +1082,7 @@ func (h *Hub) GetStats() map[string]interface{} {
 
 	roomStats := make(map[string]int)
 	for roomID, room := range h.rooms {
-		roomStats[roomID] = len(room.Clients)
+		roomStats[roomID] = room.Len()
 	}
 
 	return map[string]interface{}{
@@ -1025,20 +1121,22 @@ func (h *Hub) ListenAndServeTLS(addr string, handler http.Handler) error {
 	return srv.ListenAndServeTLS(h.config.TLS.CertFile, h.config.TLS.KeyFile)
 }
 
-// Shutdown 關閉 Hub
+// Shutdown 關閉 Hub：通知所有連線送出 close frame 並關閉，之後的連線請求回 503（可重複呼叫）
 func (h *Hub) Shutdown() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.stopOnce.Do(func() {
+		close(h.done)
 
-	// 關閉所有客戶端連接
-	for _, client := range h.clients {
-		client.Conn.Close()
-	}
+		h.mu.Lock()
+		clients := h.clients
+		h.clients = make(map[string]*Client)
+		h.channels = make(map[string]map[*Client]bool)
+		h.rooms = make(map[string]*Room)
+		h.stats.ActiveConnections.Store(0)
+		h.mu.Unlock()
 
-	// 清空所有資料
-	h.clients = make(map[string]*Client)
-	h.channels = make(map[string]map[*Client]bool)
-	h.rooms = make(map[string]*Room)
-
-	h.logger.Info("WebSocket Hub shutdown completed")
+		for _, client := range clients {
+			client.shutdown()
+		}
+		h.logger.Info("WebSocket Hub shutdown completed")
+	})
 }

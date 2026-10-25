@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -177,11 +178,16 @@ func (c *Context) Release() {
 // c.Error() 錯誤。維持 context 對 logger 的零依賴（與 BindInputReporter 同模式）。
 type RequestErrorReporter func(method, path string, errs []error)
 
-var requestErrorReporter RequestErrorReporter
+// requestErrorReporter 以 atomic 保存（理由同 bindInputReporter）
+var requestErrorReporter atomic.Pointer[RequestErrorReporter]
 
-// SetRequestErrorReporter 設定未消費錯誤的回報函式（應於啟動階段呼叫一次）。
+// SetRequestErrorReporter 設定未消費錯誤的回報函式（並行安全；後設定者覆蓋先前的值）。
 func SetRequestErrorReporter(fn RequestErrorReporter) {
-	requestErrorReporter = fn
+	if fn == nil {
+		requestErrorReporter.Store(nil)
+		return
+	}
+	requestErrorReporter.Store(&fn)
 }
 
 // Finish 於請求結束時收尾：清理 multipart 暫存檔、回報未消費的錯誤。
@@ -198,7 +204,7 @@ func (c *Context) Finish() {
 	// 2) 回報未被消費的錯誤。
 	// c.Error()/AbortWithError() 累積的錯誤原本無任何消費者——
 	// AbortWithError(500, err) 只送出空 500，錯誤本身徹底消失、連 log 都沒有。
-	if requestErrorReporter != nil && len(c.Errors) > 0 {
+	if report := requestErrorReporter.Load(); report != nil && len(c.Errors) > 0 {
 		errs := make([]error, 0, len(c.Errors))
 		for _, e := range c.Errors {
 			if e != nil && e.Err != nil {
@@ -210,7 +216,7 @@ func (c *Context) Finish() {
 			if c.Request != nil {
 				method, path = c.Request.Method, c.Request.URL.Path
 			}
-			requestErrorReporter(method, path, errs)
+			(*report)(method, path, errs)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package websocket
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -69,28 +70,47 @@ func (FlatBuffersCodec) Marshal(msg *Message) ([]byte, error) {
 	return result, nil
 }
 
-// Unmarshal 從 FlatBuffers 二進制格式解碼 Message
-func (FlatBuffersCodec) Unmarshal(data []byte, msg *Message) error {
-	if len(data) < 4 {
+// errFBMalformed 解碼時發現偏移量或長度超出緩衝區
+var errFBMalformed = errors.New("flatbuffers: malformed message")
+
+// fbNeed 檢查失敗時中止解碼（由 Unmarshal 的 recover 轉為錯誤）
+func fbNeed(ok bool) {
+	if !ok {
+		panic(errFBMalformed)
+	}
+}
+
+// Unmarshal 從 FlatBuffers 二進制格式解碼 Message。
+// flatbuffers 的讀取 API 不檢查邊界，輸入來自客戶端：先前 4 bytes 的惡意訊息（root offset 指到
+// 緩衝區外）就讓索引越界 panic，而 panic 發生在 readPump goroutine，整個行程隨之崩潰。
+// 每個偏移量與長度都先對照緩衝區長度（向量長度在配置記憶體前檢查，避免宣稱 2GB 的向量），
+// 其餘越界由 recover 轉為錯誤
+func (FlatBuffersCodec) Unmarshal(data []byte, msg *Message) (err error) {
+	if len(data) < 8 {
 		return fmt.Errorf("flatbuffers data too short: %d bytes", len(data))
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", errFBMalformed, r)
+		}
+	}()
 
 	// 取得 root table
 	n := flatbuffers.GetUOffsetT(data)
-	tab := &flatbuffers.Table{}
-	tab.Bytes = data
-	tab.Pos = flatbuffers.UOffsetT(n)
+	fbNeed(uint64(n)+4 <= uint64(len(data)))
+	tab := &flatbuffers.Table{Bytes: data, Pos: n}
 
-	// vtable base offset
-	vtableOffset := flatbuffers.SOffsetT(tab.Pos) - tab.GetSOffsetT(tab.Pos)
+	// vtable 位置與大小
+	vt := int64(tab.Pos) - int64(tab.GetSOffsetT(tab.Pos))
+	fbNeed(vt >= 0 && vt+4 <= int64(len(data)))
+	vtSize := int64(tab.GetVOffsetT(flatbuffers.UOffsetT(vt)))
+	fbNeed(vtSize >= 4 && vt+vtSize <= int64(len(data)))
 
-	// 讀取各欄位
-	msg.Type = fbReadString(tab, vtableOffset, fbFieldType)
-	msg.Channel = fbReadString(tab, vtableOffset, fbFieldChannel)
-	msg.Data = json.RawMessage(fbReadByteVector(tab, vtableOffset, fbFieldData))
-	msg.Timestamp = fbReadInt64(tab, vtableOffset, fbFieldTimestamp)
-	msg.ClientID = fbReadString(tab, vtableOffset, fbFieldClientID)
-
+	msg.Type = fbReadString(tab, fbFieldType)
+	msg.Channel = fbReadString(tab, fbFieldChannel)
+	msg.Data = json.RawMessage(fbReadByteVector(tab, fbFieldData))
+	msg.Timestamp = fbReadInt64(tab, fbFieldTimestamp)
+	msg.ClientID = fbReadString(tab, fbFieldClientID)
 	return nil
 }
 
@@ -100,57 +120,50 @@ func (FlatBuffersCodec) WebSocketMessageType() int {
 
 // ===== FlatBuffers 讀取 helpers =====
 
-// fbReadString 從 table 讀取 string 欄位
-func fbReadString(tab *flatbuffers.Table, vtableOffset flatbuffers.SOffsetT, field int) string {
-	o := flatbuffers.VOffsetT(vtableOffset + flatbuffers.SOffsetT(4+field*2))
-	if o >= flatbuffers.VOffsetT(len(tab.Bytes)) {
-		return ""
+// fbField 回傳欄位在 table 內的絕對位置；欄位不存在時回傳 0
+func fbField(tab *flatbuffers.Table, field int) flatbuffers.UOffsetT {
+	off := tab.Offset(flatbuffers.VOffsetT(4 + field*2))
+	if off == 0 {
+		return 0
 	}
-
-	// 讀取 vtable 中此欄位的偏移量
-	vtablePos := flatbuffers.UOffsetT(vtableOffset)
-	if vtablePos+flatbuffers.UOffsetT(4+field*2+2) > flatbuffers.UOffsetT(len(tab.Bytes)) {
-		return ""
-	}
-
-	fieldOff := tab.GetVOffsetTSlot(flatbuffers.VOffsetT(4+field*2), 0)
-	if fieldOff == 0 {
-		return ""
-	}
-
-	start := tab.Pos + flatbuffers.UOffsetT(fieldOff)
-	strOffset := tab.Pos + flatbuffers.UOffsetT(fieldOff) + flatbuffers.UOffsetT(tab.GetInt32(start))
-	strLen := tab.GetInt32(strOffset)
-	return string(tab.Bytes[strOffset+4 : strOffset+flatbuffers.UOffsetT(4+strLen)])
+	pos := uint64(tab.Pos) + uint64(off)
+	fbNeed(pos+4 <= uint64(len(tab.Bytes)))
+	return flatbuffers.UOffsetT(pos)
 }
 
-// fbReadByteVector 從 table 讀取 byte vector 欄位
-func fbReadByteVector(tab *flatbuffers.Table, vtableOffset flatbuffers.SOffsetT, field int) []byte {
-	_ = vtableOffset // 使用 tab 的方法
-	fieldOff := tab.GetVOffsetTSlot(flatbuffers.VOffsetT(4+field*2), 0)
-	if fieldOff == 0 {
+// fbVector 回傳欄位指向的 string / byte vector 內容（不複製）
+func fbVector(tab *flatbuffers.Table, field int) []byte {
+	pos := fbField(tab, field)
+	if pos == 0 {
 		return nil
 	}
+	start := uint64(pos) + uint64(tab.GetUOffsetT(pos))
+	fbNeed(start+4 <= uint64(len(tab.Bytes)))
+	length := uint64(tab.GetUint32(flatbuffers.UOffsetT(start)))
+	fbNeed(start+4+length <= uint64(len(tab.Bytes)))
+	return tab.Bytes[start+4 : start+4+length]
+}
 
-	start := tab.Pos + flatbuffers.UOffsetT(fieldOff)
-	vecOffset := start + flatbuffers.UOffsetT(tab.GetInt32(start))
-	vecLen := tab.GetInt32(vecOffset)
-	if vecLen == 0 {
+// fbReadString 從 table 讀取 string 欄位
+func fbReadString(tab *flatbuffers.Table, field int) string {
+	return string(fbVector(tab, field))
+}
+
+// fbReadByteVector 從 table 讀取 byte vector 欄位（複製，避免引用原始 buffer）
+func fbReadByteVector(tab *flatbuffers.Table, field int) []byte {
+	v := fbVector(tab, field)
+	if len(v) == 0 {
 		return nil
 	}
-
-	// 複製以避免引用原始 buffer
-	result := make([]byte, vecLen)
-	copy(result, tab.Bytes[vecOffset+4:vecOffset+flatbuffers.UOffsetT(4+vecLen)])
-	return result
+	return append([]byte(nil), v...)
 }
 
 // fbReadInt64 從 table 讀取 int64 欄位
-func fbReadInt64(tab *flatbuffers.Table, vtableOffset flatbuffers.SOffsetT, field int) int64 {
-	_ = vtableOffset
-	fieldOff := tab.GetVOffsetTSlot(flatbuffers.VOffsetT(4+field*2), 0)
-	if fieldOff == 0 {
+func fbReadInt64(tab *flatbuffers.Table, field int) int64 {
+	pos := fbField(tab, field)
+	if pos == 0 {
 		return 0
 	}
-	return tab.GetInt64(tab.Pos + flatbuffers.UOffsetT(fieldOff))
+	fbNeed(uint64(pos)+8 <= uint64(len(tab.Bytes)))
+	return tab.GetInt64(pos)
 }

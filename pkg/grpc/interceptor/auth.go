@@ -3,6 +3,7 @@ package interceptor
 
 import (
 	"context"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -11,7 +12,8 @@ import (
 )
 
 // AuthFunc 驗證函式型別
-// 接收 token 字串，回傳使用者資訊（存入 context）和錯誤
+// 接收 token 字串（已去掉 "Bearer " 前綴），回傳使用者資訊（存入 context）和錯誤。
+// 回傳 status error（如 codes.PermissionDenied）時原樣傳給客戶端，其他錯誤一律為 Unauthenticated
 type AuthFunc func(ctx context.Context, token string) (interface{}, error)
 
 // contextKey 避免 key 衝突
@@ -19,23 +21,53 @@ type contextKey string
 
 const userContextKey contextKey = "grpc_user"
 
-// Auth 驗證 interceptor
+// Auth 驗證 unary RPC
 // 從 metadata 中提取 "authorization" token，呼叫 authFn 驗證
-// 驗證成功時將使用者資訊存入 context
+// 驗證成功時將使用者資訊存入 context。streaming RPC 需另掛 StreamAuth
 //
 // 可跳過不需驗證的方法（如 Health check）：
 //
 //	Auth(authFn, "/grpc.health.v1.Health/Check")
 func Auth(authFn AuthFunc, skipMethods ...string) grpc.UnaryServerInterceptor {
+	authenticate := newAuthenticator(authFn, skipMethods)
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		ctx, err := authenticate(ctx, info.FullMethod)
+		if err != nil {
+			return nil, err
+		}
+		return handler(ctx, req)
+	}
+}
+
+// StreamAuth Auth 的 stream 版本：handler 以 UserFromContext(ss.Context()) 取得使用者。
+// 只掛 Auth 時 streaming RPC 完全不經驗證
+func StreamAuth(authFn AuthFunc, skipMethods ...string) grpc.StreamServerInterceptor {
+	authenticate := newAuthenticator(authFn, skipMethods)
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		ctx, err := authenticate(ss.Context(), info.FullMethod)
+		if err != nil {
+			return err
+		}
+		return handler(srv, &contextStream{ServerStream: ss, ctx: ctx})
+	}
+}
+
+// contextStream 以替換過的 context 包裝 ServerStream
+type contextStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *contextStream) Context() context.Context { return s.ctx }
+
+func newAuthenticator(authFn AuthFunc, skipMethods []string) func(context.Context, string) (context.Context, error) {
 	skip := make(map[string]bool, len(skipMethods))
 	for _, m := range skipMethods {
 		skip[m] = true
 	}
-
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		// 跳過不需驗證的方法
-		if skip[info.FullMethod] {
-			return handler(ctx, req)
+	return func(ctx context.Context, method string) (context.Context, error) {
+		if skip[method] {
+			return ctx, nil
 		}
 
 		// 從 metadata 取單一 key：FromIncomingContext 會防禦性複製
@@ -45,20 +77,26 @@ func Auth(authFn AuthFunc, skipMethods ...string) grpc.UnaryServerInterceptor {
 		if len(tokens) == 0 {
 			return nil, status.Error(codes.Unauthenticated, "missing authorization token")
 		}
-
-		// 驗證
-		user, err := authFn(ctx, tokens[0])
-		if err != nil {
-			return nil, status.Error(codes.Unauthenticated, err.Error())
+		// 去掉 "Bearer " 前綴（不分大小寫），與 HTTP 的 JWT 中間件一致
+		token := tokens[0]
+		if len(token) >= 7 && strings.EqualFold(token[:7], "Bearer ") {
+			token = token[7:]
 		}
 
-		// 將使用者資訊存入 context
-		ctx = context.WithValue(ctx, userContextKey, user)
-		return handler(ctx, req)
+		user, err := authFn(ctx, token)
+		if err != nil {
+			// status error 原樣傳出。先前一律包成 Unauthenticated：PermissionDenied 等代碼遺失，
+			// 訊息還帶著 "rpc error: code = ... desc = ..." 前綴
+			if _, ok := status.FromError(err); ok {
+				return nil, err
+			}
+			return nil, status.Error(codes.Unauthenticated, err.Error())
+		}
+		return context.WithValue(ctx, userContextKey, user), nil
 	}
 }
 
-// UserFromContext 從 context 取出使用者資訊（Auth interceptor 存入的）
+// UserFromContext 從 context 取出使用者資訊（Auth / StreamAuth 存入的）
 func UserFromContext(ctx context.Context) (interface{}, bool) {
 	user := ctx.Value(userContextKey)
 	return user, user != nil

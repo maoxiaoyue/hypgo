@@ -182,3 +182,22 @@ func TestSummaryInferenceQuality(t *testing.T) {
 		t.Errorf("sanitizeResponse produced invalid UTF-8 or too long (%d bytes)", len(got))
 	}
 }
+
+type listItem struct {
+	ID int `json:"id"`
+}
+
+// TestCollectTypesRegistersSliceElements 迴歸測試（schema B2）：list 回應登錄元素型別。
+// 歷史 bug：FieldsOf(slice) 為 nil，output_type 為 slice 的路由在 types 區段沒有任何定義
+func TestCollectTypesRegistersSliceElements(t *testing.T) {
+	types := map[string]TypeFields{}
+	r := schema.Route{Output: []listItem{}, OutputName: schema.TypeName([]listItem{}),
+		Responses: map[int]schema.ResponseSchema{200: {Type: map[string]*listItem{}, TypeName: "map[string]listItem"}}}
+	collectTypes(types, &r)
+	if r.OutputName != "[]listItem" {
+		t.Errorf("OutputName = %q, want []listItem", r.OutputName)
+	}
+	if f, ok := types["listItem"]; !ok || len(f) != 1 || f[0].Name != "id" {
+		t.Errorf("types = %v, want listItem with field id", types)
+	}
+}

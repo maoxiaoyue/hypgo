@@ -77,7 +77,9 @@ type Route struct {
 	HandlerNames []string `json:"handler_names,omitempty" yaml:"handler_names,omitempty"`
 }
 
-// RouteKey 回傳 Registry 的查詢 key
+// RouteKey 回傳 Registry 的查詢 key：REST 為 "rest|METHOD /path"；其他協議為 "proto|Command"，
+// 有 Platform 時為 "proto|platform:Command"，沒有 Command 時改用 Method / Path（如 websocket 路由）。
+// 先前不含 Platform（同一個 bot 指令註冊到多個平台互相取代），Command 留空時同協議的路由全部共用一個 key
 func (r Route) RouteKey() string {
 	proto := r.Protocol
 	if proto == "" {
@@ -86,7 +88,14 @@ func (r Route) RouteKey() string {
 	if proto == "rest" {
 		return proto + "|" + r.Method + " " + r.Path
 	}
-	return proto + "|" + r.Command
+	id := r.Command
+	if id == "" {
+		id = strings.TrimSpace(r.Method + " " + r.Path)
+	}
+	if r.Platform != "" {
+		id = r.Platform + ":" + id
+	}
+	return proto + "|" + id
 }
 
 // IsREST 判斷是否為 REST 路由

@@ -132,7 +132,11 @@ func bodyHasThink(comments []*ast.CommentGroup, fset *token.FileSet, bodyStart, 
 
 // FormatThinkReport 格式化 @ai:think 檢查報告為終端輸出
 func FormatThinkReport(report *ThinkReport) string {
-	if report == nil || len(report.Missing) == 0 {
+	// 先前 nil 也會落到下面讀 report.Filename 而 panic
+	if report == nil {
+		return "\n[unintent] no report\n"
+	}
+	if len(report.Missing) == 0 {
 		return fmt.Sprintf("\n[unintent] %s: all %d AI-generated funcs have @ai:think ✓\n",
 			report.Filename, report.Scanned)
 	}

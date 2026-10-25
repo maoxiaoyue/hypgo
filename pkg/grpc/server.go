@@ -5,6 +5,7 @@
 package grpc
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -25,7 +26,8 @@ type Config struct {
 	// Addr 監聽地址（如 ":9090"）
 	Addr string
 
-	// TLS 配置（nil 表示不使用 TLS）
+	// TLS 配置（nil 表示不使用 TLS）。憑證載入失敗時 Start 回傳錯誤。
+	// mTLS 等進階設定請以 grpc.Creds 經 New 的 opts 傳入（後者覆蓋前者）
 	TLS *TLSConfig
 
 	// EnableReflection 是否啟用 gRPC reflection（方便 grpcurl 偵錯）
@@ -37,7 +39,7 @@ type Config struct {
 	// MaxRecvMsgSize 最大接收訊息大小（bytes，預設 4MB）
 	MaxRecvMsgSize int
 
-	// MaxSendMsgSize 最大發送訊息大小（bytes，預設 4MB）
+	// MaxSendMsgSize 最大發送訊息大小（bytes，預設 math.MaxInt32，即不限）
 	MaxSendMsgSize int
 
 	// ===== 連線與吞吐調校（零值 = 沿用 grpc-go 預設） =====
@@ -88,6 +90,7 @@ type Server struct {
 	listener     atomic.Value
 	healthServer *health.Server
 	shuttingDown atomic.Bool
+	initErr      error // New 階段的設定錯誤（如 TLS 憑證載入失敗），由 Start 回傳
 }
 
 // getListener 取得目前已發布的 listener（尚未 Start 時為 nil）
@@ -114,11 +117,12 @@ func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 	// 組裝 server options
 	serverOpts := make([]grpc.ServerOption, 0, len(opts)+4)
 
-	// TLS
-	if cfg.TLS != nil && cfg.TLS.CertFile != "" {
+	// TLS：載入失敗（含未給憑證檔）時記下錯誤由 Start 回傳。
+	// 先前只記一行 log 照常啟動，設定了 TLS 卻以明文服務
+	if cfg.TLS != nil {
 		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 		if err != nil {
-			log.Errorf("Failed to load TLS certificate: %v", err)
+			s.initErr = fmt.Errorf("grpc: failed to load TLS certificate: %w", err)
 		} else {
 			tlsConfig := &tls.Config{
 				Certificates: []tls.Certificate{cert},
@@ -188,8 +192,11 @@ func (s *Server) SetServingStatus(service string, status healthpb.HealthCheckRes
 	}
 }
 
-// Start 啟動 gRPC Server（阻塞）
+// Start 啟動 gRPC Server（阻塞）；New 階段的設定錯誤（如 TLS 憑證）在此回傳
 func (s *Server) Start() error {
+	if s.initErr != nil {
+		return s.initErr
+	}
 	lis, err := net.Listen("tcp", s.config.Addr)
 	if err != nil {
 		return fmt.Errorf("grpc: failed to listen on %s: %w", s.config.Addr, err)
@@ -212,7 +219,26 @@ func (s *Server) Start() error {
 	return s.grpcServer.Serve(lis)
 }
 
-// GracefulStop 優雅關閉（等待進行中的 RPC 完成）
+// Shutdown 優雅關閉；ctx 到期時改為 Stop，中斷仍在進行的 RPC。
+// GracefulStop 本身沒有逾時：開著的 stream（如客戶端的 health Watch）不結束就永遠不返回。
+// 強制停止時回傳 ctx.Err()
+func (s *Server) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.Stop()
+		<-done
+		return ctx.Err()
+	}
+}
+
+// GracefulStop 優雅關閉（等待進行中的 RPC 完成，沒有逾時；需要逾時請用 Shutdown）
 func (s *Server) GracefulStop() {
 	if s.shuttingDown.Swap(true) {
 		return // 已在關閉中
@@ -222,9 +248,10 @@ func (s *Server) GracefulStop() {
 		s.logger.Info("gRPC server shutting down gracefully...")
 	}
 
-	// 標記為 NOT_SERVING
+	// 所有服務（含以 SetServingStatus 設定的個別服務）標記為 NOT_SERVING。
+	// 先前只改整體狀態 ""，個別服務仍回報 SERVING，LB 照樣導流量進來
 	if s.healthServer != nil {
-		s.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+		s.healthServer.Shutdown()
 	}
 
 	s.grpcServer.GracefulStop()
@@ -237,6 +264,9 @@ func (s *Server) GracefulStop() {
 // Stop 立即停止（不等待）
 func (s *Server) Stop() {
 	s.shuttingDown.Store(true)
+	if s.healthServer != nil {
+		s.healthServer.Shutdown()
+	}
 	s.grpcServer.Stop()
 }
 
