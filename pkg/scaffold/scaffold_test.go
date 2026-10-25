@@ -539,8 +539,14 @@ func TestGenerateGRPCProject(t *testing.T) {
 	if !strings.Contains(s, "cfg.Server.Addr") {
 		t.Error("main.go should take the listen address from config")
 	}
-	if !strings.Contains(s, "reflection.Register") {
+	if !strings.Contains(s, "EnableReflection:  true") {
 		t.Error("main.go should enable grpc reflection")
+	}
+	if !strings.Contains(s, "interceptor.StreamRecovery") {
+		t.Error("main.go should recover panics in streaming RPCs too")
+	}
+	if !strings.Contains(s, "srv.Shutdown(ctx)") {
+		t.Error("main.go should shut down with a timeout")
 	}
 
 	// .proto 應有 service 和 message 定義

@@ -818,17 +818,19 @@ require (
 const grpcMainTemplate = `package main
 
 import (
+	"context"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/reflection"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	hypgrpc "github.com/maoxiaoyue/hypgo/pkg/grpc"
+	"github.com/maoxiaoyue/hypgo/pkg/grpc/interceptor"
+	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 
@@ -846,27 +848,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load %s: %v", configPath, err)
 	}
-	addr := cfg.Server.Addr
-
-	lis, err := net.Listen("tcp", addr)
+	appLog, err := logger.New(cfg.Logger.Level, cfg.Logger.Output, nil, cfg.Logger.Colors)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		log.Fatalf("Failed to init logger: %v", err)
 	}
 
-	var opts []grpc.ServerOption
+	var tlsCfg *hypgrpc.TLSConfig
 	if cfg.Server.TLS.Enabled {
-		creds, err := credentials.NewServerTLSFromFile(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
-		if err != nil {
-			log.Fatalf("Failed to load TLS credentials: %v", err)
-		}
-		opts = append(opts, grpc.Creds(creds))
+		tlsCfg = &hypgrpc.TLSConfig{CertFile: cfg.Server.TLS.CertFile, KeyFile: cfg.Server.TLS.KeyFile}
 	}
-	// Interceptor（中間件）可在此加入：
-	// opts = append(opts, grpc.ChainUnaryInterceptor(interceptor.Recovery(), interceptor.Logger()))
-	s := grpc.NewServer(opts...)
+	srv := hypgrpc.New(hypgrpc.Config{
+		Addr:              cfg.Server.Addr,
+		TLS:               tlsCfg, // 憑證載入失敗時 Start 回傳錯誤，不會退回明文
+		EnableReflection:  true,   // 方便 grpcurl 偵錯
+		EnableHealthCheck: true,
+	}, appLog,
+		// 中間件：unary 與 stream 都要掛，只掛 unary 時 streaming RPC 不經過它們。
+		// 需要驗證時加上 interceptor.Auth(authFn) 與 interceptor.StreamAuth(authFn)
+		grpc.ChainUnaryInterceptor(interceptor.Recovery(appLog), interceptor.Logger(appLog)),
+		grpc.ChainStreamInterceptor(interceptor.StreamRecovery(appLog), interceptor.StreamLogger(appLog)),
+	)
 
 	// 註冊服務
-	pb.Register{{.Name}}ServiceServer(s, rpc.New{{.Name}}Server())
+	pb.Register{{.Name}}ServiceServer(srv.GRPCServer(), rpc.New{{.Name}}Server())
 
 	// 註冊 Schema（Protocol "grpc"；供 hyp context / contract.TestAll 理解服務介面）
 	rpc.RegisterSchemas()
@@ -874,25 +878,20 @@ func main() {
 	// 同步 manifest 到 .hyp/context.yaml（gRPC 不走 server.Start 的 AutoSync，故啟動時主動寫一次）
 	manifest.NewAutoSync(manifest.AutoSyncConfig{Enabled: true}, router.New(), nil, nil).Run()
 
-	// 啟用 gRPC reflection（方便 grpcurl 偵錯）
-	reflection.Register(s)
-
-	log.Printf("gRPC server listening on %s", addr)
-
-	// 優雅關閉
+	// SIGINT / SIGTERM 時優雅關閉；30 秒內未結束的 RPC（如開著的 stream）強制中斷
 	go func() {
-		if err := s.Serve(lis); err != nil {
-			log.Fatalf("Failed to serve: %v", err)
-		}
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Println("Shutting down gRPC server...")
-	s.GracefulStop()
-	log.Println("Server stopped")
+	// 阻塞到關閉完成
+	if err := srv.Start(); err != nil {
+		log.Fatalf("gRPC server: %v", err)
+	}
 }
 `
 
@@ -1072,7 +1071,7 @@ const grpcConfigTemplate = `# {{.Name}} gRPC service runtime configuration
 server:
   addr: ":9090"        # gRPC 監聽位址
   tls:
-    enabled: false     # true 時 main.go 以 cert_file / key_file 建立 grpc.Creds
+    enabled: false     # true 時以 cert_file / key_file 啟用 TLS（載入失敗則啟動失敗）
     cert_file: ""
     key_file: ""
 
@@ -1093,7 +1092,7 @@ go 1.24
 
 require (
 	github.com/maoxiaoyue/hypgo v0.9.2
-	google.golang.org/grpc v1.72.0
+	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.8
 )
 `

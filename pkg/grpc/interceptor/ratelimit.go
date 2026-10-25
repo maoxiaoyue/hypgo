@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,32 +16,43 @@ import (
 
 // RateLimitConfig 限流配置
 type RateLimitConfig struct {
-	// MaxRequests 時間窗口內的最大請求數
+	// MaxRequests 時間窗口內的最大請求數（預設 100）
 	MaxRequests int
 
-	// Window 時間窗口
+	// Window 時間窗口（預設 1 分鐘）
 	Window time.Duration
 
-	// CleanupInterval 清理過期 key 的間隔（防止記憶體洩漏）
+	// CleanupInterval 清理過期 key 的間隔（防止記憶體洩漏，預設 5 分鐘）
 	CleanupInterval time.Duration
+
+	// KeyFunc 決定限流的 key，預設為客戶端 IP（連線來源位址去掉 port）。
+	// 在 LB / 代理之後所有請求的來源都是代理本身，應改用 metadata 裡的真實來源或已驗證的使用者
+	KeyFunc func(ctx context.Context) string
 }
 
-// rateLimitEntry 單一 IP 的滑動窗口計數（entry 級鎖，非全域鎖）
+// rateLimitEntry 單一 key 的固定窗口計數（entry 級鎖，非全域鎖）
 type rateLimitEntry struct {
 	mu        sync.Mutex
 	count     int
 	windowEnd time.Time
 }
 
-// RateLimit 根據客戶端 IP 限流
+// RateLimiter 固定窗口限流：每個 key 在一個窗口內最多 MaxRequests 次呼叫（stream 開啟時計一次），
+// 窗口自該 key 的第一次呼叫起算。同一個 RateLimiter 的 Unary 與 Stream 共用額度。
 //
 // 併發設計：sync.Map + entry 級鎖。舊實作是一把全域 mutex——
 // 每個 RPC 都經過同一序列化點，高併發下整台 server 的吞吐天花板
-// 就是這把鎖；且清理 goroutine 掃全表時同樣持有它，掃描期間所有
-// RPC 准入停擺。key 亦改為 IP（不含 port）：舊版以 ip:port 為 key，
+// 就是這把鎖。預設 key 為 IP（不含 port）：舊版以 ip:port 為 key，
 // 每條 TCP 連線一個 bucket，map 隨連線數無界成長且限流形同虛設
 // （攻擊者換連線就重置額度）。
-func RateLimit(cfg RateLimitConfig) grpc.UnaryServerInterceptor {
+type RateLimiter struct {
+	cfg       RateLimitConfig
+	clients   sync.Map     // key → *rateLimitEntry
+	nextSweep atomic.Int64 // 下次清理過期 key 的時間（UnixNano）
+}
+
+// NewRateLimiter 建立限流器；以 Unary() / Stream() 取得 interceptor
+func NewRateLimiter(cfg RateLimitConfig) *RateLimiter {
 	if cfg.MaxRequests <= 0 {
 		cfg.MaxRequests = 100
 	}
@@ -50,64 +62,97 @@ func RateLimit(cfg RateLimitConfig) grpc.UnaryServerInterceptor {
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = 5 * time.Minute
 	}
+	if cfg.KeyFunc == nil {
+		cfg.KeyFunc = peerIP
+	}
+	l := &RateLimiter{cfg: cfg}
+	l.nextSweep.Store(time.Now().Add(cfg.CleanupInterval).UnixNano())
+	return l
+}
 
-	var clients sync.Map // ip → *rateLimitEntry
+// RateLimit 限流 unary RPC（等同 NewRateLimiter(cfg).Unary()）。
+// 要讓 streaming RPC 共用同一份額度，改用 NewRateLimiter 並同時掛 Unary() 與 Stream()
+func RateLimit(cfg RateLimitConfig) grpc.UnaryServerInterceptor {
+	return NewRateLimiter(cfg).Unary()
+}
 
-	// 背景清理過期 key（Range 不阻塞其他 goroutine 的讀寫）
-	go func() {
-		ticker := time.NewTicker(cfg.CleanupInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			clients.Range(func(k, v interface{}) bool {
-				e := v.(*rateLimitEntry)
-				e.mu.Lock()
-				expired := now.After(e.windowEnd)
-				e.mu.Unlock()
-				if expired {
-					clients.Delete(k)
-				}
-				return true
-			})
-		}
-	}()
-
+// Unary 回傳 unary interceptor
+func (l *RateLimiter) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		// 取得客戶端 IP（去掉 ephemeral port）
-		clientIP := "unknown"
-		if p, ok := peer.FromContext(ctx); ok {
-			addr := p.Addr.String()
-			if host, _, err := net.SplitHostPort(addr); err == nil {
-				clientIP = host
-			} else {
-				clientIP = addr
-			}
+		if err := l.allow(ctx); err != nil {
+			return nil, err
 		}
-
-		// Load 優先：命中時（常態）不做任何分配
-		v, ok := clients.Load(clientIP)
-		if !ok {
-			v, _ = clients.LoadOrStore(clientIP, &rateLimitEntry{})
-		}
-		entry := v.(*rateLimitEntry)
-
-		entry.mu.Lock()
-		now := time.Now()
-		if now.After(entry.windowEnd) {
-			// 新窗口
-			entry.count = 1
-			entry.windowEnd = now.Add(cfg.Window)
-			entry.mu.Unlock()
-			return handler(ctx, req)
-		}
-		entry.count++
-		if entry.count > cfg.MaxRequests {
-			entry.mu.Unlock()
-			return nil, status.Errorf(codes.ResourceExhausted,
-				"rate limit exceeded: %d requests per %s", cfg.MaxRequests, cfg.Window)
-		}
-		entry.mu.Unlock()
-
 		return handler(ctx, req)
 	}
+}
+
+// Stream 回傳 stream interceptor
+func (l *RateLimiter) Stream() grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if err := l.allow(ss.Context()); err != nil {
+			return err
+		}
+		return handler(srv, ss)
+	}
+}
+
+func (l *RateLimiter) allow(ctx context.Context) error {
+	now := time.Now()
+
+	// 過期 key 的清理在請求路徑上觸發，CAS 確保每個間隔只有一個請求負責。
+	// 先前每次呼叫 RateLimit 都起一個永不結束的背景 goroutine
+	if next := l.nextSweep.Load(); now.UnixNano() >= next &&
+		l.nextSweep.CompareAndSwap(next, now.Add(l.cfg.CleanupInterval).UnixNano()) {
+		go l.sweep(now)
+	}
+
+	key := l.cfg.KeyFunc(ctx)
+	// Load 優先：命中時（常態）不做任何分配
+	v, ok := l.clients.Load(key)
+	if !ok {
+		v, _ = l.clients.LoadOrStore(key, &rateLimitEntry{})
+	}
+	entry := v.(*rateLimitEntry)
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if now.After(entry.windowEnd) {
+		// 新窗口
+		entry.count = 1
+		entry.windowEnd = now.Add(l.cfg.Window)
+		return nil
+	}
+	entry.count++
+	if entry.count > l.cfg.MaxRequests {
+		return status.Errorf(codes.ResourceExhausted,
+			"rate limit exceeded: %d requests per %s", l.cfg.MaxRequests, l.cfg.Window)
+	}
+	return nil
+}
+
+// sweep 刪除窗口已過期的 key（Range 不阻塞其他 goroutine 的讀寫）
+func (l *RateLimiter) sweep(now time.Time) {
+	l.clients.Range(func(k, v interface{}) bool {
+		e := v.(*rateLimitEntry)
+		e.mu.Lock()
+		expired := now.After(e.windowEnd)
+		e.mu.Unlock()
+		if expired {
+			l.clients.Delete(k)
+		}
+		return true
+	})
+}
+
+// peerIP 預設的限流 key：連線來源 IP（去掉 ephemeral port）
+func peerIP(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return "unknown"
+	}
+	addr := p.Addr.String()
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
