@@ -248,19 +248,14 @@ func TestProtocolGetter(t *testing.T) {
 	cfg.ApplyDefaults()
 	s := New(&cfg, logger.NewLogger())
 
-	s.protocol = HTTP1
-	if p := s.GetProtocol(); p != "HTTP/1.1" {
-		t.Errorf("Expected HTTP/1.1, got %s", p)
-	}
-
-	s.protocol = HTTP2
-	if p := s.GetProtocol(); p != "HTTP/2" {
-		t.Errorf("Expected HTTP/2, got %s", p)
-	}
-
-	s.protocol = HTTP3
-	if p := s.GetProtocol(); p != "HTTP/3" {
-		t.Errorf("Expected HTTP/3, got %s", p)
+	for proto, want := range map[string]string{
+		"http1": "HTTP/1.1", "http2": "HTTP/2", "h2": "HTTP/2",
+		"http3": "HTTP/3", "h3": "HTTP/3", "auto": "AUTO",
+	} {
+		cfg.Server.Protocol = proto
+		if p := s.GetProtocol(); p != want {
+			t.Errorf("protocol %q: GetProtocol() = %s, want %s", proto, p, want)
+		}
 	}
 }
 
@@ -454,7 +449,7 @@ func TestWaitForChildAliveDetectsDeadProcess(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // 給它時間結束
 
 	start := time.Now()
-	alive := s.waitForChildAlive(cmd.Process, 15, 200*time.Millisecond)
+	alive := s.waitForChildAlive(cmd.Process, 3*time.Second)
 	elapsed := time.Since(start)
 
 	if alive {
@@ -466,11 +461,9 @@ func TestWaitForChildAliveDetectsDeadProcess(t *testing.T) {
 }
 
 // TestWaitForChildAliveDetectsLiveProcess 子行程全程存活時應回傳 true。
-// Windows 上 (*os.Process).Signal 僅支援 os.Kill/os.Interrupt，
-// 存活探測必定回錯——這正是 graceful restart 在 Windows 停用的原因，故跳過。
 func TestWaitForChildAliveDetectsLiveProcess(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("liveness probe via Signal(0) is unsupported on Windows (graceful restart is Windows-disabled)")
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("no sleep command to spawn a long-lived helper process")
 	}
 
 	cfg := config.Config{}
@@ -486,7 +479,7 @@ func TestWaitForChildAliveDetectsLiveProcess(t *testing.T) {
 		cmd.Wait()
 	}()
 
-	if !s.waitForChildAlive(cmd.Process, 3, 50*time.Millisecond) {
+	if !s.waitForChildAlive(cmd.Process, 150*time.Millisecond) {
 		t.Error("waitForChildAlive should report true for a process alive throughout the poll window")
 	}
 }

@@ -59,15 +59,20 @@ type Server struct {
 	// 讀取時若剛好與 startHTTPx 的寫入同時發生（例如極早的 graceful restart
 	// 訊號），裸欄位會是資料競態
 	listener atomic.Value
-
-	// 協議檢測
-	protocol Protocol
+	// udpConn HTTP/3 的 UDP socket（net.PacketConn）。http3.Server.Serve 關閉時不會關閉它，由 doShutdown 關閉
+	udpConn atomic.Value
 
 	// 0-RTT 支援（帶 LRU 淘汰 + TTL）
 	sessionCache *SessionCache
 
-	// Alt-Svc 標頭值（啟動時預計算；空字串 = 不廣告 H3）
-	altSvcValue string
+	// altSvc 目前廣告的 Alt-Svc 值（nil = 不廣告）：auto 模式下 HTTP/3 的 UDP socket 綁定成功後才設定
+	altSvc atomic.Pointer[string]
+
+	// handlerSem 限制同時執行的 handler 數（config.Server.MaxHandlers；nil = 不限）
+	handlerSem chan struct{}
+
+	// restarted 本行程是否由優雅重啟產生（HTTP/3 需等父行程釋放 UDP 埠）
+	restarted bool
 
 	// 優雅關閉（atomic 避免競態；Once 保證 Shutdown 冪等）
 	shutdownChan chan struct{}
@@ -84,15 +89,12 @@ func (s *Server) getListenerAtomic() net.Listener {
 	return v.(net.Listener)
 }
 
-// Protocol 協議類型
-type Protocol int
+// restartEnv 優雅重啟時設給子行程的環境變數
+const restartEnv = "HYPGO_RESTARTED"
 
-const (
-	HTTP1 Protocol = iota
-	HTTP2
-	HTTP3
-	AUTO // 自動檢測
-)
+// restartBindTimeout 重啟產生的子行程等待父行程釋放 HTTP/3 UDP 埠的上限
+// （父行程的優雅關閉最長 30 秒，另留餘裕）
+const restartBindTimeout = 60 * time.Second
 
 // sessionEntry 帶時間戳的 session 快取項（鏈表節點值）
 type sessionEntry struct {
@@ -247,6 +249,9 @@ func (s *Server) Start() error {
 		}, s.router, s.config, s.logger).Sync()
 	}
 
+	s.restarted = os.Getenv(restartEnv) == "1"
+	os.Unsetenv(restartEnv) // 不再傳給應用程式自行啟動的子行程
+
 	// 保存 PID 檔案
 	if err := s.savePIDFile(); err != nil {
 		s.logger.Warningf("Failed to save PID file: %v", err)
@@ -292,27 +297,22 @@ func (s *Server) Start() error {
 		go s.handleGracefulRestart()
 	}
 
-	// Alt-Svc 預計算：值在啟動後不變，先前每請求 fmt.Sprintf（格式
-	// 解析 + 2 次分配）。只在 auto 模式（真的同時起 H3 listener）
-	// 廣告——舊行為只看 TLS，純 http1/http2 模式也發 Alt-Svc，
-	// 誘使客戶端做註定失敗的 QUIC 連線嘗試
-	if s.config.Server.TLS.Enabled && s.config.Server.Protocol == "auto" {
-		s.altSvcValue = fmt.Sprintf(`h3="%s"; ma=86400`, s.config.Server.Addr)
+	// handler 並發上限：x/net 的 http2.Server.MaxHandlers 標註 TODO 未實作，
+	// 先前把設定傳給它，max_handlers 對任何協議都沒有效果
+	if n := s.config.Server.MaxHandlers; n > 0 {
+		s.handlerSem = make(chan struct{}, n)
 	}
 
-	// 自動檢測協議或使用指定協議
 	var err error
-	if s.config.Server.Protocol == "auto" {
-		err = s.startAutoProtocol()
-	} else {
-		switch s.config.Server.Protocol {
-		case "http3", "h3":
-			err = s.startHTTP3()
-		case "http2", "h2":
-			err = s.startHTTP2()
-		default:
-			err = s.startHTTP1()
-		}
+	switch s.config.Server.Protocol {
+	case "auto":
+		err = s.startAutoProtocol(false)
+	case "http3", "h3":
+		err = s.startAutoProtocol(true)
+	case "http2", "h2":
+		err = s.startHTTP2()
+	default:
+		err = s.startHTTP1()
 	}
 
 	// 優雅關閉時 Serve/ListenAndServe 依 stdlib 慣例回傳 http.ErrServerClosed
@@ -322,24 +322,50 @@ func (s *Server) Start() error {
 	if errors.Is(err, http.ErrServerClosed) || (errors.Is(err, net.ErrClosed) && s.shuttingDown.Load()) {
 		return nil
 	}
+	if err != nil && !s.shuttingDown.Load() {
+		// 啟動失敗（如埠被占用）：移除 PID 檔並停止訊號監聽。先前 PID 檔留在原地，
+		// 且 signal.Notify 持續攔截 SIGINT / SIGTERM——之後按 Ctrl+C 不會結束行程
+		s.Shutdown(context.Background())
+	}
 	return err
 }
 
-// startAutoProtocol 自動協議選擇（同時支援 HTTP/1.1/2/3）
-func (s *Server) startAutoProtocol() error {
+// startAutoProtocol 同時啟動 HTTP/3（UDP）與 HTTP/1.1 + HTTP/2（TCP，回應帶 Alt-Svc 讓瀏覽器升級）。
+// h3Required（protocol: http3）時 HTTP/3 起不來就整個 Start 失敗；auto 只記警告、照常服務 TCP。
+// 先前 http3 模式只監聽 UDP：瀏覽器沒有 TCP 回應可以讀到 Alt-Svc，無從發現 HTTP/3
+func (s *Server) startAutoProtocol(h3Required bool) error {
 	s.logger.Infof("Starting server with auto protocol detection on %s", s.config.Server.Addr)
 
-	// 啟動 HTTP/3 伺服器（UDP）
-	if s.config.Server.TLS.Enabled {
-		go func() {
-			if err := s.startHTTP3(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				s.logger.Warningf("HTTP/3 server failed: %v", err)
-			}
-		}()
+	if !s.config.Server.TLS.Enabled {
+		if h3Required {
+			return fmt.Errorf("HTTP/3 requires TLS to be enabled")
+		}
+		return s.startHTTP2WithFallback()
 	}
 
-	// 啟動 HTTP/1.1 + HTTP/2 伺服器（TCP）
-	return s.startHTTP2WithFallback()
+	h3Err := make(chan error, 1)
+	go func() {
+		err := s.startHTTP3()
+		if err == nil || errors.Is(err, http.ErrServerClosed) || s.shuttingDown.Load() {
+			return
+		}
+		if !h3Required {
+			s.logger.Warningf("HTTP/3 server failed: %v", err)
+			return
+		}
+		h3Err <- err
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+	}()
+
+	err := s.startHTTP2WithFallback()
+	select {
+	case e := <-h3Err:
+		return e
+	default:
+		return err
+	}
 }
 
 // getTLSWrapSession 取得用於 TLS 1.3 0-RTT 的 WrapSession 函數
@@ -388,10 +414,6 @@ func (s *Server) loadCertificate() (tls.Certificate, error) {
 func (s *Server) startHTTP3() error {
 	s.logger.Infof("Starting HTTP/3 server on %s", s.config.Server.Addr)
 
-	if !s.config.Server.TLS.Enabled {
-		return fmt.Errorf("HTTP/3 requires TLS to be enabled")
-	}
-
 	cert, err := s.loadCertificate()
 	if err != nil {
 		return err
@@ -420,9 +442,17 @@ func (s *Server) startHTTP3() error {
 		MaxIncomingStreams: int64(maxStreams),
 	}
 
+	// 自行綁定 UDP 再 Serve（quic-go 建議：ListenAndServe 與 Shutdown 併用可能競爭），
+	// 也才知道綁定是否成功、實際的埠號
+	pc, err := s.listenUDP()
+	if err != nil {
+		return err
+	}
+	s.udpConn.Store(pc)
+
 	// 創建 HTTP/3 伺服器
 	h3srv := &http3.Server{
-		Handler:         s.wrapH3Handler(),
+		Handler:         s.wrapHandler(s.router, false),
 		Addr:            s.config.Server.Addr,
 		TLSConfig:       tlsConfig,
 		QUICConfig:      quicConf,
@@ -435,9 +465,41 @@ func (s *Server) startHTTP3() error {
 		},
 	}
 	s.h3Server.Store(h3srv)
+	if s.shuttingDown.Load() { // 理由同 serveTCP
+		pc.Close()
+		return http.ErrServerClosed
+	}
 
-	// 監聽並服務
-	return h3srv.ListenAndServe()
+	// UDP 綁定成功才在 TCP 回應廣告 Alt-Svc，且只帶埠號：先前 HTTP/3 啟動失敗
+	// 仍每個回應都廣告，主機也直接取 Addr——綁 0.0.0.0 時叫客戶端連往 0.0.0.0
+	v := fmt.Sprintf(`h3=":%d"; ma=86400`, pc.LocalAddr().(*net.UDPAddr).Port)
+	s.altSvc.Store(&v)
+	return h3srv.Serve(pc)
+}
+
+// listenUDP 綁定 HTTP/3 的 UDP socket。優雅重啟產生的子行程在父行程釋放埠之前會綁定失敗：
+// 持續重試到成功或 restartBindTimeout，期間不廣告 Alt-Svc（客戶端走 TCP）。
+// 先前子行程只試一次即放棄，重啟後 HTTP/3 永久消失。不與父行程共用同一個 UDP socket：
+// 核心會把封包任意分給兩個行程，交接期間父行程的 QUIC 連線會大量掉封包
+func (s *Server) listenUDP() (net.PacketConn, error) {
+	pc, err := net.ListenPacket("udp", s.config.Server.Addr)
+	if err == nil || !s.restarted {
+		return pc, err
+	}
+	s.logger.Infof("HTTP/3 port busy (%v); waiting for the previous process to release it", err)
+	deadline := time.Now().Add(restartBindTimeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-s.shutdownChan:
+			return nil, http.ErrServerClosed
+		case <-time.After(200 * time.Millisecond):
+		}
+		if pc, err = net.ListenPacket("udp", s.config.Server.Addr); err == nil {
+			s.logger.Info("HTTP/3 port bound after the previous process released it")
+			return pc, nil
+		}
+	}
+	return nil, err
 }
 
 // startHTTP2WithFallback 啟動 HTTP/2 伺服器（支援 HTTP/1.1 降級）
@@ -460,7 +522,6 @@ func (s *Server) startHTTP2WithFallback() error {
 
 	// 配置 HTTP/2
 	h2s := &http2.Server{
-		MaxHandlers:                  s.config.Server.MaxHandlers,
 		MaxConcurrentStreams:         uint32(maxConcurrentStreams),
 		MaxReadFrameSize:             uint32(maxReadFrameSize),
 		PermitProhibitedCipherSuites: false,
@@ -480,7 +541,7 @@ func (s *Server) startHTTP2WithFallback() error {
 	if !s.config.Server.TLS.Enabled {
 		handler = h2c.NewHandler(s.router, h2s)
 	}
-	handler = s.wrapHandler(handler)
+	handler = s.wrapHandler(handler, true)
 
 	// 創建 HTTP 伺服器
 	httpSrv := &http.Server{
@@ -508,25 +569,18 @@ func (s *Server) startHTTP2WithFallback() error {
 		if err := http2.ConfigureServer(httpSrv, h2s); err != nil {
 			return fmt.Errorf("http2.ConfigureServer: %w", err)
 		}
-		s.httpServer.Store(httpSrv)
-		return httpSrv.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
 	}
-
-	s.httpServer.Store(httpSrv)
-	return httpSrv.Serve(listener)
+	return s.serveTCP(httpSrv, listener)
 }
 
-// startHTTP2 啟動純 HTTP/2 伺服器
+// startHTTP2 啟動 HTTP/2 伺服器（同 startHTTP2WithFallback）
 func (s *Server) startHTTP2() error {
-	// 強制 HTTP/2
-	s.protocol = HTTP2
 	return s.startHTTP2WithFallback()
 }
 
 // startHTTP1 啟動 HTTP/1.1 伺服器
 func (s *Server) startHTTP1() error {
 	s.logger.Infof("Starting HTTP/1.1 server on %s", s.config.Server.Addr)
-	s.protocol = HTTP1
 
 	listener, err := s.getListener()
 	if err != nil {
@@ -534,7 +588,7 @@ func (s *Server) startHTTP1() error {
 	}
 	s.listener.Store(listener)
 
-	handler := s.wrapHandler(s.router)
+	handler := s.wrapHandler(s.router, true)
 
 	httpSrv := &http.Server{
 		Handler:           handler,
@@ -548,49 +602,56 @@ func (s *Server) startHTTP1() error {
 	// TLS 配置（統一 cipher suites）
 	if s.config.Server.TLS.Enabled {
 		httpSrv.TLSConfig = &tls.Config{
+			NextProtos:   []string{"http/1.1"},
 			MinVersion:   tls.VersionTLS12,
 			CipherSuites: strongCipherSuites,
 		}
-		s.httpServer.Store(httpSrv)
-		return httpSrv.ServeTLS(listener, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
+		// 非 nil 的空 map 停用 net/http 自動啟用的 h2：先前 protocol: http1 加上 TLS 仍協商出 HTTP/2
+		httpSrv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
-
-	s.httpServer.Store(httpSrv)
-	return httpSrv.Serve(listener)
+	return s.serveTCP(httpSrv, listener)
 }
 
-// wrapHandler 包裝處理器以注入 Alt-Svc 標頭（值於 Start 預計算；
-// 無 H3 可廣告時不加包裝層）
-func (s *Server) wrapHandler(h http.Handler) http.Handler {
-	altSvc := s.altSvcValue
-	if altSvc == "" {
+// serveTCP 記錄 httpServer 後開始服務。記錄之後再檢查 shuttingDown：Shutdown 若在記錄之前
+// 就讀到 nil（HTTP/3 啟動失敗、啟動中收到訊號），這裡會看到旗標並先關閉，否則 TCP 會在
+// Shutdown 之後繼續服務。關閉後的 Serve 立即回傳 http.ErrServerClosed 並關掉 listener
+func (s *Server) serveTCP(srv *http.Server, l net.Listener) error {
+	s.httpServer.Store(srv)
+	if s.shuttingDown.Load() {
+		srv.Close()
+	}
+	if s.config.Server.TLS.Enabled {
+		return srv.ServeTLS(l, s.config.Server.TLS.CertFile, s.config.Server.TLS.KeyFile)
+	}
+	return srv.Serve(l)
+}
+
+// wrapHandler 最外層包裝：限制同時執行的 handler 數（MaxHandlers），
+// TCP 側另在 HTTP/3 可用時加上 Alt-Svc。兩者都不需要時不加包裝層
+func (s *Server) wrapHandler(h http.Handler, tcp bool) http.Handler {
+	// altSvc 只在 HTTP/3 綁定後才有值（auto / http3 模式），其餘模式讀到 nil 不廣告
+	advertise := tcp && s.config.Server.TLS.Enabled
+	sem := s.handlerSem
+	if !advertise && sem == nil {
 		return h
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor < 3 {
-			w.Header().Set("Alt-Svc", altSvc)
+		if advertise {
+			if v := s.altSvc.Load(); v != nil {
+				w.Header().Set("Alt-Svc", *v)
+			}
+		}
+		if sem != nil {
+			// 達上限時等待空位；客戶端取消請求即放棄
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-r.Context().Done():
+				return
+			}
 		}
 		h.ServeHTTP(w, r)
 	})
-}
-
-// wrapH3Handler 包裝 HTTP/3 處理器
-func (s *Server) wrapH3Handler() http.Handler {
-	// 直接回傳 router：先前多包一層只轉呼叫的 HandlerFunc，
-	// 每請求平白多一個 call frame
-	return s.router
-}
-
-// detectProtocol 檢測請求使用的協議
-func (s *Server) detectProtocol(r *http.Request) string {
-	switch r.ProtoMajor {
-	case 3:
-		return "HTTP/3"
-	case 2:
-		return "HTTP/2"
-	default:
-		return "HTTP/1.1"
-	}
 }
 
 // getListener 創建或繼承監聽器
@@ -662,7 +723,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// doShutdown 實際的關閉流程（僅由 shutdownOnce 執行一次）
+// doShutdown 實際的關閉流程（僅由 shutdownOnce 執行一次）：HTTP/1+2 與 HTTP/3 並行優雅關閉，
+// ctx 到期時強制關閉剩餘連線。先前逾時只記一行 "forcing close"、連線照樣跑完；HTTP/3 以 Close
+// 直接中斷且要等 TCP 側關完才開始；逾時後讀取錯誤變數與背景 goroutine 的寫入有 data race
 func (s *Server) doShutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down server...")
 	s.shuttingDown.Store(true)
@@ -670,36 +733,36 @@ func (s *Server) doShutdown(ctx context.Context) error {
 	// 注意：不手動 Close listener——http.Server.Shutdown 的第一步就是關閉
 	// 所有 listener；搶先手動關會讓 Serve 的 Accept 以 net.ErrClosed 收場
 	// （"use of closed network connection"），而非預期的 http.ErrServerClosed
-
-	// 並行關閉 HTTP/1+2 和 HTTP/3 伺服器
-	var httpErr, h3Err error
-	done := make(chan struct{})
-
-	go func() {
-		if hs := s.httpServer.Load(); hs != nil {
-			httpErr = hs.Shutdown(ctx)
+	hs, h3 := s.httpServer.Load(), s.h3Server.Load()
+	errs := make(chan error, 2)
+	pending := 0
+	if hs != nil {
+		pending++
+		go func() { errs <- hs.Shutdown(ctx) }()
+	}
+	if h3 != nil {
+		pending++
+		go func() { errs <- h3.Shutdown(ctx) }() // 送 GOAWAY 等請求完成；ctx 到期時自行強制關閉
+	}
+	var err error
+	for ; pending > 0; pending-- {
+		if e := <-errs; e != nil && err == nil {
+			err = e
 		}
-		if h3 := s.h3Server.Load(); h3 != nil {
-			h3Err = h3.Close()
-		}
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// 正常完成
-	case <-ctx.Done():
-		// 超時
+	}
+	if ctx.Err() != nil {
 		s.logger.Warning("Shutdown timed out, forcing close")
+		if hs != nil {
+			hs.Close()
+		}
+	}
+	if pc, ok := s.udpConn.Load().(net.PacketConn); ok {
+		pc.Close()
 	}
 
 	close(s.shutdownChan)
 	s.removePIDFile()
-
-	if httpErr != nil {
-		return httpErr
-	}
-	return h3Err
+	return err
 }
 
 // handleGracefulRestart 處理優雅重啟
@@ -720,25 +783,21 @@ func (s *Server) handleGracefulRestart() {
 				continue
 			}
 
-			// 輪詢新進程存活狀態（每 200ms 最多 15 次 = 3 秒）。
-			// 舊版只是空睡 3 秒、從不檢查任何狀態——若新進程啟動瞬間崩潰
-			// （壞的執行檔、init 階段 panic 等），舊進程仍會照常自我關閉，
-			// 造成兩個進程都不在、服務完全中斷。這裡改為真正輪詢：
-			// 只要偵測到新進程已死，就放棄本次重啟、繼續留守，不自我關閉。
-			if !s.waitForChildAlive(child, 15, 200*time.Millisecond) {
+			// 新進程在 3 秒內結束（壞的執行檔、init 階段 panic 等）就放棄本次重啟、繼續留守，
+			// 不自我關閉——否則兩個進程都不在、服務完全中斷
+			if !s.waitForChildAlive(child, 3*time.Second) {
 				s.logger.Emergencyf("New process (pid=%d) exited during startup; aborting restart, this process keeps serving", child.Pid)
 				continue
 			}
 
-			// 優雅關閉
+			// 優雅關閉：Start() 隨之返回 nil，由 main 正常結束。先前直接 os.Exit(0)，
+			// 跳過 main 裡的 defer（如 db.Close()）
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := s.Shutdown(ctx); err != nil {
 				s.logger.Emergencyf("Failed to shutdown gracefully: %v", err)
 			}
 			cancel()
-
-			s.removePIDFile()
-			os.Exit(0)
+			return
 
 		case <-s.shutdownChan:
 			return // Server 被正常關閉，退出 goroutine
@@ -766,8 +825,15 @@ func (s *Server) forkNewProcess() (*os.Process, error) {
 		}
 	}
 
+	// 標記子行程由重啟產生（HTTP/3 需等本行程釋放 UDP 埠）
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, restartEnv+"=") {
+			env = append(env, kv)
+		}
+	}
 	attr := &os.ProcAttr{
-		Env:   os.Environ(),
+		Env:   append(env, restartEnv+"=1"),
 		Files: files,
 	}
 
@@ -780,18 +846,21 @@ func (s *Server) forkNewProcess() (*os.Process, error) {
 	return process, nil
 }
 
-// waitForChildAlive 輪詢子進程是否仍存活，最多 attempts 次、每次間隔 interval。
-// 用 signal 0（不送任何實際訊號，僅探測進程是否存在）逐次探測；只要有一次探測
-// 失敗就視為子進程已結束，立即回傳 false（不必空等滿整個時長）。
-// 全程存活則回傳 true。
-func (s *Server) waitForChildAlive(child *os.Process, attempts int, interval time.Duration) bool {
-	for i := 0; i < attempts; i++ {
-		time.Sleep(interval)
-		if err := child.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
+// waitForChildAlive 等待 window；子進程在此期間結束即回傳 false。
+// 以 Wait 判斷（跨平台準確）：先前以 Signal(0) 探測，但在 Unix 上已結束、尚未被 Wait 的子進程
+// 是 zombie，Signal(0) 照樣成功——啟動即崩潰的子進程被當成存活，父進程照常自我關閉
+func (s *Server) waitForChildAlive(child *os.Process, window time.Duration) bool {
+	exited := make(chan struct{})
+	go func() {
+		child.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+		return false
+	case <-time.After(window):
+		return true
 	}
-	return true
 }
 
 // applyDefaultMiddlewares 應用預設中間件
@@ -841,24 +910,19 @@ func (s *Server) MethodNotAllowed(handler hypcontext.HandlerFunc) {
 	s.router.MethodNotAllowed(handler)
 }
 
-// GetProtocol 獲取當前協議
+// GetProtocol 回傳設定的協議（"HTTP/1.1" / "HTTP/2" / "HTTP/3" / "AUTO"）。
+// 先前讀取 Start 內寫入的欄位：auto 與 http3 模式從未設定，零值使兩者都回報 HTTP/1.1
 func (s *Server) GetProtocol() string {
-	switch s.protocol {
-	case HTTP3:
+	switch s.config.Server.Protocol {
+	case "http3", "h3":
 		return "HTTP/3"
-	case HTTP2:
+	case "http2", "h2":
 		return "HTTP/2"
-	case HTTP1:
-		return "HTTP/1.1"
-	default:
+	case "auto":
 		return "AUTO"
+	default:
+		return "HTTP/1.1"
 	}
-}
-
-// Manifest 生成應用程式的結構描述
-func (s *Server) Manifest() *manifest.Manifest {
-	c := manifest.NewCollector(s.router, s.config)
-	return c.Collect()
 }
 
 // pidFilePath PID 檔案路徑（相對於 CWD，固定檔名 hypgo.pid 以維持既有腳本相容性）

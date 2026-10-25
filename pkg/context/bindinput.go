@@ -10,6 +10,7 @@ import (
 	stderrors "errors"
 	"net/http"
 	"reflect"
+	"sync/atomic"
 
 	"github.com/go-playground/validator/v10"
 	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
@@ -19,7 +20,9 @@ import (
 // 以 hook 形式提供，讓 server/app 可接到 logger，而 pkg/context 不需依賴 pkg/logger（避免循環依賴）。
 type BindInputReporter func(routeKey, declared, bound string)
 
-var bindInputReporter BindInputReporter
+// bindInputReporter 以 atomic 保存：server.Start 寫入時，其他 server（或重啟中的同一行程）
+// 的請求可能正在讀取——先前的裸變數是 data race
+var bindInputReporter atomic.Pointer[BindInputReporter]
 
 // SetBindInputReporter 設定型別不符的回報函式。
 //
@@ -27,9 +30,13 @@ var bindInputReporter BindInputReporter
 // @ai:purpose 讓上層（server）注入 logger 回報，維持 context 對 logger 零依賴
 // @ai:input 回報函式，參數為 routeKey、宣告型別名、實際綁定型別名
 // @ai:output none
-// @ai:sideeffect 設定套件層級變數（應於程式啟動階段呼叫，非並行安全）
+// @ai:sideeffect 設定套件層級變數（並行安全；後設定者覆蓋先前的值）
 func SetBindInputReporter(fn BindInputReporter) {
-	bindInputReporter = fn
+	if fn == nil {
+		bindInputReporter.Store(nil)
+		return
+	}
+	bindInputReporter.Store(&fn)
 }
 
 // SetSchemaInput 記錄當前路由宣告的 Input 型別，供 BindInput 對齊比對。
@@ -78,11 +85,11 @@ func (c *Context) BindInput(obj interface{}) bool {
 
 	// 1. 對齊 Schema 宣告型別：偵測 handler 綁錯 struct 的靜默失敗
 	//    （Go 的 json.Unmarshal 綁錯型別不會報錯，這是整條工具鏈唯一能攔截之處）
-	if c.schemaInput != nil && bindInputReporter != nil {
+	if report := bindInputReporter.Load(); c.schemaInput != nil && report != nil {
 		declared := derefType(reflect.TypeOf(c.schemaInput))
 		bound := derefType(reflect.TypeOf(obj))
 		if declared != nil && bound != nil && declared != bound {
-			bindInputReporter(c.schemaRouteKey, declared.String(), bound.String())
+			(*report)(c.schemaRouteKey, declared.String(), bound.String())
 		}
 	}
 
