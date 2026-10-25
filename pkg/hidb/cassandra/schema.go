@@ -39,9 +39,6 @@ func (c *CassandraDB) TableFromModel(model interface{}, opts ...TableOption) (*T
 // AutoMigrate creates the tables for every model (idempotent when
 // IF NOT EXISTS is set). Models should be pointers to structs.
 func (c *CassandraDB) AutoMigrate(ctx context.Context, models ...interface{}) error {
-	if c.session == nil {
-		return fmt.Errorf("cassandra: session not connected")
-	}
 	for _, m := range models {
 		t, err := c.TableFromModel(m)
 		if err != nil {

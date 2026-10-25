@@ -4,7 +4,8 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -46,13 +47,12 @@ func NewNetworkReplication(dcs map[string]int) KeyspaceReplication {
 // ToCQL renders the REPLICATION JSON-like map.
 func (r KeyspaceReplication) ToCQL() string {
 	var sb strings.Builder
-	sb.WriteString("{'class': '")
-	if r.Class == "" {
-		sb.WriteString(string(NetworkTopologyStrategy))
-	} else {
-		sb.WriteString(string(r.Class))
+	class := r.Class
+	if class == "" {
+		class = NetworkTopologyStrategy
 	}
-	sb.WriteString("'")
+	sb.WriteString("{'class': ")
+	sb.WriteString(cqlLiteral(string(class)))
 	switch r.Class {
 	case SimpleStrategy, "":
 		if r.Class == SimpleStrategy {
@@ -66,30 +66,17 @@ func (r KeyspaceReplication) ToCQL() string {
 			if r.Factor > 0 {
 				fmt.Fprintf(&sb, ", 'replication_factor': %d", r.Factor)
 			}
-			if len(r.DataCenters) > 0 {
-				keys := sortedDCKeys(r.DataCenters)
-				for _, k := range keys {
-					fmt.Fprintf(&sb, ", '%s': %d", k, r.DataCenters[k])
-				}
+			for _, k := range slices.Sorted(maps.Keys(r.DataCenters)) {
+				fmt.Fprintf(&sb, ", %s: %d", cqlLiteral(k), r.DataCenters[k])
 			}
 		}
 	case NetworkTopologyStrategy:
-		keys := sortedDCKeys(r.DataCenters)
-		for _, k := range keys {
-			fmt.Fprintf(&sb, ", '%s': %d", k, r.DataCenters[k])
+		for _, k := range slices.Sorted(maps.Keys(r.DataCenters)) {
+			fmt.Fprintf(&sb, ", %s: %d", cqlLiteral(k), r.DataCenters[k])
 		}
 	}
 	sb.WriteString("}")
 	return sb.String()
-}
-
-func sortedDCKeys(m map[string]int) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // KeyspaceOptions collects optional keyspace-level settings.

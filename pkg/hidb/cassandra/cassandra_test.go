@@ -34,7 +34,7 @@ func TestTableDefaultsApplied(t *testing.T) {
 		PartitionKey("id").
 		CreateCQL()
 	for _, c := range []string{
-		"'class': 'UnifiedCompactionStrategy'",
+		"'class': 'SizeTieredCompactionStrategy'",
 		"'sstable_compression': 'LZ4Compressor'",
 		"'keys': 'ALL'",
 		"gc_grace_seconds = 864000",
@@ -398,8 +398,8 @@ func TestParseConsistency(t *testing.T) {
 		"": gocql.LocalOne,
 	}
 	for in, want := range cases {
-		if got := parseConsistency(in); got != want {
-			t.Errorf("parseConsistency(%q) = %v, want %v", in, got, want)
+		if got, err := parseConsistencyStrict(in); err != nil || got != want {
+			t.Errorf("parseConsistencyStrict(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
 }
@@ -750,8 +750,12 @@ func TestParseConsistencyStrict(t *testing.T) {
 }
 
 func TestParseConsistencyFallbackLocalOne(t *testing.T) {
-	// 舊 API：拼錯不再回 Quorum，改回 LocalOne
-	if got := parseConsistency("typo"); got != gocql.LocalOne {
+	// 非嚴格模式：拼錯不回 Quorum，cluster 設為 LocalOne
+	c := &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}, Consistency: "typo"}}
+	if err := c.init(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.cluster.Consistency; got != gocql.LocalOne {
 		t.Errorf("expected LocalOne fallback, got %v", got)
 	}
 }
@@ -862,44 +866,6 @@ func TestConnectAfterCloseRejected(t *testing.T) {
 	_ = c.Close()
 	if err := c.Connect(); err == nil {
 		t.Fatal("Connect() after Close() should error")
-	}
-}
-
-func TestInitMapHostsInterfaceSlice(t *testing.T) {
-	c := &CassandraDB{}
-	err := c.Init(map[string]interface{}{
-		"hosts":              []interface{}{"1.1.1.1", "2.2.2.2"},
-		"keyspace":           "ks",
-		"consistency":        "local_quorum",
-		"connect_timeout":    "3s",
-		"timeout":            int64(5_000_000_000), // 5s
-		"num_retries":        2,
-		"reconnect_interval": "500ms",
-		"strict_consistency": false,
-		"tls": map[string]interface{}{
-			"enabled":              true,
-			"cert_file":            "/c.pem",
-			"key_file":             "/c.key",
-			"insecure_skip_verify": true,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(c.config.Hosts) != 2 || c.config.Hosts[0] != "1.1.1.1" {
-		t.Errorf("hosts not parsed: %v", c.config.Hosts)
-	}
-	if c.config.ConnectTimeout != 3*time.Second {
-		t.Errorf("connect_timeout: %v", c.config.ConnectTimeout)
-	}
-	if c.config.Timeout != 5*time.Second {
-		t.Errorf("timeout: %v", c.config.Timeout)
-	}
-	if c.config.NumRetries != 2 {
-		t.Errorf("num_retries: %d", c.config.NumRetries)
-	}
-	if !c.config.TLS.Enabled || c.config.TLS.CertFile != "/c.pem" {
-		t.Errorf("tls block: %+v", c.config.TLS)
 	}
 }
 

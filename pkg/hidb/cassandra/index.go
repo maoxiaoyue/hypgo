@@ -4,7 +4,6 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -106,13 +105,6 @@ func (i *IndexBuilder) Option(key string, value interface{}) *IndexBuilder {
 	return i
 }
 
-func (i *IndexBuilder) tableRef() string {
-	if i.keyspace != "" {
-		return quoteIdent(i.keyspace) + "." + quoteIdent(i.table)
-	}
-	return quoteIdent(i.table)
-}
-
 // CreateCQL renders the CREATE INDEX statement.
 func (i *IndexBuilder) CreateCQL() string {
 	var sb strings.Builder
@@ -132,7 +124,7 @@ func (i *IndexBuilder) CreateCQL() string {
 		sb.WriteString(" ")
 	}
 	sb.WriteString("ON ")
-	sb.WriteString(i.tableRef())
+	sb.WriteString(qualifiedName(i.keyspace, i.table))
 	sb.WriteString(" (")
 	if i.target != "" {
 		fmt.Fprintf(&sb, "%s(%s)", i.target, quoteIdent(i.column))
@@ -145,32 +137,20 @@ func (i *IndexBuilder) CreateCQL() string {
 	case IndexSAI:
 		sb.WriteString(" USING 'sai'")
 	case IndexCustom:
-		fmt.Fprintf(&sb, " USING '%s'", i.customCls)
+		fmt.Fprintf(&sb, " USING %s", cqlLiteral(i.customCls))
 	}
 
 	if len(i.options) > 0 {
-		sb.WriteString(" WITH OPTIONS = {")
-		keys := make([]string, 0, len(i.options))
-		for k := range i.options {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, fmt.Sprintf("'%s': %s", k, quoteOptionValue(i.options[k])))
-		}
-		sb.WriteString(strings.Join(parts, ", "))
-		sb.WriteString("}")
+		sb.WriteString(" WITH OPTIONS = ")
+		sb.WriteString(cqlLiteral(i.options))
 	}
 	return sb.String()
 }
 
-// DropCQL renders DROP INDEX IF EXISTS <name>.
+// DropCQL renders DROP INDEX IF EXISTS <name>. Dropping needs an explicit
+// index name; Drop returns an error without one.
 func (i *IndexBuilder) DropCQL(ifExists bool) string {
-	ref := quoteIdent(i.name)
-	if i.keyspace != "" {
-		ref = quoteIdent(i.keyspace) + "." + ref
-	}
+	ref := qualifiedName(i.keyspace, i.name)
 	if ifExists {
 		return "DROP INDEX IF EXISTS " + ref
 	}
@@ -184,5 +164,8 @@ func (i *IndexBuilder) Create(ctx context.Context) error {
 
 // Drop executes DROP INDEX IF EXISTS.
 func (i *IndexBuilder) Drop(ctx context.Context) error {
+	if i.name == "" {
+		return fmt.Errorf("cassandra: dropping an index requires its name")
+	}
 	return i.db.Exec(ctx, i.DropCQL(true))
 }

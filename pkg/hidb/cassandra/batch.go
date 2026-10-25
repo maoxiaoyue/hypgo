@@ -14,18 +14,26 @@ type Statement interface {
 	CQL() (string, []interface{})
 }
 
-// BatchBuilder wraps gocql.Batch with a typed fluent API.
+// BatchBuilder collects statements and executes them as one gocql batch.
+// The gocql batch is built at Exec time: previously NewBatch read the session
+// when the builder was created and panicked on an unconnected instance.
 type BatchBuilder struct {
 	db          *CassandraDB
-	batch       *gocql.Batch
+	batchType   gocql.BatchType
+	entries     []batchEntry
 	consistency *gocql.Consistency
 	timestamp   int64
+}
+
+type batchEntry struct {
+	stmt string
+	args []interface{}
 }
 
 // NewBatch creates a new batch of the given type.
 // Use gocql.LoggedBatch (default), gocql.UnloggedBatch, or gocql.CounterBatch.
 func (c *CassandraDB) NewBatch(bt gocql.BatchType) *BatchBuilder {
-	return &BatchBuilder{db: c, batch: c.session.NewBatch(bt)}
+	return &BatchBuilder{db: c, batchType: bt}
 }
 
 // NewLoggedBatch is a convenience for gocql.LoggedBatch.
@@ -40,13 +48,12 @@ func (c *CassandraDB) NewCounterBatch() *BatchBuilder { return c.NewBatch(gocql.
 // Add appends a Statement to the batch.
 func (b *BatchBuilder) Add(stmt Statement) *BatchBuilder {
 	s, args := stmt.CQL()
-	b.batch.Query(s, args...)
-	return b
+	return b.AddRaw(s, args...)
 }
 
 // AddRaw appends a raw CQL statement with bind args.
 func (b *BatchBuilder) AddRaw(stmt string, args ...interface{}) *BatchBuilder {
-	b.batch.Query(stmt, args...)
+	b.entries = append(b.entries, batchEntry{stmt: stmt, args: args})
 	return b
 }
 
@@ -60,31 +67,50 @@ func (b *BatchBuilder) Consistency(cl gocql.Consistency) *BatchBuilder {
 func (b *BatchBuilder) Timestamp(us int64) *BatchBuilder { b.timestamp = us; return b }
 
 // Size returns the number of statements queued.
-func (b *BatchBuilder) Size() int { return b.batch.Size() }
+func (b *BatchBuilder) Size() int { return len(b.entries) }
+
+// build turns the queued statements into a gocql batch on the current session.
+func (b *BatchBuilder) build(ctx context.Context) (*gocql.Session, *gocql.Batch, error) {
+	s, err := b.db.sess()
+	if err != nil {
+		return nil, nil, err
+	}
+	batch := s.NewBatch(b.batchType).WithContext(ctx)
+	for _, e := range b.entries {
+		batch.Query(e.stmt, e.args...)
+	}
+	if b.consistency != nil {
+		batch.SetConsistency(*b.consistency)
+	}
+	if b.timestamp > 0 {
+		batch.WithTimestamp(b.timestamp)
+	}
+	return s, batch, nil
+}
 
 // Exec executes the batch.
 func (b *BatchBuilder) Exec(ctx context.Context) error {
-	if b.consistency != nil {
-		b.batch.SetConsistency(*b.consistency)
+	s, batch, err := b.build(ctx)
+	if err != nil {
+		return err
 	}
-	if b.timestamp > 0 {
-		b.batch.WithTimestamp(b.timestamp)
-	}
-	return b.db.session.ExecuteBatch(b.batch.WithContext(ctx))
+	return s.ExecuteBatch(batch)
 }
 
 // ExecCAS executes the batch as a conditional batch (LWT) returning
 // applied + existing row values.
 func (b *BatchBuilder) ExecCAS(ctx context.Context, dest ...interface{}) (bool, error) {
-	if b.batch.Size() == 0 {
+	if len(b.entries) == 0 {
 		return false, fmt.Errorf("cassandra: empty batch")
 	}
-	if b.consistency != nil {
-		b.batch.SetConsistency(*b.consistency)
+	s, batch, err := b.build(ctx)
+	if err != nil {
+		return false, err
 	}
-	if b.timestamp > 0 {
-		b.batch.WithTimestamp(b.timestamp)
+	applied, iter, err := s.ExecuteBatchCAS(batch, dest...)
+	if err != nil {
+		return false, err
 	}
-	applied, _, err := b.db.session.ExecuteBatchCAS(b.batch.WithContext(ctx), dest...)
-	return applied, err
+	// close the iter: it was previously dropped, leaking it and hiding Scan errors
+	return applied, iter.Close()
 }

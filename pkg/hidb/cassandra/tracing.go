@@ -4,7 +4,7 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"sort"
+	"strings"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -60,14 +60,15 @@ func (t Trace) TotalElapsed() time.Duration {
 // session ID. Cassandra writes traces asynchronously, so a short wait/retry
 // loop is often needed; use WaitForTrace for that.
 func (c *CassandraDB) GetTrace(ctx context.Context, sessionID gocql.UUID) (*Trace, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	s, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 
 	t := &Trace{Session: TraceSession{SessionID: sessionID}}
 
 	// sessions row
-	err := c.session.Query(
+	err = s.Query(
 		`SELECT command, coordinator, duration, parameters, request, started_at, client
 		 FROM system_traces.sessions WHERE session_id = ?`, sessionID,
 	).WithContext(ctx).Scan(
@@ -87,7 +88,7 @@ func (c *CassandraDB) GetTrace(ctx context.Context, sessionID gocql.UUID) (*Trac
 	}
 
 	// events rows
-	iter := c.session.Query(
+	iter := s.Query(
 		`SELECT event_id, activity, source, source_elapsed, thread
 		 FROM system_traces.events WHERE session_id = ?`, sessionID,
 	).WithContext(ctx).Iter()
@@ -102,12 +103,9 @@ func (c *CassandraDB) GetTrace(ctx context.Context, sessionID gocql.UUID) (*Trac
 		return nil, fmt.Errorf("cassandra: read trace events: %w", err)
 	}
 
-	// Events are clustered by event_id (timeuuid) which orders chronologically,
-	// but sort by SourceElapsed as a secondary guarantee for display.
-	sort.SliceStable(t.Events, func(i, j int) bool {
-		return t.Events[i].SourceElapsed < t.Events[j].SourceElapsed
-	})
-
+	// Events come back clustered by event_id (timeuuid), i.e. chronologically.
+	// They are deliberately not re-sorted by SourceElapsed: each source node
+	// measures from its own start, so that order scrambles multi-node traces.
 	return t, nil
 }
 
@@ -116,7 +114,7 @@ func (c *CassandraDB) GetTrace(ctx context.Context, sessionID gocql.UUID) (*Trac
 // Format renders a trace as a human-readable multi-line string, similar to
 // cqlsh's TRACING ON output.
 func (t Trace) Format() string {
-	var b writerBuilder
+	var b strings.Builder
 	fmt.Fprintf(&b, "Trace %s\n", t.Session.SessionID)
 	fmt.Fprintf(&b, "  command      : %s\n", t.Session.Command)
 	fmt.Fprintf(&b, "  coordinator  : %s\n", t.Session.Coordinator)
@@ -134,11 +132,6 @@ func (t Trace) Format() string {
 	}
 	return b.String()
 }
-
-type writerBuilder struct{ bs []byte }
-
-func (w *writerBuilder) Write(p []byte) (int, error) { w.bs = append(w.bs, p...); return len(p), nil }
-func (w *writerBuilder) String() string              { return string(w.bs) }
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

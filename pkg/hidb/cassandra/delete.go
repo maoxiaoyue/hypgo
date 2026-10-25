@@ -3,6 +3,7 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -66,13 +67,6 @@ func (d *DeleteBuilder) Consistency(cl gocql.Consistency) *DeleteBuilder {
 	return d
 }
 
-func (d *DeleteBuilder) tableRef() string {
-	if d.keyspace != "" {
-		return quoteIdent(d.keyspace) + "." + quoteIdent(d.table)
-	}
-	return quoteIdent(d.table)
-}
-
 // CQL renders the DELETE statement.
 func (d *DeleteBuilder) CQL() (string, []interface{}) {
 	var sb strings.Builder
@@ -93,7 +87,7 @@ func (d *DeleteBuilder) CQL() (string, []interface{}) {
 		sb.WriteString(" ")
 	}
 	sb.WriteString("FROM ")
-	sb.WriteString(d.tableRef())
+	sb.WriteString(qualifiedName(d.keyspace, d.table))
 	if d.timestamp > 0 {
 		fmt.Fprintf(&sb, " USING TIMESTAMP %d", d.timestamp)
 	}
@@ -120,22 +114,32 @@ func (d *DeleteBuilder) CQL() (string, []interface{}) {
 	return sb.String(), args
 }
 
-// Exec runs the DELETE.
+// errIfExistsWithIf: CQL accepts either IF EXISTS or IF <conditions>, not both.
+var errIfExistsWithIf = errors.New("cassandra: IfExists and If cannot be combined")
+
+// Exec runs the DELETE. With IfExists / If it returns ErrNotApplied when the
+// condition did not hold.
 func (d *DeleteBuilder) Exec(ctx context.Context) error {
-	stmt, args := d.CQL()
-	q := d.db.session.Query(stmt, args...).WithContext(ctx)
-	if d.consistency != nil {
-		q = q.Consistency(*d.consistency)
+	if d.ifExists && len(d.ifCond) > 0 {
+		return errIfExistsWithIf
 	}
-	return q.Exec()
+	stmt, args := d.CQL()
+	q, err := d.db.newQuery(ctx, stmt, args, d.consistency)
+	if err != nil {
+		return err
+	}
+	return execQuery(q, d.ifExists || len(d.ifCond) > 0)
 }
 
 // ExecCAS executes as lightweight transaction.
 func (d *DeleteBuilder) ExecCAS(ctx context.Context, dest ...interface{}) (bool, error) {
+	if d.ifExists && len(d.ifCond) > 0 {
+		return false, errIfExistsWithIf
+	}
 	stmt, args := d.CQL()
-	q := d.db.session.Query(stmt, args...).WithContext(ctx)
-	if d.consistency != nil {
-		q = q.Consistency(*d.consistency)
+	q, err := d.db.newQuery(ctx, stmt, args, d.consistency)
+	if err != nil {
+		return false, err
 	}
 	return q.ScanCAS(dest...)
 }
@@ -150,11 +154,7 @@ func (c *CassandraDB) DeleteModel(ctx context.Context, model interface{}) error 
 	for rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
-	name := info.Table
-	if info.Keyspace != "" {
-		name = info.Keyspace + "." + info.Table
-	}
-	db := c.Delete(name)
+	db := &DeleteBuilder{db: c, keyspace: info.Keyspace, table: info.Table}
 	for _, f := range info.Fields {
 		switch f.Kind {
 		case ColumnPartitionKey, ColumnClustering:

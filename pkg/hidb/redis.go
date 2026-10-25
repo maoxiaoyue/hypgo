@@ -4,6 +4,7 @@ package hidb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -316,9 +317,10 @@ func (d *Database) RedisScan(ctx context.Context, cursor uint64, match string, c
 
 // --- 輔助方法 ---
 
-// RedisIsNil 檢查 error 是否為 redis.Nil（key 不存在）
+// RedisIsNil 檢查 error 是否為 redis.Nil（key 不存在）；以 errors.Is 判斷，
+// 被 fmt.Errorf("%w") 包過的錯誤也認得（先前用 ==，包一層就判斷失敗）
 func RedisIsNil(err error) bool {
-	return err == redis.Nil
+	return errors.Is(err, redis.Nil)
 }
 
 // --- 資源追蹤 Hook ---

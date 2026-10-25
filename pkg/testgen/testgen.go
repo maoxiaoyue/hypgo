@@ -7,19 +7,27 @@
 //   - 不覆蓋既有 Test*（即使是空殼也保留）
 //   - 不假裝有測試 → 骨架預設 t.Skip("auto-generated stub")，CI 看得到
 //   - 純 AST 分析，不執行程式碼
-//   - 跳過明確標記 //hyp:notest 的函式
+//   - 跳過明確標記 //hyp:notest 的函式與自動產生的檔案（// Code generated ... DO NOT EDIT.）
+//   - 以整個套件判斷是否已有測試：同目錄所有 *_test.go（含 package x_test）
+//     中 Test<名稱> 開頭、且其後不是小寫字母的測試都算（TestAddWorks、TestAdd_Overflow）
+//   - 依簽名產生 table-driven 骨架（參數 / want / wantErr）；HypGo handler 與路由註冊函式
+//     不補單元測試，改在根註冊函式旁產生 contract.TestAll 測試（見 render.go）
 package testgen
 
 import (
-	"bufio"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Report 描述單一檔案的處理結果
@@ -30,6 +38,10 @@ type Report struct {
 	Added      []string // 新加入的 Test 函式名稱
 	Skipped    []string // 已存在的 Test 名稱（被跳過）
 	NoTestNeed []string // 標記 //hyp:notest 而被略過的函式
+	// Contract 交給 contract 測試涵蓋、不補單元測試的 handler 與路由註冊函式
+	Contract []string
+	// ContractFile 本次寫入 contract 測試的檔案（<src>_contract_test.go）；未寫入時為空
+	ContractFile string
 }
 
 // Options 控制產生行為
@@ -55,7 +67,7 @@ func DefaultOptions() Options {
 }
 
 // GenerateForFile 為單一 .go 檔生成缺少的測試骨架
-// 已存在的 Test* 不會被覆蓋。
+// 已存在的 Test* 不會被覆蓋；是否已有測試以整個套件（同目錄）判斷。
 func GenerateForFile(filename string, opts Options) (*Report, error) {
 	if !strings.HasSuffix(filename, ".go") {
 		return nil, fmt.Errorf("not a .go file: %s", filename)
@@ -63,7 +75,16 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 	if strings.HasSuffix(filename, "_test.go") {
 		return nil, fmt.Errorf("cannot process *_test.go directly: %s", filename)
 	}
+	pkg, err := loadPkgContext(filepath.Dir(filename), opts)
+	if err != nil {
+		return nil, err
+	}
+	return generateFile(filename, pkg, opts)
+}
 
+// generateFile 依套件現況為單一原始檔補上缺少的測試骨架；新增的名稱記回 pkg，
+// 同套件後續的檔案不會再產生同名測試
+func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, error) {
 	srcContent, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("read source: %w", err)
@@ -75,14 +96,17 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 		return nil, fmt.Errorf("parse source: %w", err)
 	}
 
-	pkgName := srcAST.Name.Name
-
-	// 收集本檔案中需要被測試的函式
-	candidates := collectCandidates(srcAST, srcContent, fset, opts)
-
 	// 推導 test 檔案路徑：foo.go → foo_test.go（同目錄）
 	testPath := strings.TrimSuffix(filename, ".go") + "_test.go"
 	report := &Report{SourceFile: filename, TestFile: testPath}
+
+	// 自動產生的檔案（protoc、stringer…）不補測試：先前 .pb.go 的 getter 也會各得一個空殼
+	if ast.IsGenerated(srcAST) {
+		return report, nil
+	}
+
+	// 收集本檔案中需要被測試的函式
+	candidates := collectCandidates(srcAST, opts)
 
 	// 把標記 notest 的函式也記錄
 	for _, c := range candidates {
@@ -95,31 +119,64 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 		return report, nil
 	}
 
-	existingTests, testFileExists, err := loadExistingTestNames(testPath)
-	if err != nil {
-		return nil, err
-	}
-	report.Created = !testFileExists
+	pkgName := srcAST.Name.Name
+	unitFile := readTestFile(testPath)
+	contractPath := strings.TrimSuffix(filename, ".go") + "_contract_test.go"
+	contractFile := readTestFile(contractPath)
 
-	var toAdd []candidate
+	var units, contracts []candidate
 	for _, c := range candidates {
-		if existingTests[c.testName] {
+		switch {
+		case c.kind == kindHandler || (c.kind == kindRegistrar && (c.isMethod || pkg.calledRegistrars[c.funcName])):
+			// handler 與非根註冊函式由根註冊函式的 contract 測試涵蓋
+			report.Contract = append(report.Contract, c.funcName)
+			continue
+		case c.kind == kindRegistrar:
+			// contract 測試呼叫未限定名稱的註冊函式：檔案若是 package x_test 就無法寫入
+			if !contractFile.accepts(pkgName, nil) {
+				report.Contract = append(report.Contract, c.funcName)
+				continue
+			}
+		case c.kind == kindTable && !unitFile.accepts(pkgName, c.spec.imports):
+			c.kind = kindStub // 既有測試檔是 package x_test 或 import 名稱衝突：骨架無法直接呼叫
+		}
+		if pkg.covered(c.testName) {
 			report.Skipped = append(report.Skipped, c.testName)
 			continue
 		}
-		toAdd = append(toAdd, c)
+		if c.kind == kindRegistrar {
+			c.testName += "_Contracts"
+			contracts = append(contracts, c)
+		} else {
+			units = append(units, c)
+		}
 		report.Added = append(report.Added, c.testName)
+		pkg.tests[c.testName] = true
 	}
 
-	if len(toAdd) == 0 {
+	if len(units) == 0 && !unitFile.exists {
+		report.TestFile = "" // 不會建立單元測試檔：報表不顯示 → TestFile
+	}
+	if len(units)+len(contracts) == 0 {
 		return report, nil
+	}
+	report.Created = len(units) > 0 && !unitFile.exists // 有東西要寫才算建立（先前全部已覆蓋時也回報 created）
+	if len(contracts) > 0 {
+		report.ContractFile = contractPath
 	}
 	if opts.DryRun {
 		return report, nil
 	}
 
-	if err := writeTestFile(testPath, pkgName, testFileExists, toAdd, opts); err != nil {
-		return nil, fmt.Errorf("write %s: %w", testPath, err)
+	if len(units) > 0 {
+		if err := writeTests(testPath, pkgName, unitFile, units, opts); err != nil {
+			return nil, fmt.Errorf("write %s: %w", testPath, err)
+		}
+	}
+	if len(contracts) > 0 {
+		if err := writeTests(contractPath, pkgName, contractFile, contracts, opts); err != nil {
+			return nil, fmt.Errorf("write %s: %w", contractPath, err)
+		}
 	}
 	return report, nil
 }
@@ -127,6 +184,7 @@ func GenerateForFile(filename string, opts Options) (*Report, error) {
 // GenerateForDir 遞迴處理 rootDir 下的所有 .go 檔（跳過 vendor / .git / node_modules / .hyp / testdata）
 func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 	var reports []Report
+	pkgs := map[string]*pkgContext{} // 每個目錄的套件現況只讀一次
 	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -142,17 +200,126 @@ func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		rep, genErr := GenerateForFile(path, opts)
+		dir := filepath.Dir(path)
+		pkg, ok := pkgs[dir]
+		if !ok {
+			var loadErr error
+			if pkg, loadErr = loadPkgContext(dir, opts); loadErr != nil {
+				fmt.Fprintf(os.Stderr, "  ! %s: %v\n", dir, loadErr)
+				pkg = nil
+			}
+			pkgs[dir] = pkg
+		}
+		if pkg == nil {
+			return nil // 該目錄的測試檔無法解析：不猜，整個目錄跳過
+		}
+		rep, genErr := generateFile(path, pkg, opts)
 		if genErr != nil {
 			fmt.Fprintf(os.Stderr, "  ! %s: %v\n", path, genErr)
 			return nil
 		}
-		if rep != nil && (len(rep.Added) > 0 || len(rep.Skipped) > 0 || len(rep.NoTestNeed) > 0) {
+		if rep != nil && (len(rep.Added) > 0 || len(rep.Skipped) > 0 || len(rep.NoTestNeed) > 0 || len(rep.Contract) > 0) {
 			reports = append(reports, *rep)
 		}
 		return nil
 	})
 	return reports, err
+}
+
+// pkgContext 一個目錄（Go 套件）的測試現況。先前只看成對的 foo_test.go 裡有沒有
+// 完全同名的 Test：測試寫在其他測試檔就重複產生（TestAdd redeclared，整個套件編不過），
+// 換個名字的測試（TestAddWorks）也認不得
+type pkgContext struct {
+	tests      map[string]bool // 目錄下所有 *_test.go 的 Test*（含 package x_test）與本次新增的
+	candidates []string        // 目錄下所有原始檔候選的 Test 名稱，用來把 TestAddUser 歸給 AddUser 而非 Add
+	// calledRegistrars 被同套件其他路由註冊函式呼叫的註冊函式（如 Setup 內的 RegisterUserRoutes）：
+	// 它們的路由已由根註冊函式的 contract 測試涵蓋
+	calledRegistrars map[string]bool
+}
+
+// loadPkgContext 讀取目錄下所有 .go 檔：測試檔收集 Test*，原始檔收集候選名稱。
+// 測試檔語法錯誤時回傳錯誤（無法得知已有哪些測試，寧可不產生）
+func loadPkgContext(dir string, opts Options) (*pkgContext, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	pkg := &pkgContext{tests: map[string]bool{}, calledRegistrars: map[string]bool{}}
+	registrars := map[string]*ast.FuncDecl{}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if strings.HasSuffix(name, "_test.go") {
+			f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+			if err != nil {
+				return nil, fmt.Errorf("parse existing test file %s: %w", path, err)
+			}
+			for _, decl := range f.Decls {
+				if fd, ok := decl.(*ast.FuncDecl); ok && fd.Recv == nil && strings.HasPrefix(fd.Name.Name, "Test") {
+					pkg.tests[fd.Name.Name] = true
+				}
+			}
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil || ast.IsGenerated(f) {
+			continue // 原始檔錯誤由 generateFile 回報
+		}
+		for _, c := range collectCandidates(f, opts) {
+			pkg.candidates = append(pkg.candidates, c.testName)
+			if c.kind == kindRegistrar && !c.isMethod {
+				registrars[c.funcName] = c.fd
+			}
+		}
+	}
+	for name, fd := range registrars {
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name != name && registrars[id.Name] != nil {
+					pkg.calledRegistrars[id.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return pkg, nil
+}
+
+// covers 回報測試 test 是否以 target 命名：完全相同，或其後接的不是小寫字母
+// （TestAddWorks、TestAdd_Overflow、TestAdd2 都算 TestAdd；TestAddress 不算）
+func covers(test, target string) bool {
+	if !strings.HasPrefix(test, target) {
+		return false
+	}
+	if len(test) == len(target) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(test[len(target):])
+	return !unicode.IsLower(r)
+}
+
+// covered 回報套件內是否已有測試在測 target。一個測試同時符合多個候選時歸給名稱最長者：
+// 有 AddUser 時 TestAddUserWorks 算 AddUser 的測試，不算 Add 的
+func (p *pkgContext) covered(target string) bool {
+	for test := range p.tests {
+		if !covers(test, target) {
+			continue
+		}
+		owner := target
+		for _, c := range p.candidates {
+			if len(c) > len(owner) && covers(test, c) {
+				owner = c
+			}
+		}
+		if owner == target {
+			return true
+		}
+	}
+	return false
 }
 
 // --- internal ---
@@ -163,11 +330,15 @@ type candidate struct {
 	isMethod    bool
 	receiverStr string // 用於 method（例：*Svc）
 	skipNoTest  bool   // 是否標記 //hyp:notest
+	kind        candKind
+	spec        *tableSpec // kind == kindTable 時的骨架內容
+	fd          *ast.FuncDecl
 }
 
 // collectCandidates 從 AST 抽出所有要產測試的 func / method
-func collectCandidates(f *ast.File, src []byte, fset *token.FileSet, opts Options) []candidate {
+func collectCandidates(f *ast.File, opts Options) []candidate {
 	var out []candidate
+	imps := fileImports(f)
 
 	for _, decl := range f.Decls {
 		fd, ok := decl.(*ast.FuncDecl)
@@ -183,12 +354,15 @@ func collectCandidates(f *ast.File, src []byte, fset *token.FileSet, opts Option
 			continue
 		}
 
-		c := candidate{funcName: name}
+		c := candidate{funcName: name, fd: fd, kind: classify(fd, imps)}
+		if c.kind == kindTable {
+			c.spec = newTableSpec(fd, imps)
+		}
 		if fd.Recv != nil && len(fd.Recv.List) > 0 {
 			c.isMethod = true
-			c.receiverStr = exprString(fd.Recv.List[0].Type)
-			recvBase := strings.TrimPrefix(c.receiverStr, "*")
-			c.testName = "Test" + recvBase + "_" + name
+			recv := fd.Recv.List[0].Type
+			c.receiverStr = exprString(recv)
+			c.testName = "Test" + recvBaseName(recv) + "_" + name
 		} else {
 			c.testName = "Test" + name
 		}
@@ -205,8 +379,6 @@ func collectCandidates(f *ast.File, src []byte, fset *token.FileSet, opts Option
 
 		out = append(out, c)
 	}
-	_ = fset
-	_ = src
 	return out
 }
 
@@ -232,6 +404,7 @@ func isReservedTestPrefix(name string) bool {
 	return false
 }
 
+// exprString 把 receiver 型別還原成原始碼寫法（僅用於註解），如 *List[T]
 func exprString(e ast.Expr) string {
 	switch v := e.(type) {
 	case *ast.Ident:
@@ -240,80 +413,174 @@ func exprString(e ast.Expr) string {
 		return "*" + exprString(v.X)
 	case *ast.SelectorExpr:
 		return exprString(v.X) + "." + v.Sel.Name
+	case *ast.ParenExpr:
+		return "(" + exprString(v.X) + ")"
+	case *ast.IndexExpr:
+		return exprString(v.X) + "[" + exprString(v.Index) + "]"
+	case *ast.IndexListExpr:
+		params := make([]string, len(v.Indices))
+		for i, ix := range v.Indices {
+			params[i] = exprString(ix)
+		}
+		return exprString(v.X) + "[" + strings.Join(params, ", ") + "]"
 	default:
 		return fmt.Sprintf("%T", e)
 	}
 }
 
-// loadExistingTestNames 從目標 _test.go（若存在）抽出已定義的 Test* 名稱
-// 回傳：testName→true 對照表、檔案是否存在、錯誤
-func loadExistingTestNames(testPath string) (map[string]bool, bool, error) {
-	out := map[string]bool{}
-	info, err := os.Stat(testPath)
-	if os.IsNotExist(err) {
-		return out, false, nil
-	}
-	if err != nil {
-		return out, false, fmt.Errorf("stat test file: %w", err)
-	}
-	if info.IsDir() {
-		return out, false, fmt.Errorf("%s is a directory", testPath)
-	}
-
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, testPath, nil, parser.SkipObjectResolution)
-	if err != nil {
-		// 既有檔案語法錯誤 → 視為「不知道有什麼」並警告呼叫端
-		return out, true, fmt.Errorf("parse existing test file %s: %w", testPath, err)
-	}
-	for _, decl := range f.Decls {
-		fd, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if strings.HasPrefix(fd.Name.Name, "Test") {
-			out[fd.Name.Name] = true
+// recvBaseName 取 receiver 的型別名稱（去掉 *、括號與型別參數），用於組 Test 名稱。
+// 先前泛型 receiver（*List[T]）落到 %T，產生 Test*ast.IndexExpr_Push 這種無法編譯的名稱
+func recvBaseName(e ast.Expr) string {
+	for {
+		switch v := e.(type) {
+		case *ast.StarExpr:
+			e = v.X
+		case *ast.ParenExpr:
+			e = v.X
+		case *ast.IndexExpr:
+			e = v.X
+		case *ast.IndexListExpr:
+			e = v.X
+		case *ast.Ident:
+			return v.Name
+		default:
+			return "Recv"
 		}
 	}
-	return out, true, nil
 }
 
-// writeTestFile 把新測試骨架寫進 testPath。
-// fileExists=true 時用 append；否則寫入完整新檔。
-func writeTestFile(testPath, pkgName string, fileExists bool, items []candidate, opts Options) error {
-	if fileExists {
-		// 用 append 模式：產生只含新 Test 區塊的片段
-		f, err := os.OpenFile(testPath, os.O_APPEND|os.O_WRONLY, 0644)
+// testFile 既有測試檔的狀態（不存在時 exists 為 false）
+type testFile struct {
+	exists  bool
+	pkgName string
+	imports map[string]string // import path → 引用名稱
+}
+
+func readTestFile(path string) testFile {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+	if err != nil {
+		_, statErr := os.Stat(path)
+		return testFile{exists: statErr == nil}
+	}
+	tf := testFile{exists: true, pkgName: f.Name.Name, imports: map[string]string{}}
+	for _, imp := range f.Imports {
+		path, _ := strconv.Unquote(imp.Path.Value)
+		name := guessPkgName(path)
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		tf.imports[path] = name
+	}
+	return tf
+}
+
+// accepts 回報骨架能否寫進這個測試檔：不存在、或同為 pkgName 套件（骨架以未限定名稱呼叫目標），
+// 且 specs 需要的 import 沒有以其他名稱引入
+func (tf testFile) accepts(pkgName string, specs []string) bool {
+	if !tf.exists {
+		return true
+	}
+	if tf.pkgName != pkgName {
+		return false
+	}
+	for _, s := range specs {
+		path, _ := strconv.Unquote(s[strings.LastIndex(s, " ")+1:])
+		name := guessPkgName(path)
+		if i := strings.LastIndex(s, " "); i > 0 {
+			name = s[:i]
+		}
+		if have, ok := tf.imports[path]; ok && have != name {
+			return false
+		}
+	}
+	return true
+}
+
+// requiredImports 回傳這批骨架需要的 import spec
+func requiredImports(items []candidate) []string {
+	set := map[string]bool{`"testing"`: true}
+	for _, c := range items {
+		switch c.kind {
+		case kindTable:
+			for _, s := range c.spec.imports {
+				set[s] = true
+			}
+			if c.spec.needsReflect() {
+				set[`"reflect"`] = true
+			}
+		case kindRegistrar:
+			set[strconv.Quote(hypRouterPath)] = true
+			set[strconv.Quote(hypContractPath)] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// writeTests 把骨架寫進 path：既有檔案補上缺少的 import 後追加（不重排使用者的檔案），否則建立新檔
+func writeTests(path, pkgName string, tf testFile, items []candidate, opts Options) error {
+	var body strings.Builder
+	for _, c := range items {
+		body.WriteString("\n" + renderTestStub(c, opts))
+	}
+	imports := requiredImports(items)
+
+	if tf.exists {
+		src, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		bw := bufio.NewWriter(f)
-		bw.WriteString("\n")
-		for _, c := range items {
-			bw.WriteString(renderTestStub(c, opts) + "\n")
+		src, err = addImports(src, imports)
+		if err != nil {
+			return err
 		}
-		return bw.Flush()
+		return os.WriteFile(path, append(src, body.String()...), 0644)
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("// Code generated by hyp testgen. Replace stubs with real assertions.\n"))
-	sb.WriteString(fmt.Sprintf("package %s\n\n", pkgName))
-	sb.WriteString("import \"testing\"\n\n")
-	for i, c := range items {
-		if i > 0 {
+	sb.WriteString("// Code generated by hyp testgen. Replace stubs with real assertions.\n")
+	fmt.Fprintf(&sb, "package %s\n\nimport (\n", pkgName)
+	// 標準庫一組、其餘一組（gofmt 只排序不分組）
+	for _, std := range []bool{true, false} {
+		group := false
+		for _, s := range imports {
+			if isStdImport(s[strings.LastIndex(s, " ")+1:]) == std {
+				sb.WriteString("\t" + s + "\n")
+				group = true
+			}
+		}
+		if std && group {
 			sb.WriteString("\n")
 		}
-		sb.WriteString(renderTestStub(c, opts))
 	}
-	return os.WriteFile(testPath, []byte(sb.String()), 0644)
+	sb.WriteString(")\n")
+	sb.WriteString(body.String())
+	out, err := format.Source([]byte(sb.String()))
+	if err != nil {
+		out = []byte(sb.String()) // 排版失敗仍寫入，交給 go vet 回報
+	}
+	return os.WriteFile(path, out, 0644)
 }
 
-// renderTestStub 產生單一 Test 函式骨架
+// isStdImport 回報引號包住的 import 路徑是否為標準庫（第一段不含 "."）
+func isStdImport(quoted string) bool {
+	path, _ := strconv.Unquote(quoted)
+	first, _, _ := strings.Cut(path, "/")
+	return !strings.Contains(first, ".")
+}
+
+// renderTestStub 產生單一 Test 函式：空殼、table-driven 骨架或 contract 測試
 func renderTestStub(c candidate, opts Options) string {
 	msg := opts.StubMessage
 	if msg == "" {
 		msg = "auto-generated stub"
+	}
+	if c.kind == kindRegistrar {
+		return formatDecl(renderContract(c))
 	}
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("// %s — auto-generated stub for %s\n", c.testName, c.funcName))
@@ -321,6 +588,10 @@ func renderTestStub(c candidate, opts Options) string {
 		sb.WriteString(fmt.Sprintf("// Target: (%s).%s\n", c.receiverStr, c.funcName))
 	} else {
 		sb.WriteString(fmt.Sprintf("// Target: %s\n", c.funcName))
+	}
+	if c.kind == kindTable {
+		sb.WriteString(c.spec.render(c, msg))
+		return formatDecl(sb.String())
 	}
 	sb.WriteString(fmt.Sprintf("func %s(t *testing.T) {\n", c.testName))
 	sb.WriteString(fmt.Sprintf("\tt.Skip(%q)\n", msg))
@@ -331,9 +602,9 @@ func renderTestStub(c candidate, opts Options) string {
 // FormatReports 把 GenerateForDir 的結果整理成終端可讀的報告
 func FormatReports(reports []Report) string {
 	var sb strings.Builder
-	created, added, skipped, notest := 0, 0, 0, 0
+	created, added, skipped, notest, contract := 0, 0, 0, 0, 0
 	for _, r := range reports {
-		if len(r.Added) == 0 && len(r.Skipped) == 0 && len(r.NoTestNeed) == 0 {
+		if len(r.Added) == 0 && len(r.Skipped) == 0 && len(r.NoTestNeed) == 0 && len(r.Contract) == 0 {
 			continue
 		}
 		mark := "~"
@@ -341,7 +612,11 @@ func FormatReports(reports []Report) string {
 			mark = "+"
 			created++
 		}
-		sb.WriteString(fmt.Sprintf("  %s %s → %s\n", mark, r.SourceFile, r.TestFile))
+		if r.TestFile == "" {
+			sb.WriteString(fmt.Sprintf("  · %s\n", r.SourceFile))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %s %s → %s\n", mark, r.SourceFile, r.TestFile))
+		}
 		if len(r.Added) > 0 {
 			added += len(r.Added)
 			sb.WriteString(fmt.Sprintf("      added:    %s\n", strings.Join(r.Added, ", ")))
@@ -354,8 +629,15 @@ func FormatReports(reports []Report) string {
 			notest += len(r.NoTestNeed)
 			sb.WriteString(fmt.Sprintf("      notest:   %s\n", strings.Join(r.NoTestNeed, ", ")))
 		}
+		if len(r.Contract) > 0 {
+			contract += len(r.Contract)
+			sb.WriteString(fmt.Sprintf("      contract: %s\n", strings.Join(r.Contract, ", ")))
+		}
+		if r.ContractFile != "" {
+			sb.WriteString(fmt.Sprintf("      contract test → %s\n", r.ContractFile))
+		}
 	}
-	sb.WriteString(fmt.Sprintf("\nSummary: %d files (created=%d), %d Test stubs added, %d kept, %d marked //hyp:notest\n",
-		len(reports), created, added, skipped, notest))
+	sb.WriteString(fmt.Sprintf("\nSummary: %d files (created=%d), %d Test stubs added, %d kept, %d marked //hyp:notest, %d covered by contract tests\n",
+		len(reports), created, added, skipped, notest, contract))
 	return sb.String()
 }

@@ -65,18 +65,11 @@ func (i *InsertBuilder) Consistency(cl gocql.Consistency) *InsertBuilder {
 	return i
 }
 
-func (i *InsertBuilder) tableRef() string {
-	if i.keyspace != "" {
-		return quoteIdent(i.keyspace) + "." + quoteIdent(i.table)
-	}
-	return quoteIdent(i.table)
-}
-
 // CQL renders the INSERT statement and its bind args.
 func (i *InsertBuilder) CQL() (string, []interface{}) {
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
-	sb.WriteString(i.tableRef())
+	sb.WriteString(qualifiedName(i.keyspace, i.table))
 	sb.WriteString(" (")
 	sb.WriteString(joinQuoted(i.columns, ", "))
 	sb.WriteString(") VALUES (")
@@ -100,28 +93,30 @@ func (i *InsertBuilder) CQL() (string, []interface{}) {
 	return sb.String(), i.values
 }
 
-// Exec runs the INSERT.
+// Exec runs the INSERT. With IfNotExists it returns ErrNotApplied when the
+// row already existed.
 func (i *InsertBuilder) Exec(ctx context.Context) error {
 	stmt, args := i.CQL()
-	q := i.db.session.Query(stmt, args...).WithContext(ctx)
-	if i.consistency != nil {
-		q = q.Consistency(*i.consistency)
+	q, err := i.db.newQuery(ctx, stmt, args, i.consistency)
+	if err != nil {
+		return err
 	}
-	return q.Exec()
+	return execQuery(q, i.ifNotExist)
 }
 
 // ExecCAS executes a lightweight transaction and returns applied + existing row.
 func (i *InsertBuilder) ExecCAS(ctx context.Context, dest ...interface{}) (bool, error) {
 	stmt, args := i.CQL()
-	q := i.db.session.Query(stmt, args...).WithContext(ctx)
-	if i.consistency != nil {
-		q = q.Consistency(*i.consistency)
+	q, err := i.db.newQuery(ctx, stmt, args, i.consistency)
+	if err != nil {
+		return false, err
 	}
 	return q.ScanCAS(dest...)
 }
 
 // Save inserts a model struct. Zero-valued fields tagged with omitempty are
 // skipped so Cassandra's tombstone-avoidance semantics are preserved.
+// With SaveIfNotExists it returns ErrNotApplied when the row already existed.
 func (c *CassandraDB) Save(ctx context.Context, model interface{}, opts ...SaveOption) error {
 	info, err := ParseModel(model)
 	if err != nil {
@@ -131,11 +126,7 @@ func (c *CassandraDB) Save(ctx context.Context, model interface{}, opts ...SaveO
 	for rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
-	name := info.Table
-	if info.Keyspace != "" {
-		name = info.Keyspace + "." + info.Table
-	}
-	ins := c.Insert(name)
+	ins := &InsertBuilder{db: c, keyspace: info.Keyspace, table: info.Table}
 	for _, f := range info.Fields {
 		v := rv.FieldByIndex(f.Index).Interface()
 		if f.OmitEmpty && isZero(v) {

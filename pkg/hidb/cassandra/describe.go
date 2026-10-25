@@ -4,6 +4,7 @@ package cassandra
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -41,14 +42,7 @@ func DescribeCQL(target DescribeTarget, name string) string {
 
 // qualifyIdent quotes each dotted segment ("ks.table" -> "ks"."table").
 func qualifyIdent(name string) string {
-	if name == "" {
-		return ""
-	}
-	parts := strings.SplitN(name, ".", 2)
-	for i, p := range parts {
-		parts[i] = quoteIdent(p)
-	}
-	return strings.Join(parts, ".")
+	return qualifiedName(splitQualified(name))
 }
 
 // ===== High-level introspection via system_schema =====
@@ -65,7 +59,6 @@ type TableInfo struct {
 	Keyspace string
 	Name     string
 	Comment  string
-	Options  map[string]string // raw string options (flattened)
 }
 
 // ColumnInfo describes one column from system_schema.columns.
@@ -81,10 +74,11 @@ type ColumnInfo struct {
 
 // DescribeKeyspaces lists all keyspaces via system_schema.keyspaces.
 func (c *CassandraDB) DescribeKeyspaces(ctx context.Context) ([]KeyspaceInfo, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT keyspace_name, replication, durable_writes FROM system_schema.keyspaces`,
 	).WithContext(ctx).Iter()
 	defer iter.Close()
@@ -104,13 +98,14 @@ func (c *CassandraDB) DescribeKeyspaces(ctx context.Context) ([]KeyspaceInfo, er
 
 // DescribeKeyspace returns the KeyspaceInfo for a single keyspace.
 func (c *CassandraDB) DescribeKeyspace(ctx context.Context, ks string) (*KeyspaceInfo, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 	var name string
 	var repl map[string]string
 	var durable bool
-	err := c.session.Query(
+	err = sess.Query(
 		`SELECT keyspace_name, replication, durable_writes FROM system_schema.keyspaces WHERE keyspace_name = ?`,
 		ks,
 	).WithContext(ctx).Scan(&name, &repl, &durable)
@@ -122,8 +117,9 @@ func (c *CassandraDB) DescribeKeyspace(ctx context.Context, ks string) (*Keyspac
 
 // DescribeTables lists all tables in the given keyspace (empty = session keyspace).
 func (c *CassandraDB) DescribeTables(ctx context.Context, keyspace string) ([]TableInfo, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 	ks := keyspace
 	if ks == "" {
@@ -132,7 +128,7 @@ func (c *CassandraDB) DescribeTables(ctx context.Context, keyspace string) ([]Ta
 	if ks == "" {
 		return nil, fmt.Errorf("cassandra: keyspace required")
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT keyspace_name, table_name, comment FROM system_schema.tables WHERE keyspace_name = ?`,
 		ks,
 	).WithContext(ctx).Iter()
@@ -151,8 +147,9 @@ func (c *CassandraDB) DescribeTables(ctx context.Context, keyspace string) ([]Ta
 
 // DescribeColumns returns the columns of a single table.
 func (c *CassandraDB) DescribeColumns(ctx context.Context, keyspace, table string) ([]ColumnInfo, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 	ks := keyspace
 	if ks == "" {
@@ -161,7 +158,7 @@ func (c *CassandraDB) DescribeColumns(ctx context.Context, keyspace, table strin
 	if ks == "" || table == "" {
 		return nil, fmt.Errorf("cassandra: keyspace and table are required")
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT keyspace_name, table_name, column_name, kind, position, type, clustering_order
 		 FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?`,
 		ks, table,
@@ -192,8 +189,12 @@ func (c *CassandraDB) DescribeTable(ctx context.Context, keyspace, table string)
 	if ks == "" || table == "" {
 		return nil, nil, fmt.Errorf("cassandra: keyspace and table are required")
 	}
+	sess, err := c.sess()
+	if err != nil {
+		return nil, nil, err
+	}
 	var kn, tn, comment string
-	err := c.session.Query(
+	err = sess.Query(
 		`SELECT keyspace_name, table_name, comment FROM system_schema.tables
 		 WHERE keyspace_name = ? AND table_name = ?`,
 		ks, table,
@@ -225,11 +226,7 @@ func RenderTableDDL(tbl TableInfo, cols []ColumnInfo) string {
 	}
 	// stable sort by position for key parts
 	sortByPos := func(xs []ColumnInfo) {
-		for i := 1; i < len(xs); i++ {
-			for j := i; j > 0 && xs[j-1].Position > xs[j].Position; j-- {
-				xs[j-1], xs[j] = xs[j], xs[j-1]
-			}
-		}
+		sort.SliceStable(xs, func(i, j int) bool { return xs[i].Position < xs[j].Position })
 	}
 	sortByPos(partition)
 	sortByPos(clustering)

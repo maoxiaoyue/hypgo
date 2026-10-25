@@ -40,13 +40,6 @@ func (u *UDTBuilder) Field(name string, typ DataType) *UDTBuilder {
 	return u
 }
 
-func (u *UDTBuilder) ref() string {
-	if u.keyspace != "" {
-		return quoteIdent(u.keyspace) + "." + quoteIdent(u.name)
-	}
-	return quoteIdent(u.name)
-}
-
 // CreateCQL renders CREATE TYPE.
 func (u *UDTBuilder) CreateCQL() string {
 	var sb strings.Builder
@@ -54,7 +47,7 @@ func (u *UDTBuilder) CreateCQL() string {
 	if u.ifNotExist {
 		sb.WriteString("IF NOT EXISTS ")
 	}
-	sb.WriteString(u.ref())
+	sb.WriteString(qualifiedName(u.keyspace, u.name))
 	sb.WriteString(" (\n")
 	for i, f := range u.fields {
 		fmt.Fprintf(&sb, "  %s %s", quoteIdent(f.Name), f.Type)
@@ -69,20 +62,20 @@ func (u *UDTBuilder) CreateCQL() string {
 
 // AlterAddCQL renders ALTER TYPE ... ADD.
 func (u *UDTBuilder) AlterAddCQL(name string, typ DataType) string {
-	return fmt.Sprintf("ALTER TYPE %s ADD %s %s", u.ref(), quoteIdent(name), typ)
+	return fmt.Sprintf("ALTER TYPE %s ADD %s %s", qualifiedName(u.keyspace, u.name), quoteIdent(name), typ)
 }
 
 // AlterRenameCQL renders ALTER TYPE ... RENAME <old> TO <new>.
 func (u *UDTBuilder) AlterRenameCQL(oldName, newName string) string {
-	return fmt.Sprintf("ALTER TYPE %s RENAME %s TO %s", u.ref(), quoteIdent(oldName), quoteIdent(newName))
+	return fmt.Sprintf("ALTER TYPE %s RENAME %s TO %s", qualifiedName(u.keyspace, u.name), quoteIdent(oldName), quoteIdent(newName))
 }
 
 // DropCQL renders DROP TYPE IF EXISTS.
 func (u *UDTBuilder) DropCQL(ifExists bool) string {
 	if ifExists {
-		return "DROP TYPE IF EXISTS " + u.ref()
+		return "DROP TYPE IF EXISTS " + qualifiedName(u.keyspace, u.name)
 	}
-	return "DROP TYPE " + u.ref()
+	return "DROP TYPE " + qualifiedName(u.keyspace, u.name)
 }
 
 // Create executes CREATE TYPE.

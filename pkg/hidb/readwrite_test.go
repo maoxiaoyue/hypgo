@@ -1,6 +1,7 @@
 package hidb
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -153,14 +154,14 @@ func TestReplicaPoolPingAll(t *testing.T) {
 	pool := NewReplicaPool()
 
 	// 空池健康檢查不應有錯誤
-	errs := pool.PingAll()
+	errs := pool.PingAll(context.Background())
 	if len(errs) != 0 {
 		t.Errorf("expected no errors pinging empty pool, got %v", errs)
 	}
 
 	// 帶 nil sqlDB 的副本不會被 ping（跳過）
 	pool.Add(ReadReplica{sqlDB: nil, hypDB: nil})
-	errs = pool.PingAll()
+	errs = pool.PingAll(context.Background())
 	if len(errs) != 0 {
 		t.Errorf("expected no errors pinging pool with nil sqlDB, got %v", errs)
 	}
@@ -172,7 +173,6 @@ func TestReadHypDBFallback(t *testing.T) {
 	db := &Database{
 		hypDB:       masterDB,
 		replicaPool: nil,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 無副本：應回退到主庫
@@ -198,7 +198,6 @@ func TestReadHypDBWithReplicas(t *testing.T) {
 	db := &Database{
 		hypDB:       masterDB,
 		replicaPool: pool,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 有副本：應返回副本
@@ -218,7 +217,6 @@ func TestReadSQLFallback(t *testing.T) {
 	db := &Database{
 		sqlDB:       nil,
 		replicaPool: nil,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 
 	// 無任何連接：返回 nil
@@ -238,7 +236,6 @@ func TestHasReplicas(t *testing.T) {
 	// 無副本池
 	db := &Database{
 		replicaPool: nil,
-		plugins:     make(map[string]DatabasePlugin),
 	}
 	if db.HasReplicas() {
 		t.Error("HasReplicas should return false when replicaPool is nil")

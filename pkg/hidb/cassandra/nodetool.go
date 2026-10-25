@@ -45,11 +45,12 @@ type ClusterSnapshot struct {
 
 // LocalInfo reads system.local (equivalent of `nodetool info` subset).
 func (c *CassandraDB) LocalInfo(ctx context.Context) (*NodetoolInfo, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 	var info NodetoolInfo
-	err := c.session.Query(
+	err = sess.Query(
 		`SELECT host_id, cluster_name, data_center, rack, release_version,
 		        cql_version, partitioner, broadcast_address, listen_address,
 		        rpc_address, schema_version, tokens
@@ -67,10 +68,11 @@ func (c *CassandraDB) LocalInfo(ctx context.Context) (*NodetoolInfo, error) {
 
 // Peers reads system.peers_v2 (equivalent of `nodetool status` minus load metrics).
 func (c *CassandraDB) Peers(ctx context.Context) ([]PeerInfo, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT peer, peer_port, data_center, rack, host_id, release_version, schema_version, tokens
 		 FROM system.peers_v2`,
 	).WithContext(ctx).Iter()
@@ -104,33 +106,36 @@ func (c *CassandraDB) ClusterStatus(ctx context.Context) (*ClusterSnapshot, erro
 // ===== system_views (Cassandra 4.0+/5.0 virtual keyspace) =====
 
 // ThreadPoolStat represents one row of system_views.thread_pools (tpstats).
+// Columns as defined by Cassandra 4.0 / 5.0; the table has no
+// total_blocked_tasks or max_pool_size column, so the previous query failed
+// with "Undefined column name" on every call.
 type ThreadPoolStat struct {
-	Name           string
-	ActiveTasks    int
-	PendingTasks   int
-	CompletedTasks int64
-	BlockedTasks   int
-	TotalBlocked   int64
-	MaxPoolSize    int
-	CoreActive     int
+	Name             string
+	ActiveTasks      int
+	ActiveTasksLimit int
+	PendingTasks     int
+	CompletedTasks   int64
+	BlockedTasks     int64
+	BlockedAllTime   int64
 }
 
 // ThreadPools is equivalent of `nodetool tpstats`.
 func (c *CassandraDB) ThreadPools(ctx context.Context) ([]ThreadPoolStat, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
-		`SELECT name, active_tasks, pending_tasks, completed_tasks,
-		        blocked_tasks, total_blocked_tasks, max_pool_size, active_tasks_limit
+	iter := sess.Query(
+		`SELECT name, active_tasks, active_tasks_limit, pending_tasks, completed_tasks,
+		        blocked_tasks, blocked_tasks_all_time
 		 FROM system_views.thread_pools`,
 	).WithContext(ctx).Iter()
 	defer iter.Close()
 
 	var out []ThreadPoolStat
 	var s ThreadPoolStat
-	for iter.Scan(&s.Name, &s.ActiveTasks, &s.PendingTasks, &s.CompletedTasks,
-		&s.BlockedTasks, &s.TotalBlocked, &s.MaxPoolSize, &s.CoreActive) {
+	for iter.Scan(&s.Name, &s.ActiveTasks, &s.ActiveTasksLimit, &s.PendingTasks, &s.CompletedTasks,
+		&s.BlockedTasks, &s.BlockedAllTime) {
 		out = append(out, s)
 	}
 	if err := iter.Close(); err != nil {
@@ -152,10 +157,11 @@ type SSTableTask struct {
 
 // CompactionTasks is equivalent of `nodetool compactionstats`.
 func (c *CassandraDB) CompactionTasks(ctx context.Context) ([]SSTableTask, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT keyspace_name, table_name, task_id, kind, progress, total, unit
 		 FROM system_views.sstable_tasks`,
 	).WithContext(ctx).Iter()
@@ -190,10 +196,11 @@ type ClientConnection struct {
 
 // Clients is equivalent of `nodetool clientstats --all`.
 func (c *CassandraDB) Clients(ctx context.Context) ([]ClientConnection, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT address, port, hostname, username, connection_stage, driver_name,
 		        driver_version, protocol_version, ssl_enabled, ssl_protocol,
 		        ssl_cipher_suite, request_count
@@ -222,10 +229,11 @@ type Setting struct {
 
 // Settings is equivalent of `nodetool getlogginglevels` + many get* commands.
 func (c *CassandraDB) Settings(ctx context.Context) ([]Setting, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT name, value FROM system_views.settings`,
 	).WithContext(ctx).Iter()
 	defer iter.Close()
@@ -243,11 +251,12 @@ func (c *CassandraDB) Settings(ctx context.Context) ([]Setting, error) {
 
 // Setting returns the current value of a single setting by name (e.g. "compaction_throughput_mb_per_sec").
 func (c *CassandraDB) Setting(ctx context.Context, name string) (string, error) {
-	if c.session == nil {
-		return "", fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return "", err
 	}
 	var v string
-	err := c.session.Query(
+	err = sess.Query(
 		`SELECT value FROM system_views.settings WHERE name = ?`, name,
 	).WithContext(ctx).Scan(&v)
 	return v, err
@@ -267,10 +276,11 @@ type CacheStat struct {
 
 // Caches is equivalent of `nodetool info` cache lines.
 func (c *CassandraDB) Caches(ctx context.Context) ([]CacheStat, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT name, capacity_bytes, entry_count, size_bytes, hit_ratio,
 		        hit_count, request_count, recent_hit_rate_per_second
 		 FROM system_views.caches`,
@@ -302,8 +312,9 @@ type SizeEstimate struct {
 // TableSizeEstimates returns size estimates for a table (per-range).
 // Pass empty keyspace to use the session keyspace.
 func (c *CassandraDB) TableSizeEstimates(ctx context.Context, keyspace, table string) ([]SizeEstimate, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 	ks := keyspace
 	if ks == "" {
@@ -312,7 +323,7 @@ func (c *CassandraDB) TableSizeEstimates(ctx context.Context, keyspace, table st
 	if ks == "" || table == "" {
 		return nil, fmt.Errorf("cassandra: keyspace and table are required")
 	}
-	iter := c.session.Query(
+	iter := sess.Query(
 		`SELECT keyspace_name, table_name, range_start, range_end,
 		        mean_partition_size, partitions_count
 		 FROM system.size_estimates WHERE keyspace_name = ? AND table_name = ?`,
@@ -362,8 +373,9 @@ func (c *CassandraDB) TableStats(ctx context.Context, keyspace, table string) (*
 // RawSystemViewRow returns all columns of a system_views table as a map.
 // Useful for tables whose schema varies across versions.
 func (c *CassandraDB) RawSystemViewRow(ctx context.Context, table string, where map[string]interface{}) ([]map[string]interface{}, error) {
-	if c.session == nil {
-		return nil, fmt.Errorf("cassandra: session not connected")
+	sess, err := c.sess()
+	if err != nil {
+		return nil, err
 	}
 	stmt := "SELECT * FROM system_views." + quoteIdent(table)
 	args := make([]interface{}, 0, len(where))
@@ -379,7 +391,7 @@ func (c *CassandraDB) RawSystemViewRow(ctx context.Context, table string, where 
 			args = append(args, v)
 		}
 	}
-	iter := c.session.Query(stmt, args...).WithContext(ctx).Iter()
+	iter := sess.Query(stmt, args...).WithContext(ctx).Iter()
 	defer iter.Close()
 
 	var out []map[string]interface{}

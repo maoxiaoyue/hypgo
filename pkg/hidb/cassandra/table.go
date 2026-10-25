@@ -4,19 +4,18 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 )
 
-// CompactionStrategy names as accepted by Cassandra 5.0.
-// UnifiedCompactionStrategy (UCS) is new in 5.0 and is the recommended default
-// for most workloads.
+// CompactionStrategy names as accepted by Cassandra.
+// UnifiedCompactionStrategy (UCS) requires Cassandra 5.0.
 const (
-	CompactionUnified     = "UnifiedCompactionStrategy"
-	CompactionSTCS        = "SizeTieredCompactionStrategy"
-	CompactionLCS         = "LeveledCompactionStrategy"
-	CompactionTWCS        = "TimeWindowCompactionStrategy"
-	CompactionIncremental = "IncrementalCompactionStrategy"
+	CompactionUnified = "UnifiedCompactionStrategy"
+	CompactionSTCS    = "SizeTieredCompactionStrategy"
+	CompactionLCS     = "LeveledCompactionStrategy"
+	CompactionTWCS    = "TimeWindowCompactionStrategy"
 )
 
 // CompressionAlgorithm names supported by Cassandra 5.0 sstable compression.
@@ -36,23 +35,17 @@ type CompactionOptions struct {
 	Extra map[string]interface{}
 }
 
-// ToCQL renders the compaction option map.
+// ToCQL renders the compaction option map (empty Class = SizeTiered).
 func (c CompactionOptions) ToCQL() string {
 	class := c.Class
 	if class == "" {
-		class = CompactionUnified
+		class = CompactionSTCS
 	}
 	var sb strings.Builder
-	sb.WriteString("{'class': '")
-	sb.WriteString(class)
-	sb.WriteString("'")
-	keys := make([]string, 0, len(c.Extra))
-	for k := range c.Extra {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(&sb, ", '%s': %s", k, quoteOptionValue(c.Extra[k]))
+	sb.WriteString("{'class': ")
+	sb.WriteString(cqlLiteral(class))
+	for _, k := range slices.Sorted(maps.Keys(c.Extra)) {
+		fmt.Fprintf(&sb, ", %s: %s", cqlLiteral(k), cqlLiteral(c.Extra[k]))
 	}
 	sb.WriteString("}")
 	return sb.String()
@@ -76,27 +69,18 @@ func (c CompressionOptions) ToCQL() string {
 		if !first {
 			sb.WriteString(", ")
 		}
-		fmt.Fprintf(&sb, "'%s': %s", k, v)
+		fmt.Fprintf(&sb, "%s: %s", cqlLiteral(k), v)
 		first = false
 	}
-	if c.SSTableCompression == "" {
-		write("sstable_compression", "''")
-	} else {
-		write("sstable_compression", "'"+c.SSTableCompression+"'")
-	}
+	write("sstable_compression", cqlLiteral(c.SSTableCompression))
 	if c.ChunkLengthKB > 0 {
 		write("chunk_length_in_kb", fmt.Sprintf("%d", c.ChunkLengthKB))
 	}
 	if c.CRCCheckChance > 0 {
 		write("crc_check_chance", fmt.Sprintf("%g", c.CRCCheckChance))
 	}
-	keys := make([]string, 0, len(c.Extra))
-	for k := range c.Extra {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		write(k, quoteOptionValue(c.Extra[k]))
+	for _, k := range slices.Sorted(maps.Keys(c.Extra)) {
+		write(k, cqlLiteral(c.Extra[k]))
 	}
 	sb.WriteString("}")
 	return sb.String()
@@ -118,58 +102,27 @@ func (c CachingOptions) ToCQL() string {
 	if rpp == "" {
 		rpp = "NONE"
 	}
-	return fmt.Sprintf("{'keys': '%s', 'rows_per_partition': '%s'}", keys, rpp)
-}
-
-func quoteOptionValue(v interface{}) string {
-	switch x := v.(type) {
-	case string:
-		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
-	case bool:
-		if x {
-			return "true"
-		}
-		return "false"
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		return fmt.Sprintf("%d", x)
-	case float32, float64:
-		return fmt.Sprintf("%g", x)
-	case map[string]interface{}:
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, fmt.Sprintf("'%s': %s", k, quoteOptionValue(x[k])))
-		}
-		return "{" + strings.Join(parts, ", ") + "}"
-	default:
-		return fmt.Sprintf("%v", x)
-	}
+	return fmt.Sprintf("{'keys': %s, 'rows_per_partition': %s}", cqlLiteral(keys), cqlLiteral(rpp))
 }
 
 // TableOptions holds all CREATE TABLE WITH ... properties supported by
 // Cassandra 5.0. Zero values mean "leave default".
 type TableOptions struct {
-	Comment                 string
-	DefaultTTL              int // seconds
-	GCGraceSeconds          int
-	BloomFilterFPChance     float64
-	MemtableFlushPeriodMs   int
-	CRCCheckChance          float64
-	ReadRepairChance        float64 // deprecated in 4.0+, kept for compat
-	DCLocalReadRepairChance float64 // deprecated in 4.0+, kept for compat
-	MinIndexInterval        int
-	MaxIndexInterval        int
-	SpeculativeRetry        string // e.g. "99p", "ALWAYS", "NONE"
-	AdditionalWritePolicy   string
-	CDC                     *bool
-	Caching                 *CachingOptions
-	Compaction              *CompactionOptions
-	Compression             *CompressionOptions
-	Extensions              map[string]interface{}
+	Comment               string
+	DefaultTTL            int // seconds
+	GCGraceSeconds        int
+	BloomFilterFPChance   float64
+	MemtableFlushPeriodMs int
+	CRCCheckChance        float64
+	MinIndexInterval      int
+	MaxIndexInterval      int
+	SpeculativeRetry      string // e.g. "99p", "ALWAYS", "NONE"
+	AdditionalWritePolicy string
+	CDC                   *bool
+	Caching               *CachingOptions
+	Compaction            *CompactionOptions
+	Compression           *CompressionOptions
+	Extensions            map[string]interface{}
 	// Extra accepts any additional option key=value pair the user wants to set,
 	// useful for properties added in future Cassandra versions.
 	Extra map[string]interface{}
@@ -208,13 +161,6 @@ func splitQualified(name string) (string, string) {
 		return name[:i], name[i+1:]
 	}
 	return "", name
-}
-
-func (t *TableBuilder) qualified() string {
-	if t.keyspace != "" {
-		return quoteIdent(t.keyspace) + "." + quoteIdent(t.name)
-	}
-	return quoteIdent(t.name)
 }
 
 // Keyspace sets the keyspace for this table.
@@ -303,17 +249,20 @@ func (t *TableBuilder) WithCDC(enabled bool) *TableBuilder {
 
 // CreateCQL renders the CREATE TABLE statement.
 // Unless NoDefaults() was called, unset compaction/compression/caching and
-// related knobs are filled from the package-level Default* variables.
+// related knobs are filled from the package-level Default* variables — on a
+// copy: previously the defaults were written back into the builder, so a
+// later NoDefaults() still emitted them.
 func (t *TableBuilder) CreateCQL() string {
+	opts := t.options
 	if !t.noDefaults {
-		applyTableDefaults(&t.options)
+		applyTableDefaults(&opts)
 	}
 	var sb strings.Builder
 	sb.WriteString("CREATE TABLE ")
 	if t.ifNotExist {
 		sb.WriteString("IF NOT EXISTS ")
 	}
-	sb.WriteString(t.qualified())
+	sb.WriteString(qualifiedName(t.keyspace, t.name))
 	sb.WriteString(" (\n")
 	columns := t.orderedColumns()
 	for i, col := range columns {
@@ -330,7 +279,10 @@ func (t *TableBuilder) CreateCQL() string {
 		sb.WriteString("\n")
 	}
 	sb.WriteString(")")
-	t.renderWithClauses(&sb)
+	if parts := buildWithParts(t.orderBy, opts); len(parts) > 0 {
+		sb.WriteString(" WITH ")
+		sb.WriteString(strings.Join(parts, "\n  AND "))
+	}
 	return sb.String()
 }
 
@@ -369,20 +321,13 @@ func (t *TableBuilder) orderedColumns() []Column {
 	return ordered
 }
 
-func (t *TableBuilder) renderWithClauses(sb *strings.Builder) {
-	parts := t.buildWithParts()
-	if len(parts) == 0 {
-		return
-	}
-	sb.WriteString(" WITH ")
-	sb.WriteString(strings.Join(parts, "\n  AND "))
-}
-
-func (t *TableBuilder) buildWithParts() []string {
+// buildWithParts renders the WITH clauses shared by CREATE TABLE, ALTER TABLE
+// and CREATE MATERIALIZED VIEW.
+func buildWithParts(orderBy []Column, o TableOptions) []string {
 	var parts []string
-	if len(t.orderBy) > 0 {
-		specs := make([]string, 0, len(t.orderBy))
-		for _, c := range t.orderBy {
+	if len(orderBy) > 0 {
+		specs := make([]string, 0, len(orderBy))
+		for _, c := range orderBy {
 			order := c.Order
 			if order == "" {
 				order = Asc
@@ -391,7 +336,6 @@ func (t *TableBuilder) buildWithParts() []string {
 		}
 		parts = append(parts, "CLUSTERING ORDER BY ("+strings.Join(specs, ", ")+")")
 	}
-	o := t.options
 	if o.Comment != "" {
 		parts = append(parts, fmt.Sprintf("comment = %s", cqlLiteral(o.Comment)))
 	}
@@ -409,12 +353,6 @@ func (t *TableBuilder) buildWithParts() []string {
 	}
 	if o.CRCCheckChance > 0 {
 		parts = append(parts, fmt.Sprintf("crc_check_chance = %g", o.CRCCheckChance))
-	}
-	if o.ReadRepairChance > 0 {
-		parts = append(parts, fmt.Sprintf("read_repair_chance = %g", o.ReadRepairChance))
-	}
-	if o.DCLocalReadRepairChance > 0 {
-		parts = append(parts, fmt.Sprintf("dclocal_read_repair_chance = %g", o.DCLocalReadRepairChance))
 	}
 	if o.MinIndexInterval > 0 {
 		parts = append(parts, fmt.Sprintf("min_index_interval = %d", o.MinIndexInterval))
@@ -441,17 +379,11 @@ func (t *TableBuilder) buildWithParts() []string {
 		parts = append(parts, fmt.Sprintf("compression = %s", o.Compression.ToCQL()))
 	}
 	if len(o.Extensions) > 0 {
-		parts = append(parts, fmt.Sprintf("extensions = %s", quoteOptionValue(map[string]interface{}(o.Extensions))))
+		parts = append(parts, fmt.Sprintf("extensions = %s", cqlLiteral(o.Extensions)))
 	}
-	if len(o.Extra) > 0 {
-		keys := make([]string, 0, len(o.Extra))
-		for k := range o.Extra {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			parts = append(parts, fmt.Sprintf("%s = %s", k, quoteOptionValue(o.Extra[k])))
-		}
+	// Extra keys are property names (identifiers), values are literals
+	for _, k := range slices.Sorted(maps.Keys(o.Extra)) {
+		parts = append(parts, fmt.Sprintf("%s = %s", quoteIdent(k), cqlLiteral(o.Extra[k])))
 	}
 	return parts
 }
@@ -459,14 +391,14 @@ func (t *TableBuilder) buildWithParts() []string {
 // DropCQL renders DROP TABLE IF EXISTS ...
 func (t *TableBuilder) DropCQL(ifExists bool) string {
 	if ifExists {
-		return fmt.Sprintf("DROP TABLE IF EXISTS %s", t.qualified())
+		return fmt.Sprintf("DROP TABLE IF EXISTS %s", qualifiedName(t.keyspace, t.name))
 	}
-	return fmt.Sprintf("DROP TABLE %s", t.qualified())
+	return fmt.Sprintf("DROP TABLE %s", qualifiedName(t.keyspace, t.name))
 }
 
 // TruncateCQL renders TRUNCATE <table>.
 func (t *TableBuilder) TruncateCQL() string {
-	return fmt.Sprintf("TRUNCATE %s", t.qualified())
+	return fmt.Sprintf("TRUNCATE %s", qualifiedName(t.keyspace, t.name))
 }
 
 // Create executes the CREATE TABLE statement.
@@ -500,13 +432,6 @@ func (c *CassandraDB) AlterTable(name string) *AlterTableBuilder {
 	return &AlterTableBuilder{db: c, keyspace: ks, name: tbl}
 }
 
-func (a *AlterTableBuilder) qualified() string {
-	if a.keyspace != "" {
-		return quoteIdent(a.keyspace) + "." + quoteIdent(a.name)
-	}
-	return quoteIdent(a.name)
-}
-
 // AddColumn appends an ADD clause.
 func (a *AlterTableBuilder) AddColumn(name string, typ DataType) *AlterTableBuilder {
 	a.actions = append(a.actions, fmt.Sprintf("ADD %s %s", quoteIdent(name), typ))
@@ -527,9 +452,7 @@ func (a *AlterTableBuilder) RenameColumn(oldName, newName string) *AlterTableBui
 
 // WithOptions appends a WITH ... AND ... clause from a TableOptions.
 func (a *AlterTableBuilder) WithOptions(opts TableOptions) *AlterTableBuilder {
-	tb := &TableBuilder{options: opts}
-	parts := tb.buildWithParts()
-	if len(parts) > 0 {
+	if parts := buildWithParts(nil, opts); len(parts) > 0 {
 		a.actions = append(a.actions, "WITH "+strings.Join(parts, " AND "))
 	}
 	return a
@@ -543,7 +466,7 @@ func (a *AlterTableBuilder) CQL() string {
 	}
 	stmts := make([]string, len(a.actions))
 	for i, act := range a.actions {
-		stmts[i] = fmt.Sprintf("ALTER TABLE %s %s", a.qualified(), act)
+		stmts[i] = fmt.Sprintf("ALTER TABLE %s %s", qualifiedName(a.keyspace, a.name), act)
 	}
 	return strings.Join(stmts, ";\n") + ";"
 }
@@ -551,7 +474,7 @@ func (a *AlterTableBuilder) CQL() string {
 // Exec executes the ALTER TABLE statements one at a time.
 func (a *AlterTableBuilder) Exec(ctx context.Context) error {
 	for _, act := range a.actions {
-		stmt := fmt.Sprintf("ALTER TABLE %s %s", a.qualified(), act)
+		stmt := fmt.Sprintf("ALTER TABLE %s %s", qualifiedName(a.keyspace, a.name), act)
 		if err := a.db.Exec(ctx, stmt); err != nil {
 			return err
 		}
