@@ -369,3 +369,82 @@ func TestSecurityKeyValidation(t *testing.T) {
 		t.Error("no MaxClockSkew should accept any timestamp")
 	}
 }
+
+// TestSlowCallbackDoesNotBlockHub 迴歸測試（C）：一條連線的 onConnect 卡住時，其他連線仍能
+// 註冊並收到廣播。歷史 bug：callback 在 Hub 唯一的 goroutine 上執行，任一 callback 慢下來就卡住全部連線
+func TestSlowCallbackDoesNotBlockHub(t *testing.T) {
+	hub, srv, _ := wsServer(t, DefaultConfig, true)
+	block := make(chan struct{})
+	defer close(block)
+	var first atomic.Bool
+	var connected atomic.Int32
+	hub.SetCallbacks(func(c *Client) {
+		if first.CompareAndSwap(false, true) {
+			<-block // 第一條連線的 onConnect 卡住
+		}
+		connected.Add(1)
+	}, nil, nil)
+
+	mustDial(t, srv, nil)
+	eventually(t, "first onConnect entered", first.Load)
+	fast := mustDial(t, srv, nil)
+	eventually(t, "second connection's onConnect", func() bool { return connected.Load() == 1 })
+
+	hub.Broadcast([]byte(`"hello"`))
+	fast.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, data, err := fast.ReadMessage(); err != nil || !strings.Contains(string(data), "hello") {
+		t.Errorf("broadcast while another onConnect is blocked: %q, %v", data, err)
+	}
+}
+
+// TestOnDisconnectExactlyOnce onConnect 時已可 SendToClient；onDisconnect 每條連線恰好一次，
+// 不論斷線原因（客戶端關閉、被同 ID 取代、Shutdown）
+func TestOnDisconnectExactlyOnce(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.ClientID = func(c *hypcontext.Context) string { return c.Query("user") }
+	hub, srv, _ := wsServer(t, cfg, true)
+	var mu sync.Mutex
+	disconnects := map[*Client]int{}
+	hub.SetCallbacks(
+		func(c *Client) { hub.SendToClient(c.ID, "welcome") },
+		func(c *Client) { mu.Lock(); disconnects[c]++; mu.Unlock() },
+		nil)
+	total := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, v := range disconnects {
+			n += v
+		}
+		return n
+	}
+
+	dialUser := func(user string) *gws.Conn {
+		c, _, err := gws.DefaultDialer.Dial(wsURL(srv)+"?user="+user, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, data, err := c.ReadMessage(); err != nil || !strings.Contains(string(data), "welcome") {
+			t.Fatalf("%s: onConnect SendToClient not delivered: %q, %v", user, data, err)
+		}
+		return c
+	}
+	a := dialUser("a")
+	a.Close() // 客戶端關閉
+	eventually(t, "a disconnected", func() bool { return total() == 1 })
+	dialUser("b")
+	dialUser("b") // 取代第一個 b
+	eventually(t, "replaced b disconnected", func() bool { return total() == 2 })
+	dialUser("c")
+	hub.Shutdown() // 關閉剩下的 b 與 c
+	eventually(t, "all disconnected", func() bool { return total() == 4 })
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	for c, n := range disconnects {
+		if n != 1 {
+			t.Errorf("client %s: onDisconnect called %d times", c.ID, n)
+		}
+	}
+}

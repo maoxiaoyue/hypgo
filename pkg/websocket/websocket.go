@@ -134,7 +134,6 @@ func (c Config) withDefaults() Config {
 // Upgrader WebSocket 升級器
 type Upgrader struct {
 	upgrader websocket.Upgrader
-	config   Config
 }
 
 // NewUpgrader 創建新的 Upgrader
@@ -165,7 +164,6 @@ func NewUpgrader(config Config) *Upgrader {
 			CheckOrigin:       checkOrigin,
 			Subprotocols:      subprotocols,
 		},
-		config: config,
 	}
 }
 
@@ -350,19 +348,19 @@ func (c *Client) SetHMACKey(key []byte) {
 
 // ===== Hub =====
 
-// Hub WebSocket 中心
+// Hub WebSocket 中心。連線的註冊 / 注銷直接在 mu 內完成；Run goroutine 只負責廣播佇列與
+// 不活躍連線清理。onConnect / onDisconnect 在該連線自己的 readPump goroutine 執行：
+// 先前在 Hub 唯一的 goroutine 上執行，任一 callback 慢下來，全部連線的註冊與廣播都被卡住
 type Hub struct {
-	clients    map[string]*Client
-	broadcast  chan *Message
-	register   chan *Client
-	unregister chan *Client
-	channels   map[string]map[*Client]bool
-	rooms      map[string]*Room
-	logger     *logger.Logger
-	config     Config
-	upgrader   *Upgrader
-	security   *SecurityConfig // AES + HMAC 安全管線配置
-	mu         sync.RWMutex
+	clients   map[string]*Client
+	broadcast chan *Message
+	channels  map[string]map[*Client]bool
+	rooms     map[string]*Room
+	logger    *logger.Logger
+	config    Config
+	upgrader  *Upgrader
+	security  *SecurityConfig // AES + HMAC 安全管線配置
+	mu        sync.RWMutex
 
 	started  atomic.Bool
 	done     chan struct{} // Run 結束（Shutdown）時關閉
@@ -394,21 +392,21 @@ func NewHub(logger *logger.Logger, config Config) *Hub {
 		}
 	}
 	return &Hub{
-		clients:    make(map[string]*Client),
-		broadcast:  make(chan *Message, 256),
-		register:   make(chan *Client, 16),
-		unregister: make(chan *Client, 16),
-		channels:   make(map[string]map[*Client]bool),
-		rooms:      make(map[string]*Room),
-		logger:     logger,
-		config:     config,
-		upgrader:   NewUpgrader(config),
-		security:   config.Security,
-		done:       make(chan struct{}),
+		clients:   make(map[string]*Client),
+		broadcast: make(chan *Message, 256),
+		channels:  make(map[string]map[*Client]bool),
+		rooms:     make(map[string]*Room),
+		logger:    logger,
+		config:    config,
+		upgrader:  NewUpgrader(config),
+		security:  config.Security,
+		done:      make(chan struct{}),
 	}
 }
 
-// SetCallbacks 設置回調函數
+// SetCallbacks 設置回調函數（須在開始接受連線前設定）。三者都在該連線的 readPump goroutine 執行：
+// onConnect 早於該連線的任何 onMessage，且此時已註冊（可直接 SendToClient）；
+// onDisconnect 每條連線恰好一次，不論斷線原因（客戶端關閉、清理不活躍連線、同 ID 取代、Shutdown）
 func (h *Hub) SetCallbacks(
 	onConnect func(*Client),
 	onDisconnect func(*Client),
@@ -435,12 +433,6 @@ func (h *Hub) Run(ctx context.Context) {
 		case <-h.done:
 			return
 
-		case client := <-h.register:
-			h.handleRegister(client)
-
-		case client := <-h.unregister:
-			h.handleUnregister(client)
-
 		case message := <-h.broadcast:
 			h.handleBroadcast(message)
 			message.Release()
@@ -461,13 +453,12 @@ func (h *Hub) stopped() bool {
 	}
 }
 
-// handleRegister 處理客戶端註冊
-func (h *Hub) handleRegister(client *Client) {
+// handleRegister 註冊客戶端；Hub 已關閉時回傳 false
+func (h *Hub) handleRegister(client *Client) bool {
 	h.mu.Lock()
-	if client.gone {
-		// 註冊前就已斷線（Run 先處理了 unregister）：不再放進 map，否則永遠留著
+	if h.stopped() {
 		h.mu.Unlock()
-		return
+		return false
 	}
 	old := h.clients[client.ID]
 	h.clients[client.ID] = client
@@ -480,20 +471,15 @@ func (h *Hub) handleRegister(client *Client) {
 	}
 	h.mu.Unlock()
 	h.stats.TotalConnections.Add(1)
-
-	if h.onConnect != nil {
-		h.onConnect(client)
-	}
-
-	h.logger.Infof("Client %s connected", client.ID)
+	return true
 }
 
-// handleUnregister 處理客戶端註銷（重複呼叫無作用）。
+// handleUnregister 自 Hub 移除客戶端並通知其連線關閉（重複呼叫無作用；不呼叫 callback）。
 // 先前以 ID 查 map：同一 ID 的第二條連線會被第一條的斷線一併刪除，留下收不到任何訊息的連線
 func (h *Hub) handleUnregister(client *Client) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if client.gone {
-		h.mu.Unlock()
 		return
 	}
 	client.gone = true
@@ -505,6 +491,7 @@ func (h *Hub) handleUnregister(client *Client) {
 	}
 
 	client.mu.RLock()
+	defer client.mu.RUnlock()
 	for channel := range client.Channels {
 		if clients, ok := h.channels[channel]; ok {
 			delete(clients, client)
@@ -522,13 +509,6 @@ func (h *Hub) handleUnregister(client *Client) {
 			}
 		}
 	}
-	client.mu.RUnlock()
-	h.mu.Unlock()
-
-	if h.onDisconnect != nil {
-		h.onDisconnect(client)
-	}
-	h.logger.Infof("Client %s disconnected", client.ID)
 }
 
 // handleBroadcast 處理廣播（支持跨協議序列化 + 安全管線）
@@ -574,10 +554,9 @@ func (h *Hub) cleanupInactiveClients() {
 	}
 	h.mu.RUnlock()
 
-	// 直接呼叫 handleUnregister 而非送進 h.unregister channel：
-	// 本函式在 Hub 的 Run goroutine 內執行，而該 channel 的唯一消費者
-	// 就是 Run 自己——一次清掃超過 channel 容量的不活躍連線時，
-	// 發送方（Run）會永久阻塞，整個 Hub 凍結
+	// 只移除並通知關閉，onDisconnect 由該連線的 readPump 結束時呼叫（不在 Run goroutine 上執行）。
+	// 先前改為送進 unregister channel，而其唯一消費者就是執行本函式的 Run 自己——一次清掃超過
+	// channel 容量的不活躍連線時永久阻塞，整個 Hub 凍結
 	for _, client := range inactiveClients {
 		h.logger.Debugf("Cleaning up inactive client: %s", client.ID)
 		h.handleUnregister(client)
@@ -628,43 +607,46 @@ func (h *Hub) ServeHTTP(c *hypcontext.Context) {
 		return nil
 	})
 
-	// 註冊客戶端
-	select {
-	case h.register <- client:
-	case <-h.done:
+	// 先註冊再啟動讀寫循環：onConnect（於 readPump 開頭執行）時已可 SendToClient
+	if !h.handleRegister(client) {
 		conn.Close()
 		return
 	}
-
-	// 啟動讀寫循環
 	go client.writePump(h.config)
 	go client.readPump()
 }
 
-// unregisterClient 送出注銷請求；Hub 已關閉時直接返回（先前 Run 結束後，
-// 超過 channel 容量的 readPump 在送出時永久阻塞）
-func (h *Hub) unregisterClient(c *Client) {
-	select {
-	case h.unregister <- c:
-	case <-h.done:
-	}
-}
-
 // ===== Client 讀寫方法 =====
 
-// readPump 讀取循環
+// readPump 讀取循環；連線的 onConnect / onDisconnect 也在這裡執行
 func (c *Client) readPump() {
+	hub := c.Hub
 	defer func() {
-		// 處理單則訊息時的 panic（如 callback 或 codec 錯誤）只關閉這條連線：
+		// 處理訊息或 callback 時的 panic 只關閉這條連線：
 		// readPump 是獨立 goroutine，Recovery 中介層管不到，先前會讓整個行程崩潰
 		if r := recover(); r != nil {
-			c.Hub.logger.Errorf("websocket: panic while handling a message from client %s: %v", c.ID, r)
+			hub.logger.Errorf("websocket: panic while serving client %s: %v", c.ID, r)
 		}
-		c.Hub.unregisterClient(c)
+		hub.handleUnregister(c)
 		c.Conn.Close()
+		if hub.onDisconnect != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						hub.logger.Errorf("websocket: panic in onDisconnect for client %s: %v", c.ID, r)
+					}
+				}()
+				hub.onDisconnect(c)
+			}()
+		}
+		hub.logger.Infof("Client %s disconnected", c.ID)
 	}()
 
-	hub := c.Hub
+	hub.logger.Infof("Client %s connected", c.ID)
+	if hub.onConnect != nil {
+		hub.onConnect(c)
+	}
+
 	for {
 		_, data, err := c.Conn.ReadMessage()
 		if err != nil {
@@ -872,24 +854,19 @@ func (c *Client) Unsubscribe(channel string) {
 // 先前 JoinRoom 與 LeaveRoom 各自取鎖，可能把客戶端加進剛被刪除、放回池並分配給
 // 其他房間 ID 的 Room
 type Room struct {
-	ID           string
-	Clients      map[*Client]bool // mu 保護
-	Metadata     map[string]interface{}
-	mu           sync.RWMutex
-	hub          *Hub
-	created      time.Time
-	lastActivity time.Time
+	ID       string
+	Clients  map[*Client]bool // mu 保護
+	Metadata map[string]interface{}
+	mu       sync.RWMutex
+	hub      *Hub
 }
 
 func newRoom(id string, hub *Hub) *Room {
-	now := time.Now()
 	return &Room{
-		ID:           id,
-		Clients:      make(map[*Client]bool),
-		Metadata:     make(map[string]interface{}),
-		hub:          hub,
-		created:      now,
-		lastActivity: now,
+		ID:       id,
+		Clients:  make(map[*Client]bool),
+		Metadata: make(map[string]interface{}),
+		hub:      hub,
 	}
 }
 
@@ -905,7 +882,6 @@ func (r *Room) AddClient(client *Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.Clients[client] = true
-	r.lastActivity = time.Now()
 }
 
 // RemoveClient 從房間移除客戶端
@@ -913,7 +889,6 @@ func (r *Room) RemoveClient(client *Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.Clients, client)
-	r.lastActivity = time.Now()
 }
 
 // Broadcast 房間廣播原始位元組：包成 Type 為 "broadcast" 的 Message，

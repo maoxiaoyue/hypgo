@@ -63,7 +63,7 @@ func TestUpgrader_Upgrade(t *testing.T) {
 
 		// Connect to the Hub (Simulate ServeHTTP)
 		client := newClient("test-client", conn, hub, codecJSON)
-		hub.register <- client
+		hub.handleRegister(client)
 
 		// Immediately close the connection for test
 		conn.Close()
