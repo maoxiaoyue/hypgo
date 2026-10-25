@@ -2,6 +2,9 @@
 package schema
 
 import (
+	"encoding"
+	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 )
@@ -13,21 +16,32 @@ type FieldInfo struct {
 	Required bool   `json:"required" yaml:"required"`
 }
 
-// TypeName 返回型別的短名稱
-// 例如：TypeName(MyStruct{}) → "MyStruct"
+// TypeName 返回型別的短名稱（指標去掉，複合型別的元素也用短名稱）
+// 例如：TypeName(MyStruct{}) → "MyStruct"、TypeName([]*MyStruct{}) → "[]MyStruct"。
+// 先前複合型別回 t.String()，帶套件前綴（"[]main.MyStruct"），與 struct 的命名不一致
 func TypeName(v interface{}) string {
 	if v == nil {
 		return ""
 	}
-	t := reflect.TypeOf(v)
+	return shortTypeName(reflect.TypeOf(v))
+}
+
+func shortTypeName(t reflect.Type) string {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	name := t.Name()
-	if name == "" {
-		return t.String()
+	if name := t.Name(); name != "" {
+		return name
 	}
-	return name
+	switch t.Kind() {
+	case reflect.Slice:
+		return "[]" + shortTypeName(t.Elem())
+	case reflect.Array:
+		return fmt.Sprintf("[%d]%s", t.Len(), shortTypeName(t.Elem()))
+	case reflect.Map:
+		return "map[" + shortTypeName(t.Key()) + "]" + shortTypeName(t.Elem())
+	}
+	return t.String()
 }
 
 // FieldsOf 返回 struct 的所有 JSON 欄位資訊（規則見 JSONFields）。
@@ -40,15 +54,19 @@ func FieldsOf(v interface{}) []FieldInfo {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	if t.Kind() != reflect.Struct {
+	if t.Kind() != reflect.Struct || customJSON(t) { // time.Time 等自訂序列化的型別不是 object
 		return nil
 	}
 	fields := JSONFields(t)
 	out := make([]FieldInfo, len(fields))
 	for i, f := range fields {
+		typ := goTypeToSchemaType(f.Type)
+		if _, opts, _ := strings.Cut(f.Tag.Get("json"), ","); hasTagOpt(opts, "string") && quotable(f.Type) {
+			typ = "string" // json:",string"：數字 / bool 以字串輸出
+		}
 		out[i] = FieldInfo{
 			Name:     f.Name,
-			Type:     goTypeToSchemaType(f.Type),
+			Type:     typ,
 			Required: f.Required,
 		}
 	}
@@ -64,14 +82,28 @@ type JSONField struct {
 
 // JSONFields 依 encoding/json 的規則列出 struct 型別 t 的 JSON 欄位：
 // 未帶 json 名稱的內嵌 struct（含未匯出型別）展開成上層欄位，而非一個以型別名為鍵的 object；
-// 內嵌指標之下的欄位為選填（指標為 nil 時整組不出現）。
+// 內嵌指標之下的欄位為選填（指標為 nil 時整組不出現）；同名欄位只留 encoding/json 實際輸出的那個。
 // FieldsOf 與 pkg/contract（必填檢查、測試資料生成）共用，各處對 JSON 形狀的認知才會一致
 func JSONFields(t reflect.Type) []JSONField {
-	return appendJSONFields(nil, t, false)
+	return dominantFields(appendJSONFields(nil, t, 0, false, map[reflect.Type]bool{}))
 }
 
-// ponytail: 不處理同名欄位的遮蔽規則（較淺層者優先），實務上極少見
-func appendJSONFields(out []JSONField, t reflect.Type, optional bool) []JSONField {
+// jsonCandidate 展開過程中的候選欄位：depth 為內嵌層數，tagged 為 json tag 有指定名稱
+type jsonCandidate struct {
+	JSONField
+	depth  int
+	tagged bool
+}
+
+// appendJSONFields 深度優先展開欄位。onPath 記錄目前展開路徑上的型別：
+// 先前沒有記錄，自我參照（type Node struct{ *Node }）或互相內嵌的型別無限遞迴，整個行程 stack overflow
+func appendJSONFields(out []jsonCandidate, t reflect.Type, depth int, optional bool, onPath map[reflect.Type]bool) []jsonCandidate {
+	if onPath[t] {
+		return out // 更深層的同名欄位必被淺層遮蔽，略過不影響結果
+	}
+	onPath[t] = true
+	defer delete(onPath, t)
+
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		tag := f.Tag.Get("json")
@@ -89,23 +121,66 @@ func appendJSONFields(out []JSONField, t reflect.Type, optional bool) []JSONFiel
 				if isPtr && !f.IsExported() {
 					continue // encoding/json 忽略未匯出型別的內嵌指標
 				}
-				out = appendJSONFields(out, ft, optional || isPtr)
+				out = appendJSONFields(out, ft, depth+1, optional || isPtr, onPath)
 				continue
 			}
 		}
 		if !f.IsExported() {
 			continue
 		}
-		if name == "" {
-			name = f.Name
-		}
 		// omitzero（Go 1.24）與 omitempty 一樣：零值時根本不會序列化，不能算必填
 		omit := hasTagOpt(opts, "omitempty") || hasTagOpt(opts, "omitzero")
-		out = append(out, JSONField{
-			StructField: f,
-			Name:        name,
-			Required:    !optional && !omit && f.Type.Kind() != reflect.Ptr,
+		tagged := name != ""
+		if !tagged {
+			name = f.Name
+		}
+		out = append(out, jsonCandidate{
+			JSONField: JSONField{
+				StructField: f,
+				Name:        name,
+				Required:    !optional && !omit && f.Type.Kind() != reflect.Ptr,
+			},
+			depth:  depth,
+			tagged: tagged,
 		})
+	}
+	return out
+}
+
+// dominantFields 套用 encoding/json 的同名規則：內嵌層數最淺者勝出；同層有多個時，
+// 唯一帶 json 名稱者勝出，否則全部捨棄。先前同名欄位全部列出——manifest 重複、
+// contract 以被遮蔽（實際不會輸出）的欄位做必填檢查
+func dominantFields(cands []jsonCandidate) []JSONField {
+	minDepth := make(map[string]int, len(cands))
+	for _, c := range cands {
+		if d, ok := minDepth[c.Name]; !ok || c.depth < d {
+			minDepth[c.Name] = c.depth
+		}
+	}
+	// 最淺層的候選者：只有一個就是它；多個時取唯一帶名稱者；否則捨棄
+	type pick struct{ n, tagged, sole, soleTagged int }
+	picks := make(map[string]*pick, len(minDepth))
+	for i, c := range cands {
+		if c.depth != minDepth[c.Name] {
+			continue
+		}
+		p := picks[c.Name]
+		if p == nil {
+			p = &pick{}
+			picks[c.Name] = p
+		}
+		p.n++
+		p.sole = i
+		if c.tagged {
+			p.tagged++
+			p.soleTagged = i
+		}
+	}
+	out := make([]JSONField, 0, len(cands))
+	for i, c := range cands {
+		if p := picks[c.Name]; p != nil && (p.n == 1 && p.sole == i || p.n > 1 && p.tagged == 1 && p.soleTagged == i) {
+			out = append(out, c.JSONField)
+		}
 	}
 	return out
 }
@@ -115,10 +190,53 @@ func hasTagOpt(opts, opt string) bool {
 	return strings.Contains(","+opts+",", ","+opt+",")
 }
 
-// goTypeToSchemaType 將 Go 型別轉為 schema 型別字串
+var (
+	jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
+	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
+)
+
+// implements 回報 t 或 *t 是否實作 iface
+func implements(t, iface reflect.Type) bool {
+	return t.Implements(iface) || reflect.PointerTo(t).Implements(iface)
+}
+
+// customJSON 回報 t 是否以自訂方法序列化（不依欄位展開）
+func customJSON(t reflect.Type) bool {
+	return implements(t, jsonMarshalerType) || implements(t, textMarshalerType)
+}
+
+// quotable 回報 json:",string" 是否作用於此型別（字串、數字、bool 及其指標）
+func quotable(t reflect.Type) bool {
+	if t.Kind() == reflect.Ptr && t.Name() == "" {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
+// goTypeToSchemaType 將 Go 型別轉為 schema 型別字串（描述的是 JSON 形狀，不是 Go 型別）。
+// 先前只看 Kind：time.Time 寫成 object、[]byte 與 json.RawMessage 寫成 array（實際是字串 / 任意 JSON）
 func goTypeToSchemaType(t reflect.Type) string {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
+	}
+	switch {
+	case implements(t, textMarshalerType):
+		// time.Time、net.IP、uuid 等：MarshalText 輸出字串；同時有 MarshalJSON 的（time.Time）也是字串。
+		// ponytail: math/big 的 MarshalJSON 輸出數字，例外不處理
+		return "string"
+	case implements(t, jsonMarshalerType):
+		return "any" // json.RawMessage 等：形狀由 MarshalJSON 決定
+	case t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 && !customJSON(t.Elem()):
+		return "string" // []byte 以 base64 字串輸出
+	case t.Kind() == reflect.Interface:
+		return "any"
 	}
 	switch t.Kind() {
 	case reflect.String:
