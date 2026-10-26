@@ -35,10 +35,10 @@ database:
 logger:
   level: "info"  # 可選: debug, info, notice, warning, emergency
   output: "logs/app.log"  # stdout 或檔案路徑
-  colors: true
+  colors: true            # 僅輸出到終端機時上色
   rotation:
-    max_size: 100MB    # 10MB, 100MB, 1GB
-    max_age: 7d        # 1h, 1d, 1w
+    max_size: 100MB    # 10MB, 100M, 1.5GB, 512KB
+    max_age: 7d        # 備份保留期限：12h, 7d, 1w（換算成天數）
     max_backups: 10
     compress: true
 

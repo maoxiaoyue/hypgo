@@ -701,10 +701,10 @@ database:
 logger:
   level: info              # debug | info | notice | warning | emergency
   output: "logs/api.log"   # stdout 或檔案路徑
-  colors: true
+  colors: true             # 僅輸出到終端機時上色；寫檔、管線、Docker 不含色碼
   rotation:
     max_size: 100MB
-    max_age: 7d
+    max_age: 7d            # 備份保留期限（換算成天數）
     max_backups: 10
     compress: true
 `

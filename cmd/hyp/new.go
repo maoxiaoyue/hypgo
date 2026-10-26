@@ -491,10 +491,10 @@ database:
 logger:
   level: debug  # debug, info, notice, warning, emergency
   output: logs/app.log  # stdout or file path
-  colors: true
+  colors: true  # only applied when writing to a terminal
   rotation:
     max_size: 100MB
-    max_age: 7d
+    max_age: 7d  # backup retention (rounded up to days)
     max_backups: 10
     compress: true
 `

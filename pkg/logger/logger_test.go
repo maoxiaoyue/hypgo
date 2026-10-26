@@ -2,8 +2,15 @@ package logger
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestGetLevelString(t *testing.T) {
@@ -31,18 +38,18 @@ func TestGetLevelString(t *testing.T) {
 }
 
 func TestFormatMessage(t *testing.T) {
-	l := NewLogger()
-	// Disable colorizer for simpler testing
-	l.colorize = false
+	var buf bytes.Buffer
+	l, _ := New("debug", "", &buf, false)
 
-	msg := l.formatMessage(INFO, "test message")
-	if !strings.Contains(msg, "[INFO]") || !strings.Contains(msg, "test message") {
+	l.Info("test message")
+	if msg := buf.String(); !strings.Contains(msg, "[INFO]") || !strings.Contains(msg, "test message") {
 		t.Errorf("unexpected formatted message: %s", msg)
 	}
 
-	msgWithKV := l.formatMessage(DEBUG, "test with kv", "key", "value")
-	if !strings.Contains(msgWithKV, "[DEBUG]") || !strings.Contains(msgWithKV, "key=value") {
-		t.Errorf("unexpected formatted message with KV: %s", msgWithKV)
+	buf.Reset()
+	l.Debug("test with kv", "key", "value")
+	if msg := buf.String(); !strings.Contains(msg, "[DEBUG]") || !strings.Contains(msg, "| key=value") {
+		t.Errorf("unexpected formatted message with KV: %s", msg)
 	}
 }
 
@@ -123,6 +130,11 @@ func TestNewRespectsLevel(t *testing.T) {
 }
 
 func TestNewRespectsColorize(t *testing.T) {
+	// 色碼只在 colors=true 且目的地為終端機時輸出；以替換 isTerminal 模擬終端機
+	orig := isTerminal
+	isTerminal = func(io.Writer) bool { return true }
+	defer func() { isTerminal = orig }()
+
 	var buf bytes.Buffer
 	l, _ := New("info", "stdout", &buf, true)
 
@@ -130,8 +142,15 @@ func TestNewRespectsColorize(t *testing.T) {
 	l.Info("colored")
 
 	output := buf.String()
-	if !strings.Contains(output, "\033[") {
-		t.Errorf("expected color escape codes when colorize=true, got: %s", output)
+	if !strings.Contains(output, ColorGreen+"[INFO]"+ColorReset) {
+		t.Errorf("expected color escape codes when colorize=true, got: %q", output)
+	}
+
+	buf.Reset()
+	off, _ := New("info", "stdout", &buf, false)
+	off.Info("plain")
+	if strings.Contains(buf.String(), "\x1b[") {
+		t.Errorf("colors=false must not emit escape codes, got: %q", buf.String())
 	}
 }
 
@@ -265,15 +284,127 @@ func TestNilLoggerSafety(t *testing.T) {
 }
 
 func TestFormatMessageOddKeysAndValues(t *testing.T) {
-	l, _ := New("debug", "stdout", &bytes.Buffer{}, false)
+	var buf bytes.Buffer
+	l, _ := New("debug", "stdout", &buf, false)
 
 	// BUG-8: 奇數鍵值對 — 最後一個 key 應顯示 (MISSING)
-	msg := l.formatMessage(INFO, "test", "key1", "val1", "orphanKey")
+	l.Info("test", "key1", "val1", "orphanKey")
+	msg := buf.String()
 
 	if !strings.Contains(msg, "key1=val1") {
 		t.Errorf("expected key1=val1 in output, got: %s", msg)
 	}
 	if !strings.Contains(msg, "orphanKey=(MISSING)") {
 		t.Errorf("expected orphanKey=(MISSING) for odd key, got: %s", msg)
+	}
+}
+
+// TestConcurrentLoggingWithReconfigure 多個 goroutine 同時寫入、切換層級 / 格式並強制輪轉（以 -race 執行）
+func TestConcurrentLoggingWithReconfigure(t *testing.T) {
+	dir := t.TempDir()
+	rot, err := NewRotation(filepath.Join(dir, "app.log"), &RotationConfig{MaxSize: "1MB", MaxBackups: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, _ := New("debug", "", rot, true)
+	defer rot.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 300; j++ {
+				l.Info("work", "worker", id, "j", j, "note", "a b")
+				l.Warnf("worker %d step %d", id, j)
+				l.Slog().Info("via slog", "id", id)
+			}
+		}(i)
+	}
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 100; j++ {
+			l.SetLevel(Level(j % 6))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 100; j++ {
+			if j%2 == 0 {
+				l.SetFormat("json")
+			} else {
+				l.SetFormat("text")
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 5; j++ {
+			_ = rot.Rotate()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	wg.Wait()
+}
+
+// TestSlogAccessor Slog() 共用 Logger 的輸出、層級與格式，支援 WithAttrs / WithGroup
+func TestSlogAccessor(t *testing.T) {
+	var buf bytes.Buffer
+	l, _ := New("info", "", &buf, false)
+	sl := l.Slog().With("svc", "api").WithGroup("req")
+
+	sl.Debug("hidden")
+	sl.Info("handled", "id", 7)
+	if out := buf.String(); !strings.Contains(out, "[INFO] handled | svc=api req.id=7") || strings.Contains(out, "hidden") {
+		t.Errorf("unexpected slog text output: %q", out)
+	}
+
+	buf.Reset()
+	l.SetFormat("json")
+	sl.Log(context.Background(), slogNotice, "n", "id", 8)
+	if out := buf.String(); !strings.Contains(out, `"level":"NOTICE"`) || !strings.Contains(out, `"svc":"api","req":{"id":8}`) {
+		t.Errorf("unexpected slog JSON output: %q", out)
+	}
+
+	var nilLogger *Logger
+	nilLogger.Slog().Info("discarded") // 不得 panic
+}
+
+// TestFatalClosesBeforeExit Fatal / Fatalf 先寫出並關閉日誌檔再退出
+func TestFatalClosesBeforeExit(t *testing.T) {
+	var code int
+	osExit = func(c int) { code = c }
+	defer func() { osExit = os.Exit }()
+
+	logfile := filepath.Join(t.TempDir(), "app.log")
+	l, err := NewWithRotation("info", logfile, &RotationConfig{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Fatalf("fatal %s", "boom")
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	l.Info("after fatal") // 已關閉：丟棄
+	data, _ := os.ReadFile(logfile)
+	if !strings.Contains(string(data), "[EMERGENCY] fatal boom") || strings.Contains(string(data), "after fatal") {
+		t.Errorf("unexpected log file content: %q", data)
+	}
+	// 關閉後檔案可被刪除（Windows 上開著的檔案無法刪除）
+	if err := os.Remove(logfile); err != nil {
+		t.Errorf("log file should be closed after Fatal: %v", err)
+	}
+}
+
+// TestTextValueFormatting 文字模式各種值的呈現
+func TestTextValueFormatting(t *testing.T) {
+	var buf bytes.Buffer
+	l, _ := New("info", "", &buf, false)
+	l.Info("vals", "int", 42, "float", 1.5, "bool", true, "dur", 5*time.Millisecond,
+		"err", errors.New("disk full"), "cn", "中文", "slice", []int{1, 2})
+	want := `| int=42 float=1.5 bool=true dur=5ms err="disk full" cn=中文 slice="[1 2]"`
+	if !strings.Contains(buf.String(), want) {
+		t.Errorf("got %q, want suffix %q", buf.String(), want)
 	}
 }
