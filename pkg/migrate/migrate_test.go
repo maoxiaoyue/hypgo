@@ -114,9 +114,9 @@ func TestScanModelPost(t *testing.T) {
 		t.Fatal("ScanModel returned nil")
 	}
 
-	// TestPost 無 BaseModel，表名從 struct name 推導
-	if ts.Name != "test_post" {
-		t.Errorf("Name = %q, want %q", ts.Name, "test_post")
+	// TestPost 無 BaseModel，表名同 bun：struct 名稱轉 snake_case 後取複數（先前為 test_post）
+	if ts.Name != "test_posts" {
+		t.Errorf("Name = %q, want %q", ts.Name, "test_posts")
 	}
 
 	if len(ts.Columns) != 4 {
@@ -136,29 +136,9 @@ func TestScanModels(t *testing.T) {
 	r := NewRegistry()
 	r.Register((*TestUser)(nil), (*TestPost)(nil))
 
-	tables := ScanModels(r)
+	tables := mustScan(t, r, "postgres")
 	if len(tables) != 2 {
 		t.Fatalf("got %d tables, want 2", len(tables))
-	}
-}
-
-// --- toSnakeCase ---
-
-func TestToSnakeCase(t *testing.T) {
-	tests := []struct {
-		input, want string
-	}{
-		{"UserID", "user_i_d"},
-		{"Name", "name"},
-		{"CreatedAt", "created_at"},
-		{"ID", "i_d"},
-		{"simple", "simple"},
-	}
-	for _, tt := range tests {
-		got := toSnakeCase(tt.input)
-		if got != tt.want {
-			t.Errorf("toSnakeCase(%q) = %q, want %q", tt.input, got, tt.want)
-		}
 	}
 }
 
@@ -175,12 +155,12 @@ func TestDiffAddTable(t *testing.T) {
 
 	changes := Diff(current, snapshot)
 
-	// 1 AddTable + 2 AddColumn
-	if len(changes) != 3 {
-		t.Fatalf("got %d changes, want 3", len(changes))
+	// 1 AddTable，整張表定義放在 Schema（先前另附每欄一個 AddColumn）
+	if len(changes) != 1 {
+		t.Fatalf("got %d changes, want 1", len(changes))
 	}
-	if changes[0].Type != AddTable {
-		t.Errorf("changes[0].Type = %v, want AddTable", changes[0].Type)
+	if changes[0].Type != AddTable || changes[0].Schema == nil || len(changes[0].Schema.Columns) != 2 {
+		t.Errorf("changes[0] = %+v, want AddTable with the full schema", changes[0])
 	}
 }
 
@@ -283,9 +263,10 @@ func TestGenerateSQLPostgres(t *testing.T) {
 		}},
 	}
 
-	up, down := GenerateSQL(changes, "postgres")
+	up, down := mustGenerate(t, changes, "postgres")
 
-	if !strings.Contains(up, `ADD COLUMN "bio" TEXT`) {
+	// 明確的 type: 與 bun 相同、原樣輸出（先前一律轉大寫）
+	if !strings.Contains(up, `ADD COLUMN "bio" text`) {
 		t.Errorf("up SQL missing ADD COLUMN: %s", up)
 	}
 	if !strings.Contains(down, `DROP COLUMN "bio"`) {
@@ -296,11 +277,11 @@ func TestGenerateSQLPostgres(t *testing.T) {
 func TestGenerateSQLMySQL(t *testing.T) {
 	changes := []Change{
 		{Type: AddColumn, Table: "users", Column: &ColumnSchema{
-			Name: "age", GoType: "int",
+			Name: "age", GoType: "int", SQLType: "BIGINT",
 		}},
 	}
 
-	up, _ := GenerateSQL(changes, "mysql")
+	up, _ := mustGenerate(t, changes, "mysql")
 
 	if !strings.Contains(up, "`users`") {
 		t.Errorf("MySQL should use backticks: %s", up)
@@ -308,14 +289,14 @@ func TestGenerateSQLMySQL(t *testing.T) {
 }
 
 func TestGenerateSQLAutoIncrement(t *testing.T) {
-	changes := []Change{
-		{Type: AddColumn, Table: "users", Column: &ColumnSchema{
-			Name: "id", GoType: "int64", PrimaryKey: true, AutoIncrement: true,
-		}},
+	scan := func(dialect string) []Change {
+		r := NewRegistry()
+		r.Register((*TestPost)(nil))
+		return Diff(mustScan(t, r, dialect), &Snapshot{Tables: map[string]TableSchema{}})
 	}
 
-	upPg, _ := GenerateSQL(changes, "postgres")
-	upMy, _ := GenerateSQL(changes, "mysql")
+	upPg, _ := mustGenerate(t, scan("postgres"), "postgres")
+	upMy, _ := mustGenerate(t, scan("mysql"), "mysql")
 
 	if !strings.Contains(upPg, "BIGSERIAL") {
 		t.Errorf("Postgres should use BIGSERIAL: %s", upPg)
@@ -327,18 +308,19 @@ func TestGenerateSQLAutoIncrement(t *testing.T) {
 
 func TestGenerateSQLDropTable(t *testing.T) {
 	changes := []Change{
-		{Type: DropTable, Table: "old_table"},
+		{Type: DropTable, Table: "old_table", Schema: &TableSchema{Name: "old_table",
+			Columns: []ColumnSchema{{Name: "id", SQLType: "BIGINT"}}}},
 	}
 
-	up, _ := GenerateSQL(changes, "postgres")
-	if !strings.Contains(up, `DROP TABLE IF EXISTS "old_table"`) {
+	up, _ := mustGenerate(t, changes, "postgres")
+	if !strings.Contains(up, `DROP TABLE "old_table";`) {
 		t.Errorf("up SQL: %s", up)
 	}
 }
 
 func TestGenerateSQLEmpty(t *testing.T) {
-	up, down := GenerateSQL(nil, "postgres")
-	if up != "" || down != "" {
+	up, down, err := GenerateSQL(nil, "postgres")
+	if up != "" || down != "" || err != nil {
 		t.Error("empty changes should produce empty SQL")
 	}
 }
@@ -356,7 +338,7 @@ func TestSnapshotSaveLoad(t *testing.T) {
 		}},
 	}
 
-	if err := SaveSnapshot(path, tables); err != nil {
+	if err := SaveSnapshot(path, tables, "postgres"); err != nil {
 		t.Fatalf("SaveSnapshot failed: %v", err)
 	}
 
@@ -441,6 +423,24 @@ func findColumn(ts *TableSchema, name string) *ColumnSchema {
 	return nil
 }
 
+func mustScan(t *testing.T, r *ModelRegistry, dialect string) []TableSchema {
+	t.Helper()
+	tables, err := ScanModels(r, dialect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tables
+}
+
+func mustGenerate(t *testing.T, changes []Change, dialect string) (up, down string) {
+	t.Helper()
+	up, down, err := GenerateSQL(changes, dialect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return up, down
+}
+
 // --- Full Integration ---
 
 func TestFullDiffWorkflow(t *testing.T) {
@@ -451,7 +451,7 @@ func TestFullDiffWorkflow(t *testing.T) {
 	r := NewRegistry()
 	r.Register((*TestPost)(nil))
 
-	tables := ScanModels(r)
+	tables := mustScan(t, r, "postgres")
 	snap, _ := LoadSnapshot(snapshotPath)
 	changes := Diff(tables, snap)
 
@@ -459,7 +459,7 @@ func TestFullDiffWorkflow(t *testing.T) {
 		t.Fatal("first diff should have changes")
 	}
 
-	up, down := GenerateSQL(changes, "postgres")
+	up, down := mustGenerate(t, changes, "postgres")
 	if up == "" {
 		t.Fatal("up SQL should not be empty")
 	}
@@ -468,7 +468,7 @@ func TestFullDiffWorkflow(t *testing.T) {
 	}
 
 	// 儲存快照
-	if err := SaveSnapshot(snapshotPath, tables); err != nil {
+	if err := SaveSnapshot(snapshotPath, tables, "postgres"); err != nil {
 		t.Fatal(err)
 	}
 

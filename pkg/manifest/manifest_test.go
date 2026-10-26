@@ -11,6 +11,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"github.com/uptrace/bun"
 )
 
 // 測試用 struct
@@ -220,21 +221,21 @@ func TestWriteJSON(t *testing.T) {
 
 // --- Model Manifest ---
 
-// 測試用 Model struct（使用 BaseModel 欄位名，與 bun ORM 慣例一致）
+// 測試用 Model struct（內嵌 bun.BaseModel；migrate 以 bun 的 metadata 掃描，具名的 BaseModel struct{} 欄位不會被 bun 視為表設定）
 type testUser struct {
-	BaseModel struct{} `bun:"table:users,alias:u"`
-	ID        int64    `bun:"id,pk,autoincrement"`
-	Name      string   `bun:"name,notnull"`
-	Email     string   `bun:"email,unique,notnull"`
-	Role      string   `bun:"role,default:user"`
-	DeletedAt string   `bun:"deleted_at"`
+	bun.BaseModel `bun:"table:users,alias:u"`
+	ID            int64  `bun:"id,pk,autoincrement"`
+	Name          string `bun:"name,notnull"`
+	Email         string `bun:"email,unique,notnull"`
+	Role          string `bun:"role,default:user"`
+	DeletedAt     string `bun:"deleted_at"`
 }
 
 type testPost struct {
-	BaseModel struct{} `bun:"table:posts"`
-	ID        int64    `bun:"id,pk,autoincrement"`
-	Title     string   `bun:"title,notnull"`
-	Body      string   `bun:"body"`
+	bun.BaseModel `bun:"table:posts"`
+	ID            int64  `bun:"id,pk,autoincrement"`
+	Title         string `bun:"title,notnull"`
+	Body          string `bun:"body"`
 }
 
 func setupModelRegistry() *migrate.ModelRegistry {
