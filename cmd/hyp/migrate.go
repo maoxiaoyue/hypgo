@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"github.com/spf13/cobra"
 )
 
@@ -294,7 +295,8 @@ func collectProjectTables(cmd *cobra.Command, pkg, dialect string) ([]migrate.Ta
 	defer os.Remove(out)
 
 	run := exec.CommandContext(cmd.Context(), "go", "run", pkg)
-	run.Env = append(os.Environ(), migrate.SchemaOutEnv+"="+out, migrate.SchemaDialectEnv+"="+dialect)
+	// 只為取得 model，不解密 ${secret:name}：CI 不需要持有解密金鑰
+	run.Env = append(os.Environ(), migrate.SchemaOutEnv+"="+out, migrate.SchemaDialectEnv+"="+dialect, secret.OptionalEnv+"=1")
 	run.Stdout, run.Stderr = os.Stderr, os.Stderr
 	runErr := run.Run()
 

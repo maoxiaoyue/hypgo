@@ -1233,6 +1233,46 @@ ai_comment: false
 think_comment: false
 `
 
+// CryptYamlTemplate 是 .hyp/crypt.yaml 的預設內容（機密值的加密方式，見 pkg/secret）。
+// 由 hyp new / hyp api / hyp secret init 建立。
+const CryptYamlTemplate = `# HypGo 機密加密設定
+# 放置於 .hyp/crypt.yaml（可進版控：這裡沒有任何機密，只有設定與公鑰）
+#
+# 機密值加密後存在 key.secret，config.yaml 以 ${secret:name} 引用，例如：
+#   database:
+#     dsn: "app:${secret:db_pass}@tcp(db:3306)/app"
+#
+# 管理：hyp secret init / set / get / list / rm / rotate
+# 改 method 或金鑰後，執行 hyp secret rotate 重新加密。
+
+# 加密方式：
+#   aes-256-gcm        對稱式，32 bytes 金鑰（預設）
+#   chacha20-poly1305  對稱式，沒有 AES 硬體加速的機器較快
+#   passphrase         由密碼以 Argon2id 衍生金鑰；適合本機與手動啟動的服務
+#   age                非對稱式（X25519）：有公鑰即可加密，解密需要私鑰；適合多人協作與 CI
+method: aes-256-gcm
+
+# 密文檔（相對於專案根目錄），可進版控
+secret_file: key.secret
+
+# aes-256-gcm / chacha20-poly1305 的金鑰來源：環境變數優先，其次金鑰檔（內容為 base64）
+# file 留空時為 ~/.hypgo/keys/<專案目錄名>.key。金鑰不要放進專案或 .hyp/：AI 工具會讀取這些目錄
+key:
+  env: HYPGO_MASTER_KEY
+  file: ""
+
+# passphrase 的密碼來源（hyp secret 指令在沒有環境變數時會詢問；伺服器啟動只讀環境變數）
+passphrase:
+  env: HYPGO_PASSPHRASE
+
+# age：recipients 為公鑰（可列多把，每位持有對應私鑰的人都能解密）
+# 私鑰來源：環境變數優先，其次私鑰檔；identity_file 留空時為 ~/.hypgo/keys/<專案目錄名>.age
+age:
+  recipients: []
+  identity_env: HYPGO_AGE_IDENTITY
+  identity_file: ""
+`
+
 // HypConfigYamlTemplate 是 .hyp/config.yaml 的預設內容。
 // 由 hyp new / hyp api 在建立專案時複製為 .hyp/config.yaml。
 // 內容與 pkg/config.DefaultHypConfigYAML 同步。

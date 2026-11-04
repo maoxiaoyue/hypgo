@@ -23,6 +23,9 @@ var commentYamlContent = scaffold.CommentYamlTemplate
 // hypConfigYamlContent 為 hyp api 生成 .hyp/config.yaml 時採用的預設內容。
 var hypConfigYamlContent = scaffold.HypConfigYamlTemplate
 
+// cryptYamlContent 為 hyp api 生成 .hyp/crypt.yaml 時採用的預設內容。
+var cryptYamlContent = scaffold.CryptYamlTemplate
+
 var apiCmd = &cobra.Command{
 	Use:   "api [project-name]",
 	Short: "Create a new HypGo API-only project with HTTP/3 support",
@@ -76,6 +79,7 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		{Path: ".hyp/llm.yaml", Content: llmYamlContent},
 		{Path: ".hyp/comment.yaml", Content: commentYamlContent},
 		{Path: ".hyp/config.yaml", Content: hypConfigYamlContent},
+		{Path: ".hyp/crypt.yaml", Content: cryptYamlContent},
 		{Path: ".env.example", Content: envExampleContent},
 
 		// 部署和配置
@@ -565,7 +569,8 @@ func createAPIMainFile(projectName string) error {
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/hidb\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/hidb/mysql\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/hidb/pg\"\n" +
-		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/logger\"\n" +
+		"\t\"github.com/maoxiaoyue/hypgo/pkg/secret\"\n\n" +
 		"\t\"" + projectName + "/routers\"\n" +
 		")\n\n" +
 		"// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）\n" +
@@ -596,6 +601,10 @@ func createAPIMainFile(projectName string) error {
 		"func openDatabase(cfg *config.Config, log *logger.Logger) *hidb.Database {\n" +
 		"\tif cfg.Database.DSN == \"\" {\n" +
 		"\t\tlog.Info(\"database.dsn not set, skipping database init\")\n" +
+		"\t\treturn nil\n" +
+		"\t}\n" +
+		"\t// hyp context / hyp migrate 只為取得路由與 model：不連資料庫，也不需要解密金鑰\n" +
+		"\tif os.Getenv(secret.OptionalEnv) != \"\" {\n" +
 		"\t\treturn nil\n" +
 		"\t}\n\n" +
 		"\tvar dialect hidb.Dialect\n" +
@@ -645,7 +654,7 @@ func printSuccessMessage(projectName string) {
 	fmt.Printf("   │   └── services/       # user_service.go, auth_service.go（業務邏輯 + Error Catalog）\n")
 	fmt.Printf("   ├── routers/            # router.go（Setup）+ user.go / auth.go（Schema 路由）+ middleware.go\n")
 	fmt.Printf("   ├── config/config.yaml  # server / database / logger\n")
-	fmt.Printf("   ├── .hyp/               # llm.yaml / comment.yaml / config.yaml\n")
+	fmt.Printf("   ├── .hyp/               # llm.yaml / comment.yaml / config.yaml / crypt.yaml\n")
 	fmt.Printf("   ├── migrations/         # SQL migrations\n")
 	fmt.Printf("   ├── logs/               # .gitkeep（logger 輸出 logs/api.log）\n")
 	fmt.Printf("   ├── certs/              # make cert → HTTP/3 用 TLS 憑證\n")
@@ -744,8 +753,11 @@ RUN addgroup -g 1000 -S appuser && \
 
 WORKDIR /app
 
-COPY --from=builder /app/main .
+# key.secret 只有密文，不存在時略過（結尾的 [t] 讓 COPY 不因缺檔失敗）；
+# 解密金鑰不進映像，執行時以環境變數注入（如 docker run -e HYPGO_MASTER_KEY=...）
+COPY --from=builder /app/main /app/key.secre[t] ./
 COPY --from=builder /app/config ./config
+COPY --from=builder /app/.hyp/crypt.yaml ./.hyp/crypt.yaml
 
 RUN mkdir -p logs certs && \
     chown -R appuser:appuser /app
@@ -1111,7 +1123,7 @@ Redis: add ` + "`hidb.WithRedis(redis.New())`" + ` (import ` + "`github.com/maox
 │   └── services/       # business logic + Error Catalog
 ├── routers/            # router.go (Setup) + <resource>.go Schema routes + middleware.go
 ├── config/config.yaml  # server / database / logger
-├── .hyp/               # llm.yaml / comment.yaml / config.yaml (AI tooling)
+├── .hyp/               # llm.yaml / comment.yaml / config.yaml / crypt.yaml
 ├── migrations/         # SQL migrations (make migrate)
 ├── logs/               # logger output (logs/api.log)
 ├── certs/              # make cert

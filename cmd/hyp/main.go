@@ -37,6 +37,7 @@ Database:
 
 Deployment:
   health         Check running application health
+  secret         Encrypt credentials into key.secret (${secret:name} in config.yaml)
 
 Use "hyp [command] --help" for detailed information about each command.`,
 		Version: Version,
@@ -72,6 +73,7 @@ func registerCommands() {
 	// 真正的實作從未被註冊；docker 已移除（hyp api 會產生 Dockerfile）
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(restartCmd)
+	rootCmd.AddCommand(secretCmd)
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)

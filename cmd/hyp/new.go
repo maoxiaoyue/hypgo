@@ -373,7 +373,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 創建設計時設定檔（.hyp/llm.yaml + comment.yaml + config.yaml）
+	// 創建設計時設定檔（.hyp/llm.yaml + comment.yaml + config.yaml + crypt.yaml）
 	if err := createLLMConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
 		return err
 	}
@@ -381,6 +381,9 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if err := createHypConfigFile(filepath.Join(projectName, ".hyp")); err != nil {
+		return err
+	}
+	if err := writeNewFile(filepath.Join(projectName, ".hyp", "crypt.yaml"), []byte(scaffold.CryptYamlTemplate), 0644); err != nil {
 		return err
 	}
 

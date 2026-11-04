@@ -9,6 +9,7 @@ import (
 	"os/exec"
 
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -108,7 +109,8 @@ func collectProjectManifest(cmd *cobra.Command, pkg string) (*manifest.Manifest,
 	defer os.Remove(out)
 
 	run := exec.CommandContext(cmd.Context(), "go", "run", pkg)
-	run.Env = append(os.Environ(), manifest.ManifestOutEnv+"="+out)
+	// 只為取得路由，不解密 ${secret:name}：CI 不需要持有解密金鑰
+	run.Env = append(os.Environ(), manifest.ManifestOutEnv+"="+out, secret.OptionalEnv+"=1")
 	run.Stdout, run.Stderr = os.Stderr, os.Stderr
 	if err := run.Run(); err != nil {
 		return nil, fmt.Errorf("go run %s: %w", pkg, err)
