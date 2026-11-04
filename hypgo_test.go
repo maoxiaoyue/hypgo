@@ -1,8 +1,10 @@
 package hypgo
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -78,6 +80,46 @@ func TestWithConfigPathFallsBackOnMissing(t *testing.T) {
 	app := New(WithConfigPath(filepath.Join(t.TempDir(), "absent.yaml")))
 	if app == nil || app.Config().Server.Addr != ":8080" {
 		t.Errorf("expected default Addr :8080 on missing config, got %v", app.Config().Server.Addr)
+	}
+}
+
+// TestNewPanicsOnInvalidConfig 迴歸測試：設定檔存在但無效時 New 必須 panic。
+// 歷史 bug：靜默退回內建預設值——:9443 + TLS 的正式設定只要有一個值不合法就跑成 :8080 明文，
+// 缺機密金鑰時則跑成沒有資料庫設定，全程沒有任何訊息
+func TestNewPanicsOnInvalidConfig(t *testing.T) {
+	t.Setenv("HYPGO_MASTER_KEY", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for name, content := range map[string]string{
+		"validation failure": "server:\n  addr: ':9443'\n  protocol: nonsense\n",
+		"malformed yaml":     "server: [\n",
+		"secret unavailable": "database:\n  dsn: \"${secret:db_pass}\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("New silently fell back to defaults instead of panicking")
+				}
+				if msg := fmt.Sprint(r); !strings.Contains(msg, path) {
+					t.Errorf("panic should name the file: %s", msg)
+				}
+			}()
+			New(WithConfigPath(path))
+		})
+	}
+}
+
+// TestNewProbeSkipsMissingFiles 沒有任何設定檔時維持零配置：不 panic，使用內建預設值
+func TestNewProbeSkipsMissingFiles(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if app := New(); app.Config().Server.Addr != ":8080" {
+		t.Errorf("Addr = %q, want the default :8080", app.Config().Server.Addr)
 	}
 }
 
