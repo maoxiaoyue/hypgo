@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/eval"
 	"github.com/maoxiaoyue/hypgo/pkg/resource"
 	hypRouter "github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
@@ -305,7 +306,7 @@ func writeObserveReport(t *testing.T, results []ObserveResult, filter string, op
 
 	outPath := opt.OutputPath
 	if outPath == "" {
-		outPath = filepath.Join(".hyp", "observe_"+time.Now().Format("20060102_150405")+".html")
+		outPath = filepath.Join(eval.HypDir(), "observe_"+time.Now().Format("20060102_150405")+".html")
 	}
 	// 先前目錄或檔案寫入失敗時完全無訊息，使用者只會發現報告不見了
 	err := os.MkdirAll(filepath.Dir(outPath), 0o755)

@@ -28,7 +28,7 @@ type GraderResult struct {
 	// Name 評判器名稱（同 Grader.Name()，作為 Scores map 的 key）
 	Name string
 
-	// Score 評分，0.0（最差）～ 1.0（最好）
+	// Score 評分，0.0（最差）～ 1.0（最好）。超出範圍（含 NaN）視為評分失敗，不會被當成分數
 	Score float64
 
 	// Reason 評分理由（deterministic 評判器可為空）

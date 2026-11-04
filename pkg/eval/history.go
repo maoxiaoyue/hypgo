@@ -4,7 +4,7 @@ package eval
 // @ai purpose: Evaluation History 持久化 — 將 contract 測試結果以 JSONL 格式 append 到 .hyp/eval_history.jsonl
 // @ai input: EvalRecord（測試結果結構）、可選的自訂路徑
 // @ai output: 錯誤（nil 表示成功）
-// @ai sideeffect: 建立 .hyp/ 目錄、讀寫 .hyp/eval_history.jsonl（原子替換：寫 .tmp → rename）
+// @ai sideeffect: 建立 .hyp/ 目錄、以 O_APPEND 寫入 .hyp/eval_history.jsonl
 // date: 2026-05-23
 
 import (
@@ -44,6 +44,10 @@ type EvalRecord struct {
 	// TestCase.Graders 的各評判器分數（"llm_judge"、"similarity"、"aggregate" 等）
 	Scores map[string]float64 `json:"scores,omitempty"`
 
+	// Attempts 為執行次數（1 = 第一次就有結果；> 1 = 重試過，hyp eval-report 會標為不穩定）。
+	// 舊紀錄沒有這個欄位
+	Attempts int `json:"attempts,omitempty"`
+
 	// LatencyMs 為完整執行時間（含重試），單位毫秒
 	LatencyMs int64 `json:"latency_ms"`
 
@@ -58,15 +62,30 @@ type EvalRecord struct {
 // historyMu 保護同一進程內對 history 檔案的並行寫入
 var historyMu sync.Mutex
 
-// DefaultHistoryPath 回傳預設的 history 檔案路徑
-//
-// @ai purpose: 集中管理 history 檔案路徑，讓呼叫者不需硬編碼路徑字串
-// @ai input: none
-// @ai output: .hyp/eval_history.jsonl 的相對路徑字串
-// @ai sideeffect: none
-// date: 2026-05-23
+// HypDir 回傳專案的 .hyp 目錄：自工作目錄往上找第一個 go.mod，找不到時為相對路徑 ".hyp"。
+// go test 的工作目錄是套件目錄，先前直接用相對路徑時紀錄寫到 routers/.hyp/，
+// 在專案根目錄執行的 hyp eval-report / hyp observe 永遠找不到
+func HypDir() string {
+	const name = ".hyp"
+	dir, err := os.Getwd()
+	if err != nil {
+		return name
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return filepath.Join(dir, name)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return name
+		}
+		dir = parent
+	}
+}
+
+// DefaultHistoryPath 回傳預設的 history 檔案路徑（專案 .hyp 目錄下的 eval_history.jsonl，見 HypDir）
 func DefaultHistoryPath() string {
-	return filepath.Join(".hyp", "eval_history.jsonl")
+	return filepath.Join(HypDir(), "eval_history.jsonl")
 }
 
 // HashInput 計算請求 body 的 sha256 前綴摘要
@@ -174,26 +193,31 @@ func AppendHistoryTo(path string, record EvalRecord) error {
 // @ai sideeffect: 讀取指定檔案
 // date: 2026-05-23
 func LoadHistory(path string) ([]EvalRecord, error) {
+	records, _, err := ScanHistory(path)
+	return records, err
+}
+
+// ScanHistory 與 LoadHistory 相同，另外回傳跳過的壞行數（截斷的寫入、不是紀錄的 JSON）
+func ScanHistory(path string) (records []EvalRecord, skipped int, err error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("eval: read history %s: %w", path, err)
+		return nil, 0, fmt.Errorf("eval: read history %s: %w", path, err)
 	}
 
-	var records []EvalRecord
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		var r EvalRecord
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			// 跳過格式錯誤的行（可能由截斷寫入產生）
+		if err := json.Unmarshal([]byte(line), &r); err != nil || r.Route == "" {
+			skipped++
 			continue
 		}
 		records = append(records, r)
 	}
-	return records, nil
+	return records, skipped, nil
 }

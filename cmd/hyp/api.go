@@ -972,6 +972,10 @@ go.work
 *~
 .DS_Store
 
+# 本機產生的報告（.hyp/ 其餘設定要進版控）
+.hyp/eval_history.jsonl
+.hyp/observe_*.html
+
 # Logs（保留 logs/.gitkeep 讓目錄存在）
 logs/*
 !logs/.gitkeep

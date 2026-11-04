@@ -52,7 +52,8 @@ type RunConfig struct {
 	FailFast bool
 
 	// RecordHistory 將每次測試結果 append 到 .hyp/eval_history.jsonl
-	// true 時自動記錄（含路由、狀態、延遲、git commit、輸入 hash）
+	// true 時自動記錄（含路由、狀態、執行次數、延遲、git commit、輸入 hash），寫入失敗時測試失敗。
+	// TestAll 不能掛 Graders（自動產生的輸入評不出品質）；要記錄評分請用 Test 與 TestCase.RecordHistory
 	// false 時不記錄（零值，向後相容）
 	RecordHistory bool
 }

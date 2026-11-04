@@ -1,18 +1,20 @@
 // llm.go — LLM 評判器共用的最小 HTTP 客戶端
 //
 // 支援與 pkg/manifest 的 LLM enricher 相同的三種 wire format
-//（ollama /api/generate、OpenAI 相容 /chat/completions、Anthropic /messages），
+// （ollama /api/generate、OpenAI 相容 /chat/completions、Anthropic /messages），
 // 設定沿用 pkg/config 的 LLMConfig（.hyp/llm.yaml）。刻意不 import
 // pkg/manifest：那是 server 會載入的重量級套件，eval 只需要百餘行 HTTP 呼叫
 package eval
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -59,12 +61,16 @@ func completeText(ctx context.Context, cfg *config.LLMConfig, client *http.Clien
 
 // ollamaGenerate 呼叫 Ollama /api/generate（format=json 強制 JSON 輸出）
 func ollamaGenerate(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string) (string, error) {
-	body, _ := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"model":  cfg.Ollama.Model,
 		"prompt": prompt,
 		"stream": false,
 		"format": "json",
-	})
+	}
+	if cfg.Ollama.MaxTokens > 0 {
+		payload["options"] = map[string]int{"num_predict": cfg.Ollama.MaxTokens}
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", cfg.Ollama.URL+"/api/generate", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -137,15 +143,18 @@ func anthropicComplete(ctx context.Context, cfg *config.LLMConfig, client *http.
 	if err := doJSON(client, req, &out); err != nil {
 		return "", fmt.Errorf("eval: anthropic messages: %w", err)
 	}
-	if len(out.Content) == 0 {
-		return "", fmt.Errorf("eval: anthropic messages returned no content")
+	// 第一個區塊不一定是文字（例如 thinking），取第一個有文字的區塊
+	for _, block := range out.Content {
+		if block.Text != "" {
+			return block.Text, nil
+		}
 	}
-	return out.Content[0].Text, nil
+	return "", fmt.Errorf("eval: anthropic messages returned no text")
 }
 
 // embedText 取得文字的 embedding 向量（Ollama /api/embeddings）。
-// api 模式走 OpenAI 相容 /embeddings
-func embedText(ctx context.Context, cfg *config.LLMConfig, client *http.Client, text string) ([]float64, error) {
+// api 模式走 OpenAI 相容 /embeddings。model 留空時沿用 cfg 的模型
+func embedText(ctx context.Context, cfg *config.LLMConfig, client *http.Client, model, text string) ([]float64, error) {
 	if cfg == nil || !cfg.IsEnabled() {
 		return nil, fmt.Errorf("eval: LLM config is nil or mode=none")
 	}
@@ -156,7 +165,7 @@ func embedText(ctx context.Context, cfg *config.LLMConfig, client *http.Client, 
 	switch cfg.Mode {
 	case config.LLMModeOllama:
 		body, _ := json.Marshal(map[string]string{
-			"model":  cfg.Ollama.Model,
+			"model":  cmp.Or(model, cfg.Ollama.Model),
 			"prompt": text,
 		})
 		req, err := http.NewRequestWithContext(ctx, "POST", cfg.Ollama.URL+"/api/embeddings", bytes.NewReader(body))
@@ -173,8 +182,11 @@ func embedText(ctx context.Context, cfg *config.LLMConfig, client *http.Client, 
 		return out.Embedding, nil
 
 	case config.LLMModeAPI:
+		if cfg.API.Provider == "anthropic" {
+			return nil, fmt.Errorf("eval: provider anthropic has no embeddings API: give SimilarityGrader a separate Config (ollama or an OpenAI-compatible provider)")
+		}
 		body, _ := json.Marshal(map[string]interface{}{
-			"model": cfg.API.Model,
+			"model": cmp.Or(model, cfg.API.Model),
 			"input": text,
 		})
 		req, err := http.NewRequestWithContext(ctx, "POST", cfg.API.BaseURL+"/embeddings", bytes.NewReader(body))
@@ -216,7 +228,7 @@ func doJSON(client *http.Client, req *http.Request, out interface{}) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet := string(data)
 		if len(snippet) > 200 {
-			snippet = snippet[:200]
+			snippet = strings.ToValidUTF8(snippet[:200], "")
 		}
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
 	}
