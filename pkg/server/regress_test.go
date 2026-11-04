@@ -473,7 +473,7 @@ func TestStartMigrateOutWritesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), `"name":"regress_widget"`) {
+	if !strings.Contains(string(data), `"name":"regress_widgets"`) {
 		t.Errorf("schema output missing registered model: %s", data)
 	}
 	if _, err := os.Stat(pidFilePath); err == nil {

@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // backups 回傳目前的備份檔數量（app-*.log 型式）
@@ -25,17 +24,18 @@ func TestRotationWriteTriggersBySize(t *testing.T) {
 	dir := t.TempDir()
 	logfile := filepath.Join(dir, "app.log")
 
-	r, err := NewRotation(logfile, &RotationConfig{MaxSize: "1KB"})
+	// 底層以 MB 為單位，1MB 為最小門檻
+	r, err := NewRotation(logfile, &RotationConfig{MaxSize: "1MB"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
 
-	chunk := strings.Repeat("x", 600) + "\n"
-	if _, err := r.Write([]byte(chunk)); err != nil { // 601B，未達標
+	chunk := strings.Repeat("x", 600<<10) + "\n"
+	if _, err := r.Write([]byte(chunk)); err != nil { // 600KB，未達標
 		t.Fatal(err)
 	}
-	if _, err := r.Write([]byte(chunk)); err != nil { // 601+601 > 1024 → 應先輪轉再寫
+	if _, err := r.Write([]byte(chunk)); err != nil { // 1.2MB > 1MB → 應先輪轉再寫
 		t.Fatal(err)
 	}
 
@@ -52,27 +52,45 @@ func TestRotationWriteTriggersBySize(t *testing.T) {
 	}
 }
 
-// TestRotationWriteTriggersByAge Write 依 max_age（自檔案開啟起算，非 ModTime）輪轉
-func TestRotationWriteTriggersByAge(t *testing.T) {
-	dir := t.TempDir()
-	logfile := filepath.Join(dir, "app.log")
-
-	r, err := NewRotation(logfile, &RotationConfig{MaxAge: "50ms"})
-	if err != nil {
-		t.Fatal(err)
+// TestRotationConfigMapping RotationConfig 換算成 lumberjack 設定：
+// max_size 進位到 MB（最少 1MB），max_age 為保留天數（無條件進位、最少 1 天）
+func TestRotationConfigMapping(t *testing.T) {
+	tests := []struct {
+		size, age   string
+		wantMB      int
+		wantDays    int
+		wantErrPart string
+	}{
+		{size: "100MB", age: "7d", wantMB: 100, wantDays: 7},
+		{size: "100M", age: "1w", wantMB: 100, wantDays: 7},
+		{size: "1.5GB", age: "12h", wantMB: 1536, wantDays: 1},
+		{size: "512KB", age: "50ms", wantMB: 1, wantDays: 1},
+		{size: "1048577", age: "36h", wantMB: 2, wantDays: 2},
+		{size: "", age: "", wantMB: noSizeLimitMB, wantDays: 0},
+		{size: "0", age: "0", wantMB: noSizeLimitMB, wantDays: 0},
+		{size: "-5MB", wantErrPart: "max size"},
+		{size: "abc", wantErrPart: "max size"},
+		{size: "1e3", wantErrPart: "max size"},
+		{size: "10MB", age: "-1d", wantErrPart: "max age"},
+		{size: "10MB", age: "soon", wantErrPart: "max age"},
 	}
-	defer r.Close()
-
-	if _, err := r.Write([]byte("first\n")); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(80 * time.Millisecond)
-	if _, err := r.Write([]byte("second\n")); err != nil { // 已超齡 → 應輪轉
-		t.Fatal(err)
-	}
-
-	if got := backups(t, dir); len(got) != 1 {
-		t.Fatalf("expected 1 backup after age-triggered rotation, got %d: %v", len(got), got)
+	for _, tt := range tests {
+		r, err := NewRotation(filepath.Join(t.TempDir(), "app.log"), &RotationConfig{MaxSize: tt.size, MaxAge: tt.age})
+		if tt.wantErrPart != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Errorf("size=%q age=%q: err = %v, want %q error", tt.size, tt.age, err, tt.wantErrPart)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("size=%q age=%q: unexpected error %v", tt.size, tt.age, err)
+			continue
+		}
+		if r.lj.MaxSize != tt.wantMB || r.lj.MaxAge != tt.wantDays {
+			t.Errorf("size=%q age=%q: got %dMB / %d days, want %dMB / %d days",
+				tt.size, tt.age, r.lj.MaxSize, r.lj.MaxAge, tt.wantMB, tt.wantDays)
+		}
+		r.Close()
 	}
 }
 

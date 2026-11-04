@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"gopkg.in/yaml.v3"
 )
 
@@ -178,6 +179,15 @@ func (cl *ConfigLoader) Load(configFile string, config interface{}) error {
 	// 解析配置到用戶提供的結構體
 	if err := yaml.Unmarshal(configData, config); err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// 展開 ${secret:name}（值來自 key.secret，見 pkg/secret）；沒有引用時不碰金鑰
+	source := configFile
+	if source == "" {
+		source = filepath.Join(cl.configPath, "config.yaml")
+	}
+	if err := secret.ExpandConfig(config, source); err != nil {
+		return err
 	}
 
 	// 應用預設值

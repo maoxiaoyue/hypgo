@@ -256,6 +256,45 @@ func TestMigrateDiffRunsProject(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a project against the local hypgo module")
 	}
+	migrateProject(t)
+	writeWidgetModel(t, "Name string `bun:\"name,notnull\"`", true)
+
+	if err := runHyp(t, "migrate", "diff", "-o", "migs"); err != nil {
+		t.Fatal(err)
+	}
+	ups, _ := filepath.Glob(filepath.Join("migs", "*_auto.up.sql"))
+	if len(ups) != 1 {
+		t.Fatalf("expected one up migration, got %v", ups)
+	}
+	up, _ := os.ReadFile(ups[0])
+	// 與 bun CREATE TABLE 相同：字串為 VARCHAR、主鍵為表層級約束、不加 IF NOT EXISTS（先前為 IF NOT EXISTS 與 TEXT）
+	if !strings.Contains(string(up), `CREATE TABLE "widgets" (`) || !strings.Contains(string(up), `"name" VARCHAR NOT NULL`) {
+		t.Errorf("up migration missing CREATE TABLE widgets:\n%s", up)
+	}
+	if _, err := os.Stat(filepath.Join(".hyp", "schema_snapshot.json")); err != nil {
+		t.Errorf("snapshot not written: %v", err)
+	}
+}
+
+// runHypOutput 同 runHyp，另回傳命令輸出
+func runHypOutput(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var out bytes.Buffer
+	rootCmd.SetOut(&out)
+	rootCmd.SetErr(&out)
+	defer func() {
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+		resetFlags(rootCmd)
+	}()
+	rootCmd.SetArgs(args)
+	err := rootCmd.Execute()
+	return out.String(), err
+}
+
+// migrateProject 在暫存目錄建立以本機 hypgo 為依賴的專案並切換過去
+func migrateProject(t *testing.T) {
+	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -269,7 +308,19 @@ func TestMigrateDiffRunsProject(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module widgetapp\n\ngo 1.24\n\n"+
 		"require github.com/maoxiaoyue/hypgo v0.0.0\n\n"+
 		"replace github.com/maoxiaoyue/hypgo => "+filepath.ToSlash(root)+"\n"), 0644)
-	os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
+	t.Setenv("GOFLAGS", "-mod=mod")
+	t.Setenv("GOWORK", "off")
+	t.Chdir(dir)
+}
+
+// writeWidgetModel 寫入 main.go：Widget（id + fields）；register 為 false 時不註冊任何 model
+func writeWidgetModel(t *testing.T, fields string, register bool) {
+	t.Helper()
+	reg := "func init() { migrate.GlobalRegistry().Register((*Widget)(nil)) }"
+	if !register {
+		reg = "var _ = migrate.GlobalRegistry"
+	}
+	src := `package main
 
 import (
 	"github.com/maoxiaoyue/hypgo"
@@ -278,37 +329,111 @@ import (
 )
 
 type Widget struct {
-	bun.BaseModel `+"`bun:\"table:widgets\"`"+`
+	bun.BaseModel ` + "`bun:\"table:widgets\"`" + `
 
-	ID   int64  `+"`bun:\"id,pk,autoincrement\"`"+`
-	Name string `+"`bun:\"name,notnull\"`"+`
+	ID int64 ` + "`bun:\"id,pk,autoincrement\"`" + `
+	` + fields + `
 }
 
-func init() { migrate.GlobalRegistry().Register((*Widget)(nil)) }
+` + reg + `
 
 func main() {
 	if err := hypgo.New().Run(); err != nil {
 		panic(err)
 	}
 }
-`), 0644)
-	t.Setenv("GOFLAGS", "-mod=mod")
-	t.Setenv("GOWORK", "off")
-	t.Chdir(dir)
+`
+	if err := os.WriteFile("main.go", []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
 
+// TestMigrateDiffValidatesDialectAndSnapshot 迴歸測試（B）：--dialect 不分大小寫驗證；快照的方言 / 格式不符時失敗。
+// 歷史 bug：--dialect 未驗證（pg 得到 PostgreSQL 引號搭配 MySQL 型別）；快照不記錄方言，換方言後每欄都被當成變更
+func TestMigrateDiffValidatesDialectAndSnapshot(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, sub := range []string{"diff", "snapshot"} {
+		if err := runHyp(t, "migrate", sub, "--dialect", "oracle"); err == nil || !strings.Contains(err.Error(), "unsupported dialect") {
+			t.Errorf("hyp migrate %s --dialect oracle: err = %v, want unsupported dialect", sub, err)
+		}
+	}
+
+	os.MkdirAll(".hyp", 0755)
+	snap := filepath.Join(".hyp", "schema_snapshot.json")
+	os.WriteFile(snap, []byte(`{"version":2,"dialect":"postgres","tables":{"t":{"name":"t","columns":[]}}}`), 0644)
+	if err := runHyp(t, "migrate", "diff", "-d", "MySQL"); err == nil || !strings.Contains(err.Error(), `taken with dialect "postgres"`) {
+		t.Errorf("mysql diff against a postgres snapshot: err = %v", err)
+	}
+	os.WriteFile(snap, []byte(`{"tables":{"t":{"name":"t","columns":[]}}}`), 0644)
+	if err := runHyp(t, "migrate", "diff"); err == nil || !strings.Contains(err.Error(), "older hyp migrate") {
+		t.Errorf("legacy snapshot: err = %v", err)
+	}
+}
+
+// TestMigrateDiffDestructiveGateAndRenames 迴歸測試（A10、A11、A12、B）：破壞性變更未加 --allow-destructive 時失敗且不寫檔、不更新快照；
+// rename 提示產生 RENAME COLUMN、未加提示時印出提示；移除最後一個 model 產生 DROP TABLE（down 重建）；檔名為 golang-migrate 格式。
+// 歷史 bug：DROP / 更名當成 DROP + ADD 且無任何警告；沒有 model 時直接返回，表永遠不會被刪；
+// 檔名 20261026_143000_auto.up.sql 被解析為版本 20261026
+func TestMigrateDiffDestructiveGateAndRenames(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a project against the local hypgo module")
+	}
+	migrateProject(t)
+	snapPath := filepath.Join(".hyp", "schema_snapshot.json")
+	ups := func() []string {
+		files, _ := filepath.Glob(filepath.Join("migs", "*.up.sql"))
+		return files
+	}
+	lastUp := func() string {
+		files := ups()
+		data, _ := os.ReadFile(files[len(files)-1])
+		return string(data)
+	}
+
+	writeWidgetModel(t, "Name string `bun:\"name,notnull\"`\n\tNote string", true)
 	if err := runHyp(t, "migrate", "diff", "-o", "migs"); err != nil {
 		t.Fatal(err)
 	}
-	ups, _ := filepath.Glob(filepath.Join("migs", "*_auto.up.sql"))
-	if len(ups) != 1 {
-		t.Fatalf("expected one up migration, got %v", ups)
+	if files := ups(); len(files) != 1 || !regexp.MustCompile(`^\d{14}_auto\.up\.sql$`).MatchString(filepath.Base(files[0])) {
+		t.Fatalf("up files = %v, want <14-digit version>_auto.up.sql", files)
 	}
-	up, _ := os.ReadFile(ups[0])
-	if !strings.Contains(string(up), `CREATE TABLE IF NOT EXISTS "widgets"`) || !strings.Contains(string(up), `"name" TEXT NOT NULL`) {
-		t.Errorf("up migration missing CREATE TABLE widgets:\n%s", up)
+
+	// 更名（有提示）+ 刪欄：未允許時失敗、不寫檔、快照不變
+	writeWidgetModel(t, "Title string `bun:\"title,notnull\" migrate:\"renamed_from=name\"`", true)
+	before, _ := os.ReadFile(snapPath)
+	if err := runHyp(t, "migrate", "diff", "-o", "migs"); err == nil || !strings.Contains(err.Error(), "drops column widgets.note") {
+		t.Fatalf("dropping a column without --allow-destructive: err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(".hyp", "schema_snapshot.json")); err != nil {
-		t.Errorf("snapshot not written: %v", err)
+	if after, _ := os.ReadFile(snapPath); len(ups()) != 1 || !bytes.Equal(before, after) {
+		t.Fatal("a refused migration must not write files or update the snapshot")
+	}
+	if err := runHyp(t, "migrate", "diff", "-o", "migs", "--allow-destructive"); err != nil {
+		t.Fatal(err)
+	}
+	if up := lastUp(); !strings.Contains(up, `ALTER TABLE "widgets" RENAME COLUMN "name" TO "title";`) ||
+		!strings.Contains(up, `ALTER TABLE "widgets" DROP COLUMN "note";`) || strings.Contains(up, `ADD COLUMN "title"`) {
+		t.Errorf("rename with hint + drop:\n%s", up)
+	}
+
+	// 未加提示的更名：印出提示
+	writeWidgetModel(t, "Label string `bun:\"label\"`", true)
+	out, err := runHypOutput(t, "migrate", "diff", "-o", "migs")
+	if err == nil || !strings.Contains(out, `migrate:"renamed_from=title"`) {
+		t.Errorf("rename without hint: err = %v, output:\n%s", err, out)
+	}
+
+	// 移除所有 model：DROP TABLE（受把關），down 重建
+	writeWidgetModel(t, "Title string `bun:\"title,notnull\"`", false)
+	if err := runHyp(t, "migrate", "diff", "-o", "migs"); err == nil || !strings.Contains(err.Error(), "drops table widgets") {
+		t.Fatalf("removing the last model: err = %v", err)
+	}
+	if err := runHyp(t, "migrate", "diff", "-o", "migs", "--allow-destructive"); err != nil {
+		t.Fatal(err)
+	}
+	files := ups()
+	down, _ := os.ReadFile(strings.TrimSuffix(files[len(files)-1], ".up.sql") + ".down.sql")
+	if len(files) != 3 || !strings.Contains(lastUp(), `DROP TABLE "widgets";`) || !strings.Contains(string(down), `CREATE TABLE "widgets" (`) {
+		t.Errorf("drop table: files %v\nup:\n%s\ndown:\n%s", files, lastUp(), down)
 	}
 }
 
@@ -462,5 +587,28 @@ func TestContextRejectsUnknownFormat(t *testing.T) {
 func TestTestgenFileShorthand(t *testing.T) {
 	if f := testgenCmd.Flags().ShorthandLookup("f"); f == nil || f.Name != "file" {
 		t.Errorf("-f should be the shorthand of --file, got %v", f)
+	}
+}
+
+// TestNewHomePageUsesEmbeddedTemplate 迴歸測試（scaffold 首頁 404）：首頁以 embed 打包的樣板渲染。
+// 歷史 bug：以相對路徑 c.File("templates/welcome.html") 送出，工作目錄不是專案根目錄時
+// （從 routers/ 執行的 contract 測試、從別處啟動的伺服器）一律 404，{{.Title}} 也從未渲染
+func TestNewHomePageUsesEmbeddedTemplate(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "new", "webapp"); err != nil {
+		t.Fatal(err)
+	}
+	home, _ := os.ReadFile(filepath.Join("webapp", "app", "controllers", "home.go"))
+	if strings.Contains(string(home), "c.File(") || !strings.Contains(string(home), `c.HTML(200, "welcome.html"`) {
+		t.Errorf("home controller should render the embedded template:\n%s", home)
+	}
+	tmpl, err := os.ReadFile(filepath.Join("webapp", "templates", "templates.go"))
+	if err != nil || !strings.Contains(string(tmpl), "//go:embed *.html") {
+		t.Errorf("templates/templates.go missing or not embedding: %v", err)
+	}
+	router, _ := os.ReadFile(filepath.Join("webapp", "routers", "router.go"))
+	if !strings.Contains(string(router), "r.SetHTMLTemplate(templates.HTML)") {
+		t.Error("router.go should install the embedded template set")
 	}
 }

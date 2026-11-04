@@ -185,7 +185,7 @@ schema.Global().Register(schema.Route{
 使用 `pkg/errors` 的 typed error catalog，不要直接回 `c.JSON(500, ...)`：
 
 ```go
-var ErrUserNotFound = errors.Define("E1001", 404, "User not found", "users")
+var ErrUserNotFound = errors.Define("E4001", 404, "User not found", "users")
 
 // Handler 中
 errors.AbortWithAppError(c, ErrUserNotFound.With("id", userID))

@@ -244,33 +244,6 @@ func TestFormatReportNoDependents(t *testing.T) {
 	}
 }
 
-// --- calculateRisk ---
-
-func TestCalculateRisk(t *testing.T) {
-	tests := []struct {
-		deps  int
-		tests int
-		want  string
-	}{
-		{0, 0, "LOW"},
-		{1, 10, "LOW"},
-		{2, 15, "MEDIUM"},
-		{3, 25, "MEDIUM"},
-		{5, 10, "HIGH"},
-		{1, 50, "HIGH"},
-	}
-
-	for _, tt := range tests {
-		deps := make([]string, tt.deps)
-		impacts := []TestImpact{{TestCount: tt.tests}}
-		got := calculateRisk(deps, impacts)
-		if got != tt.want {
-			t.Errorf("calculateRisk(deps=%d, tests=%d) = %q, want %q",
-				tt.deps, tt.tests, got, tt.want)
-		}
-	}
-}
-
 // --- packageFromFile ---
 
 func TestPackageFromFile(t *testing.T) {

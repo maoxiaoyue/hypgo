@@ -1,6 +1,11 @@
 # HypGo LLM 智慧增強配置
 # 放置於 .hyp/llm.yaml
 # 使用方式：hyp chkcomment --llm .hyp/llm.yaml
+#
+# 注意 timeout 設定（秒）：
+#   - 雲端 API（GPT/Claude/Gemini）：30 通常足夠
+#   - 本地大模型（llama.cpp + 30B+）：建議 120-180，避免 hyp chkcomment --fixintent 退回 heuristic
+#   - 若每次都退回 heuristic，先試 HYP_DEBUG_LLM=1 hyp chkcomment --fixintent ... 看是不是 timeout
 
 # ============================================================
 # mode: 控制 LLM 增強模式
@@ -67,3 +72,4 @@ mode: none
 #   api_key: "my-key"
 #   timeout: 30
 #   max_tokens: 256
+

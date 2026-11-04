@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"gopkg.in/yaml.v3"
 )
 
 // Manifest 描述整個 HypGo 應用程式的結構。
@@ -24,6 +25,7 @@ type Manifest struct {
 	// Types 路由引用的型別欄位，每個型別只列一次（EnrichConfig.IncludeFields）
 	Types       map[string]TypeFields `json:"types,omitempty" yaml:"types,omitempty"`
 	Models      []ModelManifest       `json:"models,omitempty" yaml:"models,omitempty"`
+	Errors      []ErrorManifest       `json:"errors,omitempty" yaml:"errors,omitempty"`
 	Lint        *LintReport           `json:"lint,omitempty" yaml:"lint,omitempty"`
 	GeneratedAt time.Time             `json:"generated_at" yaml:"generated_at"`
 }
@@ -80,6 +82,26 @@ type RouteManifest struct {
 type DatabaseInfo struct {
 	Driver      string `json:"driver" yaml:"driver"`
 	HasReplicas bool   `json:"has_replicas" yaml:"has_replicas"`
+}
+
+// ErrorManifest 描述一個已定義的錯誤碼（pkg/errors 的 catalog，含框架內建）；YAML 每筆一行。
+// 先前 catalog 沒有任何消費者，AI 看不到有哪些錯誤碼，只能自行發明
+type ErrorManifest struct {
+	Code     string `json:"code" yaml:"code"`
+	Status   int    `json:"status" yaml:"status"`
+	Message  string `json:"message" yaml:"message"`
+	Category string `json:"category,omitempty" yaml:"category,omitempty"`
+}
+
+// MarshalYAML 每筆輸出成一行 flow mapping（{code: E0001, status: 404, ...}），一筆四行太佔 token
+func (e ErrorManifest) MarshalYAML() (interface{}, error) {
+	type plain ErrorManifest // 去掉 MarshalYAML，避免遞迴
+	var n yaml.Node
+	if err := n.Encode(plain(e)); err != nil {
+		return nil, err
+	}
+	n.Style = yaml.FlowStyle
+	return &n, nil
 }
 
 // ModelManifest 描述一個資料模型（對應資料庫資料表）

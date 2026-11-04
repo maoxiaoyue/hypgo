@@ -8,9 +8,15 @@ import (
 	"path/filepath"
 )
 
+// SnapshotVersion 為目前的快照格式版本。
+// 2：欄位取自 bun metadata、記錄方言與依方言的 sql_type、主鍵與 UNIQUE 約束
+const SnapshotVersion = 2
+
 // Snapshot 儲存上次掃描的 schema 狀態
 type Snapshot struct {
-	Tables map[string]TableSchema `json:"tables"`
+	Version int                    `json:"version"`
+	Dialect string                 `json:"dialect"`
+	Tables  map[string]TableSchema `json:"tables"`
 }
 
 // LoadSnapshot 從檔案載入快照
@@ -19,7 +25,7 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Snapshot{Tables: make(map[string]TableSchema)}, nil
+			return &Snapshot{Version: SnapshotVersion, Tables: make(map[string]TableSchema)}, nil
 		}
 		return nil, fmt.Errorf("failed to read snapshot: %w", err)
 	}
@@ -35,12 +41,40 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	return &snap, nil
 }
 
-// SaveSnapshot 儲存快照到檔案
-func SaveSnapshot(path string, tables []TableSchema) error {
+// CheckDialect 確認快照可與 dialect 掃描出的 schema 比對：
+// 舊版快照（自行解析 tag，欄位名、型別都可能錯）與其他方言的快照都會回錯，請重建基準
+func (s *Snapshot) CheckDialect(dialect string) error {
+	if len(s.Tables) == 0 {
+		return nil
+	}
+	if s.Version < SnapshotVersion {
+		return fmt.Errorf("snapshot format v%d is from an older hyp migrate (column names and types were parsed differently); "+
+			"make sure the database matches your models, then run hyp migrate snapshot to rebuild it", s.Version)
+	}
+	if s.Version > SnapshotVersion {
+		return fmt.Errorf("snapshot format v%d is newer than this hyp migrate (v%d); upgrade hyp", s.Version, SnapshotVersion)
+	}
+	if s.Dialect != dialect {
+		return fmt.Errorf("snapshot was taken with dialect %q, not %q (column types differ between dialects)", s.Dialect, dialect)
+	}
+	return nil
+}
+
+// SaveSnapshot 以 dialect 儲存快照到檔案（JSON 依表名排序；rename 提示不寫入）
+func SaveSnapshot(path string, tables []TableSchema, dialect string) error {
 	snap := Snapshot{
-		Tables: make(map[string]TableSchema, len(tables)),
+		Version: SnapshotVersion,
+		Dialect: dialect,
+		Tables:  make(map[string]TableSchema, len(tables)),
 	}
 	for _, t := range tables {
+		t.RenamedFrom = ""
+		cols := make([]ColumnSchema, len(t.Columns))
+		for i, c := range t.Columns {
+			c.RenamedFrom = ""
+			cols[i] = c
+		}
+		t.Columns = cols
 		snap.Tables[t.Name] = t
 	}
 
@@ -54,5 +88,5 @@ func SaveSnapshot(path string, tables []TableSchema) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, append(data, '\n'), 0644)
 }

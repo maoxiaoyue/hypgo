@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	"github.com/maoxiaoyue/hypgo/pkg/errors"
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
@@ -51,6 +52,7 @@ func (c *Collector) Collect() *Manifest {
 		Framework:   "HypGo",
 		GeneratedAt: time.Now(),
 		Models:      c.collectModels(),
+		Errors:      collectErrors(),
 		Lint:        lintRoutes(c.router, c.registry),
 	}
 
@@ -62,6 +64,16 @@ func (c *Collector) Collect() *Manifest {
 	}
 
 	return m
+}
+
+// collectErrors 收集 pkg/errors catalog 的錯誤碼（依錯誤碼排序）
+func collectErrors() []ErrorManifest {
+	all := errors.GlobalCatalog().All()
+	out := make([]ErrorManifest, len(all))
+	for i, e := range all {
+		out[i] = ErrorManifest{Code: e.Code, Status: e.HTTPStatus, Message: e.Message, Category: e.Category}
+	}
+	return out
 }
 
 // collectServer 收集伺服器配置

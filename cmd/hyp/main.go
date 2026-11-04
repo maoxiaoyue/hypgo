@@ -4,6 +4,7 @@ package main
 import (
 	"os"
 
+	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
 )
 
@@ -36,6 +37,7 @@ Database:
 
 Deployment:
   health         Check running application health
+  secret         Encrypt credentials into key.secret (${secret:name} in config.yaml)
 
 Use "hyp [command] --help" for detailed information about each command.`,
 		Version: Version,
@@ -52,6 +54,8 @@ func init() {
 	rootCmd.SetVersionTemplate(`HypGo CLI {{.Version}}
 AI-Human Collaborative Go Framework — Web (HTTP/1.1 + HTTP/2 + HTTP/3) / CLI / Desktop / gRPC
 `)
+	// 生成專案的 go.mod 一律 require 與 CLI 相同的 hypgo 版本
+	scaffold.HypgoVersion = "v" + Version
 	registerCommands()
 }
 
@@ -69,6 +73,7 @@ func registerCommands() {
 	// 真正的實作從未被註冊；docker 已移除（hyp api 會產生 Dockerfile）
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(restartCmd)
+	rootCmd.AddCommand(secretCmd)
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)

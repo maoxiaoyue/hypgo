@@ -3,249 +3,467 @@ package migrate
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	bundialect "github.com/uptrace/bun/dialect"
 )
 
-// GenerateSQL 根據 ChangeSet 產生 up/down SQL
-// dialect: "postgres" 或 "mysql"
-func GenerateSQL(changes []Change, dialect string) (up, down string) {
+// UnsupportedError 列出無法以 SQL 表達的變更。GenerateSQL 遇到任一項即不產生任何 SQL，
+// 呼叫端不應更新快照（先前 MySQL 的 NOT NULL / DEFAULT 變更、主鍵 / UNIQUE / 自動遞增變更
+// 不產生 SQL，快照卻照樣更新，變更就此遺失）
+type UnsupportedError struct {
+	Items []string
+}
+
+func (e *UnsupportedError) Error() string {
+	return "cannot generate SQL for:\n  - " + strings.Join(e.Items, "\n  - ") +
+		"\nwrite these changes as a manual migration, apply it, then run hyp migrate snapshot"
+}
+
+// GenerateSQL 根據 ChangeSet 產生 up/down SQL。
+// dialect：postgres / mysql（見 NormalizeDialect；其他值回錯）。
+// 任一變更無法表達時回傳 *UnsupportedError 且 up / down 為空。
+// PostgreSQL 的 DDL 可在交易內執行，up / down 各自包在 BEGIN; … COMMIT; 內；MySQL 的 DDL 會隱含 commit，不包
+func GenerateSQL(changes []Change, dialect string) (up, down string, err error) {
+	d, err := NormalizeDialect(dialect)
+	if err != nil {
+		return "", "", err
+	}
 	if len(changes) == 0 {
-		return "", ""
+		return "", "", nil
 	}
 
-	gen := &sqlGenerator{dialect: dialect}
-	var upLines, downLines []string
-
-	// 新增的表：其 AddColumn 併入 CREATE TABLE，不另外產生 ALTER TABLE。
-	// 先前 AddTable 只產出 down 的 DROP TABLE，up 只有一串 ALTER TABLE ... ADD COLUMN——
-	// 對不存在的表執行必定失敗
-	newCols := make(map[string][]*ColumnSchema)
-	for _, c := range changes {
-		if c.Type == AddTable {
-			newCols[c.Table] = []*ColumnSchema{}
-		}
-	}
-	for _, c := range changes {
-		if cols, ok := newCols[c.Table]; ok && c.Type == AddColumn && c.Column != nil {
-			newCols[c.Table] = append(cols, c.Column)
-		}
-	}
+	gen := &sqlGenerator{dialect: d}
+	var ups []string
+	downsPerChange := make([][]string, 0, len(changes))
+	var unsupported []string
 
 	for _, c := range changes {
-		if _, ok := newCols[c.Table]; ok && c.Type == AddColumn {
+		u, dn, err := gen.generate(c)
+		if err != nil {
+			unsupported = append(unsupported, c.String()+": "+err.Error())
 			continue
 		}
-		u, d := gen.generate(c)
-		if c.Type == AddTable {
-			u = gen.createTable(c.Table, newCols[c.Table])
-		}
-		if u != "" {
-			upLines = append(upLines, u)
-		}
-		if d != "" {
-			downLines = append(downLines, d)
-		}
+		ups = append(ups, u...)
+		downsPerChange = append(downsPerChange, dn)
+	}
+	if len(unsupported) > 0 {
+		return "", "", &UnsupportedError{Items: unsupported}
 	}
 
 	// down 依相反順序回滾
-	for i, j := 0, len(downLines)-1; i < j; i, j = i+1, j-1 {
-		downLines[i], downLines[j] = downLines[j], downLines[i]
+	var downs []string
+	for i := len(downsPerChange) - 1; i >= 0; i-- {
+		downs = append(downs, downsPerChange[i]...)
 	}
-
-	return strings.Join(upLines, "\n"), strings.Join(downLines, "\n")
+	return gen.wrap(ups), gen.wrap(downs), nil
 }
 
-// createTable 產生含所有欄位的 CREATE TABLE
-func (g *sqlGenerator) createTable(table string, cols []*ColumnSchema) string {
-	defs := make([]string, 0, len(cols))
-	for _, col := range cols {
-		defs = append(defs, "    "+g.quote(col.Name)+" "+g.columnDefinition(col))
+func (g *sqlGenerator) wrap(stmts []string) string {
+	if len(stmts) == 0 {
+		return ""
 	}
-	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n%s\n);", g.quote(table), strings.Join(defs, ",\n"))
+	body := strings.Join(stmts, "\n")
+	if g.dialect == DialectPostgres {
+		return "BEGIN;\n\n" + body + "\n\nCOMMIT;\n"
+	}
+	return body + "\n"
 }
 
-// MigrationFiles 回傳建議的檔案名稱
-func MigrationFiles(prefix string) (upFile, downFile string) {
-	ts := time.Now().Format("20060102_150405")
-	return fmt.Sprintf("%s%s_auto.up.sql", prefix, ts),
-		fmt.Sprintf("%s%s_auto.down.sql", prefix, ts)
+// createTable 產生與 bun db.NewCreateTable().Model(m) 相同內容的 CREATE TABLE（分行排版）。
+// 不加 IF NOT EXISTS：表已存在時應明確失敗，否則 up 不做事、down 卻會 DROP 掉既有的表
+func (g *sqlGenerator) createTable(ts *TableSchema) (string, error) {
+	defs := make([]string, 0, len(ts.Columns)+len(ts.Uniques)+1)
+	for i := range ts.Columns {
+		def, err := g.columnDefinition(&ts.Columns[i])
+		if err != nil {
+			return "", err
+		}
+		defs = append(defs, g.quote(ts.Columns[i].Name)+" "+def)
+	}
+	if len(ts.PrimaryKey) > 0 {
+		defs = append(defs, "PRIMARY KEY ("+g.quoteList(ts.PrimaryKey)+")")
+	}
+	for _, u := range ts.Uniques {
+		if u.Name != "" {
+			defs = append(defs, "CONSTRAINT "+g.quote(u.Name)+" UNIQUE ("+g.quoteList(u.Columns)+")")
+		} else {
+			defs = append(defs, "UNIQUE ("+g.quoteList(u.Columns)+")")
+		}
+	}
+	return fmt.Sprintf("CREATE TABLE %s (\n    %s\n);", g.quote(ts.Name), strings.Join(defs, ",\n    ")), nil
+}
+
+var migrationFileRe = regexp.MustCompile(`^(\d+)_.*\.(?:up|down)\.sql$`)
+
+// MigrationFiles 回傳 golang-migrate 相容的檔名 <dir>/<版本>_<name>.up.sql / .down.sql，
+// 版本為 14 位數時間戳（YYYYMMDDhhmmss）。若 dir 內已有相同或更大的版本（同一秒內再次產生、
+// 時鐘回撥），改用既有最大版本 +1，確保不撞號且依序執行。
+// 先前檔名為 20261026_143000_auto.up.sql，golang-migrate 解析出的版本是 20261026，同一天必定撞號
+func MigrationFiles(dir, name string, now time.Time) (upFile, downFile string, err error) {
+	version, _ := strconv.ParseUint(now.Format("20060102150405"), 10, 64)
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+	for _, e := range entries {
+		if m := migrationFileRe.FindStringSubmatch(e.Name()); m != nil {
+			if v, err := strconv.ParseUint(m[1], 10, 64); err == nil && v >= version {
+				version = v + 1
+			}
+		}
+	}
+	base := fmt.Sprintf("%d_%s", version, migrationName(name))
+	return filepath.Join(dir, base+".up.sql"), filepath.Join(dir, base+".down.sql"), nil
+}
+
+// migrationName 把名稱轉為小寫英數與底線；空白時為 auto
+func migrationName(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	s := strings.Trim(b.String(), "_")
+	if s == "" {
+		return "auto"
+	}
+	return s
 }
 
 type sqlGenerator struct {
 	dialect string
 }
 
-func (g *sqlGenerator) generate(c Change) (up, down string) {
+// generate 回傳單一變更的 up 陳述式與「回滾此變更」的 down 陳述式（已依執行順序排列）
+func (g *sqlGenerator) generate(c Change) (up, down []string, err error) {
+	table := g.quote(c.Table)
 	switch c.Type {
 	case AddTable:
-		// up 的 CREATE TABLE 需要該表全部的 AddColumn，由 GenerateSQL 呼叫 createTable 產生
-		return "", fmt.Sprintf("DROP TABLE IF EXISTS %s;", g.quote(c.Table))
+		if c.Schema == nil {
+			return nil, nil, fmt.Errorf("missing table definition")
+		}
+		create, err := g.createTable(c.Schema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return []string{create}, []string{"DROP TABLE " + table + ";"}, nil
 
 	case DropTable:
-		return fmt.Sprintf("DROP TABLE IF EXISTS %s;", g.quote(c.Table)), ""
+		// down 依快照重建整張表（先前 down 為空，無法回滾）
+		if c.Schema == nil {
+			return nil, nil, fmt.Errorf("the snapshot has no definition of this table to restore it in down")
+		}
+		create, err := g.createTable(c.Schema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return []string{"DROP TABLE " + table + ";"}, []string{create}, nil
 
-	case AddColumn:
-		colDef := g.columnDefinition(c.Column)
-		up = fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;",
-			g.quote(c.Table), g.quote(c.Column.Name), colDef)
-		down = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;",
-			g.quote(c.Table), g.quote(c.Column.Name))
-		return up, down
+	case RenameTable:
+		return g.renameTable(c)
 
-	case DropColumn:
-		up = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;",
-			g.quote(c.Table), g.quote(c.Column.Name))
-		down = fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;",
-			g.quote(c.Table), g.quote(c.Column.Name), g.columnDefinition(c.Column))
-		return up, down
+	case RenameColumn:
+		return g.renameColumn(c)
+
+	case AddColumn, DropColumn:
+		def, err := g.columnDefinition(c.Column)
+		if err != nil {
+			return nil, nil, err
+		}
+		add := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", table, g.quote(c.Column.Name), def)
+		drop := fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", table, g.quote(c.Column.Name))
+		if c.Type == AddColumn {
+			return []string{add}, []string{drop}, nil
+		}
+		return []string{drop}, []string{add}, nil
 
 	case AlterColumn:
-		return g.generateAlter(c)
+		if c.Column == nil || c.OldCol == nil {
+			return nil, nil, fmt.Errorf("missing column definition")
+		}
+		if g.dialect == DialectMySQL {
+			return g.alterMySQL(c)
+		}
+		return g.alterPostgres(c)
 
-	default:
-		return "", ""
+	case AddUnique, DropUnique:
+		if c.Unique == nil || len(c.Unique.Columns) == 0 {
+			return nil, nil, fmt.Errorf("missing unique columns")
+		}
+		name, err := g.uniqueName(c.Table, c.Unique)
+		if err != nil {
+			return nil, nil, err
+		}
+		add := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s);", table, g.quote(name), g.quoteList(c.Unique.Columns))
+		drop := fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", table, g.quote(name))
+		if g.dialect == DialectMySQL {
+			drop = fmt.Sprintf("ALTER TABLE %s DROP INDEX %s;", table, g.quote(name))
+		}
+		if c.Type == AddUnique {
+			return []string{add}, []string{drop}, nil
+		}
+		return []string{drop}, []string{add}, nil
+
+	case AlterPrimaryKey:
+		return nil, nil, fmt.Errorf("changing the primary key is not supported")
 	}
+	return nil, nil, fmt.Errorf("unknown change type %d", c.Type)
 }
 
-func (g *sqlGenerator) generateAlter(c Change) (up, down string) {
-	if c.Column == nil {
-		return "", ""
+func (g *sqlGenerator) renameTable(c Change) (up, down []string, err error) {
+	if c.OldTable == "" {
+		return nil, nil, fmt.Errorf("missing old table name")
 	}
+	oldSchema, oldBase := splitTableName(c.OldTable)
+	newSchema, newBase := splitTableName(c.Table)
+	target := g.quote(c.Table)
+	back := g.quote(c.OldTable)
+	if g.dialect == DialectPostgres {
+		// PostgreSQL 的 RENAME TO 只接受不含 schema 的名稱
+		if oldSchema != newSchema {
+			return nil, nil, fmt.Errorf("moving a table to another schema is not supported")
+		}
+		target, back = g.quote(newBase), g.quote(oldBase)
+	}
+	up = append(up, fmt.Sprintf("ALTER TABLE %s RENAME TO %s;", g.quote(c.OldTable), target))
+	down = append(down, fmt.Sprintf("ALTER TABLE %s RENAME TO %s;", g.quote(c.Table), back))
 
-	var upParts, downParts []string
+	// PostgreSQL 未命名 UNIQUE 約束的名稱含表名（<table>_<col>_key），更名後一併改成新表的預設名稱，
+	// 之後的 DROP UNIQUE 才找得到
+	if g.dialect == DialectPostgres && c.Schema != nil {
+		for _, u := range c.Schema.Uniques {
+			if u.Name != "" {
+				continue
+			}
+			from, err := g.uniqueName(c.OldTable, &u)
+			if err != nil {
+				return nil, nil, err
+			}
+			to, err := g.uniqueName(c.Table, &u)
+			if err != nil {
+				return nil, nil, err
+			}
+			up = append(up, fmt.Sprintf("ALTER TABLE %s RENAME CONSTRAINT %s TO %s;", g.quote(c.Table), g.quote(from), g.quote(to)))
+			down = append([]string{fmt.Sprintf("ALTER TABLE %s RENAME CONSTRAINT %s TO %s;", g.quote(c.Table), g.quote(to), g.quote(from))}, down...)
+		}
+	}
+	return up, down, nil
+}
+
+func (g *sqlGenerator) renameColumn(c Change) (up, down []string, err error) {
+	if c.Column == nil || c.OldCol == nil {
+		return nil, nil, fmt.Errorf("missing column names")
+	}
 	table := g.quote(c.Table)
-	col := g.quote(c.Column.Name)
+	oldName, newName := c.OldCol.Name, c.Column.Name
+	up = append(up, fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s;", table, g.quote(oldName), g.quote(newName)))
+	down = append(down, fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s;", table, g.quote(newName), g.quote(oldName)))
 
-	// 型別變更
-	if c.OldCol != nil && g.sqlType(c.Column) != g.sqlType(c.OldCol) {
-		if g.dialect == "postgres" {
-			upParts = append(upParts,
-				fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;", table, col, g.sqlType(c.Column)))
-			downParts = append(downParts,
-				fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;", table, col, g.sqlType(c.OldCol)))
-		} else {
-			upParts = append(upParts,
-				fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s;", table, col, g.columnDefinition(c.Column)))
-			downParts = append(downParts,
-				fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s;", table, col, g.columnDefinition(c.OldCol)))
+	// 未命名 UNIQUE 的名稱來自欄位名（PostgreSQL <table>_<col>_key、MySQL <col>），一併改名
+	if c.OldCol.Unique {
+		from, err := g.uniqueName(c.Table, &UniqueSchema{Columns: []string{oldName}})
+		if err != nil {
+			return nil, nil, err
 		}
-	}
-
-	// NOT NULL 變更
-	if c.OldCol != nil && c.Column.NotNull != c.OldCol.NotNull {
-		if g.dialect == "postgres" {
-			if c.Column.NotNull {
-				upParts = append(upParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;", table, col))
-				downParts = append(downParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;", table, col))
-			} else {
-				upParts = append(upParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;", table, col))
-				downParts = append(downParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;", table, col))
-			}
+		to, err := g.uniqueName(c.Table, &UniqueSchema{Columns: []string{newName}})
+		if err != nil {
+			return nil, nil, err
 		}
-	}
-
-	// DEFAULT 變更
-	if c.OldCol != nil && c.Column.Default != c.OldCol.Default {
-		if g.dialect == "postgres" {
-			if c.Column.Default != "" {
-				upParts = append(upParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", table, col, c.Column.Default))
-			} else {
-				upParts = append(upParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", table, col))
-			}
-			if c.OldCol.Default != "" {
-				downParts = append(downParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", table, col, c.OldCol.Default))
-			} else {
-				downParts = append(downParts,
-					fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", table, col))
-			}
+		verb := "CONSTRAINT"
+		if g.dialect == DialectMySQL {
+			verb = "INDEX"
 		}
+		up = append(up, fmt.Sprintf("ALTER TABLE %s RENAME %s %s TO %s;", table, verb, g.quote(from), g.quote(to)))
+		down = append([]string{fmt.Sprintf("ALTER TABLE %s RENAME %s %s TO %s;", table, verb, g.quote(to), g.quote(from))}, down...)
 	}
-
-	return strings.Join(upParts, "\n"), strings.Join(downParts, "\n")
+	return up, down, nil
 }
 
-// columnDefinition 產生欄位的 SQL 定義（不含欄位名）
-func (g *sqlGenerator) columnDefinition(col *ColumnSchema) string {
-	var parts []string
-	parts = append(parts, g.sqlType(col))
+// alterMySQL 以 MODIFY COLUMN 重寫整個欄位定義（型別、NOT NULL、DEFAULT、AUTO_INCREMENT 一次處理）；
+// 定義不含 PRIMARY KEY / UNIQUE（為表層級約束），先前 MODIFY 重複宣告主鍵 / UNIQUE 而失敗
+func (g *sqlGenerator) alterMySQL(c Change) (up, down []string, err error) {
+	o, n := c.OldCol, c.Column
+	if strings.EqualFold(o.SQLType, n.SQLType) && o.NotNull == n.NotNull && o.Default == n.Default && o.AutoIncrement == n.AutoIncrement {
+		return nil, nil, nil // 只有 identity 等對 MySQL DDL 無影響的差異
+	}
+	newDef, err := g.columnDefinition(n)
+	if err != nil {
+		return nil, nil, err
+	}
+	oldDef, err := g.columnDefinition(o)
+	if err != nil {
+		return nil, nil, err
+	}
+	table, col := g.quote(c.Table), g.quote(n.Name)
+	return []string{fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s;", table, col, newDef)},
+		[]string{fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s;", table, col, oldDef)}, nil
+}
 
-	if col.PrimaryKey {
-		parts = append(parts, "PRIMARY KEY")
+func (g *sqlGenerator) alterPostgres(c Change) (up, down []string, err error) {
+	o, n := c.OldCol, c.Column
+	if o.SQLType == "" || n.SQLType == "" {
+		return nil, nil, fmt.Errorf("column has no SQL type")
 	}
+	if isPgSerial(o.SQLType) != isPgSerial(n.SQLType) {
+		return nil, nil, fmt.Errorf("adding or removing autoincrement (SERIAL) on an existing PostgreSQL column is not supported; " +
+			"consider bun:\",identity\"")
+	}
+	table, col := g.quote(c.Table), g.quote(n.Name)
+	alter := func(clause string) string {
+		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s %s;", table, col, clause)
+	}
+	var downs []string
+
+	// 型別：SERIAL 系列不是真正的型別，ALTER 時用對應的整數型別（先前產生 TYPE BIGSERIAL 而失敗），並加 USING
+	if ob, nb := pgBaseType(o.SQLType), pgBaseType(n.SQLType); !strings.EqualFold(ob, nb) {
+		up = append(up, alter(fmt.Sprintf("TYPE %s USING %s::%s", nb, col, nb)))
+		downs = append(downs, alter(fmt.Sprintf("TYPE %s USING %s::%s", ob, col, ob)))
+	}
+	if o.NotNull != n.NotNull {
+		set, drop := alter("SET NOT NULL"), alter("DROP NOT NULL")
+		if n.NotNull {
+			up, downs = append(up, set), append(downs, drop)
+		} else {
+			up, downs = append(up, drop), append(downs, set)
+		}
+	}
+	if o.Default != n.Default {
+		toClause := func(def string) string {
+			if def == "" {
+				return "DROP DEFAULT"
+			}
+			return "SET DEFAULT " + def
+		}
+		up, downs = append(up, alter(toClause(n.Default))), append(downs, alter(toClause(o.Default)))
+	}
+	if o.Identity != n.Identity {
+		add, drop := alter("ADD GENERATED BY DEFAULT AS IDENTITY"), alter("DROP IDENTITY")
+		if n.Identity {
+			up, downs = append(up, add), append(downs, drop)
+		} else {
+			up, downs = append(up, drop), append(downs, add)
+		}
+	}
+	for i := len(downs) - 1; i >= 0; i-- {
+		down = append(down, downs[i])
+	}
+	return up, down, nil
+}
+
+func isPgSerial(t string) bool {
+	switch strings.ToUpper(strings.TrimSpace(t)) {
+	case "SMALLSERIAL", "SERIAL", "BIGSERIAL", "SERIAL2", "SERIAL4", "SERIAL8":
+		return true
+	}
+	return false
+}
+
+// pgBaseType 把 SERIAL 系列轉為其整數型別
+func pgBaseType(t string) string {
+	switch strings.ToUpper(strings.TrimSpace(t)) {
+	case "SMALLSERIAL", "SERIAL2":
+		return "SMALLINT"
+	case "SERIAL", "SERIAL4":
+		return "INTEGER"
+	case "BIGSERIAL", "SERIAL8":
+		return "BIGINT"
+	}
+	return t
+}
+
+// columnDefinition 產生欄位的 SQL 定義（不含欄位名），與 bun CREATE TABLE 相同：
+// 型別、NOT NULL、IDENTITY（PostgreSQL）/ AUTO_INCREMENT（MySQL）、DEFAULT。
+// 主鍵與 UNIQUE 為表層級約束，不在此輸出（先前每個 pk 欄位各寫一次 PRIMARY KEY，複合主鍵建表失敗）
+func (g *sqlGenerator) columnDefinition(col *ColumnSchema) (string, error) {
+	if col.SQLType == "" {
+		return "", fmt.Errorf("column %q has no SQL type (snapshot from an older hyp migrate?)", col.Name)
+	}
+	s := col.SQLType
 	if col.NotNull {
-		parts = append(parts, "NOT NULL")
+		s += " NOT NULL"
 	}
-	if col.Unique {
-		parts = append(parts, "UNIQUE")
+	if g.dialect == DialectPostgres && col.Identity {
+		s += " GENERATED BY DEFAULT AS IDENTITY"
+	}
+	if g.dialect == DialectMySQL && col.AutoIncrement {
+		s += " AUTO_INCREMENT"
 	}
 	if col.Default != "" {
-		parts = append(parts, "DEFAULT "+col.Default)
+		s += " DEFAULT " + col.Default
 	}
-
-	return strings.Join(parts, " ")
+	return s, nil
 }
 
-// sqlType 將 Go 型別（或明確 SQL type）轉為 SQL 型別
-func (g *sqlGenerator) sqlType(col *ColumnSchema) string {
-	if col.SQLType != "" {
-		return strings.ToUpper(col.SQLType)
+// uniqueName 回傳 UNIQUE 約束在資料庫中的名稱：具名約束用其名稱；未命名者用資料庫的預設命名——
+// PostgreSQL <table>_<col>_key（超過 63 bytes 時依 PostgreSQL makeObjectName 截短）、MySQL 第一個欄位名
+func (g *sqlGenerator) uniqueName(table string, u *UniqueSchema) (string, error) {
+	if u.Name != "" {
+		return u.Name, nil
 	}
-
-	isPostgres := g.dialect == "postgres"
-
-	if col.PrimaryKey && col.AutoIncrement {
-		if isPostgres {
-			if col.GoType == "int64" {
-				return "BIGSERIAL"
-			}
-			return "SERIAL"
-		}
-		if col.GoType == "int64" {
-			return "BIGINT AUTO_INCREMENT"
-		}
-		return "INT AUTO_INCREMENT"
+	if g.dialect == DialectMySQL {
+		return u.Columns[0], nil
 	}
-
-	switch col.GoType {
-	case "int64":
-		return "BIGINT"
-	case "int", "int32":
-		return "INTEGER"
-	case "int16":
-		return "SMALLINT"
-	case "float64":
-		if isPostgres {
-			return "DOUBLE PRECISION"
-		}
-		return "DOUBLE"
-	case "float32":
-		return "REAL"
-	case "bool":
-		return "BOOLEAN"
-	case "string":
-		return "TEXT"
-	case "time.Time":
-		if isPostgres {
-			return "TIMESTAMPTZ"
-		}
-		return "DATETIME"
-	default:
-		return "TEXT"
-	}
+	_, base := splitTableName(table)
+	return pgObjectName(base, strings.Join(u.Columns, "_"), "key"), nil
 }
 
-// quote 用引號包裹識別符
+// pgObjectName 同 PostgreSQL makeObjectName：name1_name2_label，總長超過 63 bytes 時輪流截短較長的部分
+func pgObjectName(name1, name2, label string) string {
+	const maxLen = 63
+	overhead := 1 + len(label) + 1
+	n1, n2 := len(name1), len(name2)
+	for n1+n2 > maxLen-overhead {
+		if n1 > n2 {
+			n1--
+		} else {
+			n2--
+		}
+	}
+	return clipUTF8(name1, n1) + "_" + clipUTF8(name2, n2) + "_" + label
+}
+
+// clipUTF8 取前 n bytes，不切斷多位元組字元
+func clipUTF8(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// splitTableName 把 "schema.table" 拆成 schema 與表名
+func splitTableName(name string) (schemaName, table string) {
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		return name[:i], name[i+1:]
+	}
+	return "", name
+}
+
+// quote 用與 bun 相同的規則包裹識別符（"a.b" 視為 schema.table，內含引號時重複）
 func (g *sqlGenerator) quote(name string) string {
-	if g.dialect == "mysql" {
-		return "`" + name + "`"
+	q := byte('"')
+	if g.dialect == DialectMySQL {
+		q = '`'
 	}
-	return `"` + name + `"`
+	return string(bundialect.AppendIdent(nil, name, q))
+}
+
+func (g *sqlGenerator) quoteList(names []string) string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = g.quote(n)
+	}
+	return strings.Join(out, ", ")
 }

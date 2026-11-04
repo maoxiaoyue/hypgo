@@ -2,187 +2,289 @@
 package migrate
 
 import (
+	"fmt"
 	"reflect"
+	"sort"
 	"strings"
+
+	"github.com/uptrace/bun/dialect/mysqldialect"
+	"github.com/uptrace/bun/dialect/pgdialect"
+	"github.com/uptrace/bun/dialect/sqltype"
+	"github.com/uptrace/bun/schema"
 )
+
+// 支援的 SQL 方言（NormalizeDialect 的回傳值）
+const (
+	DialectPostgres = "postgres"
+	DialectMySQL    = "mysql"
+)
+
+// NormalizeDialect 正規化方言名稱（不分大小寫）：postgres / postgresql / pg → postgres，
+// mysql / mariadb → mysql，空字串 → postgres；其餘回錯。
+// 先前未驗證，`pg` 會產生 PostgreSQL 引號搭配 MySQL 型別
+func NormalizeDialect(name string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "postgres", "postgresql", "pg":
+		return DialectPostgres, nil
+	case "mysql", "mariadb":
+		return DialectMySQL, nil
+	}
+	return "", fmt.Errorf("unsupported dialect %q (use postgres or mysql)", name)
+}
 
 // TableSchema 描述一張資料表的結構
 type TableSchema struct {
-	Name    string         `json:"name"`
-	Columns []ColumnSchema `json:"columns"`
+	Name        string         `json:"name"`
+	Columns     []ColumnSchema `json:"columns"`
+	PrimaryKey  []string       `json:"primary_key,omitempty"`  // 主鍵欄位（依 bun 順序，可為複合主鍵）
+	Uniques     []UniqueSchema `json:"uniques,omitempty"`      // UNIQUE 約束（依 bun CREATE TABLE 的順序）
+	RenamedFrom string         `json:"renamed_from,omitempty"` // migrate:"renamed_from=..." 提示，不寫進快照
+}
+
+// UniqueSchema 描述一個 UNIQUE 約束；Name 為空表示 bun:",unique" 的單欄未命名約束，
+// 否則為 bun:",unique:name" 的具名（可多欄）約束
+type UniqueSchema struct {
+	Name    string   `json:"name,omitempty"`
+	Columns []string `json:"columns"`
 }
 
 // ColumnSchema 描述一個欄位
 type ColumnSchema struct {
 	Name          string `json:"name"`
 	GoType        string `json:"go_type"`
-	SQLType       string `json:"sql_type,omitempty"`
+	SQLType       string `json:"sql_type"` // 與 bun CREATE TABLE 相同的欄位型別（依方言，如 BIGSERIAL、VARCHAR(255)）
 	PrimaryKey    bool   `json:"primary_key,omitempty"`
 	AutoIncrement bool   `json:"auto_increment,omitempty"`
+	Identity      bool   `json:"identity,omitempty"` // bun:",identity"（僅 PostgreSQL 有 DDL 效果）
 	NotNull       bool   `json:"not_null,omitempty"`
 	Default       string `json:"default,omitempty"`
-	Unique        bool   `json:"unique,omitempty"`
+	Unique        bool   `json:"unique,omitempty"`       // 屬於單欄未命名 UNIQUE（僅供顯示；比對以 TableSchema.Uniques 為準）
+	RenamedFrom   string `json:"renamed_from,omitempty"` // migrate:"renamed_from=..." 提示，不寫進快照
 }
 
-// ScanModels 掃描所有已註冊的 Model，提取 TableSchema
-func ScanModels(registry *ModelRegistry) []TableSchema {
-	tables := make([]TableSchema, 0, len(registry.models))
-	for _, model := range registry.models {
-		if ts := ScanModel(model); ts != nil {
-			tables = append(tables, *ts)
+// ScanModels 以 dialect 掃描所有已註冊的 Model，提取 TableSchema（依註冊順序）。
+//
+// 欄位、表名、型別、約束一律取自 bun 自己的 table metadata（schema.Tables），與 bun 的
+// db.NewCreateTable() 一致；先前自行解析 tag：ID → i_d、表名不轉複數、relation / scanonly /
+// 未加 tag 的 bun.BaseModel 被當成 TEXT 欄位、內嵌 struct 未攤平、type:'decimal(10,2)' 被逗號切斷。
+// 只需方言，不需要資料庫連線
+func ScanModels(registry *ModelRegistry, dialect string) ([]TableSchema, error) {
+	d, err := NormalizeDialect(dialect)
+	if err != nil {
+		return nil, err
+	}
+	models := registry.Models()
+	types := make([]reflect.Type, 0, len(models))
+	for _, m := range models {
+		t := reflect.TypeOf(m)
+		if t == nil {
+			return nil, fmt.Errorf("migrate: Register(nil): register a typed nil pointer such as (*User)(nil)")
 		}
+		for t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return nil, fmt.Errorf("migrate: registered model %T is not a struct (pointer)", m)
+		}
+		types = append(types, t)
 	}
-	return tables
+
+	tables, err := bunTables(types, d)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]TableSchema, 0, len(tables))
+	owner := make(map[string]int)
+	for i, tbl := range tables {
+		ts, err := tableSchema(tbl, types[i], d)
+		if err != nil {
+			return nil, err
+		}
+		// 不同型別對應同一張表：定義相同時只取一次，不同時回錯（先前產生重複的 CREATE TABLE）
+		if j, ok := owner[ts.Name]; ok {
+			if !reflect.DeepEqual(out[j], ts) {
+				return nil, fmt.Errorf("migrate: models %s and %s both map to table %q with different columns",
+					types[j], types[i], ts.Name)
+			}
+			continue
+		}
+		owner[ts.Name] = len(out)
+		out = append(out, ts)
+	}
+	return out, nil
 }
 
-// ScanModel 掃描單一 Model struct，提取 TableSchema
-// 解析 bun:"..." tag 來取得表名、欄位名、約束等資訊
+// ScanModel 以 PostgreSQL 方言掃描單一 Model struct；無效的 model 回傳 nil
 func ScanModel(model interface{}) *TableSchema {
-	t := reflect.TypeOf(model)
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if t.Kind() != reflect.Struct {
+	r := NewRegistry()
+	r.Register(model)
+	tables, err := ScanModels(r, DialectPostgres)
+	if err != nil || len(tables) == 0 {
 		return nil
 	}
-
-	ts := &TableSchema{
-		Name:    toSnakeCase(t.Name()),
-		Columns: make([]ColumnSchema, 0),
-	}
-
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-
-		// 處理 bun.BaseModel（提取表名）
-		bunTag := f.Tag.Get("bun")
-		if f.Name == "BaseModel" && bunTag != "" {
-			if tableName := extractTableName(bunTag); tableName != "" {
-				ts.Name = tableName
-			}
-			continue
-		}
-
-		// 跳過非導出欄位
-		if !f.IsExported() {
-			continue
-		}
-
-		// 跳過 bun:"-"
-		if bunTag == "-" {
-			continue
-		}
-
-		col := parseColumnFromField(f)
-		if col != nil {
-			ts.Columns = append(ts.Columns, *col)
-		}
-	}
-
-	return ts
+	return &tables[0]
 }
 
-// parseColumnFromField 從 struct field 解析 ColumnSchema
-func parseColumnFromField(f reflect.StructField) *ColumnSchema {
-	bunTag := f.Tag.Get("bun")
+func newBunDialect(d string) schema.Dialect {
+	if d == DialectMySQL {
+		return mysqldialect.New()
+	}
+	return pgdialect.New()
+}
 
-	col := &ColumnSchema{
-		Name:   toSnakeCase(f.Name),
-		GoType: goTypeName(f.Type),
+// bunTables 取得 types 各自的 bun table（順序同 types）。
+// bun 的 m2m relation 要求 junction model 先註冊，因此失敗的 model 移到後面、以新的 dialect 重試，
+// 直到全部成功或不再有進展；bun 以 panic 回報的 tag 錯誤轉為 error
+func bunTables(types []reflect.Type, d string) ([]*schema.Table, error) {
+	order := append([]reflect.Type(nil), types...)
+	prevOK := -1
+	for {
+		dia := newBunDialect(d)
+		got := make(map[reflect.Type]*schema.Table, len(order))
+		var ok, failed []reflect.Type
+		var firstErr error
+		for _, t := range order {
+			tbl, err := bunTable(dia, t)
+			if err != nil {
+				failed = append(failed, t)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			got[t] = tbl
+			ok = append(ok, t)
+		}
+		if len(failed) == 0 {
+			out := make([]*schema.Table, len(types))
+			for i, t := range types {
+				out[i] = got[t]
+			}
+			return out, nil
+		}
+		if len(ok) <= prevOK {
+			return nil, firstErr
+		}
+		prevOK = len(ok)
+		order = append(ok, failed...)
+	}
+}
+
+func bunTable(dia schema.Dialect, t reflect.Type) (tbl *schema.Table, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("migrate: model %s: %v", t, r)
+		}
+	}()
+	return dia.Tables().Get(t), nil
+}
+
+var baseModelType = reflect.TypeOf(schema.BaseModel{})
+
+// tableSchema 把 bun table 轉為 TableSchema；欄位為 bun CREATE TABLE 會輸出的 table.Fields
+func tableSchema(tbl *schema.Table, typ reflect.Type, d string) (TableSchema, error) {
+	ts := TableSchema{Name: tbl.Name, Columns: make([]ColumnSchema, 0, len(tbl.Fields))}
+	varcharLen := tbl.Dialect().DefaultVarcharLen()
+
+	for _, f := range tbl.Fields {
+		col := ColumnSchema{
+			Name:          f.Name,
+			GoType:        f.StructField.Type.String(),
+			SQLType:       createTableSQLType(f, varcharLen, d),
+			PrimaryKey:    f.IsPK,
+			AutoIncrement: f.AutoIncrement,
+			Identity:      f.Identity && d == DialectPostgres,
+			NotNull:       f.NotNull,
+			Default:       f.SQLDefault,
+		}
+		hint, err := parseMigrateTag(f.StructField.Tag.Get("migrate"))
+		if err != nil {
+			return ts, fmt.Errorf("migrate: %s.%s: %w", typ, f.GoName, err)
+		}
+		col.RenamedFrom = hint
+		ts.Columns = append(ts.Columns, col)
+	}
+	for _, pk := range tbl.PKs {
+		ts.PrimaryKey = append(ts.PrimaryKey, pk.Name)
 	}
 
-	if bunTag == "" {
-		return col
+	// 與 bun appendUniqueConstraints 相同順序：未命名（各欄獨立）在前，具名依名稱排序
+	for _, f := range tbl.Unique[""] {
+		ts.Uniques = append(ts.Uniques, UniqueSchema{Columns: []string{f.Name}})
+		for i := range ts.Columns {
+			if ts.Columns[i].Name == f.Name {
+				ts.Columns[i].Unique = true
+			}
+		}
+	}
+	names := make([]string, 0, len(tbl.Unique))
+	for name := range tbl.Unique {
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		u := UniqueSchema{Name: name}
+		for _, f := range tbl.Unique[name] {
+			u.Columns = append(u.Columns, f.Name)
+		}
+		ts.Uniques = append(ts.Uniques, u)
 	}
 
-	parts := strings.Split(bunTag, ",")
-
-	// 第一個 part 是欄位名（如果有的話）
-	if len(parts) > 0 && parts[0] != "" && !isOption(parts[0]) {
-		col.Name = parts[0]
+	for i := 0; i < typ.NumField(); i++ {
+		sf := typ.Field(i)
+		if sf.Anonymous && sf.Type == baseModelType {
+			hint, err := parseMigrateTag(sf.Tag.Get("migrate"))
+			if err != nil {
+				return ts, fmt.Errorf("migrate: %s.BaseModel: %w", typ, err)
+			}
+			ts.RenamedFrom = hint
+		}
 	}
+	return ts, nil
+}
 
-	// 解析選項
-	for _, opt := range parts {
+// createTableSQLType 回傳 bun CREATE TABLE 對此欄位輸出的型別（同 bun CreateTableQuery.appendSQLType）。
+// 例外：PostgreSQL 的 autoincrement 搭配小寫 type:bigint 等時，bun 只比對大寫型別而不轉為 SERIAL、
+// 默默丟掉自動遞增；此處不分大小寫轉換（先前明確 type: 一律丟掉 autoincrement）
+func createTableSQLType(f *schema.Field, varcharLen int, d string) string {
+	t := f.CreateTableSQLType
+	if varcharLen > 0 && strings.EqualFold(t, f.DiscoveredSQLType) && strings.EqualFold(t, sqltype.VarChar) {
+		return fmt.Sprintf("%s(%d)", sqltype.VarChar, varcharLen)
+	}
+	if d == DialectPostgres && f.AutoIncrement && !f.Identity {
+		switch strings.ToUpper(t) {
+		case "SMALLINT", "INT2":
+			return "SMALLSERIAL"
+		case "INTEGER", "INT", "INT4":
+			return "SERIAL"
+		case "BIGINT", "INT8":
+			return "BIGSERIAL"
+		}
+	}
+	return t
+}
+
+// parseMigrateTag 解析 migrate:"renamed_from=<舊名稱>" tag，回傳舊名稱
+func parseMigrateTag(tag string) (string, error) {
+	var renamedFrom string
+	for _, opt := range strings.Split(tag, ",") {
 		opt = strings.TrimSpace(opt)
-		switch {
-		case opt == "pk":
-			col.PrimaryKey = true
-		case opt == "autoincrement":
-			col.AutoIncrement = true
-		case opt == "notnull":
-			col.NotNull = true
-		case opt == "unique":
-			col.Unique = true
-		case strings.HasPrefix(opt, "type:"):
-			col.SQLType = strings.TrimPrefix(opt, "type:")
-		case strings.HasPrefix(opt, "default:"):
-			col.Default = strings.TrimPrefix(opt, "default:")
+		if opt == "" {
+			continue
 		}
-	}
-
-	return col
-}
-
-// extractTableName 從 bun tag 提取表名
-// 例如 "table:users,alias:u" → "users"
-func extractTableName(tag string) string {
-	parts := strings.Split(tag, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "table:") {
-			return strings.TrimPrefix(part, "table:")
-		}
-	}
-	return ""
-}
-
-// isOption 判斷是否為 bun tag 選項（非欄位名）
-func isOption(s string) bool {
-	options := []string{"pk", "autoincrement", "notnull", "unique", "nullzero",
-		"scanonly", "extend", "soft_delete"}
-	for _, opt := range options {
-		if s == opt {
-			return true
-		}
-	}
-	return strings.HasPrefix(s, "type:") || strings.HasPrefix(s, "default:") ||
-		strings.HasPrefix(s, "table:") || strings.HasPrefix(s, "alias:")
-}
-
-// toSnakeCase 將 PascalCase 轉為 snake_case
-func toSnakeCase(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if r >= 'A' && r <= 'Z' {
-			if i > 0 {
-				result.WriteByte('_')
+		key, value, _ := strings.Cut(opt, "=")
+		switch strings.TrimSpace(key) {
+		case "renamed_from":
+			renamedFrom = strings.TrimSpace(value)
+			if renamedFrom == "" {
+				return "", fmt.Errorf(`migrate tag %q: renamed_from needs a name`, tag)
 			}
-			result.WriteRune(r + ('a' - 'A'))
-		} else {
-			result.WriteRune(r)
+		default:
+			return "", fmt.Errorf(`migrate tag %q: unknown option %q (supported: renamed_from=<old name>)`, tag, key)
 		}
 	}
-	return result.String()
-}
-
-// goTypeName 取得 Go 型別的簡短名稱
-func goTypeName(t reflect.Type) string {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	switch t.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return t.Kind().String()
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return t.Kind().String()
-	case reflect.Float32, reflect.Float64:
-		return t.Kind().String()
-	case reflect.Bool:
-		return "bool"
-	case reflect.String:
-		return "string"
-	default:
-		return t.String()
-	}
+	return renamedFrom, nil
 }

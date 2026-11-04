@@ -14,6 +14,7 @@ import (
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"gopkg.in/yaml.v3"
 )
 
 type regressIn struct {
@@ -199,5 +200,31 @@ func TestCollectTypesRegistersSliceElements(t *testing.T) {
 	}
 	if f, ok := types["listItem"]; !ok || len(f) != 1 || f[0].Name != "id" {
 		t.Errorf("types = %v, want listItem with field id", types)
+	}
+}
+
+// TestManifestListsErrorCatalog 迴歸測試（errors C1）：manifest 的 errors 區段列出 catalog 的錯誤碼，YAML 每筆一行。
+// 歷史 bug：catalog 沒有任何消費者，AI 讀 manifest 看不到有哪些錯誤碼，只能自行發明
+func TestManifestListsErrorCatalog(t *testing.T) {
+	m := NewCollector(router.New(), nil).Collect()
+	var found bool
+	for _, e := range m.Errors {
+		if e.Code == "E1001" && e.Status == 422 && e.Category == "validation" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("manifest errors missing built-in E1001: %+v", m.Errors)
+	}
+	out, err := yaml.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "- {code: E1001, status: 422, message: Validation failed, category: validation}") {
+		t.Errorf("errors should be one flow mapping per line:\n%s", out)
+	}
+	var back Manifest
+	if err := yaml.Unmarshal(out, &back); err != nil || len(back.Errors) != len(m.Errors) {
+		t.Errorf("round trip: err=%v, %d errors, want %d", err, len(back.Errors), len(m.Errors))
 	}
 }

@@ -8,17 +8,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
+	"sync"
 )
 
-// ModelRegistry 儲存所有需要管理的 Model
+// ModelRegistry 儲存所有需要管理的 Model（可並行使用）
 type ModelRegistry struct {
+	mu     sync.Mutex
 	models []interface{}
+	seen   map[reflect.Type]bool
 }
 
 // globalRegistry 全域 Model 註冊表（供 CLI 使用）
-var globalRegistry = &ModelRegistry{
-	models: make([]interface{}, 0),
-}
+var globalRegistry = NewRegistry()
 
 // GlobalRegistry 返回全域 Model 註冊表
 // 應用程式啟動時呼叫 GlobalRegistry().Register() 註冊 models
@@ -31,6 +33,7 @@ func GlobalRegistry() *ModelRegistry {
 func NewRegistry() *ModelRegistry {
 	return &ModelRegistry{
 		models: make([]interface{}, 0),
+		seen:   make(map[reflect.Type]bool),
 	}
 }
 
@@ -42,32 +45,85 @@ func NewRegistry() *ModelRegistry {
 //	    (*models.User)(nil),
 //	    (*models.Post)(nil),
 //	)
+//
+// 同一型別重複註冊只算一次（先前會產生重複的 CREATE TABLE / 欄位）。
+// 無效的值（nil、非 struct）照樣收下，於 ScanModels 回報錯誤——先前 Register(nil) 會讓 server.Start 內 panic
 func (r *ModelRegistry) Register(models ...interface{}) {
-	r.models = append(r.models, models...)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seen == nil {
+		r.seen = make(map[reflect.Type]bool)
+	}
+	for _, m := range models {
+		if t := reflect.TypeOf(m); t != nil {
+			for t.Kind() == reflect.Ptr {
+				t = t.Elem()
+			}
+			if r.seen[t] {
+				continue
+			}
+			r.seen[t] = true
+		}
+		r.models = append(r.models, m)
+	}
 }
 
-// Models 返回所有已註冊的 Model
+// Models 返回所有已註冊 Model 的副本（先前回傳內部切片，呼叫端可改到註冊表）
 func (r *ModelRegistry) Models() []interface{} {
-	return r.models
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]interface{}(nil), r.models...)
 }
 
 // Len 返回已註冊數量
 func (r *ModelRegistry) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.models)
 }
 
 // SchemaOutEnv 設定此環境變數時，server.Start() 在路由註冊完成後把 GlobalRegistry 掃描出的
-// []TableSchema（JSON）寫到該路徑並直接返回、不開始監聽。
+// schema（JSON，見 SchemaFile）寫到該路徑並直接返回、不開始監聽。
 // hyp migrate diff / snapshot 以此執行使用者專案取得已註冊的 models——models 只會註冊在
 // 使用者專案的行程裡，hyp 自己的行程讀 GlobalRegistry 永遠是空的
 const SchemaOutEnv = "HYPGO_MIGRATE_OUT"
 
-// WriteSchemaFile 掃描 GlobalRegistry 並把結果以 JSON 寫到 path（沒有 model 時寫出 []）
+// SchemaDialectEnv 指定 WriteSchemaFile 掃描所用的 SQL 方言（postgres / mysql；未設定為 postgres）。
+// 欄位型別依方言而異（如 string 在 PostgreSQL 為 VARCHAR、MySQL 為 VARCHAR(255)），hyp migrate 會一併設定
+const SchemaDialectEnv = "HYPGO_MIGRATE_DIALECT"
+
+// SchemaFileFormat 為 SchemaFile 的格式版本；hyp migrate 讀到不同版本時要求升級 hypgo
+const SchemaFileFormat = 2
+
+// SchemaFile 為 WriteSchemaFile 寫出、hyp migrate 讀回的內容
+type SchemaFile struct {
+	Format  int           `json:"format"`
+	Dialect string        `json:"dialect"`
+	Tables  []TableSchema `json:"tables"`
+	Error   string        `json:"error,omitempty"` // 掃描失敗時的原因（同時由 WriteSchemaFile 回傳）
+}
+
+// WriteSchemaFile 以 SchemaDialectEnv 指定的方言掃描 GlobalRegistry，把結果以 JSON 寫到 path。
+// 掃描失敗時錯誤也會寫進檔案（讓 hyp migrate 顯示原因，即使專案忽略了 Start() 的回傳值）並回傳
 func WriteSchemaFile(path string) error {
-	tables := ScanModels(globalRegistry)
-	data, err := json.Marshal(tables)
-	if err != nil {
-		return fmt.Errorf("failed to marshal schema: %w", err)
+	out := SchemaFile{Format: SchemaFileFormat, Tables: []TableSchema{}}
+	dialect, err := NormalizeDialect(os.Getenv(SchemaDialectEnv))
+	if err == nil {
+		out.Dialect = dialect
+		var tables []TableSchema
+		if tables, err = ScanModels(globalRegistry, dialect); err == nil {
+			out.Tables = tables
+		}
 	}
-	return os.WriteFile(path, data, 0644)
+	if err != nil {
+		out.Error = err.Error()
+	}
+	data, merr := json.Marshal(out)
+	if merr != nil {
+		return fmt.Errorf("failed to marshal schema: %w", merr)
+	}
+	if werr := os.WriteFile(path, data, 0644); werr != nil {
+		return werr
+	}
+	return err
 }
