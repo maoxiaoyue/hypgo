@@ -38,6 +38,7 @@ Database:
 Deployment:
   health         Check running application health
   secret         Encrypt credentials into key.secret (${secret:name} in config.yaml)
+  crypt          Encrypt the user/password under a config.yaml key into key.secret
 
 Use "hyp [command] --help" for detailed information about each command.`,
 		Version: Version,
@@ -74,6 +75,7 @@ func registerCommands() {
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(restartCmd)
 	rootCmd.AddCommand(secretCmd)
+	rootCmd.AddCommand(cryptCmd)
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(chkcommentCmd)
