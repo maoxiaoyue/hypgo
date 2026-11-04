@@ -103,7 +103,7 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ```bash
 hyp api myservice && cd myservice && go mod tidy
 hyp generate model user && hyp generate controller user
-hyp ai-rules    # ⚡ 必要 — 生成 AGENTS.md、GEMINI.md、Copilot、Cursor、Windsurf 配置
+hyp ai-rules    # ⚡ 必要 — 生成 AGENTS.md、CLAUDE.md、GEMINI.md、Cursor、Trae、通义灵码 配置
 ```
 
 ### CLI 工具
@@ -202,7 +202,7 @@ func main() {
 | **Schema-first 路由** | 路由携带 Input/Output 类型 — AI 不读 handler 就能理解 API |
 | **Project Manifest** | `hyp context` 用 ~500 tokens 输出整个项目结构 |
 | **Contract Testing** | `contract.TestAll(t, router)` 一行验证所有路由 |
-| **AI Rules** | `hyp ai-rules` 生成 Codex、Gemini、Cursor、Copilot、Windsurf 配置文件 |
+| **AI Rules** | `hyp ai-rules` 生成 Codex、Claude、Gemini、Cursor、Copilot、Windsurf 等配置文件 |
 | **Typed Error Catalog** | 预定义错误码（`E1001`）— AI 用它而非自行发明 |
 | **Annotation Protocol** | `// @ai:constraint max=100` — AI 从注解读业务约束 |
 | **Change Impact** | `hyp impact <file>` 修改前看影响范围 |

@@ -7,158 +7,145 @@ package airules
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 )
 
-// effectiveComment 回傳 opts.Comment 或預設值
+// windsurfCharLimit Windsurf 規則檔的字數上限（各來源不一致，取較保守的值）
+const windsurfCharLimit = 6000
+
+// effectiveComment 回傳 opts.Comment；未設定（nil）時用預設值。
+// 全部為 false 是使用者的明確選擇：先前當成「未設定」，comment.yaml 全關仍生成 REQUIRED 的註釋規範
 func effectiveComment(opts Options) CommentToggles {
-	c := opts.Comment
-	// 全部關閉時視為「未設定」→ 回退預設（避免全空時生成出意義不明的規則檔）
-	if !c.NormalComment && !c.AIComment && !c.ThinkComment {
+	if opts.Comment == nil {
 		return DefaultCommentToggles()
 	}
-	return c
+	return *opts.Comment
+}
+
+// routeCell 跳脫表格儲存格：Summary 含 | 會多出欄位，含換行會斷掉這一列
+var routeCell = strings.NewReplacer("|", `\|`, "\r\n", " ", "\n", " ")
+
+// routeRow 回傳路由在表格中的前兩欄。非 REST 路由沒有 Method / Path，
+// 先前這兩欄是空的，gRPC、CLI 路由看不出是哪一條
+func routeRow(r manifest.RouteManifest) (method, path string) {
+	if r.Protocol == "" {
+		return r.Method, r.Path
+	}
+	if r.Platform != "" {
+		return r.Protocol + "/" + r.Platform, r.Command
+	}
+	return r.Protocol, r.Command
 }
 
 func coreContent(m *manifest.Manifest, opts Options) string {
 	var sb strings.Builder
 	cm := effectiveComment(opts)
 
-	sb.WriteString(`## Framework
+	sb.WriteString("## Framework\n\n")
+	sb.WriteString("HypGo: Go web framework (HTTP/1.1, HTTP/2, HTTP/3). Go 1.24+, Bun ORM. Module: github.com/maoxiaoyue/hypgo\n")
 
-- **HypGo**: Modern Go web framework (HTTP/1.1 + HTTP/2 + HTTP/3 QUIC)
-- Go 1.24+, Bun ORM, Radix Tree router, WebSocket multi-protocol
-- Module: github.com/maoxiaoyue/hypgo
+	sb.WriteString("\n## Project Structure (Web / API)\n\n```\n")
+	sb.WriteString("app/models/       Bun models + Req/Resp DTOs (CreateXxxReq, XxxResp)\n")
+	sb.WriteString("app/services/     Business logic, DB access, Error Catalog\n")
+	sb.WriteString("app/controllers/  Thin handlers: parse input, call service, write response\n")
+	sb.WriteString("routers/          Schema-first route registration + middleware\n")
+	sb.WriteString("app/views/        Templates\n")
+	sb.WriteString("config/           Runtime config (config.yaml, including logger)\n")
+	sb.WriteString(".hyp/             Design-time settings and generated context.yaml\n")
+	sb.WriteString("```\n\n")
+	sb.WriteString("**MVC layering (MUST, Web / API projects only)**: no business logic or direct DB access in controllers. Generate layers with `hyp generate model|service|controller <name>`. CLI, Desktop and gRPC projects keep the layout `hyp new` created.\n")
 
-## Project Structure
-
-`)
-	sb.WriteString("```\n")
-	sb.WriteString("app/models/        Bun ORM models + Req/Resp DTO structs (CreateXxxReq, XxxResp)\n")
-	sb.WriteString("app/services/      Business logic + Error Catalog (errors.Define) + CRUD methods\n")
-	sb.WriteString("app/controllers/   HTTP handlers — thin: parse input, call service, write response\n")
-	sb.WriteString("routers/           Schema-first route registration + Setup() + middleware (project root, beside app/)\n")
-	sb.WriteString("app/views/         Templates / desktop (Fyne) views\n")
-	sb.WriteString("config/            Runtime configuration (config.yaml; project root, loaded in main.go)\n")
-	sb.WriteString(".hyp/              Auto-generated project context (manifest + lint report)\n")
-	sb.WriteString("```\n")
-
-	sb.WriteString("\n## Architecture — MVC (MUST follow)\n\n")
-	sb.WriteString("HypGo projects MUST use the layered MVC structure. Keep controllers thin; ALL business logic lives in services. Generate layers with `hyp generate model|service|controller <name>` — do not hand-roll the structure.\n\n")
-	sb.WriteString("- **Model** (`app/models/`, pkg/hidb): Bun ORM struct + its Req/Resp DTOs (CreateXxxReq, UpdateXxxReq, XxxResp).\n")
-	sb.WriteString("- **Service** (`app/services/`, pkg/errors): business logic, DB access, Error Catalog.\n")
-	sb.WriteString("- **Controller** (`app/controllers/`, pkg/context): parse input → call service → write response. NO business logic, NO direct DB access.\n")
-	sb.WriteString("- **Router** (`routers/`, pkg/router + pkg/schema): Schema-first registration + Setup() + middleware only.\n")
-
-	sb.WriteString("\n## Key Conventions (STRICT — no exceptions)\n\n")
-	sb.WriteString("1. **Schema-first routes** (MANDATORY, pkg/schema): every API route MUST be registered with type metadata via `r.Schema(...)`. NEVER call `r.GET/POST(...)` directly for API routes.\n")
+	sb.WriteString("\n## Key Conventions\n\n")
+	sb.WriteString("1. **Schema-first routes** (MANDATORY, pkg/schema): register REST routes with `r.Schema(...)`, never `r.GET/POST(...)` directly. gRPC services use `schema.RegisterGRPC(...)`.\n")
 	sb.WriteString("   ```go\n")
 	sb.WriteString("   r.Schema(schema.Route{\n")
-	sb.WriteString("       Method: \"POST\", Path: \"/api/users\",\n")
-	sb.WriteString("       Summary: \"Create user\",\n")
+	sb.WriteString("       Method: \"POST\", Path: \"/api/users\", Summary: \"Create user\",\n")
 	sb.WriteString("       Input: CreateUserReq{}, Output: UserResp{},\n")
-	sb.WriteString("       Responses: map[int]schema.ResponseSchema{201: {Description: \"created\"}},\n")
 	sb.WriteString("   }).Handle(handler)\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("2. **BindInput** (MANDATORY, pkg/context): handlers MUST bind input via `c.BindInput(&req)` (parse + validate + schema type-align; auto 400/422 on failure). NEVER hand-roll JSON decoding.\n")
+	sb.WriteString("2. **BindInput** (MANDATORY, pkg/context): bind input with `c.BindInput`, which parses, validates and answers 400/422 on failure. Never hand-roll JSON decoding.\n")
 	sb.WriteString("   ```go\n")
 	sb.WriteString("   var req CreateUserReq\n")
 	sb.WriteString("   if !c.BindInput(&req) { return }\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("3. **Typed errors + always log** (MANDATORY, pkg/errors + pkg/logger): use the Error Catalog; NEVER `c.JSON(500, ...)`. EVERY error MUST be logged via `pkg/logger` (`log.Error`) before aborting. Logger config (level/output/rotation/format) comes ONLY from `.hyp/config.yaml` — never hardcode.\n")
+	// 範例的錯誤碼不能落在保留區：AI 照抄 E1001 會與 BindInput 的驗證錯誤撞號，啟動就 panic
+	sb.WriteString("3. **Typed errors + always log** (MANDATORY, pkg/errors, pkg/logger): use the Error Catalog, never `c.JSON(500, ...)`. Log every error with `log.Error` before aborting. Logger settings live under `logger:` in `config/config.yaml`; never hardcode them.\n")
 	sb.WriteString("   ```go\n")
-	sb.WriteString("   var ErrNotFound = errors.Define(\"E1001\", 404, \"Not found\", \"general\")\n")
-	sb.WriteString("   log.Error(\"load user failed\", \"id\", id, \"err\", err) // log EVERY error\n")
+	sb.WriteString("   // E0xxx-E2xxx are reserved for the framework; a duplicate code panics at startup\n")
+	sb.WriteString("   var ErrNotFound = errors.Define(\"E4001\", 404, \"Not found\", \"users\")\n")
+	sb.WriteString("   log.Error(\"load user failed\", \"id\", id, \"err\", err)\n")
 	sb.WriteString("   errors.AbortWithAppError(c, ErrNotFound.With(\"id\", id))\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("4. **Contract tests** (MANDATORY, pkg/contract): every schema route MUST have a `_test.go` covering happy path, boundary, and at least one error case. Use the fixture builder (`contract.Request`) for explicit cases.\n")
+	sb.WriteString("4. **Contract tests** (MANDATORY, pkg/contract): every schema route needs tests for the happy path, a boundary and at least one error case. Use `contract.Request` for explicit cases.\n")
 	sb.WriteString("   ```go\n")
 	sb.WriteString("   func TestContracts(t *testing.T) {\n")
-	sb.WriteString("       contract.TestAll(t, setupRouter()) // validates all schema-registered routes\n")
+	sb.WriteString("       contract.TestAll(t, setupRouter())\n")
 	sb.WriteString("   }\n")
 	sb.WriteString("   ```\n\n")
 
-	// 規範編號連續：依 toggles 動態決定是否寫入 §5（普通註釋）、§6（@ai）、§7（@ai:think）
+	// 規範編號連續：依 toggles 動態決定是否寫入普通註釋、@ai、@ai:think
 	ruleNum := 5
 
 	if cm.NormalComment {
-		sb.WriteString(fmt.Sprintf("%d. **Comments** (REQUIRED): every exported func, type, and package MUST have a Go doc comment. Comments explain **why**, not **what** (the name covers what). Keep them concise; prefer one tight sentence over a paragraph. Verify with `go vet ./...` (missing exported-name docs surface in `golint`-style checks).\n\n", ruleNum))
+		fmt.Fprintf(&sb, "%d. **Comments** (REQUIRED): exported funcs, types and packages need a Go doc comment that explains why, not what. Prefer one tight sentence.\n\n", ruleNum)
 		ruleNum++
 	}
 
 	if cm.AIComment {
-		sb.WriteString(fmt.Sprintf("%d. **@ai annotations** (MANDATORY): every exported func/struct MUST carry a full `@ai` block (generated / purpose / input / output / sideeffect). Dates use `YYYY-MM-DD`; model names use official ids (e.g. `claude-opus-4-8`). Verify with `hyp chkcomment <file>`.\n\n", ruleNum))
+		fmt.Fprintf(&sb, "%d. **@ai annotations** (MANDATORY): exported funcs and structs carry a full `@ai` block (generated / purpose / input / output / sideeffect). Dates use `YYYY-MM-DD`; model names use official ids (e.g. `claude-opus-4-8`). Check with `hyp chkcomment <file>`.\n\n", ruleNum)
 		ruleNum++
 	}
 
 	if cm.ThinkComment {
-		sb.WriteString(fmt.Sprintf("%d. **@ai:think** (MANDATORY): every func body MUST begin with a `//@ai:think` comment explaining:\n", ruleNum))
-		sb.WriteString("   - **Intent**: why AI wrote this func / what problem it solves\n")
-		sb.WriteString("   - **Special notes**: non-obvious design choices, edge-case handling, or workarounds inside the func\n")
+		fmt.Fprintf(&sb, "%d. **@ai:think** (MANDATORY): every func body, exported or not, starts with the intent and any non-obvious choices:\n", ruleNum)
 		sb.WriteString("   ```go\n")
-		sb.WriteString("   func CreateUser(ctx context.Context, req CreateUserReq) (*UserResp, error) {\n")
-		sb.WriteString("       //@ai:think intent=create user; verify email uniqueness first model=claude-opus-4-8\n")
-		sb.WriteString("       //@ai:think special=upsert (not insert) to avoid concurrent unique conflict model=claude-opus-4-8\n")
-		sb.WriteString("       // ... implementation\n")
-		sb.WriteString("   }\n")
+		sb.WriteString("   //@ai:think intent=create user; verify email uniqueness first model=claude-opus-4-8\n")
+		sb.WriteString("   //@ai:think special=upsert to avoid a concurrent unique conflict model=claude-opus-4-8\n")
 		sb.WriteString("   ```\n")
-		sb.WriteString("   This applies to ALL funcs (exported and unexported). Omitting `@ai:think` is a lint violation. Auto-fix with `hyp chkcomment --fixintent --llm .hyp/llm.yaml <file>`.\n")
-		_ = ruleNum // 最後一條規範不再需要編號
+		sb.WriteString("   Check with `hyp chkcomment --unintent <file>`; auto-fix with `hyp chkcomment --fixintent --llm .hyp/llm.yaml <file>`.\n\n")
 	}
 
-	// 註釋開關來源（always emitted）— 即使某些規範因 toggle 關閉而沒寫進此文件，
-	// AI 在每次生成程式碼前仍應重讀 .hyp/comment.yaml 確認當下設定。
-	sb.WriteString("\n### Comment Generation Toggle (source of truth: `.hyp/comment.yaml`)\n\n")
-	sb.WriteString("Before generating ANY code, read `.hyp/comment.yaml` to confirm which comment types to write. Only emit a comment type whose toggle is `true`. If the file is missing or unreadable, fall back to defaults:\n\n")
-	sb.WriteString("| Toggle | Default | What it controls |\n")
-	sb.WriteString("|--------|---------|------------------|\n")
-	sb.WriteString("| `normal_comment` | **true** | Standard Go doc comments on exported funcs/types/packages |\n")
-	sb.WriteString("| `ai_comment` | **false** | `@ai:generated` / `@ai:purpose` / `@ai:input` / `@ai:output` / `@ai:sideeffect` |\n")
-	sb.WriteString("| `think_comment` | **false** | `//@ai:think intent=… / special=… / model=…` inside func bodies |\n\n")
-	sb.WriteString("Rules above marked MANDATORY/REQUIRED apply ONLY when their toggle is on. The toggle file overrides any rule shown here — re-read it on every session start; do NOT cache.\n")
-	sb.WriteString("Fallback behaviour (missing/unreadable file): write `normal_comment` only — do NOT add `@ai` or `@ai:think` lines.\n")
+	// 註釋開關來源（always emitted）：即使某些規範因 toggle 關閉而沒寫進此文件，
+	// AI 在每次生成程式碼前仍應重讀 .hyp/comment.yaml 確認當下設定
+	sb.WriteString("### Comment Generation Toggle (source of truth: `.hyp/comment.yaml`)\n\n")
+	sb.WriteString("Re-read this file before generating code; do not cache it. Only write comment types set to `true`. It overrides the comment rules above and does not affect rules 1-4.\n\n")
+	sb.WriteString("- `normal_comment` (default true): Go doc comments\n")
+	sb.WriteString("- `ai_comment` (default false): `@ai:generated` / `purpose` / `input` / `output` / `sideeffect`\n")
+	sb.WriteString("- `think_comment` (default false): `//@ai:think` in func bodies\n\n")
+	sb.WriteString("Fallback behaviour (missing or unreadable file): `normal_comment` only.\n")
 
-	sb.WriteString("\n## Database access (pkg/hidb)\n\n")
-	sb.WriteString("- Reads → `hidb.ReadHypDB()` (replica)\n")
-	sb.WriteString("- Writes → `hidb.WriteHypDB()` (master)\n")
-	sb.WriteString("- Transactions → `hidb.HypDBTransaction(ctx, fn)`\n")
+	// hidb 的讀寫方法在 *hidb.Database 上：先前寫 hidb.ReadHypDB()，照抄編譯不過
+	sb.WriteString("\n## Database Access (pkg/hidb)\n\n")
+	sb.WriteString("On a `*hidb.Database`: reads `db.ReadHypDB()` (replica), writes `db.WriteHypDB()` (master), transactions `db.HypDBTransaction(ctx, fn)`.\n")
 
 	sb.WriteString("\n## Forbidden\n\n")
-	sb.WriteString("- No `panic()` in request handlers (init phase only)\n")
-	sb.WriteString("- No `fmt.Println` for logging — use `pkg/logger` (`log.Info` KV / `log.Infof` printf)\n")
-	sb.WriteString("- No `math/rand` for tokens / session ids — use `crypto/rand`\n")
-	sb.WriteString("- No `time.Sleep` inside handlers\n")
-	sb.WriteString("- No hardcoded DSN / API key / secret — read from config (pkg/config)\n")
+	sb.WriteString("- `panic()` in request handlers (init phase only)\n")
+	sb.WriteString("- `fmt.Println` for logging: use `pkg/logger` (`log.Info` KV / `log.Infof` printf)\n")
+	sb.WriteString("- `math/rand` for tokens or session ids: use `crypto/rand`\n")
+	sb.WriteString("- `time.Sleep` inside handlers\n")
+	sb.WriteString("- Hardcoded DSN, API key or secret: read from config (pkg/config)\n")
 
-	sb.WriteString(`
-## Build & Test
-
-`)
-	sb.WriteString("```bash\n")
-	sb.WriteString("go build ./...\ngo test ./... -v\ngo vet ./...\n")
+	sb.WriteString("\n## Build & Test\n\n```bash\n")
+	sb.WriteString("go build ./... && go vet ./... && go test ./...\n")
 	sb.WriteString("hyp lint              # Schema completeness CI gate (non-zero exit on gaps)\n")
-	sb.WriteString("hyp chkcomment ./...  # @ai annotation completeness\n")
+	sb.WriteString("hyp chkcomment ./...  # Comment completeness\n")
 	sb.WriteString("```\n")
 
-	sb.WriteString(`
-## AI Collaboration
-
-- **Start here**: Read ` + "`.hyp/context.yaml`" + ` — all routes, types and config in one compact file
-- **Authoritative rules**: ` + "`.hyp/AI_CODING_RULES.md`" + ` is the single source of truth — read it before generating code
-- **Before modifying shared packages**: Run ` + "`hyp impact <file>`" + `
-- **After writing code**: Run ` + "`hyp chkcomment <file>`" + ` then ` + "`hyp lint`" + ` (CI gate; non-zero exit blocks merge)
-- **Generate manifest**: ` + "`hyp context -o .hyp/manifest.yaml`" + `
-- **Error codes**: Pattern E{category}{number} (e.g., E1001, E2001)
-- **All schema routes have Input/Output types** — use them for code generation
-`)
+	// 這裡不寫 .hyp/AI_CODING_RULES.md：它只在框架 repo 裡，hyp new / hyp api 的專案沒有這個檔案。
+	// manifest 的路徑要與 hyp lint / hyp impact 讀的 .hyp/context.yaml 一致
+	sb.WriteString("\n## AI Collaboration\n\n")
+	sb.WriteString("- **Start here**: `.hyp/context.yaml` lists all routes, types and config. Regenerate with `hyp context -o .hyp/context.yaml`\n")
+	sb.WriteString("- **Before modifying shared packages**: `hyp impact <file>`\n")
+	sb.WriteString("- **After writing code**: `hyp chkcomment <file>`, then `hyp lint` (non-zero exit blocks merge)\n")
 
 	// 條件性加入 diff-log 指令（開啟時才寫入，關閉時省 token）
 	if opts.DiffLogEnabled {
-		sb.WriteString("- **After making changes**: Run " + "`hyp diff-log`" + " to log your changes to logs/ai.diff_YYYYMMDD.log\n")
+		sb.WriteString("- **After making changes**: `hyp diff-log` logs them to logs/ai.diff_YYYYMMDD.log\n")
 	}
 
 	if m != nil && len(m.Routes) > 0 {
@@ -166,11 +153,12 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 		sb.WriteString("| Method | Path | Summary |\n")
 		sb.WriteString("|--------|------|--------|\n")
 		for _, r := range m.Routes {
+			method, path := routeRow(r)
 			summary := r.Summary
 			if summary == "" {
 				summary = "-"
 			}
-			sb.WriteString(fmt.Sprintf("| %s | %s | %s |\n", r.Method, r.Path, summary))
+			fmt.Fprintf(&sb, "| %s | %s | %s |\n", routeCell.Replace(method), routeCell.Replace(path), routeCell.Replace(summary))
 		}
 	}
 
@@ -179,10 +167,10 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 
 // plainMD 通用純 markdown 模板（多數 AI 工具規範檔皆為此格式）
 func plainMD(title string, m *manifest.Manifest, opts Options) string {
-	return autoGenMarker + "\n# " + title + "\n\n" + coreContent(m, opts)
+	return render("", "# "+title+"\n\n"+coreContent(m, opts))
 }
 
-// --- 預設集（"all" 模式包含的 7 個） ---
+// --- 各工具的模板 ---
 
 func generateChatGPTMD(m *manifest.Manifest, opts Options) string {
 	return plainMD("HypGo — ChatGPT Instructions", m, opts)
@@ -210,19 +198,14 @@ func generateGeminiMD(m *manifest.Manifest, opts Options) string {
 }
 
 func generateCursorMDC(m *manifest.Manifest, opts Options) string {
-	var sb strings.Builder
-	sb.WriteString(autoGenMarker + "\n")
-	sb.WriteString("---\n")
-	sb.WriteString("description: HypGo framework conventions and AI collaboration rules\n")
-	sb.WriteString("globs: \"**/*.go\"\n")
-	sb.WriteString("alwaysApply: true\n")
-	sb.WriteString("---\n\n")
-	sb.WriteString("# HypGo Framework Instructions\n\n")
-	sb.WriteString(coreContent(m, opts))
-	return sb.String()
+	// frontmatter 要在檔案開頭才會生效：先前標記寫在它前面，alwaysApply 可能被忽略
+	const frontmatter = "---\n" +
+		"description: HypGo framework conventions and AI collaboration rules\n" +
+		"globs: \"**/*.go\"\n" +
+		"alwaysApply: true\n" +
+		"---\n"
+	return render(frontmatter, "\n# HypGo Framework Instructions\n\n"+coreContent(m, opts))
 }
-
-// --- 擴充集（僅在 --only 明確列出時生成） ---
 
 func generateAgentsMD(m *manifest.Manifest, opts Options) string {
 	return plainMD("HypGo Framework Instructions", m, opts)
@@ -233,17 +216,15 @@ func generateCopilotMD(m *manifest.Manifest, opts Options) string {
 }
 
 func generateWindsurfMD(m *manifest.Manifest, opts Options) string {
-	var sb strings.Builder
-	sb.WriteString(autoGenMarker + "\n")
-	sb.WriteString("# HypGo Framework Instructions\n\n")
-	content := coreContent(m, opts)
-	if len(content) > 5800 {
-		if idx := strings.Index(content, "\n## Current Routes"); idx > 0 {
-			content = content[:idx]
-		}
+	// Windsurf 依 trigger 決定何時套用規則
+	const frontmatter = "---\ntrigger: always_on\n---\n"
+	const title = "\n# HypGo Framework Instructions\n\n"
+	out := render(frontmatter, title+coreContent(m, opts))
+	if utf8.RuneCountInString(out) > windsurfCharLimit {
+		// 超過上限時拿掉路由表：AI 仍可從 .hyp/context.yaml 取得路由
+		out = render(frontmatter, title+coreContent(nil, opts))
 	}
-	sb.WriteString(content)
-	return sb.String()
+	return out
 }
 
 func generateClineMD(m *manifest.Manifest, opts Options) string {

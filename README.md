@@ -103,7 +103,7 @@ go install github.com/maoxiaoyue/hypgo/cmd/hyp@latest
 ```bash
 hyp api myservice && cd myservice && go mod tidy
 hyp generate model user && hyp generate controller user
-hyp ai-rules    # ⚡ Essential — generates AGENTS.md, GEMINI.md, Copilot, Cursor, Windsurf configs
+hyp ai-rules    # ⚡ Essential — generates AGENTS.md, CLAUDE.md, GEMINI.md, Cursor, Trae, Tongyi configs
 ```
 
 ### CLI Tool
@@ -202,7 +202,7 @@ func main() {
 | **Schema-first Routes** | Routes carry Input/Output types — AI understands API without reading handler code |
 | **Project Manifest** | `hyp context` outputs your entire project structure in ~500 tokens |
 | **Contract Testing** | `contract.TestAll(t, router)` validates all routes in one line |
-| **AI Rules** | `hyp ai-rules` generates config for Codex, Gemini, Cursor, Copilot, Windsurf |
+| **AI Rules** | `hyp ai-rules` generates rules for Codex, Claude, Gemini, Cursor, Copilot, Windsurf and more |
 | **Typed Error Catalog** | Predefined error codes (`E1001`) — AI uses them instead of inventing ad-hoc errors |
 | **Annotation Protocol** | `// @ai:constraint max=100` — AI reads business constraints from comments |
 | **Change Impact** | `hyp impact <file>` shows blast radius before modifying shared packages |
