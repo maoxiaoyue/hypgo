@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"sort"
-	"strings"
 	"text/tabwriter"
 
 	"github.com/maoxiaoyue/hypgo/pkg/eval"
@@ -22,23 +21,27 @@ import (
 var evalReportCmd = &cobra.Command{
 	Use:   "eval-report",
 	Short: "Show contract test quality trend from eval history",
-	Long: `Read .hyp/eval_history.jsonl and display a quality trend report for each route.
+	Long: `Read .hyp/eval_history.jsonl (in the module root) and display a quality trend per route.
 
 The report shows:
   - Route path (METHOD /path)
-  - Average contract score over the last N runs (default: 5)
-  - Trend vs. the previous N runs (↑ improving / ↓ degrading / → stable)
-  - Flaky detection: routes that alternate between pass and fail
-  - Warning ⚠ for routes where score dropped more than 0.1
+  - Average score over the last N runs (default: 5): the grader aggregate when recorded, otherwise contract
+  - The same average over the previous N runs (N/A until there are 2N runs)
+  - Contract: pass rate over the last N runs
+  - Trend vs. the previous N runs (↑ improving / ↓ degrading / → stable), ⚠ when the score dropped more than 0.1
+  - Flaky: the result flipped at least twice, or a run needed a retry
 
 History is generated automatically when using:
   contract.TestAll(t, router, contract.RunConfig{RecordHistory: true})
+  contract.Test(t, router, contract.TestCase{..., RecordHistory: true})   // with Graders
 
 Examples:
   hyp eval-report                       # read .hyp/eval_history.jsonl
   hyp eval-report --path my/history.jsonl
   hyp eval-report --n 10                # average over last 10 runs`,
-	RunE: runEvalReport,
+	Args:         cobra.NoArgs,
+	SilenceUsage: true,
+	RunE:         runEvalReport,
 }
 
 var (
@@ -47,8 +50,8 @@ var (
 )
 
 func init() {
-	evalReportCmd.Flags().StringVar(&evalReportPath, "path", eval.DefaultHistoryPath(),
-		"Path to the eval history JSONL file")
+	evalReportCmd.Flags().StringVar(&evalReportPath, "path", "",
+		"Path to the eval history JSONL file (default: .hyp/eval_history.jsonl in the module root)")
 	evalReportCmd.Flags().IntVar(&evalReportN, "n", 5,
 		"Number of recent runs to average for the trend window")
 }
@@ -58,19 +61,29 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 	if evalReportN < 1 {
 		return fmt.Errorf("--n must be >= 1, got %d", evalReportN)
 	}
+	out := cmd.OutOrStdout()
 
-	records, err := eval.LoadHistory(evalReportPath)
+	path := evalReportPath
+	if path == "" {
+		path = eval.DefaultHistoryPath()
+	} else if _, err := os.Stat(path); err != nil {
+		// 明確指定的路徑不存在是打錯字，不是還沒有紀錄
+		return fmt.Errorf("讀取 eval history 失敗: %w", err)
+	}
+
+	records, skipped, err := eval.ScanHistory(path)
 	if err != nil {
 		return fmt.Errorf("讀取 eval history 失敗: %w", err)
 	}
 
 	if len(records) == 0 {
-		fmt.Println("📋 尚無 eval 記錄。")
-		fmt.Println()
-		fmt.Println("啟用歷史記錄：")
-		fmt.Println(`  contract.TestAll(t, r, contract.RunConfig{RecordHistory: true})`)
-		fmt.Println()
-		fmt.Printf("記錄儲存位置：%s\n", evalReportPath)
+		fmt.Fprintln(out, "📋 尚無 eval 記錄。")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "啟用歷史記錄：")
+		fmt.Fprintln(out, `  contract.TestAll(t, r, contract.RunConfig{RecordHistory: true})`)
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "記錄儲存位置：%s\n", path)
+		reportSkipped(cmd, skipped)
 		return nil
 	}
 
@@ -85,23 +98,26 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 	sort.Strings(routes)
 
 	// 輸出報告頭
-	fmt.Printf("📊 Eval Report — %s\n", evalReportPath)
-	fmt.Printf("   Total records: %d  |  Routes: %d  |  Window: last %d\n\n",
+	fmt.Fprintf(out, "📊 Eval Report — %s\n", path)
+	fmt.Fprintf(out, "   Total records: %d  |  Routes: %d  |  Window: last %d\n\n",
 		len(records), len(routes), evalReportN)
 
 	// 使用 tabwriter 對齊欄位
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "Route\tLast N avg\tPrev N avg\tTrend\tFlaky\tRuns")
-	fmt.Fprintln(w, "─────\t──────────\t──────────\t─────\t─────\t────")
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "Route\tLast N avg\tPrev N avg\tContract\tTrend\tFlaky\tRuns")
+	fmt.Fprintln(w, "─────\t──────────\t──────────\t────────\t─────\t─────\t────")
 
-	var hasWarning bool
+	var hasWarning, hasFlaky bool
 	for _, route := range routes {
 		recs := byRoute[route]
 
 		n := evalReportN
-		lastAvg := windowAvg(recs, 0, n)
-		prevAvg := windowAvg(recs, n, 2*n)
-		flaky := isFlaky(recs, n)
+		lastAvg := windowAvg(recs, 0, n, qualityScore)
+		// 前期要滿 N 筆才比較：先前 6 筆紀錄的前期只有 1 筆，一次失敗就顯示 ↑ +1.00
+		prevAvg := -1.0
+		if len(recs) >= 2*n {
+			prevAvg = windowAvg(recs, n, 2*n, qualityScore)
+		}
 		trend := trendArrow(lastAvg, prevAvg)
 		warn := ""
 		if prevAvg >= 0 && lastAvg < prevAvg-0.1 {
@@ -109,33 +125,41 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 			hasWarning = true
 		}
 
-		lastStr := formatScore(lastAvg)
-		prevStr := formatScore(prevAvg)
-
 		flakyStr := ""
-		if flaky {
+		if isFlaky(recs, n) {
 			flakyStr = "⚡"
+			hasFlaky = true
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s%s\t%s\t%d\n",
-			route, lastStr, prevStr, trend, warn, flakyStr, len(recs))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s%s\t%s\t%d\n",
+			route, formatScore(lastAvg), formatScore(prevAvg),
+			formatScore(windowAvg(recs, 0, n, contractScore)), trend, warn, flakyStr, len(recs))
 	}
 	w.Flush()
 
+	if hasWarning || hasFlaky {
+		fmt.Fprintln(out)
+	}
 	if hasWarning {
-		fmt.Println()
-		fmt.Println("⚠ = score dropped more than 0.1 vs previous window")
+		fmt.Fprintln(out, "⚠ = score dropped more than 0.1 vs previous window")
+	}
+	if hasFlaky {
+		fmt.Fprintln(out, "⚡ = result flipped at least twice, or a run needed a retry, in the last N runs")
 	}
 
 	// 最後記錄的 git commit
-	if len(records) > 0 {
-		last := records[len(records)-1]
-		if last.GitCommit != "" {
-			fmt.Printf("\nLast recorded commit: %s\n", last.GitCommit)
-		}
+	if last := records[len(records)-1]; last.GitCommit != "" {
+		fmt.Fprintf(out, "\nLast recorded commit: %s\n", last.GitCommit)
 	}
-
+	reportSkipped(cmd, skipped)
 	return nil
+}
+
+// reportSkipped 提示有壞行：紀錄不完整時，看報告的人要知道
+func reportSkipped(cmd *cobra.Command, skipped int) {
+	if skipped > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: skipped %d malformed line(s)\n", skipped)
+	}
 }
 
 // groupByRoute 將 []EvalRecord 按 Route 欄位分組，組內保持時間先後順序
@@ -147,70 +171,58 @@ func groupByRoute(records []eval.EvalRecord) map[string][]eval.EvalRecord {
 	return result
 }
 
-// windowAvg 計算 records 中倒數第 (skip+n) 到倒數第 skip 筆的平均 contract score
-// skip=0,n=5 → last 5；skip=5,n=5 → previous 5
-// 若無足夠記錄回傳 -1（表示 N/A）
-func windowAvg(records []eval.EvalRecord, skip, end int) float64 {
-	total := len(records)
-	// 計算實際的倒數範圍
-	from := total - end
-	to := total - skip
-	if from < 0 {
-		from = 0
+// contractScore 回傳 contract 分數；舊紀錄沒有 scores 時由 status 推斷
+func contractScore(r eval.EvalRecord) float64 {
+	if s, ok := r.Scores["contract"]; ok {
+		return s
 	}
+	if r.Status == "pass" {
+		return 1
+	}
+	return 0
+}
+
+// qualityScore 有 Grader 分數時用 aggregate，否則用 contract。
+// 先前只看 contract：LLM 品質從 0.95 掉到 0.30，只要結構對，報告仍顯示 1.00 stable
+func qualityScore(r eval.EvalRecord) float64 {
+	if s, ok := r.Scores["aggregate"]; ok {
+		return s
+	}
+	return contractScore(r)
+}
+
+// windowAvg 計算 records 中倒數第 end 到倒數第 skip 筆的平均分數
+// skip=0,end=5 → last 5；skip=5,end=10 → previous 5
+// 若無記錄回傳 -1（表示 N/A）
+func windowAvg(records []eval.EvalRecord, skip, end int, score func(eval.EvalRecord) float64) float64 {
+	total := len(records)
+	from := max(total-end, 0)
+	to := total - skip
 	if to <= from {
 		return -1
 	}
 
-	window := records[from:to]
-	if len(window) == 0 {
-		return -1
-	}
-
 	var sum float64
-	var count int
-	for _, r := range window {
-		if score, ok := r.Scores["contract"]; ok {
-			sum += score
-			count++
-		} else {
-			// 無 scores 欄位：由 status 推斷
-			if r.Status == "pass" {
-				sum++
-			}
-			count++
-		}
+	for _, r := range records[from:to] {
+		sum += score(r)
 	}
-	if count == 0 {
-		return -1
-	}
-	return sum / float64(count)
+	return sum / float64(to-from)
 }
 
-// isFlaky 偵測最近 N 筆記錄中是否有「通過/失敗交替」模式（flaky test）
-// 若同一路由在最近 N 筆中同時有 pass 和 fail，視為 flaky
+// isFlaky 偵測最近 N 筆記錄是否不穩定：通過與失敗至少翻轉兩次，或有紀錄靠重試才有結果。
+// 先前只要同時有 pass 和 fail 就算，修好一次（F F P P P）和退化（P P P F F）都被標成 flaky
 func isFlaky(records []eval.EvalRecord, n int) bool {
-	from := len(records) - n
-	if from < 0 {
-		from = 0
-	}
-	window := records[from:]
-	if len(window) < 2 {
-		return false
-	}
-
-	hasPass, hasFail := false, false
-	for _, r := range window {
-		if r.Status == "pass" {
-			hasPass = true
-		} else {
-			hasFail = true
-		}
-		if hasPass && hasFail {
+	window := records[max(len(records)-n, 0):]
+	flips := 0
+	for i, r := range window {
+		if r.Attempts > 1 {
 			return true
 		}
+		if i > 0 && (r.Status == "pass") != (window[i-1].Status == "pass") {
+			flips++
+		}
 	}
-	return false
+	return flips >= 2
 }
 
 // trendArrow 依據最近與前期平均分數，回傳趨勢符號
@@ -222,7 +234,7 @@ func trendArrow(last, prev float64) string {
 	diff := last - prev
 	switch {
 	case math.Abs(diff) < 0.02:
-		return fmt.Sprintf("→ stable")
+		return "→ stable"
 	case diff > 0:
 		return fmt.Sprintf("↑ +%.2f", diff)
 	default:
@@ -236,26 +248,4 @@ func formatScore(score float64) string {
 		return "N/A"
 	}
 	return fmt.Sprintf("%.2f", score)
-}
-
-// truncateRoute 截短過長的路由字串，讓表格不會過寬
-func truncateRoute(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-3] + "..."
-}
-
-// filterByRoute 過濾只保留特定路由的記錄（供未來 --filter flag 使用）
-func filterByRoute(records []eval.EvalRecord, filter string) []eval.EvalRecord {
-	if filter == "" {
-		return records
-	}
-	var result []eval.EvalRecord
-	for _, r := range records {
-		if strings.Contains(strings.ToLower(r.Route), strings.ToLower(filter)) {
-			result = append(result, r)
-		}
-	}
-	return result
 }

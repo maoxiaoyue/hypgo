@@ -16,9 +16,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -60,6 +62,10 @@ type TestCase struct {
 	// 測試失敗。0 表示不設門檻——只記錄分數（t.Logf / eval history），不影響
 	// pass/fail，方便漸進導入
 	PassThreshold float64
+
+	// RecordHistory 為 true 時，Test 把結果（含 Graders 的分數）append 到 .hyp/eval_history.jsonl，
+	// 供 hyp eval-report 看趨勢。TestAll 請用 RunConfig.RecordHistory
+	RecordHistory bool
 
 	// schemaRoute 為內部欄位：TestAll / Observe 已持有路由宣告，直接帶入，
 	// 不必再以路徑查 registry（手動 Test 為 nil，改以實際路徑比對路由樣式）
@@ -208,11 +214,25 @@ func runGraders(tc TestCase, output string) (pass bool, reason string, scores ma
 	sample := eval.Sample{Route: tc.Route, Input: tc.Input, Output: output}
 	results := make([]eval.GraderResult, 0, len(tc.Graders))
 	scores = make(map[string]float64, len(tc.Graders)+1)
+	// 同名的評判器加序號（llm_judge#2）：兩個 Rubric 不同的 LLMJudge 先前互相覆蓋，
+	// aggregate 算了兩個分數，紀錄卻只剩一個。contract / aggregate 是保留名稱
+	seen := map[string]int{"contract": 1, "aggregate": 1}
 
 	for _, g := range tc.Graders {
 		res, err := g.Grade(context.Background(), sample)
 		if err != nil {
 			return false, fmt.Sprintf("[%s] grader %q failed: %v", tc.Route, g.Name(), err), scores
+		}
+		// 這個條件也擋 NaN：先前 NaN 讓 agg < threshold 為 false 而通過門檻，紀錄也寫不進去
+		if !(res.Score >= 0 && res.Score <= 1) {
+			return false, fmt.Sprintf("[%s] grader %q returned invalid score %v (must be 0.0-1.0)", tc.Route, g.Name(), res.Score), scores
+		}
+		if res.Name == "" {
+			res.Name = g.Name()
+		}
+		seen[res.Name]++
+		if n := seen[res.Name]; n > 1 {
+			res.Name = fmt.Sprintf("%s#%d", res.Name, n)
 		}
 		results = append(results, res)
 		scores[res.Name] = res.Score
@@ -246,12 +266,46 @@ func runGraders(tc TestCase, output string) (pass bool, reason string, scores ma
 // date: 2026-05-23
 func testInternal(t *testing.T, r *router.Router, tc TestCase) {
 	t.Helper()
+	start := time.Now()
 	pass, reason, scores := runTestOnce(r, tc)
 	if len(scores) > 0 {
 		t.Logf("eval scores %s: %v", tc.Route, scores)
 	}
 	if !pass {
 		t.Errorf("contract: %s", reason)
+	}
+	if tc.RecordHistory {
+		recordHistory(t, tc.Route, tc.Input, pass, reason, scores, time.Since(start), 1)
+	}
+}
+
+// gitCommit 只查一次：同一個測試行程裡 commit 不會變，每筆紀錄都開子行程太慢
+var gitCommit = sync.OnceValue(eval.GitShortCommit)
+
+// recordHistory 寫入一筆 eval history。寫入失敗讓測試失敗：要求記錄卻默默沒記，
+// 使用者要到看趨勢時才發現資料是斷的（通過的測試不顯示 t.Logf，所以不用 Logf）
+func recordHistory(t *testing.T, route, input string, pass bool, reason string, graderScores map[string]float64, latency time.Duration, attempts int) {
+	t.Helper()
+	status, score := "fail", 0.0
+	if pass {
+		status, score = "pass", 1.0
+	}
+	// contract 分數 + 各 Grader 的評分（llm_judge/similarity/aggregate…）
+	scores := map[string]float64{"contract": score}
+	maps.Copy(scores, graderScores)
+	err := eval.AppendHistory(eval.EvalRecord{
+		Timestamp:  time.Now().UTC(),
+		GitCommit:  gitCommit(),
+		Route:      route,
+		Status:     status,
+		Scores:     scores,
+		Attempts:   attempts,
+		LatencyMs:  latency.Milliseconds(),
+		InputHash:  eval.HashInput(input),
+		FailReason: reason,
+	})
+	if err != nil {
+		t.Errorf("contract: record history: %v", err)
 	}
 }
 
@@ -297,12 +351,6 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 		t.Cleanup(ticker.Stop)
 	}
 
-	// git commit hash：只在 RecordHistory=true 時查詢，且只查詢一次
-	var gitCommit string
-	if cfg.RecordHistory {
-		gitCommit = eval.GitShortCommit()
-	}
-
 	for _, route := range routes {
 		if route.IsREST() {
 			name := route.Method + " " + route.Path
@@ -338,20 +386,22 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				var pass bool
 				var reason string
 				var graderScores map[string]float64
-				for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
-					if attempt > 0 {
-						t.Logf("[retry %d/%d] %s %s", attempt, cfg.RetryCount,
+				attempts := 0
+				for attempts <= cfg.RetryCount {
+					if attempts > 0 {
+						t.Logf("[retry %d/%d] %s %s", attempts, cfg.RetryCount,
 							route.Method, route.Path)
 						if cfg.RetryDelay > 0 {
 							time.Sleep(cfg.RetryDelay)
 						}
 					}
 					pass, reason, graderScores = runTestOnce(r, tc)
+					attempts++
 					if pass {
 						break
 					}
 				}
-				latencyMs := time.Since(start).Milliseconds()
+				latency := time.Since(start)
 
 				if !pass {
 					t.Errorf("contract: %s", reason)
@@ -362,29 +412,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 
 				// 歷史記錄：RecordHistory=true 時 append 結果
 				if cfg.RecordHistory {
-					score := 0.0
-					if pass {
-						score = 1.0
-					}
-					status := "fail"
-					if pass {
-						status = "pass"
-					}
-					// contract 分數 + 各 Grader 的評分（llm_judge/similarity/aggregate…）
-					allScores := map[string]float64{"contract": score}
-					for name, s := range graderScores {
-						allScores[name] = s
-					}
-					_ = eval.AppendHistory(eval.EvalRecord{
-						Timestamp:  time.Now().UTC(),
-						GitCommit:  gitCommit,
-						Route:      route.Method + " " + route.Path,
-						Status:     status,
-						Scores:     allScores,
-						LatencyMs:  latencyMs,
-						InputHash:  eval.HashInput(tc.Input),
-						FailReason: reason,
-					})
+					recordHistory(t, route.Method+" "+route.Path, tc.Input, pass, reason, graderScores, latency, attempts)
 				}
 			})
 		} else {
@@ -400,10 +428,18 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 					sem <- struct{}{}
 					defer func() { <-sem }()
 				}
+				start := time.Now()
 				testSchemaCompleteness(t, route)
 				// FailFast：testSchemaCompleteness 失敗後設定 aborted
 				if t.Failed() && cfg.FailFast {
 					aborted.Store(true)
+				}
+				if cfg.RecordHistory {
+					reason := ""
+					if t.Failed() {
+						reason = "schema incomplete"
+					}
+					recordHistory(t, name, "", !t.Failed(), reason, nil, time.Since(start), 1)
 				}
 			})
 		}

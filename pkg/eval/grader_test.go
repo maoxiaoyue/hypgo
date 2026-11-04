@@ -105,7 +105,7 @@ func TestLLMJudgeOllama(t *testing.T) {
 	}
 }
 
-// --- LLMJudge（openai 相容 wire format + 分數夾擠 + 容錯解析）---
+// --- LLMJudge（openai 相容 wire format + 容錯解析）---
 
 func TestLLMJudgeOpenAICompatible(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -115,10 +115,10 @@ func TestLLMJudgeOpenAICompatible(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			t.Errorf("Authorization = %q", got)
 		}
-		// 模型在 JSON 前後多話 → parseVerdict 應容錯；score 超界 → 應夾到 1.0
+		// 模型在 JSON 前後多話 → parseVerdict 應容錯
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"choices": []map[string]interface{}{
-				{"message": map[string]string{"content": "Sure! {\"score\": 1.7, \"reason\": \"ok\"} hope that helps"}},
+				{"message": map[string]string{"content": "Sure! {\"score\": 0.7, \"reason\": \"ok\"} hope that helps"}},
 			},
 		})
 	}))
@@ -135,8 +135,8 @@ func TestLLMJudgeOpenAICompatible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Grade: %v", err)
 	}
-	if res.Score != 1.0 {
-		t.Errorf("out-of-range score should clamp to 1.0, got %v", res.Score)
+	if res.Score != 0.7 {
+		t.Errorf("score = %v, want 0.7", res.Score)
 	}
 }
 

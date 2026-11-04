@@ -16,13 +16,18 @@ import (
 //
 //	eval.SimilarityGrader{Golden: "預期的理想回應內容", Config: llmCfg}
 //
-// ollama 模式走 /api/embeddings；api 模式走 OpenAI 相容 /embeddings
+// ollama 模式走 /api/embeddings；api 模式走 OpenAI 相容 /embeddings。
+// 不要直接共用 LLMJudge 的設定：chat 模型不能產生 embedding，要設 EmbeddingModel；
+// provider 為 anthropic 時沒有 embeddings API，要另給一份 Config
 type SimilarityGrader struct {
 	// Golden 黃金標準（預期的理想回應），與實際回應比相似度
 	Golden string
 
-	// Config LLM 連線設定（embedding 模型沿用其 model 欄位）
+	// Config LLM 連線設定
 	Config *config.LLMConfig
+
+	// EmbeddingModel embedding 模型名稱（如 "text-embedding-3-small"）；留空時沿用 Config 的 model
+	EmbeddingModel string
 
 	// Client 可注入自訂 http.Client（測試用）
 	Client *http.Client
@@ -38,11 +43,11 @@ func (g SimilarityGrader) Grade(ctx context.Context, s Sample) (GraderResult, er
 		return GraderResult{}, fmt.Errorf("eval: SimilarityGrader.Golden is empty")
 	}
 
-	goldenVec, err := embedText(ctx, g.Config, g.Client, g.Golden)
+	goldenVec, err := embedText(ctx, g.Config, g.Client, g.EmbeddingModel, g.Golden)
 	if err != nil {
 		return GraderResult{}, err
 	}
-	outputVec, err := embedText(ctx, g.Config, g.Client, s.Output)
+	outputVec, err := embedText(ctx, g.Config, g.Client, g.EmbeddingModel, s.Output)
 	if err != nil {
 		return GraderResult{}, err
 	}

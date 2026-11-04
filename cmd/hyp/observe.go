@@ -8,6 +8,7 @@ package main
 // date: 2026-05-23
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/maoxiaoyue/hypgo/pkg/eval"
 	"github.com/spf13/cobra"
 )
 
@@ -120,15 +122,15 @@ func runObserveCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// findObserveReports 掃描 .hyp/ 目錄下的所有 observe_*.html，依時間倒序排列
+// findObserveReports 掃描專案 .hyp/ 目錄下的所有 observe_*.html，依時間倒序排列
 func findObserveReports() ([]string, error) {
-	pattern := filepath.Join(".hyp", "observe_*.html")
-	matches, err := filepath.Glob(pattern)
+	dir := eval.HypDir()
+	files, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
-	}
-	if len(matches) == 0 {
-		return nil, nil
 	}
 
 	// 依修改時間倒序（最新的在前）
@@ -136,18 +138,24 @@ func findObserveReports() ([]string, error) {
 		path    string
 		modTime int64
 	}
-	entries := make([]entry, 0, len(matches))
-	for _, m := range matches {
-		info, err := os.Stat(m)
+	entries := make([]entry, 0, len(files))
+	for _, f := range files {
+		if !strings.HasPrefix(f.Name(), "observe_") || !strings.HasSuffix(f.Name(), ".html") {
+			continue
+		}
+		info, err := f.Info()
 		if err != nil {
 			continue
 		}
-		entries = append(entries, entry{path: m, modTime: info.ModTime().UnixNano()})
+		entries = append(entries, entry{path: filepath.Join(dir, f.Name()), modTime: info.ModTime().UnixNano()})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].modTime > entries[j].modTime
 	})
 
+	if len(entries) == 0 {
+		return nil, nil
+	}
 	result := make([]string, len(entries))
 	for i, e := range entries {
 		result[i] = e.path
