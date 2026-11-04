@@ -6,119 +6,228 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"golang.org/x/mod/modfile"
 )
 
-// BuildImportGraph 掃描專案目錄，建立套件 import 依賴圖
-// 回傳 map[套件路徑][]被 import 的套件路徑
-//
-// 僅掃描 .go 檔案（排除 _test.go），用於分析正式程式碼的依賴關係
-func BuildImportGraph(root string) (map[string][]string, error) {
-	graph := make(map[string][]string)
+// pkgInfo 為專案內單一套件的掃描結果
+type pkgInfo struct {
+	path        string // 相對於專案根目錄（根套件為 "."）
+	name        string // package 名稱（不含 _test）
+	files       []string
+	testFiles   []string
+	imports     map[string]bool // 正式程式碼 import 的專案內套件
+	testImports map[string]bool // *_test.go import 的專案內套件
+	tests       int             // Test 函式數量
+}
 
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+// project 為整個專案的掃描結果
+type project struct {
+	root     string
+	module   string // go.mod 的 module 路徑；沒有 go.mod 時為空
+	packages map[string]*pkgInfo
+}
+
+// scanProject 掃描專案，建立套件依賴圖。只保留專案內的依賴：
+// 先前以路徑結尾比對，pkg/grpc 會把 import google.golang.org/grpc 的檔案都算成依賴者
+func scanProject(root string) (*project, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	p := &project{root: absRoot, module: readModulePath(absRoot), packages: map[string]*pkgInfo{}}
+	raw := map[*pkgInfo]map[string]bool{}
+	rawTest := map[*pkgInfo]map[string]bool{}
+
+	err = filepath.WalkDir(absRoot, func(file string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // 跳過無法存取的檔案
 		}
-
-		// 跳過隱藏目錄和 vendor
-		name := info.Name()
-		if info.IsDir() {
-			if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" {
+		name := d.Name()
+		if d.IsDir() {
+			if file == absRoot {
+				return nil // 根目錄本身不套用下面的規則：先前傳 "." 時第一步就被當成隱藏目錄跳過
+			}
+			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") ||
+				name == "vendor" || name == "node_modules" || name == "testdata" {
 				return filepath.SkipDir
+			}
+			if _, err := os.Stat(filepath.Join(file, "go.mod")); err == nil {
+				return filepath.SkipDir // 巢狀 module 是另一個專案
 			}
 			return nil
 		}
-
-		// 只處理 .go 檔案（含 _test.go，因為測試也是影響範圍）
 		if !strings.HasSuffix(name, ".go") {
 			return nil
 		}
-
-		// 解析 import
-		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
 		if err != nil {
 			return nil // 跳過無法解析的檔案
 		}
-
-		// 取得此檔案所屬的套件路徑
-		relDir, err := filepath.Rel(root, filepath.Dir(path))
+		rel, err := filepath.Rel(absRoot, filepath.Dir(file))
 		if err != nil {
 			return nil
 		}
-		pkgPath := filepath.ToSlash(relDir)
-
-		// 收集 import 路徑
-		for _, imp := range f.Imports {
-			importPath := strings.Trim(imp.Path.Value, `"`)
-			graph[pkgPath] = append(graph[pkgPath], importPath)
+		key := filepath.ToSlash(rel)
+		info := p.packages[key]
+		if info == nil {
+			info = &pkgInfo{path: key, imports: map[string]bool{}, testImports: map[string]bool{}}
+			p.packages[key] = info
+			raw[info], rawTest[info] = map[string]bool{}, map[string]bool{}
 		}
-
+		isTest := strings.HasSuffix(name, "_test.go")
+		target := raw[info]
+		if isTest {
+			info.testFiles = append(info.testFiles, file)
+			target = rawTest[info]
+		} else {
+			info.files = append(info.files, file)
+			if info.name == "" {
+				info.name = f.Name.Name
+			}
+		}
+		for _, imp := range f.Imports {
+			target[strings.Trim(imp.Path.Value, `"`)] = true
+		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return graph, err
+	for info := range raw {
+		for imp := range raw[info] {
+			if dep := p.resolveImport(imp); dep != "" && dep != info.path {
+				info.imports[dep] = true
+			}
+		}
+		for imp := range rawTest[info] {
+			if dep := p.resolveImport(imp); dep != "" && dep != info.path {
+				info.testImports[dep] = true
+			}
+		}
+		info.tests = countTestFuncs(info.testFiles)
+	}
+	return p, nil
 }
 
-// FindDependents 找出直接 import 指定套件的所有套件路徑
-//
-// targetPkg 可以是相對路徑（如 "pkg/errors"）或完整 module 路徑
+// readModulePath 讀取 go.mod 的 module 路徑
+func readModulePath(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return ""
+	}
+	return modfile.ModulePath(data)
+}
+
+// resolveImport 把 import 路徑轉成專案內的套件路徑；不屬於專案時回傳 ""。
+// 沒有 go.mod 時以完整路徑結尾比對已知的套件目錄，取最長者
+func (p *project) resolveImport(imp string) string {
+	if p.module != "" {
+		if imp == p.module {
+			if p.packages["."] != nil {
+				return "."
+			}
+			return ""
+		}
+		if rest, ok := strings.CutPrefix(imp, p.module+"/"); ok && p.packages[rest] != nil {
+			return rest
+		}
+		return ""
+	}
+	best := ""
+	for pkg := range p.packages {
+		if pkg != "." && len(pkg) > len(best) && (imp == pkg || strings.HasSuffix(imp, "/"+pkg)) {
+			best = pkg
+		}
+	}
+	return best
+}
+
+// BuildImportGraph 掃描專案目錄，建立套件依賴圖（含 *_test.go）
+// 回傳 map[套件路徑][]專案內被 import 的套件路徑（皆為相對路徑、已排序）
+func BuildImportGraph(root string) (map[string][]string, error) {
+	p, err := scanProject(root)
+	if err != nil {
+		return nil, err
+	}
+	graph := make(map[string][]string, len(p.packages))
+	for key, info := range p.packages {
+		seen := map[string]bool{}
+		for dep := range info.imports {
+			seen[dep] = true
+		}
+		for dep := range info.testImports {
+			seen[dep] = true
+		}
+		graph[key] = sortedKeys(seen)
+	}
+	return graph, nil
+}
+
+// FindDependents 找出直接 import 指定套件的所有套件路徑（targetPkg 為相對路徑，結果已排序）
 func FindDependents(graph map[string][]string, targetPkg string) []string {
+	target := path.Clean(filepath.ToSlash(targetPkg))
 	var dependents []string
-
-	// 標準化 target
-	target := filepath.ToSlash(targetPkg)
-
 	for pkg, imports := range graph {
 		if pkg == target {
-			continue // 排除自己
+			continue
 		}
 		for _, imp := range imports {
-			// 比對完整路徑或相對路徑後綴
-			if imp == target || strings.HasSuffix(imp, "/"+target) || strings.HasSuffix(imp, "/"+filepath.Base(target)) {
+			if imp == target {
 				dependents = append(dependents, pkg)
 				break
 			}
 		}
 	}
-
+	sort.Strings(dependents)
 	return dependents
 }
 
 // countTestsInPackage 計算指定套件目錄中的測試函式數量
 func countTestsInPackage(root, pkgPath string) int {
-	dir := filepath.Join(root, pkgPath)
-	entries, err := os.ReadDir(dir)
+	files, err := filepath.Glob(filepath.Join(root, filepath.FromSlash(pkgPath), "*_test.go"))
 	if err != nil {
 		return 0
 	}
+	return countTestFuncs(files)
+}
 
+func countTestFuncs(files []string) int {
 	count := 0
 	fset := token.NewFileSet()
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
-			continue
-		}
-
-		path := filepath.Join(dir, entry.Name())
-		f, err := parser.ParseFile(fset, path, nil, 0)
+	for _, file := range files {
+		f, err := parser.ParseFile(fset, file, nil, parser.SkipObjectResolution)
 		if err != nil {
 			continue
 		}
-
 		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			if strings.HasPrefix(fn.Name.Name, "Test") {
+			if fn, ok := decl.(*ast.FuncDecl); ok && isTestFunc(fn) {
 				count++
 			}
 		}
 	}
-
 	return count
+}
+
+// isTestFunc 依 go test 的規則判斷。先前只看 Test 前綴，TestMain、Testify 與 method 都會被算進去
+func isTestFunc(fn *ast.FuncDecl) bool {
+	name, ok := strings.CutPrefix(fn.Name.Name, "Test")
+	if !ok || fn.Recv != nil || fn.Name.Name == "TestMain" || fn.Type.Params.NumFields() != 1 {
+		return false
+	}
+	return name == "" || !(name[0] >= 'a' && name[0] <= 'z')
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

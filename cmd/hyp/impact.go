@@ -3,6 +3,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/maoxiaoyue/hypgo/pkg/impact"
 	"github.com/spf13/cobra"
@@ -11,58 +13,77 @@ import (
 var impactCmd = &cobra.Command{
 	Use:   "impact [file.go]",
 	Short: "Analyze change impact of a Go source file",
-	Long: `Analyze what packages, routes, and tests would be affected by modifying
-a specific Go source file. Run this BEFORE making changes to shared
-packages to understand the blast radius.
+	Long: `Analyze what would be affected by modifying a Go source file. Run this BEFORE
+changing shared packages to understand the blast radius.
 
-Output includes:
-  - Package the file belongs to
-  - Direct dependents (packages that import this package)
-  - Affected tests (test files in dependent packages, with test count)
-  - Risk level assessment
+The report includes:
+  - Risk level, with the reasons behind it
+  - Exported API in the file, and which packages reference each symbol
+  - Direct and transitive dependents (tests-only importers are marked)
+  - Affected routes, from .hyp/context.yaml (run hyp context to refresh it)
+  - Affected tests, packages without tests, and the go test command to run
 
-Risk levels:
-  LOW      < 2 dependent packages, < 20 affected tests
-  MEDIUM   2-4 dependent packages or 20-49 affected tests
-  HIGH     >= 5 dependent packages or >= 50 affected tests
+Risk levels ("depend" counts production code only):
+  HIGH     >= 5 direct dependents, or >= 6 in total
+  MEDIUM   >= 2 direct, >= 3 total, >= 20 tests in other packages,
+           or a route declared directly against this file
+  LOW      everything else
+  At least MEDIUM if other packages depend on it and it has no tests of its own.
 
-Example output:
-  Impact Analysis: pkg/errors/catalog.go
-  Package: pkg/errors
-
-  Direct dependents (import this package):
-    → pkg/contract
-    → pkg/diagnostic
-    → pkg/scaffold
-
-  Affected tests:
-    → pkg/errors/*_test.go (19 tests)
-    → pkg/contract/*_test.go (24 tests)
-    Total: 43 tests
-
-  Risk: MEDIUM (3 packages depend on this)
-
-Safety:
-  - Read-only analysis — never modifies any files
-  - Only scans import paths, never reads function bodies
-  - Path validated to be within project directory
+Limits:
+  - Static analysis of source files; the project does not need to compile
+  - Method calls are not tracked (x.With() needs type information), so a package
+    that imports this one may use the file even when no symbol is listed for it
+  - Routes through affected packages are matched by package name
 
 Examples:
   hyp impact pkg/errors/catalog.go
-  hyp impact pkg/router/router.go
-  hyp impact app/controllers/user.go`,
-	Args: cobra.ExactArgs(1),
-	RunE: runImpact,
+  hyp impact -f json app/controllers/user.go`,
+	Args:         cobra.ExactArgs(1),
+	SilenceUsage: true,
+	RunE:         runImpact,
+}
+
+func init() {
+	impactCmd.Flags().StringP("format", "f", "text", "Output format: text or json")
 }
 
 func runImpact(cmd *cobra.Command, args []string) error {
-	targetFile := args[0]
+	format, _ := cmd.Flags().GetString("format")
+	if format != "text" && format != "json" {
+		return fmt.Errorf("unknown format %q (use text or json)", format)
+	}
 
-	report, err := impact.Analyze(targetFile, ".")
+	report, err := impact.Analyze(args[0], moduleRoot(args[0]))
 	if err != nil {
 		return fmt.Errorf("analysis failed: %w", err)
 	}
 
-	fmt.Print(impact.FormatReport(report))
+	output := impact.FormatReport(report)
+	if format == "json" {
+		if output, err = impact.FormatJSON(report); err != nil {
+			return err
+		}
+	}
+	fmt.Fprint(cmd.OutOrStdout(), output)
 	return nil
+}
+
+// moduleRoot 自目標檔案往上找 go.mod 所在目錄；找不到時回傳工作目錄。
+// 先前固定用工作目錄：在子目錄執行時路徑與依賴全部算錯
+func moduleRoot(file string) string {
+	dir, err := filepath.Abs(filepath.Dir(file))
+	if err != nil {
+		return "."
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "."
+		}
+		dir = parent
+	}
 }
