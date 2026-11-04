@@ -6,9 +6,11 @@ import (
 	"testing"
 )
 
+func withToggles(c CommentToggles) Options { return Options{Comment: &c} }
+
 func TestCoreContent_DefaultCommentToggles(t *testing.T) {
 	// 預設值：只開普通註釋
-	out := coreContent(nil, Options{Comment: DefaultCommentToggles()})
+	out := coreContent(nil, withToggles(DefaultCommentToggles()))
 	if !strings.Contains(out, "**Comments** (REQUIRED)") {
 		t.Error("default should include Comments section")
 	}
@@ -21,9 +23,9 @@ func TestCoreContent_DefaultCommentToggles(t *testing.T) {
 }
 
 func TestCoreContent_AllToggles(t *testing.T) {
-	out := coreContent(nil, Options{Comment: CommentToggles{
+	out := coreContent(nil, withToggles(CommentToggles{
 		NormalComment: true, AIComment: true, ThinkComment: true,
-	}})
+	}))
 	if !strings.Contains(out, "**Comments** (REQUIRED)") {
 		t.Error("missing Comments section")
 	}
@@ -36,9 +38,9 @@ func TestCoreContent_AllToggles(t *testing.T) {
 }
 
 func TestCoreContent_AIOnly(t *testing.T) {
-	out := coreContent(nil, Options{Comment: CommentToggles{
+	out := coreContent(nil, withToggles(CommentToggles{
 		NormalComment: false, AIComment: true, ThinkComment: false,
-	}})
+	}))
 	if strings.Contains(out, "**Comments** (REQUIRED)") {
 		t.Error("Comments section should be off")
 	}
@@ -51,9 +53,9 @@ func TestCoreContent_AIOnly(t *testing.T) {
 }
 
 func TestCoreContent_ThinkOnly(t *testing.T) {
-	out := coreContent(nil, Options{Comment: CommentToggles{
+	out := coreContent(nil, withToggles(CommentToggles{
 		NormalComment: false, AIComment: false, ThinkComment: true,
-	}})
+	}))
 	if strings.Contains(out, "**Comments** (REQUIRED)") {
 		t.Error("Comments section should be off")
 	}
@@ -65,22 +67,32 @@ func TestCoreContent_ThinkOnly(t *testing.T) {
 	}
 }
 
-func TestCoreContent_AllOff_FallsBackToDefault(t *testing.T) {
-	// 全關 → 視為「未設定」→ 退回預設（只開 normal_comment）
-	out := coreContent(nil, Options{Comment: CommentToggles{}})
+// 全關是使用者的明確選擇，不是「未設定」：先前仍生成 REQUIRED 的註釋規範
+func TestCoreContent_AllOff_IsRespected(t *testing.T) {
+	out := coreContent(nil, withToggles(CommentToggles{}))
+	for _, section := range []string{"**Comments**", "**@ai annotations**", "**@ai:think**"} {
+		if strings.Contains(out, section) {
+			t.Errorf("all-off should not include %s", section)
+		}
+	}
+}
+
+// 沒有設定（nil）才用預設值
+func TestCoreContent_NilToggles_UsesDefault(t *testing.T) {
+	out := coreContent(nil, Options{})
 	if !strings.Contains(out, "**Comments** (REQUIRED)") {
-		t.Error("all-off should fall back to defaults (Comments on)")
+		t.Error("nil toggles should use defaults (Comments on)")
 	}
 	if strings.Contains(out, "**@ai annotations**") {
-		t.Error("all-off fallback should NOT include @ai annotations")
+		t.Error("defaults should NOT include @ai annotations")
 	}
 }
 
 func TestCoreContent_RuleNumbering(t *testing.T) {
 	// 規範編號要連續：開了 AI+Think 但關 Normal → 5. @ai / 6. @ai:think
-	out := coreContent(nil, Options{Comment: CommentToggles{
+	out := coreContent(nil, withToggles(CommentToggles{
 		NormalComment: false, AIComment: true, ThinkComment: true,
-	}})
+	}))
 	if !strings.Contains(out, "5. **@ai annotations**") {
 		t.Errorf("expected '5. **@ai annotations**' when normal_comment off")
 	}
@@ -91,9 +103,9 @@ func TestCoreContent_RuleNumbering(t *testing.T) {
 
 func TestCoreContent_RuleNumbering_NormalThink(t *testing.T) {
 	// 開了 Normal+Think 但關 AI → 5. Comments / 6. @ai:think（跳過 @ai）
-	out := coreContent(nil, Options{Comment: CommentToggles{
+	out := coreContent(nil, withToggles(CommentToggles{
 		NormalComment: true, AIComment: false, ThinkComment: true,
-	}})
+	}))
 	if !strings.Contains(out, "5. **Comments**") {
 		t.Errorf("expected '5. **Comments**'")
 	}
@@ -120,7 +132,7 @@ func TestCoreContent_TogglesSourceNote_AlwaysEmitted(t *testing.T) {
 		{},
 	}
 	for _, c := range combos {
-		out := coreContent(nil, Options{Comment: c})
+		out := coreContent(nil, withToggles(c))
 		if !strings.Contains(out, "Comment Generation Toggle") {
 			t.Errorf("toggle source note missing for %+v", c)
 		}

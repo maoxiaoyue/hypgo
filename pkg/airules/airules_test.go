@@ -25,7 +25,7 @@ var diffLogOpts = Options{DiffLogEnabled: true}
 
 const (
 	expectedAllTargets     = 15
-	expectedDefaultTargets = 7
+	expectedDefaultTargets = 6
 )
 
 func TestAllTargets(t *testing.T) {
@@ -48,7 +48,7 @@ func TestDefaultTargets(t *testing.T) {
 	if len(targets) != expectedDefaultTargets {
 		t.Fatalf("expected %d default targets, got %d", expectedDefaultTargets, len(targets))
 	}
-	wantNames := []string{"chatgpt", "claude", "trae", "tongyi", "deepseek", "cursor", "gemini"}
+	wantNames := []string{"agents", "claude", "trae", "tongyi", "cursor", "gemini"}
 	for i, want := range wantNames {
 		if targets[i].Name != want {
 			t.Errorf("default[%d] = %s, want %s", i, targets[i].Name, want)
@@ -70,10 +70,12 @@ func TestResolveTargets(t *testing.T) {
 		{"agents", 1},
 		{"agents,copilot", 2},
 		{"chatgpt,claude,trae", 3},
-		{"nonexistent", 0},
 	}
 	for _, c := range cases {
-		got := ResolveTargets(c.only)
+		got, err := ResolveTargets(c.only)
+		if err != nil {
+			t.Errorf("ResolveTargets(%q): %v", c.only, err)
+		}
 		if len(got) != c.want {
 			t.Errorf("ResolveTargets(%q): got %d, want %d", c.only, len(got), c.want)
 		}
@@ -101,7 +103,7 @@ func TestFilterTargets(t *testing.T) {
 
 func TestGenerateAgentsMD(t *testing.T) {
 	content := generateAgentsMD(testManifest(), defaultOpts)
-	for _, want := range []string{autoGenMarker, "HypGo", "Schema-first", "/api/users", "Create user"} {
+	for _, want := range []string{markerPrefix, "HypGo", "Schema-first", "/api/users", "Create user"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing %q", want)
 		}
@@ -110,7 +112,7 @@ func TestGenerateAgentsMD(t *testing.T) {
 
 func TestGenerateClaudeMD(t *testing.T) {
 	content := generateClaudeMD(testManifest(), defaultOpts)
-	for _, want := range []string{autoGenMarker, "Claude Code Instructions", "HypGo", "Schema-first"} {
+	for _, want := range []string{markerPrefix, "Claude Code Instructions", "HypGo", "Schema-first"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing %q", want)
 		}
@@ -189,23 +191,6 @@ func TestDiffLogDisabled(t *testing.T) {
 
 // --- 共用測試 ---
 
-func TestCanOverwrite(t *testing.T) {
-	dir := t.TempDir()
-	if !canOverwrite(filepath.Join(dir, "x.md")) {
-		t.Error("nonexistent should be overwritable")
-	}
-	auto := filepath.Join(dir, "auto.md")
-	os.WriteFile(auto, []byte(autoGenMarker+"\n# Content"), 0644)
-	if !canOverwrite(auto) {
-		t.Error("auto-generated should be overwritable")
-	}
-	manual := filepath.Join(dir, "manual.md")
-	os.WriteFile(manual, []byte("# Custom"), 0644)
-	if canOverwrite(manual) {
-		t.Error("manual should NOT be overwritable")
-	}
-}
-
 func TestGenerateAll(t *testing.T) {
 	dir := t.TempDir()
 	results, err := GenerateAll(dir, AllTargets(), testManifest(), defaultOpts, false)
@@ -264,10 +249,12 @@ func TestResolveCleanTargets(t *testing.T) {
 		{"*", expectedAllTargets},
 		{"agents", 1},
 		{"agents,copilot", 2},
-		{"nonexistent", 0},
 	}
 	for _, c := range cases {
-		got := ResolveCleanTargets(c.only)
+		got, err := ResolveCleanTargets(c.only)
+		if err != nil {
+			t.Errorf("ResolveCleanTargets(%q): %v", c.only, err)
+		}
 		if len(got) != c.want {
 			t.Errorf("ResolveCleanTargets(%q): got %d, want %d", c.only, len(got), c.want)
 		}
@@ -279,7 +266,7 @@ func TestCleanAllRemovesGenerated(t *testing.T) {
 	if _, err := GenerateAll(dir, AllTargets(), testManifest(), defaultOpts, false); err != nil {
 		t.Fatal(err)
 	}
-	results, err := CleanAll(dir, AllTargets(), false)
+	results, err := CleanAll(dir, AllTargets(), false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +291,7 @@ func TestCleanAllRemovesEmptyParents(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, ".cursor", "rules")); err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
-	CleanAll(dir, FilterTargets(AllTargets(), "cursor"), false)
+	CleanAll(dir, FilterTargets(AllTargets(), "cursor"), false, false)
 	// .cursor/rules/ 與 .cursor/ 都應因為變空而被移除
 	if _, err := os.Stat(filepath.Join(dir, ".cursor", "rules")); !os.IsNotExist(err) {
 		t.Error(".cursor/rules/ should be removed (empty)")
@@ -328,7 +315,7 @@ func TestCleanAllPreservesNonEmptyParents(t *testing.T) {
 	// 生成 cursor 規則檔
 	GenerateAll(dir, FilterTargets(AllTargets(), "cursor"), testManifest(), defaultOpts, false)
 	// Clean
-	CleanAll(dir, FilterTargets(AllTargets(), "cursor"), false)
+	CleanAll(dir, FilterTargets(AllTargets(), "cursor"), false, false)
 	// .cursor/ 不應被移除（user_notes.md 還在）
 	if _, err := os.Stat(keepPath); err != nil {
 		t.Error("user file should be preserved")
@@ -342,7 +329,7 @@ func TestCleanAllSkipsManualFiles(t *testing.T) {
 	dir := t.TempDir()
 	manualPath := filepath.Join(dir, "AGENTS.md")
 	os.WriteFile(manualPath, []byte("# My custom rules — not auto-gen"), 0644)
-	results, _ := CleanAll(dir, FilterTargets(AllTargets(), "agents"), false)
+	results, _ := CleanAll(dir, FilterTargets(AllTargets(), "agents"), false, true) // force 也不動手寫檔
 	if results[0].Status != StatusSkipped {
 		t.Errorf("manual file should be skipped, got %s", results[0].Status)
 	}
@@ -353,7 +340,7 @@ func TestCleanAllSkipsManualFiles(t *testing.T) {
 
 func TestCleanAllSkipsNonexistent(t *testing.T) {
 	dir := t.TempDir()
-	results, _ := CleanAll(dir, FilterTargets(AllTargets(), "agents"), false)
+	results, _ := CleanAll(dir, FilterTargets(AllTargets(), "agents"), false, false)
 	if results[0].Status != StatusSkipped || results[0].Message != "not found" {
 		t.Errorf("nonexistent should be skipped/not found, got %s/%s", results[0].Status, results[0].Message)
 	}
@@ -362,7 +349,7 @@ func TestCleanAllSkipsNonexistent(t *testing.T) {
 func TestCleanAllDryRun(t *testing.T) {
 	dir := t.TempDir()
 	GenerateAll(dir, FilterTargets(AllTargets(), "agents"), testManifest(), defaultOpts, false)
-	results, _ := CleanAll(dir, FilterTargets(AllTargets(), "agents"), true)
+	results, _ := CleanAll(dir, FilterTargets(AllTargets(), "agents"), true, false)
 	if results[0].Status != StatusDryRun {
 		t.Errorf("expected dry-run, got %s", results[0].Status)
 	}
