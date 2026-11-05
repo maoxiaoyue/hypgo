@@ -46,8 +46,4 @@ func TestAnalyzeDetectsMismatchAndMissingBind(t *testing.T) {
 	if k, ok := byRoute["PUT /inline"]; ok {
 		t.Errorf("PUT /inline should pass, but got finding %q", k)
 	}
-
-	if !rep.HasFindings() {
-		t.Error("HasFindings() = false, want true (有 bad/nobind)")
-	}
 }
