@@ -495,11 +495,18 @@ func TestGenerateEmptyNameNoPanic(t *testing.T) {
 // TestAPIDockerfileMatchesGoDirective 迴歸測試（A8）：hyp api 的 Dockerfile 基底映像與 go.mod 的 go 版本一致。
 // 歷史 bug：FROM golang:1.21-alpine 但 go.mod 為 go 1.24（官方映像 GOTOOLCHAIN=local，go mod download 失敗）
 func TestAPIDockerfileMatchesGoDirective(t *testing.T) {
-	m := regexp.MustCompile(`(?m)^go (\d+\.\d+)`).FindStringSubmatch(goModContent)
-	if m == nil {
-		t.Fatal("no go directive in goModContent")
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "api", "shop"); err != nil {
+		t.Fatal(err)
 	}
-	if want := "FROM golang:" + m[1] + "-alpine"; !strings.Contains(dockerfileContent, want) {
+	gomod, _ := os.ReadFile(filepath.Join("shop", "go.mod"))
+	m := regexp.MustCompile(`(?m)^go (\d+\.\d+)`).FindStringSubmatch(string(gomod))
+	if m == nil {
+		t.Fatalf("no go directive in go.mod:\n%s", gomod)
+	}
+	dockerfile, _ := os.ReadFile(filepath.Join("shop", "Dockerfile"))
+	if want := "FROM golang:" + m[1] + "-alpine"; !strings.Contains(string(dockerfile), want) {
 		t.Errorf("Dockerfile should use %q", want)
 	}
 }

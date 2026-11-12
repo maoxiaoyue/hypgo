@@ -507,8 +507,12 @@ func TestDiffLogSettingLivesAtProjectRoot(t *testing.T) {
 	if data, _ := os.ReadFile(cfg); string(data) != "not json" {
 		t.Error("invalid config.json was overwritten")
 	}
+	os.WriteFile(cfg, []byte(`{"diff_log": false}`), 0o644)
 	if err := runHyp(t, "diff-log", "--on", "--off"); err == nil {
 		t.Error("--on with --off should fail")
+	}
+	if IsDiffLogEnabled(root) {
+		t.Error("--on with --off must not change the setting")
 	}
 }
 
@@ -567,5 +571,212 @@ func TestHealthReportsBrokenDefaultConfig(t *testing.T) {
 	err := runHyp(t, "health")
 	if err == nil || !strings.Contains(err.Error(), "config.yaml") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// ── 就地生成（hyp new 不給名稱） ──
+
+// inPlaceProject 建立只有 go.mod 的目錄（等同 mkdir + go mod init）並切過去
+func inPlaceProject(t *testing.T, module string) string {
+	t.Helper()
+	offlineGo(t)
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module "+module+"\n\ngo 1.25.3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	return dir
+}
+
+func TestNewInPlaceUsesExistingGoMod(t *testing.T) {
+	cases := []struct {
+		args            []string
+		file, wantInSrc string
+		requires        []string
+	}{
+		{[]string{"new"}, "main.go", `"github.com/acme/billing/routers"`, []string{hypgoModule}},
+		{[]string{"new", "web"}, "routers/router.go", `"github.com/acme/billing/app/controllers"`, []string{hypgoModule}},
+		{[]string{"api"}, "routers/auth.go", `"github.com/acme/billing/app/services"`, []string{hypgoModule, "golang.org/x/crypto"}},
+		{[]string{"new", "api"}, "app/controllers/user_controller.go", `"github.com/acme/billing/app/models"`, []string{hypgoModule, "golang.org/x/crypto"}},
+		{[]string{"new", "cli"}, "main.go", `"github.com/acme/billing/app/commands"`, []string{hypgoModule, "github.com/spf13/cobra"}},
+		{[]string{"new", "grpc"}, "main.go", `"github.com/acme/billing/app/proto/billingpb"`, []string{hypgoModule, "google.golang.org/grpc"}},
+		{[]string{"new", "desktop"}, "main.go", `"github.com/acme/billing/app/views"`, []string{hypgoModule, "fyne.io/fyne/v2"}},
+	}
+	for _, c := range cases {
+		dir := inPlaceProject(t, "github.com/acme/billing")
+		if err := runHyp(t, c.args...); err != nil {
+			t.Fatalf("%v: %v", c.args, err)
+		}
+		src, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(c.file)))
+		if err != nil {
+			t.Fatalf("%v: %v", c.args, err)
+		}
+		if !strings.Contains(string(src), c.wantInSrc) {
+			t.Errorf("%v: %s should import %s", c.args, c.file, c.wantInSrc)
+		}
+		// go.mod 是使用者的：module 與 go 版本不動，只補上需要的 require
+		gomod, _ := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if !strings.HasPrefix(string(gomod), "module github.com/acme/billing\n") || !strings.Contains(string(gomod), "go 1.25.3") {
+			t.Errorf("%v: module path / go version changed:\n%s", c.args, gomod)
+		}
+		for _, r := range c.requires {
+			if !strings.Contains(string(gomod), r+" v") {
+				t.Errorf("%v: go.mod should require %s:\n%s", c.args, r, gomod)
+			}
+		}
+		// 不能多建一層以名稱命名的目錄
+		if exists(filepath.Join(dir, "billing")) {
+			t.Errorf("%v: created a nested project directory", c.args)
+		}
+	}
+}
+
+// 名稱取 module 最後一段（主版本後綴不算）；Dockerfile 的映像跟著既有 go.mod 的 go 版本
+func TestNewInPlaceNamesAndGoVersion(t *testing.T) {
+	dir := inPlaceProject(t, "github.com/acme/user-service/v2")
+	if err := runHyp(t, "new", "grpc"); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(dir, "app", "proto", "user_servicepb", "user_service.proto")) {
+		t.Error("project name should come from the module path, without the /v2 suffix")
+	}
+
+	dir = inPlaceProject(t, "github.com/acme/shop")
+	if err := runHyp(t, "api"); err != nil {
+		t.Fatal(err)
+	}
+	dockerfile, _ := os.ReadFile(filepath.Join(dir, "Dockerfile"))
+	if !strings.Contains(string(dockerfile), "FROM golang:1.25-alpine") {
+		t.Errorf("Dockerfile should follow the go directive of the existing go.mod:\n%.200s", dockerfile)
+	}
+	makefile, _ := os.ReadFile(filepath.Join(dir, "Makefile"))
+	if !strings.Contains(string(makefile), "APP_NAME=shop\n") {
+		t.Error("Makefile should use the last element of the module path")
+	}
+
+	if moduleBaseName("example.com/a/b") != "b" || moduleBaseName("demo") != "demo" || moduleBaseName("example.com/x/v3") != "x" {
+		t.Error("moduleBaseName")
+	}
+}
+
+// module 最後一段不能當識別字（含 .）：CLI / gRPC / Desktop 退而用目錄名
+func TestNewInPlaceFallsBackToDirectoryName(t *testing.T) {
+	offlineGo(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(base, "mytool")
+	os.Mkdir(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/acme/my.tool\n\ngo 1.24\n"), 0o644)
+	t.Chdir(dir)
+	if err := runHyp(t, "new", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	root, _ := os.ReadFile(filepath.Join(dir, "app", "commands", "root.go"))
+	if !strings.Contains(string(root), `Use:   "mytool"`) {
+		t.Errorf("should fall back to the directory name:\n%.300s", root)
+	}
+}
+
+func TestNewInPlaceNeedsGoMod(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, args := range [][]string{{"new"}, {"new", "cli"}, {"api"}, {"new", "api"}} {
+		err := runHyp(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "go mod init") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("files were generated without a go.mod: %v", entries)
+	}
+}
+
+// 既有專案裡誤下 hyp new 不能倒進一整套骨架；--force 才生成，而且既有檔案保留
+func TestNewInPlaceProtectsExistingProjects(t *testing.T) {
+	dir := inPlaceProject(t, "github.com/acme/billing")
+	// README、LICENSE、.gitignore、.git 不算「已有專案檔案」
+	os.WriteFile(filepath.Join(dir, "README.md"), []byte("# mine\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("mine/\n"), 0o644)
+	os.Mkdir(filepath.Join(dir, ".git"), 0o755)
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644)
+
+	err := runHyp(t, "new", "cli")
+	if err == nil || !strings.Contains(err.Error(), "--force") || !strings.Contains(err.Error(), "main.go") {
+		t.Fatalf("err = %v", err)
+	}
+	if exists(filepath.Join(dir, "app")) {
+		t.Fatal("generated into an existing project without --force")
+	}
+
+	if err := runHyp(t, "new", "cli", "--force"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "main.go")); string(data) != "package main\n\nfunc main() {}\n" {
+		t.Error("existing main.go was overwritten")
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine/\n" {
+		t.Error("existing .gitignore was overwritten")
+	}
+	if !exists(filepath.Join(dir, "app", "commands", "root.go")) {
+		t.Error("project was not generated")
+	}
+
+	// 只有 README 等檔案時不需要 --force
+	dir = inPlaceProject(t, "github.com/acme/fresh")
+	os.WriteFile(filepath.Join(dir, "README.md"), []byte("# mine\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("MIT\n"), 0o644)
+	if err := runHyp(t, "new", "cli"); err != nil {
+		t.Fatalf("a freshly initialised directory should not need --force: %v", err)
+	}
+}
+
+// 既有 go.mod 已有的 require 版本不被改動
+func TestNewInPlaceKeepsExistingRequirements(t *testing.T) {
+	dir := inPlaceProject(t, "github.com/acme/tool")
+	gomod := "module github.com/acme/tool\n\ngo 1.25.3\n\nrequire github.com/spf13/cobra v1.8.0\n"
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644)
+	if err := runHyp(t, "new", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if !strings.Contains(string(data), "github.com/spf13/cobra v1.8.0") || strings.Contains(string(data), "cobra v1.9.1") {
+		t.Errorf("an existing requirement was changed:\n%s", data)
+	}
+	if !strings.Contains(string(data), hypgoModule+" v"+Version) {
+		t.Errorf("hypgo requirement missing:\n%s", data)
+	}
+}
+
+// --force 進入已有 go.mod 的具名目錄：沿用它的 module 路徑（先前拿目錄名當 module，import 全錯）
+func TestForceUsesModulePathOfExistingGoMod(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	os.Mkdir("svc", 0o755)
+	os.WriteFile(filepath.Join("svc", "go.mod"), []byte("module github.com/acme/svc\n\ngo 1.24\n"), 0o644)
+	if err := runHyp(t, "api", "svc", "--force"); err != nil {
+		t.Fatal(err)
+	}
+	main, _ := os.ReadFile(filepath.Join("svc", "main.go"))
+	if !strings.Contains(string(main), `"github.com/acme/svc/routers"`) {
+		t.Errorf("imports should use the module path of the existing go.mod:\n%.400s", main)
+	}
+}
+
+// 型別關鍵字後面多的參數、未知型別
+func TestNewArgumentErrors(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "new", "foo", "bar"); err == nil || !strings.Contains(err.Error(), "unknown project type") {
+		t.Errorf("err = %v", err)
+	}
+	if err := runHyp(t, "new", "cli", "a", "b"); err == nil {
+		t.Error("two names should be rejected")
 	}
 }

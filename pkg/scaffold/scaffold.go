@@ -13,6 +13,7 @@ import (
 	"text/template"
 	"time"
 
+	"golang.org/x/mod/modfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,6 +31,47 @@ var KeepExisting bool
 
 // OnKeep 在 KeepExisting 略過既有檔案時被呼叫（可為 nil）
 var OnKeep func(path string)
+
+// OnMerge 在 KeepExisting 把缺少的 require 併入既有 go.mod 時被呼叫（可為 nil）
+var OnMerge func(path string)
+
+// MergeGoMod 把 rendered（模板產生的 go.mod）裡、既有 go.mod 還沒有的 require 加進去，回報是否有變更。
+// module 路徑、go 版本與既有 require 的版本都不動：就地生成（hyp new 不給名稱）與 --force 時，
+// 專案的 go.mod 是使用者自己的，只補上骨架需要的依賴
+func MergeGoMod(path string, rendered []byte) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	cur, err := modfile.Parse(path, data, nil)
+	if err != nil {
+		return false, fmt.Errorf("scaffold: parse %s: %w", path, err)
+	}
+	want, err := modfile.Parse("go.mod", rendered, nil)
+	if err != nil {
+		return false, fmt.Errorf("scaffold: parse go.mod template: %w", err)
+	}
+	have := map[string]bool{}
+	for _, r := range cur.Require {
+		have[r.Mod.Path] = true
+	}
+	changed := false
+	for _, r := range want.Require {
+		if !have[r.Mod.Path] {
+			cur.AddNewRequire(r.Mod.Path, r.Mod.Version, r.Indirect)
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	cur.Cleanup()
+	out, err := cur.Format()
+	if err != nil {
+		return false, err
+	}
+	return true, os.WriteFile(path, out, 0644)
+}
 
 // GeneratedBy 為生成程式碼 @ai:generated 的 by= 值。程式碼出自模板而非 AI，
 // 先前依 .hyp/llm.yaml 或掃描 *.md 的關鍵字猜測供應商（README 提到 OpenAI 就標 by=openai），出處不實
@@ -430,6 +472,19 @@ func generateFile(dir, filename, tmplStr string, data interface{}) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if os.IsExist(err) {
 		if KeepExisting {
+			// go.mod 不是單純略過：補上骨架需要、既有檔案還沒有的 require
+			if filename == "go.mod" {
+				merged, err := MergeGoMod(path, content)
+				if err != nil {
+					return err
+				}
+				if merged {
+					if OnMerge != nil {
+						OnMerge(path)
+					}
+					return nil
+				}
+			}
 			if OnKeep != nil {
 				OnKeep(path)
 			}
