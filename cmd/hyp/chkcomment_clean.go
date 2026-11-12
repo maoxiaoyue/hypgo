@@ -11,12 +11,14 @@ import (
 )
 
 var chkcommentCleanCmd = &cobra.Command{
-	Use:   "clean",
+	Use:   "clean [file.go | dir | dir/...]...",
 	Short: "Remove //@ai annotations from Go source files",
 	Long: `Remove //@ai annotation lines from Go source files.
 
-With --file, only that file is cleaned. Without --file, every .go file
-under the current working directory (recursively) is cleaned. Common
+Arguments work like hyp chkcomment: .go files, directories (that directory
+only) or dir/... (recursive). --file is the same as naming one file.
+Without arguments or --file, every .go file under the current working
+directory (recursively) is cleaned. Common
 directories like vendor/, .git/, node_modules/, .hyp/ and testdata/
 are skipped, as are _test.go files. Only real comments are removed
 (text inside string literals is never touched) and compiler directives
@@ -36,6 +38,8 @@ content from before this run).
 
 Examples:
   hyp chkcomment clean                              # clean every .go file (level 1)
+  hyp chkcomment clean controllers/user.go          # one file
+  hyp chkcomment clean ./app/...                    # one directory tree
   hyp chkcomment clean -l 2                         # clean only @ai:think
   hyp chkcomment clean -l 3 -f controllers/user.go  # @ai:think + @ai:generated on one file`,
 	RunE: runChkCommentClean,
@@ -56,6 +60,9 @@ func runChkCommentClean(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if file != "" && len(args) > 0 {
+		return fmt.Errorf("use either --file or path arguments, not both")
+	}
 	if file != "" {
 		report, err := annotation.CleanFile(file, level)
 		if err != nil {
@@ -67,6 +74,31 @@ func runChkCommentClean(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("Cleaned %s: removed %d line(s) (backup: %s)\n",
 			report.Filename, report.Removed, report.BackupPath)
+		return nil
+	}
+
+	// 先前位置參數被忽略：hyp chkcomment clean controllers/user.go 會清掉整個工作目錄
+	if len(args) > 0 {
+		files, err := collectChkCommentFiles(args)
+		if err != nil {
+			return err
+		}
+		var reports []annotation.CleanReport
+		for _, f := range files {
+			report, err := annotation.CleanFile(f, level)
+			if err != nil {
+				reports = append(reports, annotation.CleanReport{Filename: f, Err: err})
+				continue
+			}
+			if report.Modified {
+				reports = append(reports, *report)
+			}
+		}
+		if len(reports) == 0 {
+			fmt.Printf("No files needed cleaning (%d checked).\n", len(files))
+			return nil
+		}
+		fmt.Print(annotation.FormatCleanReports(reports))
 		return nil
 	}
 

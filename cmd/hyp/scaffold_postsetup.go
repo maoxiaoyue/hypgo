@@ -9,43 +9,74 @@ import (
 	"path/filepath"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/semver"
 )
 
-// postScaffoldUpgrade 在 scaffold 完成後嘗試把專案的 hypgo 依賴升到 @latest
-// 並執行 go mod tidy。執行失敗（沒有 go / 沒網路 / 私有 module）時印警告但不中斷
-// 整個 hyp new 流程；產生的 go.mod 已寫入與 hyp 本身相同的版本（version.go）作為後備。
-func postScaffoldUpgrade(projectDir string) {
-	// 確認 go 在 PATH 中
+const hypgoModule = "github.com/maoxiaoyue/hypgo"
+
+// postScaffoldUpgrade 在 scaffold 完成後把專案的 hypgo 依賴升到 @latest 並執行 go mod tidy。
+// 失敗（沒有 go / 沒網路 / 私有 module）不中斷 hyp new；回傳要在最後顯示的警告，空字串表示依賴已就緒。
+// 先前警告印在一長串成功訊息之前，tidy 失敗的專案仍顯示「Successfully created」而沒有任何提醒
+func postScaffoldUpgrade(projectDir string) string {
 	if _, err := exec.LookPath("go"); err != nil {
-		fmt.Fprintf(os.Stderr, "\nWarning: 'go' not found in PATH; skipping `go get @latest`.\n")
-		fmt.Fprintf(os.Stderr, "  Manually run: cd %s && go get github.com/maoxiaoyue/hypgo@latest && go mod tidy\n", projectDir)
-		return
+		return fmt.Sprintf("'go' not found in PATH; dependencies were not downloaded.\n   Run: cd %s && go get %s@latest && go mod tidy", projectDir, hypgoModule)
 	}
 
 	fmt.Printf("\n📦 Fetching latest hypgo (@latest)...\n")
+	run := func(args ...string) error {
+		c := exec.Command("go", args...)
+		c.Dir = projectDir
+		c.Stdout, c.Stderr = os.Stdout, os.Stderr
+		return c.Run()
+	}
+	warn := upgradeHypgo(projectDir, run)
+	if warn == "" {
+		fmt.Printf("✓ hypgo %s; go.sum populated.\n", requiredHypgoVersion(projectDir))
+	}
+	return warn
+}
 
-	get := exec.Command("go", "get", "github.com/maoxiaoyue/hypgo@latest")
-	get.Dir = projectDir
-	get.Stdout = os.Stdout
-	get.Stderr = os.Stderr
-	if err := get.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: `go get @latest` failed: %v\n", err)
-		// 先前固定宣稱「v0.9.2 baseline」，實際 go.mod 卻可能是 git ls-remote 失敗後的 v0.8.5
-		fmt.Fprintf(os.Stderr, "  Project keeps the hypgo version written by hyp: %s (see go.mod).\n", requiredHypgoVersion(projectDir))
-		fmt.Fprintf(os.Stderr, "  Retry manually: cd %s && go get github.com/maoxiaoyue/hypgo@latest\n", projectDir)
-		return
+// upgradeHypgo 是 postScaffoldUpgrade 的流程本體；run 在專案目錄執行一個 go 子命令（測試以假的 run 注入）。
+//
+// 先拿掉 go.mod 裡的 require 再取 @latest：go.mod 寫的是 hyp 自身的版本，該版本還沒發布時
+// （hyp 比最新的 tag 新）go 連模組圖都載不了，`go get @latest` 會直接失敗而修不回來
+func upgradeHypgo(projectDir string, run func(args ...string) error) string {
+	want := requiredHypgoVersion(projectDir)
+	manual := fmt.Sprintf("cd %s && go get %s@latest && go mod tidy", projectDir, hypgoModule)
+
+	if err := run("mod", "edit", "-droprequire="+hypgoModule); err != nil {
+		return fmt.Sprintf("could not update go.mod: %v\n   Run: %s", err, manual)
+	}
+	if err := run("get", hypgoModule+"@latest"); err != nil {
+		// 還原成 hyp 自身的版本，讓離線建立的專案之後仍能 go mod tidy
+		if want != "unknown" {
+			run("mod", "edit", "-require="+hypgoModule+"@"+want)
+		}
+		return fmt.Sprintf("`go get %s@latest` failed (%v); go.mod keeps %s and dependencies were not downloaded.\n   Retry: %s",
+			hypgoModule, err, want, manual)
 	}
 
-	tidy := exec.Command("go", "mod", "tidy")
-	tidy.Dir = projectDir
-	tidy.Stdout = os.Stdout
-	tidy.Stderr = os.Stderr
-	if err := tidy.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: `go mod tidy` failed: %v\n", err)
-		return
+	warn := ""
+	got := requiredHypgoVersion(projectDir)
+	if semver.IsValid(want) && semver.IsValid(got) && semver.Compare(got, want) < 0 {
+		warn = fmt.Sprintf("this hyp is %s but the latest published hypgo is %s (now in go.mod): the generated code may use APIs that are not released yet.\n"+
+			"   If the build fails, point go.mod at a newer hypgo (a replace directive or a pseudo-version).", want, got)
 	}
+	if err := run("mod", "tidy"); err != nil {
+		msg := fmt.Sprintf("`go mod tidy` failed (%v, see the output above); the project will not build until it succeeds.", err)
+		if warn != "" {
+			return msg + "\n   Likely cause: " + warn
+		}
+		return msg
+	}
+	return warn
+}
 
-	fmt.Printf("✓ hypgo upgraded to latest; go.sum populated.\n")
+// printScaffoldWarning 在成功訊息之後顯示 postScaffoldUpgrade 的警告
+func printScaffoldWarning(warn string) {
+	if warn != "" {
+		fmt.Fprintf(os.Stderr, "\n⚠️  %s\n", warn)
+	}
 }
 
 // requiredHypgoVersion 回傳專案 go.mod require 的 hypgo 版本；讀不到時回 "unknown"
@@ -59,7 +90,7 @@ func requiredHypgoVersion(projectDir string) string {
 		return "unknown"
 	}
 	for _, r := range f.Require {
-		if r.Mod.Path == "github.com/maoxiaoyue/hypgo" {
+		if r.Mod.Path == hypgoModule {
 			return r.Mod.Version
 		}
 	}

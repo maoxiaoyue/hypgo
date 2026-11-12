@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,9 @@ type hypConfig struct {
 
 const hypConfigPath = ".hyp/config.json"
 
+// diffLogPrefix 是 diff-log 自己寫的檔案（相對專案根目錄），記錄未追蹤檔案時要排除
+const diffLogPrefix = "logs/ai.diff_"
+
 var diffLogCmd = &cobra.Command{
 	Use:   "diff-log",
 	Short: "Log AI changes to logs/ai.diff_YYYYMMDD.log",
@@ -29,16 +33,20 @@ When enabled, AI tools are instructed to run this after making changes,
 creating an audit trail of all AI modifications.
 
 Usage:
-  hyp diff-log            Record current changes
+  hyp diff-log            Record current changes (needs a git repository)
   hyp diff-log --on       Enable diff logging (AI tools will auto-log)
   hyp diff-log --off      Disable diff logging (saves tokens)
   hyp diff-log --status   Show current setting
 
-The setting is stored in .hyp/config.json (project-level).
+The setting is stored in .hyp/config.json and the log in logs/, both at the
+project root (the nearest go.mod going up; the current directory when there is
+none), so it works the same from any subdirectory.
 When enabled, "hyp ai-rules" includes the logging instruction in
 AGENTS.md and other AI tool config files.
 When disabled, the instruction is omitted — saving tokens.`,
-	RunE: runDiffLog,
+	Args:         cobra.NoArgs,
+	RunE:         runDiffLog,
+	SilenceUsage: true,
 }
 
 func init() {
@@ -46,6 +54,7 @@ func init() {
 	diffLogCmd.Flags().Bool("on", false, "Enable diff logging")
 	diffLogCmd.Flags().Bool("off", false, "Disable diff logging")
 	diffLogCmd.Flags().Bool("status", false, "Show current setting")
+	diffLogCmd.MarkFlagsMutuallyExclusive("on", "off", "status")
 }
 
 func runDiffLog(cmd *cobra.Command, args []string) error {
@@ -53,16 +62,16 @@ func runDiffLog(cmd *cobra.Command, args []string) error {
 	off, _ := cmd.Flags().GetBool("off")
 	showStatus, _ := cmd.Flags().GetBool("status")
 
+	// 先前一律用工作目錄：在子目錄 --on 寫到子目錄的 .hyp/config.json，
+	// 而 hyp ai-rules 讀的是專案根目錄，開關等於沒開
+	root := moduleRoot(".")
+
 	// 開關控制
-	if on {
-		return setDiffLog(true)
-	}
-	if off {
-		return setDiffLog(false)
+	if on || off {
+		return setDiffLog(root, on)
 	}
 	if showStatus {
-		enabled := isDiffLogEnabled()
-		if enabled {
+		if IsDiffLogEnabled(root) {
 			fmt.Println("diff-log: ON")
 			fmt.Println("AI tools will log changes to logs/ai.diff_YYYYMMDD.log")
 		} else {
@@ -73,13 +82,11 @@ func runDiffLog(cmd *cobra.Command, args []string) error {
 	}
 
 	// 預設動作：記錄當前改動
-	return recordDiffLog()
+	return recordDiffLog(root)
 }
 
-func setDiffLog(enabled bool) error {
-	cfg := loadHypConfig()
-	cfg.DiffLog = enabled
-	if err := saveHypConfig(cfg); err != nil {
+func setDiffLog(root string, enabled bool) error {
+	if err := saveDiffLogSetting(filepath.Join(root, hypConfigPath), enabled); err != nil {
 		return err
 	}
 
@@ -95,21 +102,32 @@ func setDiffLog(enabled bool) error {
 	return nil
 }
 
-func recordDiffLog() error {
-	logDir := "logs"
-	os.MkdirAll(logDir, 0755)
+func recordDiffLog(root string) error {
+	// 先前不在 git repo（或沒裝 git）時每個 git 指令都靜默失敗，印出「No changes to log.」
+	if _, err := exec.LookPath("git"); err != nil {
+		return errors.New("git not found in PATH; hyp diff-log records git changes")
+	}
+	if strings.TrimSpace(gitOutput(root, "rev-parse", "--is-inside-work-tree")) != "true" {
+		return fmt.Errorf("%s is not inside a git repository; hyp diff-log records uncommitted git changes", root)
+	}
 
 	date := time.Now().Format("20060102")
-	logFile := filepath.Join(logDir, "ai.diff_"+date+".log")
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
 	// 取得 git diff
-	diffStat := gitOutput("diff", "--stat", "HEAD")
-	diffNum := gitOutput("diff", "--numstat", "HEAD")
-	branch := gitOutput("branch", "--show-current")
-	untracked := gitOutput("ls-files", "--others", "--exclude-standard")
+	diffStat := gitOutput(root, "diff", "--stat", "HEAD")
+	diffNum := gitOutput(root, "diff", "--numstat", "HEAD")
+	branch := gitOutput(root, "branch", "--show-current")
 
-	if diffStat == "" && untracked == "" {
+	// 未追蹤的檔案；排除 diff-log 自己的日誌（logs/ 沒被忽略時，先前第二次執行會把上一次的日誌記成新檔案）
+	var untracked []string
+	for _, f := range strings.Split(gitOutput(root, "ls-files", "--others", "--exclude-standard"), "\n") {
+		if f = strings.TrimSpace(f); f != "" && !strings.HasPrefix(f, diffLogPrefix) {
+			untracked = append(untracked, f)
+		}
+	}
+
+	if diffStat == "" && len(untracked) == 0 {
 		fmt.Println("No changes to log.")
 		return nil
 	}
@@ -126,31 +144,38 @@ func recordDiffLog() error {
 		sb.WriteString("\n")
 	}
 
-	if untracked != "" {
+	if len(untracked) > 0 {
 		sb.WriteString("\n--- New Files (untracked) ---\n")
-		for _, f := range strings.Split(strings.TrimSpace(untracked), "\n") {
-			if f == "" {
-				continue
-			}
+		for _, f := range untracked {
 			sb.WriteString(fmt.Sprintf("  + %s\n", f))
 		}
 	}
 
 	sb.WriteString("\n==========================================\n\n")
 
+	logFile := filepath.Join(root, filepath.FromSlash(diffLogPrefix)+date+".log")
+	if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
-	defer f.Close()
-
-	f.WriteString(sb.String())
+	_, werr := f.WriteString(sb.String())
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return fmt.Errorf("failed to write %s: %w", logFile, werr)
+	}
 	fmt.Printf("Diff logged to %s\n", logFile)
 	return nil
 }
 
-func gitOutput(args ...string) string {
+// gitOutput 在 dir 執行 git，失敗時回空字串
+func gitOutput(dir string, args ...string) string {
 	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -160,33 +185,37 @@ func gitOutput(args ...string) string {
 
 // IsDiffLogEnabled 供 airules 模板使用：讀取專案目錄 dir 下的 .hyp/config.json
 func IsDiffLogEnabled(dir string) bool {
-	return loadHypConfigFrom(filepath.Join(dir, hypConfigPath)).DiffLog
-}
-
-func isDiffLogEnabled() bool {
-	cfg := loadHypConfig()
-	return cfg.DiffLog
-}
-
-func loadHypConfig() hypConfig {
-	return loadHypConfigFrom(hypConfigPath)
-}
-
-func loadHypConfigFrom(path string) hypConfig {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Join(dir, hypConfigPath))
 	if err != nil {
-		return hypConfig{}
+		return false
 	}
 	var cfg hypConfig
 	json.Unmarshal(data, &cfg)
-	return cfg
+	return cfg.DiffLog
 }
 
-func saveHypConfig(cfg hypConfig) error {
-	os.MkdirAll(filepath.Dir(hypConfigPath), 0755)
-	data, err := json.MarshalIndent(cfg, "", "  ")
+// saveDiffLogSetting 更新 config.json 的 diff_log，其餘鍵原樣保留。
+// 先前以只有 diff_log 一個欄位的 struct 整個重寫，檔案裡的其他設定會被丟掉；
+// 檔案不是合法 JSON 時回錯，不拿空設定蓋掉
+func saveDiffLogSetting(path string, enabled bool) error {
+	settings := map[string]any{}
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("%s is not valid JSON (%v); fix or delete it first", path, err)
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	settings["diff_log"] = enabled
+
+	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(hypConfigPath, data, 0644)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(out, '\n'), 0644)
 }

@@ -39,6 +39,7 @@ Integration with go test:
   Option B — add //go:generate hyp testgen $GOFILE to a source file,
             then run: go generate ./... && go test ./...
 `,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runTestgen,
 }
 
@@ -64,6 +65,9 @@ func runTestgen(cmd *cobra.Command, args []string) error {
 	}
 
 	// 單一檔案
+	if file != "" && len(args) > 0 {
+		return fmt.Errorf("use either --file or a target directory, not both")
+	}
 	if file != "" {
 		rep, err := testgen.GenerateForFile(file, opts)
 		if err != nil {

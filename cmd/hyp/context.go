@@ -52,6 +52,7 @@ Examples:
   hyp context -f json                      Print JSON to stdout
   hyp context -o .hyp/manifest.yaml        Save YAML to file
   hyp context -p ./cmd/server              Run a main package outside the root`,
+	Args: cobra.NoArgs,
 	RunE: runContext,
 }
 

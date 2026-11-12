@@ -44,6 +44,7 @@ Examples:
   hyp migrate diff                    Generate PostgreSQL migration
   hyp migrate diff --dialect mysql    Generate MySQL migration
   hyp migrate snapshot                Save current schema snapshot`,
+	RunE: requireSubcommand,
 }
 
 var migrateDiffCmd = &cobra.Command{
@@ -100,6 +101,7 @@ Examples:
   hyp migrate diff --dialect mysql              MySQL dialect
   hyp migrate diff -n add_user_bio              migrations/<ts>_add_user_bio.up.sql
   hyp migrate diff -o db/migrations/ -d mysql   Custom output directory`,
+	Args:         cobra.NoArgs,
 	RunE:         runMigrateDiff,
 	SilenceUsage: true,
 }
@@ -129,6 +131,7 @@ Flags:
 Examples:
   hyp migrate snapshot
   hyp migrate snapshot -d mysql -s db/schema.json`,
+	Args:         cobra.NoArgs,
 	RunE:         runMigrateSnapshot,
 	SilenceUsage: true,
 }

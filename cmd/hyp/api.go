@@ -72,6 +72,12 @@ func runAPI(cmd *cobra.Command, args []string) error {
 	if err := createGitKeep(filepath.Join(projectName, "logs")); err != nil {
 		return err
 	}
+	// migrations/ 由 hyp migrate diff 寫入。先前內附手寫的 001_create_users / 002_create_roles，
+	// 欄位與生成的 User model 不同；第一次 hyp migrate diff 又產生一份 CREATE TABLE "users"，
+	// 依序套用時因資料表已存在而失敗
+	if err := createGitKeep(filepath.Join(projectName, "migrations")); err != nil {
+		return err
+	}
 
 	// 創建所有非 Go 檔案（設定、部署、遷移）
 	files := []fileTemplate{
@@ -86,16 +92,9 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		{Path: "Dockerfile", Content: dockerfileContent},
 		{Path: "docker-compose.yml", Content: dockerComposeContent},
 		{Path: "Makefile", Content: makefileContent},
-		{Path: ".gitignore", Content: gitignoreContent},
-		{Path: ".air.toml", Content: airTomlContent},
+		{Path: ".gitignore", Content: scaffold.GitignoreTemplate},
 		{Path: "README.md", Content: readmeContent},
 		{Path: "go.mod", Content: goModContent},
-
-		// 數據庫遷移
-		{Path: "migrations/001_create_users.up.sql", Content: createUsersUpSQL},
-		{Path: "migrations/001_create_users.down.sql", Content: createUsersDownSQL},
-		{Path: "migrations/002_create_roles.up.sql", Content: createRolesUpSQL},
-		{Path: "migrations/002_create_roles.down.sql", Content: createRolesDownSQL},
 	}
 
 	// 模板數據
@@ -144,10 +143,11 @@ func runAPI(cmd *cobra.Command, args []string) error {
 	}
 
 	// 把生成專案的 hypgo 依賴升到 @latest（如果可以）
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(projectName)
 
 	// 打印成功信息
 	printSuccessMessage(projectName)
+	printScaffoldWarning(warn)
 
 	return nil
 }
@@ -591,6 +591,7 @@ func createAPIMainFile(projectName string) error {
 		"\t}\n\n" +
 		"\t// 所有路由與中間件定義於 routers/router.go\n" +
 		"\trouters.Setup(app.Server().Router())\n\n" +
+		startupLineSnippet +
 		"\t// Run 會阻塞到收到 SIGINT/SIGTERM 並完成優雅關閉\n" +
 		"\tif err := app.Run(); err != nil {\n" +
 		"\t\tlog.Errorf(\"server error: %v\", err)\n" +
@@ -655,14 +656,14 @@ func printSuccessMessage(projectName string) {
 	fmt.Printf("   ├── routers/            # router.go（Setup）+ user.go / auth.go（Schema 路由）+ middleware.go\n")
 	fmt.Printf("   ├── config/config.yaml  # server / database / logger\n")
 	fmt.Printf("   ├── .hyp/               # llm.yaml / comment.yaml / config.yaml / crypt.yaml\n")
-	fmt.Printf("   ├── migrations/         # SQL migrations\n")
+	fmt.Printf("   ├── migrations/         # hyp migrate diff 產生的 SQL（golang-migrate 格式）\n")
 	fmt.Printf("   ├── logs/               # .gitkeep（logger 輸出 logs/api.log）\n")
 	fmt.Printf("   ├── certs/              # make cert → HTTP/3 用 TLS 憑證\n")
 	fmt.Printf("   ├── Dockerfile / docker-compose.yml / Makefile\n")
 	fmt.Printf("   └── main.go             # hypgo.NewWithConfig 嚴格載入設定 + routers.Setup\n")
 	fmt.Printf("\n🚀 Quick Start:\n")
 	fmt.Printf("   cd %s\n", projectName)
-	fmt.Printf("   go run .                # http://localhost:8080/health\n")
+	fmt.Printf("   hyp run                 # 熱重載；或 go run .（http://localhost:8080/health）\n")
 	fmt.Printf("   export JWT_SECRET=...   # /api/auth/{register,login,me}（middleware.JWT + HS256）\n")
 	fmt.Printf("   make cert               # 產生自簽憑證後，config.yaml 開 tls.enabled 即得 HTTP/3\n")
 	fmt.Printf("   hyp generate controller order   # 新增資源 → 在 routers/router.go 註冊\n")
@@ -722,7 +723,7 @@ const envExampleContent = `# JWT_SECRET：HS256 簽發／驗證金鑰（routers/
 # 未設定時每次啟動用隨機金鑰，重啟後既有 token 失效——正式環境務必設定（≥ 32 bytes）
 JWT_SECRET=change-me-to-a-random-secret-of-at-least-32-bytes
 
-# DB_DSN：供 docker-compose.yml 與 Makefile 的 migrate 目標使用；
+# DB_DSN：供 Makefile 的 migrate 目標使用；
 # 應用程式本身讀 config/config.yaml 的 database.dsn（不展開環境變數）
 DB_DSN=postgres://hypgo:password@localhost:5432/hypgo_db?sslmode=disable
 `
@@ -771,21 +772,19 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 CMD ["./main"]`
 
-const dockerComposeContent = `version: '3.8'
-
-services:
+const dockerComposeContent = `services:
   api:
     build: .
-    container_name: hypgo-api
+    container_name: {{.ProjectName}}-api
     restart: unless-stopped
     ports:
       - "8080:8080"
       - "8443:8443"
+    # 應用程式只讀 config/config.yaml（不展開環境變數）。要連下面的 postgres / redis，
+    # 在 config/config.yaml 設定：
+    #   database.dsn: postgres://hypgo:password@postgres:5432/hypgo_db?sslmode=disable
+    #   database.redis.addr: redis:6379
     environment:
-      - ENV=development
-      - DB_DSN=postgres://hypgo:password@postgres:5432/hypgo_db?sslmode=disable
-      - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=
       - JWT_SECRET=your-secret-key-change-this-in-production
     volumes:
       - ./config:/app/config:ro
@@ -799,15 +798,16 @@ services:
 
   postgres:
     image: postgres:15-alpine
-    container_name: hypgo-postgres
+    container_name: {{.ProjectName}}-postgres
     restart: unless-stopped
     environment:
       - POSTGRES_USER=hypgo
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=hypgo_db
+    # migrations/ 是 golang-migrate 格式（.up.sql / .down.sql 成對），以 make migrate 套用；
+    # 不要掛進 /docker-entrypoint-initdb.d：它依檔名順序全部執行，down 會排在 up 前面
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     networks:
@@ -815,7 +815,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: hypgo-redis
+    container_name: {{.ProjectName}}-redis
     restart: unless-stopped
     command: redis-server --appendonly yes
     volumes:
@@ -836,7 +836,7 @@ networks:
 const makefileContent = `.PHONY: help build run test clean docker migrate dev
 
 # Variables
-APP_NAME=hypgo-api
+APP_NAME={{.ProjectName}}
 MAIN_PATH=.
 DOCKER_IMAGE=$(APP_NAME):latest
 
@@ -862,9 +862,9 @@ run: ## Run the application
 	@echo "$(GREEN)Running $(APP_NAME)...$(NC)"
 	@go run $(MAIN_PATH)
 
-dev: ## Run with hot reload
+dev: ## Run with hot reload (hyp run)
 	@echo "$(GREEN)Running in development mode...$(NC)"
-	@air
+	@hyp run
 
 test: ## Run tests
 	@echo "$(GREEN)Running tests...$(NC)"
@@ -872,8 +872,9 @@ test: ## Run tests
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "$(GREEN)Tests complete!$(NC)"
 
-lint: ## Run linter
+lint: ## Run linters (Schema alignment + golangci-lint)
 	@echo "$(GREEN)Running linter...$(NC)"
+	@hyp lint --deep
 	@golangci-lint run ./...
 
 fmt: ## Format code
@@ -902,6 +903,9 @@ docker-compose-down: ## Stop all services
 	@echo "$(YELLOW)Stopping services...$(NC)"
 	@docker-compose down
 
+migrate-diff: ## Generate a migration from model changes (hyp migrate diff)
+	@hyp migrate diff
+
 migrate: ## Run database migrations
 	@echo "$(GREEN)Running migrations...$(NC)"
 	@migrate -path migrations -database "$${DB_DSN}" up
@@ -910,23 +914,12 @@ migrate-down: ## Rollback migrations
 	@echo "$(YELLOW)Rolling back migrations...$(NC)"
 	@migrate -path migrations -database "$${DB_DSN}" down 1
 
-migrate-create: ## Create new migration
-	@echo "$(GREEN)Creating migration: $(name)$(NC)"
-	@migrate create -ext sql -dir migrations -seq $(name)
-
-seed: ## Seed the database
-	@echo "$(GREEN)Seeding database...$(NC)"
-	@go run scripts/seed.go
-
-docs: ## Generate API documentation
-	@echo "$(GREEN)Generating documentation...$(NC)"
-	@swag init -g main.go -o docs
+context: ## Regenerate .hyp/context.yaml (route manifest for AI tools)
+	@hyp context -o .hyp/context.yaml
 
 install-tools: ## Install development tools
 	@echo "$(GREEN)Installing development tools...$(NC)"
-	@go install github.com/cosmtrek/air@latest
 	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-	@go install github.com/swaggo/swag/cmd/swag@latest
 	@go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 	@echo "$(GREEN)Tools installed!$(NC)"
 
@@ -938,116 +931,6 @@ cert: ## Generate self-signed certificates
 
 .DEFAULT_GOAL := help`
 
-const gitignoreContent = `# Binaries
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-bin/
-
-# Test binary
-*.test
-
-# Output
-*.out
-coverage.html
-
-# Dependency directories
-vendor/
-
-# Go workspace
-go.work
-
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# 本機產生的報告（.hyp/ 其餘設定要進版控）
-.hyp/eval_history.jsonl
-.hyp/observe_*.html
-
-# Logs（保留 logs/.gitkeep 讓目錄存在）
-logs/*
-!logs/.gitkeep
-*.log
-
-# Certificates
-certs/
-*.pem
-*.key
-*.crt
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-
-# Temporary files
-tmp/
-temp/
-
-# Build artifacts
-dist/
-build/
-
-# Air config
-.air.tmp/`
-
-const airTomlContent = `root = "."
-testdata_dir = "testdata"
-tmp_dir = "tmp"
-
-[build]
-  args_bin = []
-  bin = "./tmp/main"
-  cmd = "go build -o ./tmp/main ."
-  delay = 1000
-  exclude_dir = ["assets", "tmp", "vendor", "testdata", "docs", "scripts", "logs", "certs"]
-  exclude_file = []
-  exclude_regex = ["_test.go"]
-  exclude_unchanged = false
-  follow_symlink = false
-  full_bin = ""
-  include_dir = []
-  include_ext = ["go", "tpl", "tmpl", "html"]
-  include_file = []
-  kill_delay = "0s"
-  log = "build-errors.log"
-  poll = false
-  poll_interval = 0
-  rerun = false
-  rerun_delay = 500
-  send_interrupt = false
-  stop_on_error = false
-
-[color]
-  app = ""
-  build = "yellow"
-  main = "magenta"
-  runner = "green"
-  watcher = "cyan"
-
-[log]
-  main_only = false
-  time = false
-
-[misc]
-  clean_on_exit = false
-
-[screen]
-  clear_on_rebuild = false
-  keep_scroll = true`
-
 const readmeContent = `# {{.ProjectName}}
 
 API server built with the HypGo framework — Schema-first routes, HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC).
@@ -1056,8 +939,10 @@ API server built with the HypGo framework — Schema-first routes, HTTP/1.1 + HT
 
 ` + "```bash" + `
 go mod tidy
-go run .                 # http://localhost:8080/health
+hyp run                  # hot reload; or: go run .   → http://localhost:8080/health
 ` + "```" + `
+
+The logger writes to ` + "`logs/api.log`" + ` by default (` + "`logger.output`" + ` in ` + "`config/config.yaml`" + `; set it to ` + "`stdout`" + ` to log to the terminal).
 
 HTTP/3 needs TLS: run ` + "`make cert`" + ` (self-signed cert into ` + "`certs/`" + `), then set ` + "`server.tls.enabled: true`" + ` in ` + "`config/config.yaml`" + `.
 ` + "`server.protocol: auto`" + ` serves HTTP/1.1 + HTTP/2 over TCP and, once TLS is on, HTTP/3 over UDP as well.
@@ -1117,6 +1002,16 @@ svc := services.NewUserService(db, log)
 
 Redis: add ` + "`hidb.WithRedis(redis.New())`" + ` (import ` + "`github.com/maoxiaoyue/hypgo/pkg/hidb/redis`" + `) next to ` + "`WithDialect`" + `.
 
+### Migrations
+
+` + "`migrations/`" + ` starts empty. Models register themselves with ` + "`migrate.GlobalRegistry()`" + `, and
+` + "`hyp migrate diff`" + ` compares them with ` + "`.hyp/schema_snapshot.json`" + ` to write golang-migrate files:
+
+` + "```bash" + `
+hyp migrate diff -n create_users   # migrations/<timestamp>_create_users.up.sql / .down.sql
+make migrate                       # apply with golang-migrate (needs DB_DSN, see .env.example)
+` + "```" + `
+
 ## Project Structure
 
 ` + "```" + `
@@ -1128,7 +1023,7 @@ Redis: add ` + "`hidb.WithRedis(redis.New())`" + ` (import ` + "`github.com/maox
 ├── routers/            # router.go (Setup) + <resource>.go Schema routes + middleware.go
 ├── config/config.yaml  # server / database / logger
 ├── .hyp/               # llm.yaml / comment.yaml / config.yaml / crypt.yaml
-├── migrations/         # SQL migrations (make migrate)
+├── migrations/         # written by hyp migrate diff, applied with make migrate
 ├── logs/               # logger output (logs/api.log)
 ├── certs/              # make cert
 └── main.go             # hypgo.NewWithConfig (strict config) + routers.Setup
@@ -1137,7 +1032,7 @@ Redis: add ` + "`hidb.WithRedis(redis.New())`" + ` (import ` + "`github.com/maox
 ## Tooling
 
 ` + "```bash" + `
-make dev          # hot reload (air)
+make dev          # hot reload (hyp run)
 make test         # go test -race
 make cert         # self-signed TLS cert for HTTP/3
 make migrate      # golang-migrate (needs DB_DSN, see .env.example)
@@ -1154,106 +1049,3 @@ require (
 	golang.org/x/crypto v0.47.0 // bcrypt（auth_service.go）
 )
 `
-
-const createUsersUpSQL = `
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(50) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL,
-    first_name VARCHAR(100),
-    last_name VARCHAR(100),
-    avatar VARCHAR(500),
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP WITH TIME ZONE
-);
-
-CREATE INDEX idx_users_email ON users(email);
-CREATE INDEX idx_users_username ON users(username);
-CREATE INDEX idx_users_deleted_at ON users(deleted_at);
-
--- 更新時間觸發器
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
-
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE
-    ON users FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
-`
-
-const createUsersDownSQL = `DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-DROP FUNCTION IF EXISTS update_updated_at_column();
-DROP TABLE IF EXISTS users;`
-
-const createRolesUpSQL = `CREATE TABLE IF NOT EXISTS roles (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(50) UNIQUE NOT NULL,
-    description TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS permissions (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL,
-    resource VARCHAR(100),
-    action VARCHAR(50),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
-    assigned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, role_id)
-);
-
-CREATE TABLE IF NOT EXISTS role_permissions (
-    role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
-    permission_id INTEGER REFERENCES permissions(id) ON DELETE CASCADE,
-    granted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (role_id, permission_id)
-);
-
--- 插入默認角色
-INSERT INTO roles (name, description) VALUES 
-    ('admin', 'Administrator with full access'),
-    ('user', 'Regular user with limited access'),
-    ('moderator', 'Moderator with content management access')
-ON CONFLICT (name) DO NOTHING;
-
--- 插入默認權限
-INSERT INTO permissions (name, resource, action) VALUES 
-    ('users.read', 'users', 'read'),
-    ('users.write', 'users', 'write'),
-    ('users.delete', 'users', 'delete'),
-    ('posts.read', 'posts', 'read'),
-    ('posts.write', 'posts', 'write'),
-    ('posts.delete', 'posts', 'delete')
-ON CONFLICT (name) DO NOTHING;
-
--- 為 admin 角色分配所有權限
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id
-FROM roles r, permissions p
-WHERE r.name = 'admin'
-ON CONFLICT DO NOTHING;
-
--- 為 user 角色分配讀取權限
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id
-FROM roles r, permissions p
-WHERE r.name = 'user' AND p.action = 'read'
-ON CONFLICT DO NOTHING;`
-
-const createRolesDownSQL = `DROP TABLE IF EXISTS role_permissions;
-DROP TABLE IF EXISTS user_roles;
-DROP TABLE IF EXISTS permissions;
-DROP TABLE IF EXISTS roles;`

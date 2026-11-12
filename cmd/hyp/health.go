@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -36,6 +37,7 @@ Examples:
   hyp health
   hyp health --path /api/health
   hyp health -c config/prod.yaml --insecure`,
+	Args:         cobra.NoArgs,
 	RunE:         runHealth,
 	SilenceUsage: true,
 }
@@ -46,15 +48,20 @@ func runHealth(cmd *cobra.Command, args []string) error {
 	insecure, _ := cmd.Flags().GetBool("insecure")
 
 	addr, useTLS := ":8080", false
-	v := viper.New()
-	v.SetConfigFile(cfgFile)
-	if err := v.ReadInConfig(); err == nil {
+	// 預設設定檔不存在時用 :8080；存在但讀不了（格式錯誤等）一律回錯。
+	// 先前預設路徑的檔案壞掉也靜默改查 :8080，錯誤訊息變成「localhost:8080 連不上」
+	if _, statErr := os.Stat(cfgFile); statErr == nil {
+		v := viper.New()
+		v.SetConfigFile(cfgFile)
+		if err := v.ReadInConfig(); err != nil {
+			return fmt.Errorf("read %s: %w", cfgFile, err)
+		}
 		if a := v.GetString("server.addr"); a != "" {
 			addr = a
 		}
 		useTLS = v.GetBool("server.tls.enabled")
 	} else if cmd.Flags().Changed("config") {
-		return fmt.Errorf("read %s: %w", cfgFile, err)
+		return fmt.Errorf("read %s: %w", cfgFile, statErr)
 	}
 
 	// 先前以 addr[1:] 取埠號：127.0.0.1:9999 會變成 localhost:27.0.0.1:9999；也忽略 TLS

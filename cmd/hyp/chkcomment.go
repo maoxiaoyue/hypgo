@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,7 +24,8 @@ const, var) and check whether each has a standardized documentation comment.
 
 Arguments may be .go files, directories (that directory only) or dir/...
 (recursive, e.g. ./...). When expanding directories, vendor/, testdata/,
-hidden directories and _test.go files are skipped.
+hidden directories, _test.go files and generated files (a "// Code generated
+... DO NOT EDIT." header) are skipped.
 
 Which comments are required follows .hyp/comment.yaml (searched upward from
 each file, falling back to the current directory; missing file = defaults):
@@ -362,6 +364,10 @@ func collectChkCommentFiles(args []string) ([]string, error) {
 				!strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 				return nil
 			}
+			// 先前 --fix ./... 會改寫 protoc 等工具的產出（補上佔位註解），下次重新生成又被蓋掉
+			if isGeneratedGoFile(path) {
+				return nil
+			}
 			if !seen[path] {
 				seen[path] = true
 				files = append(files, path)
@@ -373,6 +379,27 @@ func collectChkCommentFiles(args []string) ([]string, error) {
 		}
 	}
 	return files, nil
+}
+
+// generatedHeader 是 Go 慣例的生成檔標記（https://go.dev/s/generatedcode）
+var generatedHeader = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+
+// isGeneratedGoFile 判斷檔案是否為工具生成：package 子句之前有一行生成檔標記
+func isGeneratedGoFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if generatedHeader.MatchString(line) {
+			return true
+		}
+		if strings.HasPrefix(line, "package ") {
+			return false
+		}
+	}
+	return false
 }
 
 // resolveLLMConfigPath 處理 --llm 參數及預設探測順序

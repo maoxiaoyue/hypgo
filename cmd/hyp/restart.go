@@ -30,6 +30,7 @@ the old process shuts down gracefully.
 
 Requires server.enable_graceful_restart: true in config/config.yaml.
 Not supported on Windows.`,
+	Args:         cobra.NoArgs,
 	RunE:         runRestart,
 	SilenceUsage: true,
 }

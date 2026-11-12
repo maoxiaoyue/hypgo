@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"go/format"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,21 +39,11 @@ Examples:
 			// hyp new <name> → web 專案（預設）
 			return runNew(cmd, args)
 		}
-		// hyp new <type> <name>
-		projectType := args[0]
-		projectName := args[1]
-		switch projectType {
-		case "web":
-			return runNew(cmd, []string{projectName})
-		case "cli":
-			return runNewCLI(projectName)
-		case "desktop":
-			return runNewDesktop(projectName, false)
-		case "grpc":
-			return runNewGRPC(projectName)
-		default:
-			return fmt.Errorf("unknown project type: %s (use web, cli, desktop, or grpc)", projectType)
+		// hyp new web <name>；cli / desktop / grpc 是子命令，不會走到這裡
+		if args[0] != "web" {
+			return fmt.Errorf("unknown project type: %s (use web, cli, desktop, or grpc)", args[0])
 		}
+		return runNew(cmd, args[1:])
 	},
 }
 
@@ -176,6 +167,11 @@ func checkNewProject(cmd *cobra.Command, name string) error {
 		return err
 	}
 	force, _ := cmd.Flags().GetBool("force")
+	// --force：既有檔案保留並略過。先前遇到第一個既有檔案就中斷（GitHub 新建的 repo 通常已有
+	// README.md、.gitignore），留下寫到一半、重跑卡在別的檔案而無法續完的專案
+	keepExisting = force
+	scaffold.KeepExisting = force
+	scaffold.OnKeep = reportKept
 	fi, err := os.Stat(name)
 	if os.IsNotExist(err) {
 		return nil
@@ -208,11 +204,32 @@ func validateProjectName(name string) error {
 	return nil
 }
 
-// writeNewFile 建立新檔案；檔案已存在時回錯，不截斷（hyp new / hyp api --force 不覆寫既有檔案）
+// keepExisting 由 checkNewProject 依 --force 設定：為 true 時 writeNewFile 保留既有檔案並略過
+var keepExisting bool
+
+// reportKept 回報被 --force 保留的既有檔案
+func reportKept(path string) {
+	fmt.Printf("  = kept existing %s\n", filepath.ToSlash(path))
+}
+
+// writeNewFile 建立新檔案，絕不截斷既有檔案：已存在時回錯，--force（keepExisting）時保留並略過。
+// .go 檔先經 gofmt：先前 hyp api 的 auth_service.go、routers/auth.go 過不了 gofmt -l，
+// 新專案的格式檢查一開始就失敗；模板產出不合法的 Go 時也在此回錯
 func writeNewFile(path string, data []byte, perm os.FileMode) error {
+	if strings.HasSuffix(path, ".go") {
+		formatted, err := format.Source(data)
+		if err != nil {
+			return fmt.Errorf("generated invalid Go for %s: %w", path, err)
+		}
+		data = formatted
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		if os.IsExist(err) {
+			if keepExisting {
+				reportKept(path)
+				return nil
+			}
 			return fmt.Errorf("file already exists: %s", path)
 		}
 		return err
@@ -230,7 +247,8 @@ func runNewCLI(projectName string) error {
 		return fmt.Errorf("failed to create CLI project: %w", err)
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(projectName)
+	defer printScaffoldWarning(warn)
 
 	fmt.Printf("\n✨ Successfully created CLI project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
@@ -267,7 +285,8 @@ func runNewDesktop(projectName string, installDeps bool) error {
 		return fmt.Errorf("failed to create desktop project: %w", err)
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(projectName)
+	defer printScaffoldWarning(warn)
 
 	fmt.Printf("\n✨ Successfully created Desktop project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
@@ -305,9 +324,11 @@ func runNewGRPC(projectName string) error {
 		return fmt.Errorf("failed to create gRPC project: %w", err)
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(projectName)
+	defer printScaffoldWarning(warn)
 
-	lowerName := strings.ToLower(projectName)
+	// 套件與檔名用識別字形式（user-service → user_service）
+	lowerName := strings.ToLower(scaffold.ProjectIdent(projectName))
 	fmt.Printf("\n✨ Successfully created gRPC project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
 	fmt.Printf("   %s/\n", projectName)
@@ -424,8 +445,12 @@ func runNew(cmd *cobra.Command, args []string) error {
 	if err := createGoMod(projectName); err != nil {
 		return err
 	}
+	if err := writeNewFile(filepath.Join(projectName, ".gitignore"), []byte(scaffold.GitignoreTemplate), 0644); err != nil {
+		return err
+	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(projectName)
+	defer printScaffoldWarning(warn)
 
 	fmt.Printf("✨ Successfully created full-stack project: %s\n", projectName)
 	fmt.Printf("📁 Project structure:\n")
@@ -527,6 +552,11 @@ func createHypConfigFile(configDir string) error {
 	return writeNewFile(filename, []byte(scaffold.HypConfigYamlTemplate), 0644)
 }
 
+// startupLineSnippet 是生成的 main.go 在 app.Run() 前印的一行。
+// logger 預設寫到 logs/ 下的檔案：先前 go run . 後終端機完全沒有輸出，看不出服務是否啟動、日誌在哪
+const startupLineSnippet = "\t// logger 預設寫檔，終端機另外印一行，方便確認位址與日誌位置\n" +
+	"\tfmt.Printf(\"starting on %s (logs: %s)\\n\", app.Config().Server.Addr, app.Config().Logger.Output)\n\n"
+
 func createMainFile(projectName string) error {
 	mainContent := "package main\n\n" +
 		"import (\n" +
@@ -547,6 +577,7 @@ func createMainFile(projectName string) error {
 		"\t}\n\n" +
 		"\t// 所有路由與中間件定義於 routers/router.go\n" +
 		"\trouters.Setup(app.Server().Router())\n\n" +
+		startupLineSnippet +
 		"\t// Run 會阻塞到收到 SIGINT/SIGTERM 並完成優雅關閉（Start() 內建，不必自己處理訊號）\n" +
 		"\tif err := app.Run(); err != nil {\n" +
 		"\t\tapp.Logger().Errorf(\"server error: %v\", err)\n" +
@@ -600,7 +631,7 @@ func createRouterSetup(projectName, today string) error {
 		"\t\"" + projectName + "/templates\"\n" +
 		")\n\n" +
 		"// Setup 註冊所有路由與中間件。\n" +
-		"// 在 main.go 呼叫：routers.Setup(srv.Router())。\n" +
+		"// 在 main.go 呼叫：routers.Setup(app.Server().Router())。\n" +
 		"func Setup(r *router.Router) {\n" +
 		"\t// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
 		"\t// 不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。\n" +
@@ -679,7 +710,7 @@ func createFullStackController(projectName, today string) error {
 		"\t\tSuccess: true,\n" +
 		"\t\tMessage: \"HypGo Framework\",\n" +
 		"\t\tData: models.InfoDetail{\n" +
-		"\t\t\tVersion:  \"0.8.6\",\n" +
+		"\t\t\tVersion:  \"" + Version + "\",\n" +
 		"\t\t\tProtocol: c.Request.Proto,\n" +
 		"\t\t},\n" +
 		"\t})\n" +

@@ -69,6 +69,15 @@ func runImpact(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// requireModuleRoot 回傳目前專案（自工作目錄往上最近的 go.mod）的根目錄；不在 Go module 內時回錯
+func requireModuleRoot() (string, error) {
+	root := moduleRoot(".")
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		return "", fmt.Errorf("no go.mod in this directory or its parents: run inside a project")
+	}
+	return root, nil
+}
+
 // moduleRoot 自目標檔案往上找 go.mod 所在目錄；找不到時回傳工作目錄。
 // 先前固定用工作目錄：在子目錄執行時路徑與依賴全部算錯
 func moduleRoot(file string) string {
