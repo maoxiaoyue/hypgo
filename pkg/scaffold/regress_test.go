@@ -192,3 +192,92 @@ func TestLLMYamlTemplateMatchesExample(t *testing.T) {
 		t.Error("pkg/config/llm_example.yaml differs from LLMYamlTemplate")
 	}
 }
+
+// 專案名稱允許連字號；識別字、套件名與檔名改用底線形式。
+// 歷史 bug：與資源名稱共用規則，hyp new cli my-tool 被拒絕，hyp new my-app 卻可以
+func TestProjectNamesWithHyphens(t *testing.T) {
+	for name, ok := range map[string]bool{
+		"my-tool": true, "user_service": true, "app2": true,
+		"": false, "-lead": false, "my tool": false, "a/b": false, "..": false, "my.app": false,
+	} {
+		if err := ValidateProjectName(name); (err == nil) != ok {
+			t.Errorf("ValidateProjectName(%q) = %v, want ok=%v", name, err, ok)
+		}
+	}
+	// 資源名稱（hyp generate）仍不接受連字號
+	if err := ValidateName("order-item"); err == nil {
+		t.Error("resource names should still reject hyphens")
+	}
+	if got := CamelName("user-service"); got != "UserService" {
+		t.Errorf("CamelName = %q", got)
+	}
+
+	dir := filepath.Join(t.TempDir(), "user-service")
+	if err := GenerateGRPCProject(dir, "user-service", "user-service"); err != nil {
+		t.Fatal(err)
+	}
+	proto, err := os.ReadFile(filepath.Join(dir, "app", "proto", "user_servicepb", "user_service.proto"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"package user_servicepb;", `go_package = "user-service/app/proto/user_servicepb"`, "service UserServiceService"} {
+		if !strings.Contains(string(proto), want) {
+			t.Errorf("proto missing %q", want)
+		}
+	}
+	mk, _ := os.ReadFile(filepath.Join(dir, "Makefile"))
+	if !strings.Contains(string(mk), "bin/user-service") {
+		t.Error("binary should be named after the project")
+	}
+}
+
+// 歷史 bug：只有 hyp api 產生 .gitignore
+func TestProjectsHaveGitignore(t *testing.T) {
+	gens := map[string]func(string, string, string) error{
+		"cli": GenerateCLIProject, "desktop": GenerateDesktopProject, "grpc": GenerateGRPCProject,
+	}
+	for kind, gen := range gens {
+		dir := filepath.Join(t.TempDir(), "demo")
+		if err := gen(dir, "demo", "demo"); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+		if err != nil {
+			t.Errorf("%s: no .gitignore", kind)
+			continue
+		}
+		for _, want := range []string{"hypgo.pid", "*.bak", "logs/*", "*.key"} {
+			if !strings.Contains(string(data), want) {
+				t.Errorf("%s: .gitignore missing %s", kind, want)
+			}
+		}
+	}
+}
+
+// KeepExisting：既有檔案保留並回報，其餘照常生成。
+// 歷史 bug：遇到第一個既有檔案就回錯，留下寫到一半的專案
+func TestKeepExistingSkipsFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "demo")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("mine\n"), 0o644)
+
+	if err := GenerateCLIProject(dir, "demo", "demo"); err == nil {
+		t.Fatal("an existing file should be an error by default")
+	}
+
+	var kept []string
+	KeepExisting, OnKeep = true, func(p string) { kept = append(kept, filepath.Base(p)) }
+	defer func() { KeepExisting, OnKeep = false, nil }()
+	if err := GenerateCLIProject(dir, "demo", "demo"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine\n" {
+		t.Error("existing file was overwritten")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
+		t.Error("project was not completed")
+	}
+	if !strings.Contains(strings.Join(kept, " "), ".gitignore") {
+		t.Errorf("kept = %v", kept)
+	}
+}

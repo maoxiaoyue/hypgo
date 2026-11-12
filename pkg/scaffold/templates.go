@@ -211,7 +211,7 @@ import (
 )
 
 // Setup 設定所有路由和中間件
-// 在 main.go 中呼叫：routers.Setup(srv.Router())
+// 在 main.go 中呼叫：routers.Setup(app.Server().Router())
 func Setup(r *router.Router) {
 	// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），
 	// 這裡不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。
@@ -474,7 +474,7 @@ import (
 var Cfg *config.Config
 
 var rootCmd = &cobra.Command{
-	Use:   "{{.LowerName}}",
+	Use:   "{{.ProjectName}}",
 	Short: "{{.Name}} CLI tool",
 	Long:  "{{.Name}} is a CLI tool built with HypGo scaffold.",
 }
@@ -508,7 +508,7 @@ import "github.com/maoxiaoyue/hypgo/pkg/schema"
 // @ai:output none
 // @ai:sideeffect 寫入全域 schema.Registry
 func RegisterSchemas() {
-	schema.RegisterCLI("{{.LowerName}}", "{{.Name}} root command", nil, nil)
+	schema.RegisterCLI("{{.ProjectName}}", "{{.Name}} root command", nil, nil)
 	// 由 hyp generate command <name> 新增子命令後，請在此補登：
 	// schema.RegisterCLI("process", "Process data", nil, nil)
 }
@@ -671,7 +671,7 @@ func main() {
 	// 載入主畫面
 	w.SetContent(views.MainView(w))
 
-	log.Info("{{.LowerName}} started", "config", configPath)
+	log.Info("{{.ProjectName}} started", "config", configPath)
 	w.ShowAndRun()
 }
 `
@@ -1125,7 +1125,7 @@ test:
 # Build
 .PHONY: build
 build:
-	go build -o bin/{{.LowerName}} .
+	go build -o bin/{{.ProjectName}} .
 `
 
 // LLMYamlTemplate 是 Manifest LLM 智慧增強功能的預設配置檔。
@@ -1299,4 +1299,74 @@ debug_level: debug
 # dev   — 開發/測試環境
 # prod  — 正式環境
 environment: local
+`
+
+// GitignoreTemplate 為所有專案類型共用的 .gitignore。
+// 先前只有 hyp api 產生 .gitignore，web / CLI / desktop / gRPC 專案的日誌、PID 檔、執行檔都會被 git 看到
+const GitignoreTemplate = `# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary
+*.test
+
+# Output
+*.out
+coverage.html
+
+# Dependency directories
+vendor/
+
+# Go workspace
+go.work
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 本機產生的報告（.hyp/ 其餘設定要進版控）
+.hyp/eval_history.jsonl
+.hyp/observe_*.html
+.hyp/lostintent.md
+
+# 執行期檔案：server 的 PID 檔、hyp chkcomment 的備份
+hypgo.pid
+*.bak
+
+# Logs（保留 logs/.gitkeep 讓目錄存在）
+logs/*
+!logs/.gitkeep
+*.log
+
+# Certificates
+certs/
+*.pem
+*.key
+*.crt
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+
+# Build artifacts
+dist/
+build/
 `
