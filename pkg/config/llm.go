@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -20,31 +21,31 @@ type LLMConfig struct {
 	// "none"（預設）：不使用 LLM，只做純 Go 推斷（零成本）
 	// "ollama"：直接連接本地 Ollama 伺服器
 	// "api"：連接遠端 API（OpenAI、Anthropic、Gemini 等）
-	Mode string `mapstructure:"mode" yaml:"mode"`
+	Mode string `yaml:"mode"`
 
 	// Ollama 模式配置（mode=ollama 時使用）
-	Ollama OllamaConfig `mapstructure:"ollama" yaml:"ollama"`
+	Ollama OllamaConfig `yaml:"ollama"`
 
 	// API 模式配置（mode=api 時使用）
-	API APIConfig `mapstructure:"api" yaml:"api"`
+	API APIConfig `yaml:"api"`
 }
 
 // OllamaConfig 本地 Ollama 模式配置
 type OllamaConfig struct {
-	URL       string `mapstructure:"url" yaml:"url"`               // Ollama API URL（預設 http://localhost:11434）
-	Model     string `mapstructure:"model" yaml:"model"`           // 模型名稱 e.g. "llama3", "codellama", "mistral"
-	Timeout   int    `mapstructure:"timeout" yaml:"timeout"`       // 請求逾時秒數（預設 30）
-	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"` // 最大回應 token 數（預設 256）
+	URL       string `yaml:"url"`        // Ollama API URL（預設 http://localhost:11434）
+	Model     string `yaml:"model"`      // 模型名稱 e.g. "llama3", "codellama", "mistral"
+	Timeout   int    `yaml:"timeout"`    // 請求逾時秒數（預設 30）
+	MaxTokens int    `yaml:"max_tokens"` // 最大回應 token 數（預設 256）
 }
 
 // APIConfig 遠端 API 模式配置
 type APIConfig struct {
-	Provider  string `mapstructure:"provider" yaml:"provider"`     // "openai", "anthropic", "gemini", "custom"
-	BaseURL   string `mapstructure:"base_url" yaml:"base_url"`     // API 端點（custom 時必填；其他 provider 有預設值）
-	APIKey    string `mapstructure:"api_key" yaml:"api_key"`       // API 金鑰（支援 ${ENV_VAR} 環境變數展開）
-	Model     string `mapstructure:"model" yaml:"model"`           // 模型名稱 e.g. "gpt-4o-mini", "claude-haiku-4-5"
-	Timeout   int    `mapstructure:"timeout" yaml:"timeout"`       // 請求逾時秒數（預設 30）
-	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"` // 最大回應 token（預設 256）
+	Provider  string `yaml:"provider"`   // "openai", "anthropic", "gemini", "custom"
+	BaseURL   string `yaml:"base_url"`   // API 端點（custom 時必填；其他 provider 有預設值）
+	APIKey    string `yaml:"api_key"`    // API 金鑰（支援 ${ENV_VAR} 環境變數展開）
+	Model     string `yaml:"model"`      // 模型名稱 e.g. "gpt-4o-mini", "claude-haiku-4-5"
+	Timeout   int    `yaml:"timeout"`    // 請求逾時秒數（預設 30）
+	MaxTokens int    `yaml:"max_tokens"` // 最大回應 token（預設 256）
 }
 
 // ApplyDefaults 為 LLMConfig 填入預設值
@@ -79,10 +80,17 @@ func (c *LLMConfig) ApplyDefaults() {
 		case "anthropic":
 			c.API.BaseURL = "https://api.anthropic.com/v1"
 		case "gemini":
-			c.API.BaseURL = "https://generativelanguage.googleapis.com/v1beta"
+			c.API.BaseURL = geminiOpenAIBaseURL
 		}
 	}
+	// Gemini 的 OpenAI 相容端點在 .../v1beta/openai。先前預設值少了 /openai：
+	// pkg/annotation 自己補上了，pkg/manifest 的 LLM 增強卻直接接 /chat/completions 而必定失敗
+	if strings.EqualFold(c.API.Provider, "gemini") && strings.TrimRight(c.API.BaseURL, "/") == strings.TrimSuffix(geminiOpenAIBaseURL, "/openai") {
+		c.API.BaseURL = geminiOpenAIBaseURL
+	}
 }
+
+const geminiOpenAIBaseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 // Validate 驗證 LLMConfig 的邏輯正確性
 func (c *LLMConfig) Validate() error {
@@ -137,11 +145,13 @@ func (c *APIConfig) ResolvedAPIKey() string {
 
 // expandEnvVars 展開字串中的 ${ENV_VAR} 引用
 func expandEnvVars(s string) string {
-	if !strings.Contains(s, "${") {
-		return s
-	}
-	return os.Expand(s, os.Getenv)
+	// 只展開 ${NAME}。先前用 os.Expand：字串裡有 ${ 時，其他的 $abc 也被當成環境變數而被吃掉
+	return envRef.ReplaceAllStringFunc(s, func(ref string) string {
+		return os.Getenv(ref[2 : len(ref)-1])
+	})
 }
+
+var envRef = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
 
 // IsEnabled 回傳 LLM 增強是否啟用
 func (c *LLMConfig) IsEnabled() bool {
@@ -166,6 +176,9 @@ func LoadLLMConfig(path string) (*LLMConfig, error) {
 
 	if err := LoadYAML(path, cfg); err != nil {
 		return nil, fmt.Errorf("failed to load LLM config from %s: %w", path, err)
+	}
+	if err := checkDesignConfig(path, cfg); err != nil {
+		return nil, err
 	}
 
 	cfg.ApplyDefaults()

@@ -1400,7 +1400,7 @@ const HypConfigYamlTemplate = `# HypGo 設計時通用設定
 # 這份檔案存放「開發時」hyp CLI 與工具會用到的通用設定。
 # 與 config/config.yaml（伺服器/資料庫等 runtime 設定）分離。
 
-# 語言：影響 hyp CLI 訊息、scaffold 模板與 LLM prompt 的語言偏好。
+# 語言偏好（保留欄位：目前沒有工具讀取它）。
 # 支援 zh-cn（簡中）、zh-tw（繁中）、en（英文）。預設 en。
 language: en
 
@@ -1412,7 +1412,7 @@ language: en
 # error   — 只印 error
 debug_level: debug
 
-# 環境：標示此專案目前的執行環境，影響 ai-rules / AutoSync 的口吻與嚴格度。
+# 環境：標示此專案目前的執行環境（保留欄位：目前沒有工具讀取它）。
 # local — 本機開發（預設）
 # dev   — 開發/測試環境
 # prod  — 正式環境

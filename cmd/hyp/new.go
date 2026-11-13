@@ -680,7 +680,6 @@ server:
   read_timeout: 30
   write_timeout: 30
   idle_timeout: 120
-  keep_alive: 30
   max_handlers: 1000
   max_concurrent_streams: 100
   max_read_frame_size: 1048576
