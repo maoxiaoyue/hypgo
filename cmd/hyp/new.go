@@ -358,8 +358,26 @@ func validateProjectName(name string) error {
 	if err := module.CheckImportPath(name); err != nil {
 		return fmt.Errorf("invalid project name %q: not a valid Go module path: %w", name, err)
 	}
+	// 名稱就是 module 路徑：與 go 指令的保留字或標準庫套件同名時專案建得出來，但一編譯就失敗
+	//（"tool" is not an importable package / ambiguous import: found package log in multiple modules）
+	if reservedModuleNames[strings.ToLower(name)] {
+		return fmt.Errorf("invalid project name %q: it is reserved by the go command or is a standard library package, "+
+			"so a module of that name cannot be built; choose another name (or go mod init a full module path and run hyp new without a name)", name)
+	}
 	return nil
 }
+
+// reservedModuleNames 不能當單段 module 路徑的名稱：go 指令的保留字與標準庫的頂層套件
+var reservedModuleNames = func() map[string]bool {
+	m := map[string]bool{}
+	for _, s := range strings.Fields("all cmd std tool vendor " +
+		"archive bufio builtin bytes cmp compress container context crypto database debug embed encoding errors expvar " +
+		"flag fmt go hash html image index io iter log maps math mime net os path plugin reflect regexp runtime slices " +
+		"sort strconv strings structs sync syscall testing text time unicode unique unsafe weak") {
+		m[s] = true
+	}
+	return m
+}()
 
 // keepExisting 由 checkNewProject 依 --force 設定：為 true 時 writeNewFile 保留既有檔案並略過
 var keepExisting bool

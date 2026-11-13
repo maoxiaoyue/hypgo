@@ -65,7 +65,7 @@ func TestGeneratedGoIsGofmtClean(t *testing.T) {
 	dir := t.TempDir()
 	for _, err := range []error{
 		GenerateModel(dir, "api"), GenerateModel(dir, "user_profile"),
-		GenerateController(dir, "api", "m"), GenerateService(dir, "api"),
+		GenerateController(dir, "api", "m"), GenerateService(dir, "api", "m"),
 		GenerateGRPCProject(filepath.Join(dir, "g"), "demo", ""),
 	} {
 		if err != nil {
@@ -127,8 +127,8 @@ func TestCamelCaseIdentifiers(t *testing.T) {
 	if !strings.Contains(ctrl, "type UserProfileController struct") || strings.Contains(ctrl, "User_profile") {
 		t.Errorf("controller identifiers not CamelCase:\n%s", ctrl)
 	}
-	if r := readGen(t, filepath.Join(dir, "user_profile.go")); !strings.Contains(r, `"/api/user_profile"`) {
-		t.Error("route path should keep the original name")
+	if r := readGen(t, filepath.Join(dir, "user_profile.go")); !strings.Contains(r, `"/api/user_profiles"`) {
+		t.Error("route path should be the plural of the original name")
 	}
 }
 
@@ -220,7 +220,7 @@ func TestProjectNamesWithHyphens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"package user_servicepb;", `go_package = "user-service/app/proto/user_servicepb"`, "service UserServiceService"} {
+	for _, want := range []string{"package user_servicepb;", `go_package = "user-service/app/proto/user_servicepb"`, "service UserService {"} {
 		if !strings.Contains(string(proto), want) {
 			t.Errorf("proto missing %q", want)
 		}

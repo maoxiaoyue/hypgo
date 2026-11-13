@@ -19,7 +19,8 @@ var generateCmd = &cobra.Command{
 	Long: `Generate boilerplate code that follows HypGo conventions.
 
 Available types:
-  controller    Controller (handler) + Router (Schema routes) + Middleware
+  controller    Controller (handler) + Router (Schema routes) + Middleware;
+                also the model and service it depends on when they don't exist yet
   model         Bun ORM model + Request/Response structs
   service       Service layer with Error Catalog
   command       CLI subcommand (Cobra) for CLI projects
@@ -35,7 +36,12 @@ Generated file locations (relative to the project root, the nearest go.mod going
   proto      → app/proto/<name>pb/<name>.proto + app/rpc/<name>_server.go
 
 Names are letters, digits and underscores; identifiers are CamelCase
-(order_item → OrderItem). Existing files are never overwritten.
+(order_item → OrderItem) and routes are plural (/api/order_items). Existing
+files are never overwritten, and nothing is written when the new code would
+clash with existing identifiers or error codes.
+
+Generated endpoints answer 501 until the service is implemented and injected
+into the controller (see the comment in routers/<name>.go).
 
 Examples:
   hyp generate controller user
@@ -114,8 +120,33 @@ func (g generator) dir(elem ...string) string {
 func (g generator) lower() string { return strings.ToLower(g.name) }
 func (g generator) camel() string { return scaffold.CamelName(g.name) }
 
-// controller 生成 controller + router + middleware（Web / API 專案）
+// controller 生成 controller + router + middleware（Web / API 專案），以及它依賴而尚未存在的 model 與 service
 func (g generator) controller() error {
+	// 先確認要寫的檔案都不存在再動手。先前 hyp generate controller router 寫完 controller 才發現
+	// routers/router.go 已存在而失敗，重跑又卡在 controller 已存在
+	for _, rel := range []string{
+		filepath.Join("app", "controllers", g.lower()+"_controller.go"),
+		filepath.Join("routers", g.lower()+".go"),
+	} {
+		if fileExists(g.dir(rel)) {
+			return fmt.Errorf("%s already exists; nothing was generated", filepath.ToSlash(rel))
+		}
+	}
+
+	// controller import models 與 services：缺的一併生成，否則單獨生成的 controller 編不過
+	if !fileExists(g.dir("app", "models", g.lower()+".go")) {
+		if err := scaffold.GenerateModel(g.dir("app", "models"), g.name); err != nil {
+			return err
+		}
+		fmt.Printf("  + app/models/%s.go\n", g.lower())
+	}
+	if !fileExists(g.dir("app", "services", g.lower()+"_service.go")) {
+		if err := scaffold.GenerateService(g.dir("app", "services"), g.name, g.module); err != nil {
+			return err
+		}
+		fmt.Printf("  + app/services/%s_service.go\n", g.lower())
+	}
+
 	if err := scaffold.GenerateController(g.dir("app", "controllers"), g.name, g.module); err != nil {
 		return err
 	}
@@ -145,8 +176,8 @@ func (g generator) controller() error {
 
 	fmt.Printf("\n✅ Controller generated: %sController\n", g.camel())
 	fmt.Printf("   Next steps:\n")
-	fmt.Printf("   1. Run: hyp generate model %s\n", g.lower())
-	fmt.Printf("   2. Edit routers/router.go → add to Setup: Register%sRoutes(r)\n", g.camel())
+	fmt.Printf("   1. Edit routers/router.go → add to Setup: Register%sRoutes(r)\n", g.camel())
+	fmt.Printf("   2. Implement app/services/%s_service.go and inject it in routers/%s.go (endpoints answer 501 until then)\n", g.lower(), g.lower())
 	if setupCreated {
 		fmt.Printf("   3. In main.go → call: routers.Setup(app.Server().Router())\n")
 	}
@@ -164,10 +195,13 @@ func (g generator) model() error {
 }
 
 func (g generator) service() error {
-	if err := scaffold.GenerateService(g.dir("app", "services"), g.name); err != nil {
+	if err := scaffold.GenerateService(g.dir("app", "services"), g.name, g.module); err != nil {
 		return err
 	}
 	fmt.Printf("✅ Generated: app/services/%s_service.go\n", g.lower())
+	if !fileExists(g.dir("app", "models", g.lower()+".go")) {
+		fmt.Printf("   It uses models.%sResp and friends: run hyp generate model %s\n", g.camel(), g.lower())
+	}
 	return nil
 }
 
@@ -177,7 +211,7 @@ func (g generator) command() error {
 		return err
 	}
 	fmt.Printf("✅ Generated: app/commands/%s.go\n", g.lower())
-	fmt.Printf("   Command: %s %s\n", filepath.Base(g.module), g.lower())
+	fmt.Printf("   Command: %s %s (registered with the root command and the Schema registry in its init)\n", filepath.Base(g.module), g.lower())
 	fmt.Printf("   Edit app/commands/%s.go to implement run%s\n", g.lower(), g.camel())
 	return nil
 }
@@ -199,8 +233,11 @@ func (g generator) proto() error {
 	}
 	fmt.Printf("  + app/proto/%spb/%s.proto\n", g.lower(), g.lower())
 	fmt.Printf("  + app/rpc/%s_server.go\n", g.lower())
-	fmt.Printf("\n✅ Proto generated: %sService\n", g.camel())
-	fmt.Printf("   Next: make proto    (compile .proto → Go code)\n")
+	fmt.Printf("\n✅ Proto generated: %s\n", g.lower())
+	fmt.Printf("   Next steps:\n")
+	fmt.Printf("   1. make proto    (compiles every .proto under app/proto)\n")
+	fmt.Printf("   2. In main.go → register the service on srv.GRPCServer() with rpc.New%sServer()\n", g.camel())
+	fmt.Printf("   3. In app/rpc/schema.go → add its methods to RegisterSchemas()\n")
 	return nil
 }
 

@@ -136,7 +136,9 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		fn    func() error
 	}{
 		{"app/models/user.go", func() error { return scaffold.GenerateModel(filepath.Join(projectName, "app", "models"), resource) }},
-		{"app/services/user_service.go", func() error { return scaffold.GenerateService(filepath.Join(projectName, "app", "services"), resource) }},
+		{"app/services/user_service.go", func() error {
+			return scaffold.GenerateService(filepath.Join(projectName, "app", "services"), resource, t.module)
+		}},
 		{"app/controllers/user_controller.go", func() error {
 			return scaffold.GenerateController(filepath.Join(projectName, "app", "controllers"), resource, t.module)
 		}},
@@ -990,11 +992,16 @@ HTTP/3 needs TLS: run ` + "`make cert`" + ` (self-signed cert into ` + "`certs/`
 | POST | ` + "`/api/auth/login`" + ` | ` + "`AuthController.Login`" + ` → ` + "`{token, expires_at}`" + ` (HS256) |
 | GET | ` + "`/api/auth/me`" + ` | ` + "`AuthController.Me`" + ` (requires ` + "`Authorization: Bearer <token>`" + `) |
 | GET | ` + "`/api/auth/admin/stats`" + ` | ` + "`AuthController.AdminStats`" + ` (token + ` + "`admin`" + ` role; 403 otherwise) |
-| GET | ` + "`/api/user`" + ` | ` + "`UserController.List`" + ` |
-| POST | ` + "`/api/user`" + ` | ` + "`UserController.Create`" + ` (` + "`c.BindInput`" + ` → validate → 201) |
-| GET | ` + "`/api/user/:id`" + ` | ` + "`UserController.Get`" + ` |
-| PUT | ` + "`/api/user/:id`" + ` | ` + "`UserController.Update`" + ` |
-| DELETE | ` + "`/api/user/:id`" + ` | ` + "`UserController.Delete`" + ` |
+| GET | ` + "`/api/users`" + ` | ` + "`UserController.List`" + ` |
+| POST | ` + "`/api/users`" + ` | ` + "`UserController.Create`" + ` (` + "`c.BindInput`" + ` → validate → 201) |
+| GET | ` + "`/api/users/:id`" + ` | ` + "`UserController.Get`" + ` |
+| PUT | ` + "`/api/users/:id`" + ` | ` + "`UserController.Update`" + ` |
+| DELETE | ` + "`/api/users/:id`" + ` | ` + "`UserController.Delete`" + ` |
+
+The ` + "`/api/users`" + ` endpoints validate their input and then answer **501** until you implement
+` + "`app/services/user_service.go`" + ` and inject it in ` + "`routers/user.go`" + `
+(` + "`&controllers.UserController{Service: services.NewUserService(db, log)}`" + `) — a generated
+resource never returns made-up data.
 
 Every route is registered with ` + "`r.Schema(...)`" + ` (Input/Output types), so ` + "`hyp lint --deep`" + `,
 ` + "`contract.TestAll`" + ` and ` + "`.hyp/context.yaml`" + ` all understand the API without extra work.

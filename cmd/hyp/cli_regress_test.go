@@ -780,3 +780,102 @@ func TestNewArgumentErrors(t *testing.T) {
 		t.Error("two names should be rejected")
 	}
 }
+
+// ── scaffold 審查後的修正 ──
+
+// 名稱就是 module 路徑：與 go 指令保留字或標準庫套件同名時專案建得出來，但一編譯就失敗
+func TestNewRejectsReservedModuleNames(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{
+		{"new", "cli", "tool"}, {"new", "log"}, {"api", "net"}, {"new", "grpc", "vendor"}, {"new", "cli", "Cmd"},
+	} {
+		if err := runHyp(t, args...); err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+	if entries, _ := os.ReadDir("."); len(entries) != 0 {
+		t.Errorf("projects were created: %v", entries)
+	}
+	if err := runHyp(t, "new", "cli", "logger"); err != nil {
+		t.Errorf("a name that merely starts with a reserved word should be fine: %v", err)
+	}
+}
+
+// hyp generate controller：缺的 model 與 service 一併生成（controller import 它們，單獨生成編不過）；
+// 要寫的檔案有任何一個已存在就什麼都不寫
+func TestGenerateControllerIsComplete(t *testing.T) {
+	root := airulesProject(t)
+	if err := runHyp(t, "generate", "controller", "order_item"); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{
+		"app/models/order_item.go", "app/services/order_item_service.go",
+		"app/controllers/order_item_controller.go", "routers/order_item.go", "routers/router.go", "routers/middleware.go",
+	} {
+		if !exists(filepath.Join(root, filepath.FromSlash(rel))) {
+			t.Errorf("%s missing", rel)
+		}
+	}
+	svc, _ := os.ReadFile(filepath.Join(root, "app", "services", "order_item_service.go"))
+	if !strings.Contains(string(svc), `"x/app/models"`) {
+		t.Error("service should import the project's models")
+	}
+
+	// 先前 controller 檔寫完才發現 routers/router.go 已存在而失敗，重跑又卡在 controller 已存在
+	for _, name := range []string{"router", "middleware"} {
+		err := runHyp(t, "generate", "controller", name)
+		if err == nil || !strings.Contains(err.Error(), "nothing was generated") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+		for _, rel := range []string{"app/controllers/" + name + "_controller.go", "app/models/" + name + ".go", "app/services/" + name + "_service.go"} {
+			if exists(filepath.Join(root, filepath.FromSlash(rel))) {
+				t.Errorf("%s was written although generation failed", rel)
+			}
+		}
+	}
+
+	// 既有的 model 保留、不算錯誤
+	os.WriteFile(filepath.Join(root, "app", "models", "invoice.go"), []byte("package models\n\n// mine\n"), 0o644)
+	if err := runHyp(t, "generate", "controller", "invoice"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(root, "app", "models", "invoice.go")); !strings.Contains(string(data), "// mine") {
+		t.Error("an existing model was overwritten")
+	}
+}
+
+func TestGenerateRejectsBadNames(t *testing.T) {
+	root := airulesProject(t)
+	for _, args := range [][]string{
+		{"generate", "model", "page_js"}, {"generate", "controller", "load_test"}, {"generate", "command", "help"},
+	} {
+		if err := runHyp(t, args...); err == nil {
+			t.Errorf("%v should fail", args)
+		}
+	}
+	if exists(filepath.Join(root, "app")) {
+		t.Error("files were generated for rejected names")
+	}
+}
+
+// hyp api 的 user 資源：路由複數、README 一致、未實作回 501 的說明
+func TestAPIProjectUserResource(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "api", "shop"); err != nil {
+		t.Fatal(err)
+	}
+	rt, _ := os.ReadFile(filepath.Join("shop", "routers", "user.go"))
+	if !strings.Contains(string(rt), `"/api/users"`) || strings.Contains(string(rt), `"/api/user"`) {
+		t.Error("user routes should be plural")
+	}
+	readme, _ := os.ReadFile(filepath.Join("shop", "README.md"))
+	if !strings.Contains(string(readme), "`/api/users/:id`") || strings.Contains(string(readme), "`/api/user`") || !strings.Contains(string(readme), "501") {
+		t.Error("README should list the plural routes and explain the 501 answers")
+	}
+	ctrl, _ := os.ReadFile(filepath.Join("shop", "app", "controllers", "user_controller.go"))
+	if !strings.Contains(string(ctrl), "services.ErrUserNotImplemented") {
+		t.Error("user controller should delegate to the service")
+	}
+}
