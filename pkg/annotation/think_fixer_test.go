@@ -303,13 +303,18 @@ func Do() {
 	s := &heuristicThinkSuggester{}
 	FixThinkFile(context.Background(), path, report, s)
 
-	// After fix, CheckThink should find zero missing
+	// heuristic 對 Do 這種名稱只能補 TODO：仍列為待處理（Placeholder），但不會再插第二行
 	report2, err := CheckThink(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report2.Missing) != 0 {
-		t.Errorf("after fix, still %d missing", len(report2.Missing))
+	if len(report2.Missing) != 1 || !report2.Missing[0].Placeholder {
+		t.Errorf("a TODO @ai:think should be reported as a placeholder: %+v", report2.Missing)
+	}
+	before, _ := os.ReadFile(path)
+	FixThinkFile(context.Background(), path, report2, s)
+	if after, _ := os.ReadFile(path); string(after) != string(before) {
+		t.Errorf("a placeholder should not get a second @ai:think:\n%s", after)
 	}
 }
 

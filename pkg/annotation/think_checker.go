@@ -17,6 +17,9 @@ type ThinkResult struct {
 	Name string // "CreateUser" 或 "(*UserService).GetUser"
 	Kind string // "func" 或 "method"
 	Line int
+	// Placeholder：已有 //@ai:think，但內容仍是 --fixintent 補上的 TODO。
+	// 先前只要有這一行就不再列為缺漏，佔位文字永遠留在程式碼裡
+	Placeholder bool
 }
 
 // ThinkReport 單一檔案的 @ai:think 檢查報告
@@ -87,11 +90,12 @@ func CheckThinkWithOpts(filename string, opts CheckThinkOpts) (*ThinkReport, err
 		bodyStart := fset.Position(fd.Body.Lbrace).Offset
 		bodyEnd := fset.Position(fd.Body.Rbrace).Offset
 
-		if !bodyHasThink(f.Comments, fset, bodyStart, bodyEnd) {
+		if has, placeholder := bodyThink(f.Comments, fset, bodyStart, bodyEnd); !has || placeholder {
 			report.Missing = append(report.Missing, ThinkResult{
-				Name: name,
-				Kind: kind,
-				Line: fset.Position(fd.Pos()).Line,
+				Name:        name,
+				Kind:        kind,
+				Line:        fset.Position(fd.Pos()).Line,
+				Placeholder: placeholder,
 			})
 		}
 	}
@@ -115,6 +119,13 @@ func docHasGenerated(doc *ast.CommentGroup) bool {
 
 // bodyHasThink 檢查函式體範圍內的註解是否包含 @ai:think
 func bodyHasThink(comments []*ast.CommentGroup, fset *token.FileSet, bodyStart, bodyEnd int) bool {
+	has, _ := bodyThink(comments, fset, bodyStart, bodyEnd)
+	return has
+}
+
+// bodyThink 回傳函式體內是否有 @ai:think，以及它們是否全是 TODO 佔位文字
+func bodyThink(comments []*ast.CommentGroup, fset *token.FileSet, bodyStart, bodyEnd int) (has, placeholder bool) {
+	real := false
 	for _, cg := range comments {
 		for _, c := range cg.List {
 			pos := fset.Position(c.Pos()).Offset
@@ -122,12 +133,16 @@ func bodyHasThink(comments []*ast.CommentGroup, fset *token.FileSet, bodyStart, 
 				continue
 			}
 			text := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
-			if strings.HasPrefix(text, "@ai:think") {
-				return true
+			if !strings.HasPrefix(text, "@ai:think") {
+				continue
+			}
+			has = true
+			if !strings.Contains(text, "intent=TODO") && !strings.Contains(text, "special=TODO") {
+				real = true
 			}
 		}
 	}
-	return false
+	return has, has && !real
 }
 
 // FormatThinkReport 格式化 @ai:think 檢查報告為終端輸出
@@ -146,6 +161,10 @@ func FormatThinkReport(report *ThinkReport) string {
 		report.Filename, len(report.Missing), report.Scanned))
 
 	for _, m := range report.Missing {
+		if m.Placeholder {
+			sb.WriteString(fmt.Sprintf("  [WARN] %s %s (line %d) — @ai:think is still a TODO placeholder: write the real intent\n", m.Kind, m.Name, m.Line))
+			continue
+		}
 		sb.WriteString(fmt.Sprintf("  [WARN] %s %s (line %d) — missing @ai:think\n", m.Kind, m.Name, m.Line))
 	}
 

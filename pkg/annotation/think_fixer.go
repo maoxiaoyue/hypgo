@@ -246,11 +246,7 @@ func buildThinkPrompt(req ThinkSuggestRequest) string {
 	if req.Receiver != "" {
 		fmt.Fprintf(&sb, "Receiver=%s\n", req.Receiver)
 	}
-	if req.Source != "" {
-		sb.WriteString("\n原始碼：\n```go\n")
-		sb.WriteString(req.Source)
-		sb.WriteString("\n```\n")
-	}
+	sb.WriteString(fencedSource(req.Source))
 	return sb.String()
 }
 
@@ -396,6 +392,8 @@ func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkRep
 	type insertOp struct {
 		braceLineIdx int
 		thinkLines   []string
+		// oneLine 非 nil：單行函式（func A() int { return 1 }），把這一行展開成多行後插入
+		oneLine *oneLineBody
 	}
 	var ops []insertOp
 
@@ -415,6 +413,10 @@ func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkRep
 		if !ok {
 			continue
 		}
+		// 已有 @ai:think、只是內容還是 TODO：不再插一行，留給人改寫
+		if m.Placeholder {
+			continue
+		}
 
 		lbrace := fset.Position(fd.Body.Lbrace)
 		braceIdx := lbrace.Line - 1
@@ -422,9 +424,14 @@ func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkRep
 		// 先前一律插在 `{` 的下一行：單行函式體（func A() { return }）的 think 行落到函式之外、
 		// 變成下一個函式的 doc；`{` 同行開始的多行 raw string 則被插進字串內容；且每次重跑都再插一次。
 		// `{` 之後同一行還有程式碼（含 `}`）時無法安全插入，略過並回報。
+		var oneLine *oneLineBody
 		if braceIdx < len(lines) && hasCodeAfterBrace(lines[braceIdx], lbrace.Column) {
-			res.Skipped = append(res.Skipped, m)
-			continue
+			// 整個函式體在同一行時可以安全展開；先前一律略過，這種函式永遠留在缺漏報告裡
+			rbrace := fset.Position(fd.Body.Rbrace)
+			if oneLine = splitOneLineBody(lines[braceIdx], lbrace, rbrace); oneLine == nil {
+				res.Skipped = append(res.Skipped, m)
+				continue
+			}
 		}
 
 		bodyEnd := fset.Position(fd.Body.Rbrace).Line
@@ -477,7 +484,7 @@ func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkRep
 			thinkLines = append(thinkLines, fmt.Sprintf("//@ai:think intent=%s %s", fallbackIntent(opts.Retroactive), suffix))
 		}
 
-		ops = append(ops, insertOp{braceLineIdx: braceIdx, thinkLines: thinkLines})
+		ops = append(ops, insertOp{braceLineIdx: braceIdx, thinkLines: thinkLines, oneLine: oneLine})
 		if !containsString(res.Models, modelName) {
 			res.Models = append(res.Models, modelName)
 		}
@@ -489,6 +496,22 @@ func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkRep
 
 	count := 0
 	for _, op := range ops {
+		if o := op.oneLine; o != nil {
+			repl := []string{o.head + src.eolCR}
+			for _, tl := range op.thinkLines {
+				repl = append(repl, o.indent+"\t"+tl+src.eolCR)
+			}
+			if o.inner != "" {
+				repl = append(repl, o.indent+"\t"+o.inner+src.eolCR)
+			}
+			repl = append(repl, o.indent+"}"+o.tail+src.eolCR)
+			before := append([]string{}, lines[:op.braceLineIdx]...)
+			after := append([]string{}, lines[op.braceLineIdx+1:]...)
+			lines = append(before, append(repl, after...)...)
+			count++
+			continue
+		}
+
 		insertAt := op.braceLineIdx + 1
 		if insertAt > len(lines) {
 			insertAt = len(lines)
@@ -527,6 +550,36 @@ func FixThinkFileDetailed(ctx context.Context, filename string, report *ThinkRep
 	}
 	res.Fixed = count
 	return res, nil
+}
+
+// oneLineBody 是單行函式拆開後的各部分
+type oneLineBody struct {
+	indent string // 這一行的縮排
+	head   string // 到 `{` 為止（含）
+	inner  string // 大括號之間的陳述式
+	tail   string // `}` 之後的內容（行尾註解）
+}
+
+// splitOneLineBody 把 `func A() int { return 1 }` 這一行拆開；`{` 與 `}` 不在同一行，
+// 或 `}` 之後還有程式碼時回傳 nil
+func splitOneLineBody(line string, lbrace, rbrace token.Position) *oneLineBody {
+	line = strings.TrimRight(line, "\r")
+	if lbrace.Line != rbrace.Line || lbrace.Column < 1 || rbrace.Column <= lbrace.Column || rbrace.Column > len(line) {
+		return nil
+	}
+	tail := line[rbrace.Column:]
+	if t := strings.TrimSpace(tail); t != "" && !strings.HasPrefix(t, "//") {
+		return nil
+	}
+	if tail != "" {
+		tail = " " + strings.TrimSpace(tail)
+	}
+	return &oneLineBody{
+		indent: line[:len(line)-len(strings.TrimLeft(line, " \t"))],
+		head:   line[:lbrace.Column],
+		inner:  strings.TrimSpace(line[lbrace.Column : rbrace.Column-1]),
+		tail:   tail,
+	}
 }
 
 // hasCodeAfterBrace 回傳函式體 `{`（位於 line 的第 col 欄，1-based）之後同一行是否還有程式碼；

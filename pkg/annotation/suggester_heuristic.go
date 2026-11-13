@@ -69,8 +69,7 @@ func heuristicAnnotations(req SuggestRequest) []Annotation {
 		out = append(out, Annotation{Type: Constraint, Value: "paginated max_items=100"})
 	}
 
-	// 永遠補上 owner 提示
-	out = append(out, Annotation{Type: Owner, Value: "team=unknown"})
+	// 先前一律補上 @ai:owner team=unknown：不是必填欄位，內容也沒有資訊
 	return out
 }
 

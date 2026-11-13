@@ -16,6 +16,7 @@ type SuggestRequest struct {
 	PkgName    string      // 所屬 package 名稱
 	File       string      // 檔案路徑
 	GitContext *GitContext // git 歷史脈絡（nil = 無 git 資訊）
+	Source     string      // 宣告的原始碼（不含 doc，有長度上限）；package 為空
 }
 
 // Suggestion 為 Suggester 的回傳值

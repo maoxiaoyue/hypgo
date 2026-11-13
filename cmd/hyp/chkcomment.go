@@ -34,8 +34,10 @@ each file, falling back to the current directory; missing file = defaults):
   think_comment  (default false) enable the //@ai:think checks (--unintent/--fixintent)
 
 Missing comments are reported with suggested text, and the command exits
-non-zero when any violation remains (CI gate). Use --fix to add the
-suggested comments (exit 0 when everything got fixed). When an LLM config is
+non-zero when any violation remains (CI gate). Use --fix to add a skeleton.
+Placeholders (a "Name ..." headline, an empty or "TODO:" @ai value, an
+@ai:generated without by=<author> date=YYYY-MM-DD) count as violations, so
+--fix alone does not make the gate pass: the skeleton has to be filled in. When an LLM config is
 supplied (or auto-detected at .hyp/llm.yaml), --fix asks the LLM for the doc
 text (built-in heuristics when mode=none).
 
@@ -194,6 +196,11 @@ func chkcommentFile(filename string, o chkcommentOpts, llm *chkcommentLLM, cache
 	after, err := annotation.CheckFileWithOpts(filename, checkOpts)
 	if err != nil {
 		return 0, fmt.Errorf("re-check failed: %w", err)
+	}
+	// --fix 補的是骨架：佔位文字（`Name ...`、`TODO:`）仍算違規，要換成實際內容才會通過。
+	// 先前骨架本身就能通過檢查，hyp chkcomment --fix 等於讓 CI 門檻永遠是綠的
+	if left := after.Total - after.Passed; left > 0 {
+		fmt.Fprintf(os.Stdout, "  %d block(s) still hold placeholders (`Name ...`, `TODO:`): replace them with real text\n", left)
 	}
 	return after.Total - after.Passed, nil
 }

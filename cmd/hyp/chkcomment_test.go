@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -43,7 +44,9 @@ const commentYAMLAllOn = "normal_comment: true\nai_comment: true\nthink_comment:
 // 歷史 bug：--fixintent 插入新行後仍沿用第一次 CheckFile 的結果，--fix 把下一個函式的 doc 插進前一個函式體內，
 // 該函式依舊沒有 doc（嚴重時蓋掉 `}`、doc 落進下一個函式體）。
 func TestChkCommentFixAfterFixIntentUsesFreshLines(t *testing.T) {
-	resp, _ := json.Marshal(map[string]string{"response": `{"doc":"D 說明","intent":"I","special":""}`})
+	// LLM 連必填的 @ai 欄位一起給：先前它們被 TODO 佔位值擋掉，--fix 後仍是 TODO
+	resp, _ := json.Marshal(map[string]string{"response": `{"doc":"D 說明","intent":"I","special":"","annotations":[` +
+		`{"type":"purpose","value":"P"},{"type":"input","value":"IN"},{"type":"output","value":"OUT"},{"type":"sideeffect","value":"none"}]}`})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(resp)
 	}))
@@ -80,6 +83,14 @@ func TestChkCommentFixAfterFixIntentUsesFreshLines(t *testing.T) {
 	if report, err := annotation.CheckFile("x.go"); err != nil || report.Passed != report.Total {
 		t.Errorf("blocks still failing after --fix --fixintent (err=%v):\n%s", err, out)
 	}
+	// package 沒有輸入輸出：LLM 給的 input / output 不能寫進 package doc
+	pkgDoc := string(out)[:strings.Index(string(out), "package p")]
+	if strings.Contains(pkgDoc, "@ai:input") || strings.Contains(pkgDoc, "@ai:output") || !strings.Contains(pkgDoc, "@ai:purpose P") {
+		t.Errorf("package doc should take purpose only:\n%s", pkgDoc)
+	}
+	if strings.Contains(string(out), "TODO") || !strings.Contains(string(out), "@ai:input IN") {
+		t.Errorf("the LLM's values should replace the TODO placeholders:\n%s", out)
+	}
 }
 
 // TestChkCommentExitCode 迴歸測試（CMD-B5）：有違規時 exit 非零；--fix 全部補齊後 exit 0。
@@ -93,8 +104,25 @@ func TestChkCommentExitCode(t *testing.T) {
 	if err := runChkCommentCmd(t, "x.go"); err == nil {
 		t.Error("violations should make chkcomment fail")
 	}
-	if err := runChkCommentCmd(t, "--fix", "x.go"); err != nil {
-		t.Errorf("--fix fixed everything, want success; got %v", err)
+	// --fix（沒有 LLM）補的是骨架：佔位文字仍算違規。先前骨架本身就能通過，門檻永遠是綠的
+	if err := runChkCommentCmd(t, "--fix", "x.go"); err == nil {
+		t.Error("a skeleton full of placeholders should not pass the gate")
+	}
+	skeleton, _ := os.ReadFile("x.go")
+	if !strings.Contains(string(skeleton), "@ai:purpose TODO") || !strings.Contains(string(skeleton), "// F ...") {
+		t.Fatalf("--fix should have written a skeleton:\n%s", skeleton)
+	}
+	// 重跑不會再加一份
+	_ = runChkCommentCmd(t, "--fix", "x.go")
+	if again, _ := os.ReadFile("x.go"); string(again) != string(skeleton) {
+		t.Errorf("a second --fix changed the file:\n%s", again)
+	}
+	// 把佔位文字換成實際內容後才通過
+	filled := strings.NewReplacer("// F ...", "// F does nothing.", "// Package p ...", "// Package p is a demo.").Replace(string(skeleton))
+	filled = regexp.MustCompile(`TODO[^\n]*`).ReplaceAllString(filled, "real text")
+	os.WriteFile("x.go", []byte(filled), 0o644)
+	if err := runChkCommentCmd(t, "x.go"); err != nil {
+		t.Errorf("filled-in comments should pass: %v\n%s", err, filled)
 	}
 }
 
