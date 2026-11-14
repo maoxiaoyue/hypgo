@@ -137,6 +137,10 @@ func TestCompressionRangeAndTypes(t *testing.T) {
 	if w.Code != 206 || w.Header().Get("Content-Encoding") != "" || w.Body.String() != "hypgo " {
 		t.Errorf("range = %d enc=%q body=%q", w.Code, w.Header().Get("Content-Encoding"), w.Body.String())
 	}
+	// handler 不理會 Range、回整份 200 時也不壓縮（客戶端要的是原始位元組的位置）
+	if w := get(r, "GET", "/svg", "Accept-Encoding", "gzip", "Range", "bytes=0-9"); w.Code != 200 || w.Header().Get("Content-Encoding") != "" {
+		t.Errorf("range ignored by handler = %d enc=%q", w.Code, w.Header().Get("Content-Encoding"))
+	}
 	w = get(r, "GET", "/file", "Accept-Encoding", "gzip")
 	if w.Header().Get("Content-Encoding") != "gzip" || w.Header().Get("ETag") != `W/"v1"` || w.Header().Get("Accept-Ranges") != "" {
 		t.Errorf("full: enc=%q etag=%q accept-ranges=%q", w.Header().Get("Content-Encoding"), w.Header().Get("ETag"), w.Header().Get("Accept-Ranges"))

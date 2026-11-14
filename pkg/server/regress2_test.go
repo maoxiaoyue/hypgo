@@ -363,7 +363,7 @@ func TestServerCORSConfig(t *testing.T) {
 
 	// allow_origins: [] → 不掛預設 CORS，使用者自己的 CORS 說了算
 	s = build(config.CORSConfig{AllowOrigins: []string{}})
-	if h := do(s, "GET", "https://any.example"); h.Get("Access-Control-Allow-Origin") != "" || h.Get("X-Frame-Options") != "DENY" {
+	if h := do(s, "GET", "https://any.example"); h.Get("Access-Control-Allow-Origin") != "" || h.Get("Vary") != "" || h.Get("X-Frame-Options") != "DENY" {
 		t.Errorf("disabled: %v", h)
 	}
 }
