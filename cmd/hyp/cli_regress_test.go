@@ -1,0 +1,881 @@
+package main
+
+import (
+	"errors"
+	"go/format"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"golang.org/x/mod/semver"
+)
+
+// ── 版本與 go.mod 修復 ──
+
+// fakeGo 模擬 upgradeHypgo 會執行的 go 子命令，直接改寫專案的 go.mod
+type fakeGo struct {
+	dir     string
+	latest  string // go get @latest 取得的版本；空字串表示失敗（離線）
+	tidyErr error
+	calls   []string
+}
+
+func (f *fakeGo) run(args ...string) error {
+	f.calls = append(f.calls, strings.Join(args, " "))
+	path := filepath.Join(f.dir, "go.mod")
+	const base = "module demo\n\ngo 1.24\n"
+	switch {
+	case args[0] == "mod" && args[1] == "edit" && strings.HasPrefix(args[2], "-droprequire="):
+		return os.WriteFile(path, []byte(base), 0o644)
+	case args[0] == "mod" && args[1] == "edit" && strings.HasPrefix(args[2], "-require="):
+		mod, ver, _ := strings.Cut(strings.TrimPrefix(args[2], "-require="), "@")
+		return os.WriteFile(path, []byte(base+"\nrequire "+mod+" "+ver+"\n"), 0o644)
+	case args[0] == "get":
+		if f.latest == "" {
+			return errors.New("exit status 1")
+		}
+		return os.WriteFile(path, []byte(base+"\nrequire "+hypgoModule+" "+f.latest+"\n"), 0o644)
+	case args[0] == "mod" && args[1] == "tidy":
+		return f.tidyErr
+	}
+	return errors.New("unexpected go " + strings.Join(args, " "))
+}
+
+func newFakeGo(t *testing.T, required, latest string) *fakeGo {
+	t.Helper()
+	dir := t.TempDir()
+	mod := "module demo\n\ngo 1.24\n\nrequire " + hypgoModule + " " + required + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(mod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &fakeGo{dir: dir, latest: latest}
+}
+
+// hyp 比最新的 tag 新時，go.mod 要求的版本不存在：要先拿掉 require 才取得到 @latest。
+// 先前直接 go get @latest，go 連模組圖都載不了而失敗，go.mod 停在不存在的版本
+func TestUpgradeHypgoRepairsUnreleasedVersion(t *testing.T) {
+	g := newFakeGo(t, "v0.99.9", "v0.9.2")
+	warn := upgradeHypgo(g.dir, g.run)
+
+	if got := requiredHypgoVersion(g.dir); got != "v0.9.2" {
+		t.Errorf("go.mod requires %s, want the published v0.9.2", got)
+	}
+	if len(g.calls) == 0 || !strings.Contains(g.calls[0], "-droprequire=") {
+		t.Errorf("the unreleased requirement must be dropped before go get: %v", g.calls)
+	}
+	// 生成的程式碼可能用到未發布的 API，要講明
+	if !strings.Contains(warn, "v0.99.9") || !strings.Contains(warn, "v0.9.2") {
+		t.Errorf("warning should name both versions: %q", warn)
+	}
+}
+
+func TestUpgradeHypgoOfflineKeepsCLIVersion(t *testing.T) {
+	g := newFakeGo(t, "v0.99.9", "")
+	warn := upgradeHypgo(g.dir, g.run)
+	if warn == "" {
+		t.Error("a failed download must be reported")
+	}
+	if got := requiredHypgoVersion(g.dir); got != "v0.99.9" {
+		t.Errorf("go.mod requires %s after a failed download, want the original v0.99.9", got)
+	}
+}
+
+func TestUpgradeHypgoQuietWhenUpToDate(t *testing.T) {
+	g := newFakeGo(t, "v0.9.3", "v0.9.4")
+	if warn := upgradeHypgo(g.dir, g.run); warn != "" {
+		t.Errorf("unexpected warning: %q", warn)
+	}
+}
+
+// tidy 失敗的專案不能只顯示成功訊息
+func TestUpgradeHypgoReportsTidyFailure(t *testing.T) {
+	g := newFakeGo(t, "v0.9.3", "v0.9.3")
+	g.tidyErr = errors.New("exit status 1")
+	if warn := upgradeHypgo(g.dir, g.run); !strings.Contains(warn, "go mod tidy") {
+		t.Errorf("warning should mention go mod tidy: %q", warn)
+	}
+}
+
+// Version 是單一來源：Makefile 先前以 -X main.Version=0.1.0 覆寫，生成的專案 require 不存在的 v0.1.0
+func TestVersionIsNotOverriddenByMakefile(t *testing.T) {
+	if !semver.IsValid("v" + Version) {
+		t.Errorf("Version %q is not a semantic version", Version)
+	}
+	data, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "main.Version=") {
+		t.Error("Makefile must not override main.Version with -ldflags")
+	}
+}
+
+// ── 子命令與參數 ──
+
+// 打錯的子命令要失敗：先前只印說明並 exit 0
+func TestMistypedSubcommandFails(t *testing.T) {
+	for _, args := range [][]string{{"migrate", "dif"}, {"secret", "lst"}} {
+		err := runHyp(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "unknown command") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+	if err := runHyp(t, "migrate", "dif"); err == nil || !strings.Contains(err.Error(), "diff") {
+		t.Errorf("should suggest the closest subcommand: %v", err)
+	}
+	for _, parent := range []string{"migrate", "secret"} {
+		if err := runHyp(t, parent); err != nil {
+			t.Errorf("hyp %s alone should print help: %v", parent, err)
+		}
+	}
+}
+
+func TestCommandsRejectStrayArguments(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{
+		{"version", "extra"}, {"diff-log", "--status", "extra"}, {"health", "extra"},
+		{"context", "extra"}, {"run", "extra"}, {"restart", "extra"},
+		{"migrate", "diff", "extra"}, {"migrate", "snapshot", "extra"}, {"testgen", "a", "b"},
+	} {
+		// 要是參數檢查擋下的：health、context 在空目錄本來就會失敗
+		err := runHyp(t, args...)
+		if err == nil || !(strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "accepts")) {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+}
+
+// ── chkcomment ──
+
+const aiAnnotated = "package x\n\n// Foo does it.\n// @ai:generated by=claude date=2026-01-01\n// @ai:purpose test\nfunc Foo() {}\n"
+
+// 位置參數先前被忽略：hyp chkcomment clean a.go 會清掉整個工作目錄
+func TestChkcommentCleanHonorsPathArguments(t *testing.T) {
+	t.Chdir(t.TempDir())
+	os.Mkdir("sub", 0o755)
+	for _, f := range []string{"a.go", "b.go", filepath.Join("sub", "c.go")} {
+		os.WriteFile(f, []byte(aiAnnotated), 0o644)
+	}
+	count := func(f string) int {
+		data, _ := os.ReadFile(f)
+		return strings.Count(string(data), "@ai")
+	}
+
+	if err := runHyp(t, "chkcomment", "clean", "a.go"); err != nil {
+		t.Fatal(err)
+	}
+	if count("a.go") != 0 {
+		t.Error("a.go was not cleaned")
+	}
+	if count("b.go") == 0 || count(filepath.Join("sub", "c.go")) == 0 {
+		t.Fatal("files that were not named got cleaned")
+	}
+
+	if err := runHyp(t, "chkcomment", "clean", "--file", "b.go", "a.go"); err == nil {
+		t.Error("--file together with path arguments should fail")
+	}
+	if err := runHyp(t, "chkcomment", "clean", "./sub/..."); err != nil {
+		t.Fatal(err)
+	}
+	if count(filepath.Join("sub", "c.go")) != 0 || count("b.go") == 0 {
+		t.Error("dir/... should clean that tree only")
+	}
+	// 不給參數仍是整個工作目錄
+	if err := runHyp(t, "chkcomment", "clean"); err != nil {
+		t.Fatal(err)
+	}
+	if count("b.go") != 0 {
+		t.Error("clean without arguments should cover the working directory")
+	}
+}
+
+// 展開目錄時略過生成檔：先前 --fix ./... 會改寫 protoc 的產出
+func TestChkcommentSkipsGeneratedFiles(t *testing.T) {
+	t.Chdir(t.TempDir())
+	gen := "// Code generated by protoc-gen-go. DO NOT EDIT.\n\npackage x\n\nfunc Exported() {}\n"
+	os.WriteFile("x.pb.go", []byte(gen), 0o644)
+	os.WriteFile("hand.go", []byte("// Package x is x.\npackage x\n\n// Hand is hand written.\nfunc Hand() {}\n"), 0o644)
+	// 標記出現在 package 之後不算生成檔
+	os.WriteFile("late.go", []byte("// Package x is x.\npackage x\n\n// Code generated by hand. DO NOT EDIT.\n\n// Late is checked.\nfunc Late() {}\n"), 0o644)
+
+	files, err := collectChkCommentFiles([]string{"./..."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(files, " ")
+	if strings.Contains(got, "x.pb.go") || !strings.Contains(got, "hand.go") || !strings.Contains(got, "late.go") {
+		t.Errorf("files = %v", files)
+	}
+
+	if err := runHyp(t, "chkcomment", "--fix", "./..."); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile("x.pb.go"); string(data) != gen {
+		t.Errorf("generated file was modified:\n%s", data)
+	}
+	// 明確指名的檔案仍會檢查
+	if files, _ := collectChkCommentFiles([]string{"x.pb.go"}); len(files) != 1 {
+		t.Errorf("an explicitly named file should be kept: %v", files)
+	}
+}
+
+// ── hyp test ──
+
+// 先前只有「單一、非 ... 結尾」的參數會限定範圍，其餘情況骨架寫進整個專案
+func TestTestgenTargetsFollowPackageArguments(t *testing.T) {
+	t.Chdir(t.TempDir())
+	os.MkdirAll(filepath.Join("app", "models"), 0o755)
+	os.MkdirAll("routers", 0o755)
+
+	cases := []struct {
+		pkgs             []string
+		targets, skipped string
+	}{
+		{nil, ".", ""},
+		{[]string{"./..."}, ".", ""},
+		{[]string{"./app/models/..."}, "./app/models", ""},
+		{[]string{"./app/models", "./routers"}, "./app/models ./routers", ""},
+		{[]string{"./app/models", "./app/models/..."}, "./app/models", ""},
+		{[]string{"./routers", "github.com/x/y"}, "./routers", "github.com/x/y"},
+	}
+	for _, c := range cases {
+		targets, skipped := testgenTargets(c.pkgs)
+		if strings.Join(targets, " ") != c.targets || strings.Join(skipped, " ") != c.skipped {
+			t.Errorf("%v: targets=%v skipped=%v, want %q / %q", c.pkgs, targets, skipped, c.targets, c.skipped)
+		}
+	}
+}
+
+// ── 專案生成 ──
+
+func TestProjectNamesAllowHyphens(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{
+		{"new", "my-app"}, {"api", "my-api"}, {"new", "cli", "my-tool"},
+		{"new", "grpc", "user-service"}, {"new", "desktop", "my-desk"},
+	} {
+		if err := runHyp(t, args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		name := args[len(args)-1]
+		// 先前只有 hyp api 產生 .gitignore
+		data, err := os.ReadFile(filepath.Join(name, ".gitignore"))
+		if err != nil {
+			t.Errorf("%s has no .gitignore", name)
+		} else if !strings.Contains(string(data), "hypgo.pid") || !strings.Contains(string(data), "*.bak") {
+			t.Errorf("%s/.gitignore should ignore hypgo.pid and *.bak", name)
+		}
+		if data, _ := os.ReadFile(filepath.Join(name, "go.mod")); !strings.HasPrefix(string(data), "module "+name+"\n") {
+			t.Errorf("%s: module path should keep the hyphen:\n%s", name, data)
+		}
+	}
+
+	// 套件名與檔名用底線，顯示名稱保留原樣
+	if !exists(filepath.Join("user-service", "app", "proto", "user_servicepb", "user_service.proto")) {
+		t.Error("gRPC package directory should use the identifier form")
+	}
+	root, _ := os.ReadFile(filepath.Join("my-tool", "app", "commands", "root.go"))
+	if !strings.Contains(string(root), `Use:   "my-tool"`) {
+		t.Errorf("CLI root command should be named after the project:\n%s", root)
+	}
+	// 資源名稱仍不接受連字號
+	if err := runHyp(t, "new", "cli", "bad name"); err == nil {
+		t.Error("spaces should still be rejected")
+	}
+}
+
+func TestGeneratedProjectsAreGofmtClean(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{{"new", "webapp"}, {"api", "apiapp"}} {
+		if err := runHyp(t, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 先前 hyp api 的 auth_service.go、routers/auth.go 過不了 gofmt -l
+	filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		src, _ := os.ReadFile(path)
+		formatted, ferr := format.Source(src)
+		if ferr != nil {
+			t.Errorf("%s: %v", path, ferr)
+		} else if string(formatted) != string(src) {
+			t.Errorf("%s is not gofmt-clean", path)
+		}
+		return nil
+	})
+}
+
+func TestAPIProjectTemplate(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "api", "shop"); err != nil {
+		t.Fatal(err)
+	}
+	read := func(rel string) string {
+		data, err := os.ReadFile(filepath.Join("shop", filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	// 先前內附的 001_create_users 與生成的 User model 欄位不同，hyp migrate diff 又產生一份 CREATE TABLE users
+	entries, _ := os.ReadDir(filepath.Join("shop", "migrations"))
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".sql") {
+			t.Errorf("hyp api should not ship hand-written SQL: %s", e.Name())
+		}
+	}
+	if !exists(filepath.Join("shop", "migrations", ".gitkeep")) {
+		t.Error("migrations/ should be kept with .gitkeep")
+	}
+
+	compose := read("docker-compose.yml")
+	// 應用程式不展開環境變數；initdb.d 會把 down 排在 up 前面執行
+	for _, bad := range []string{"- DB_DSN=", "- REDIS_ADDR=", "- ./migrations:/docker-entrypoint-initdb.d"} {
+		if strings.Contains(compose, bad) {
+			t.Errorf("docker-compose.yml still has %q", bad)
+		}
+	}
+	makefile := read("Makefile")
+	for _, bad := range []string{"@air", "scripts/seed.go", "swag init"} {
+		if strings.Contains(makefile, bad) {
+			t.Errorf("Makefile still has %q", bad)
+		}
+	}
+	if !strings.Contains(makefile, "APP_NAME=shop") || exists(filepath.Join("shop", ".air.toml")) {
+		t.Error("Makefile should use the project name and .air.toml should be gone")
+	}
+	// logger 預設寫檔，終端機要有一行啟動訊息
+	if !strings.Contains(read("main.go"), `fmt.Printf("starting on %s (logs: %s)\n"`) {
+		t.Error("main.go should print a startup line")
+	}
+}
+
+func TestWebProjectTemplate(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "new", "site"); err != nil {
+		t.Fatal(err)
+	}
+	main, _ := os.ReadFile(filepath.Join("site", "main.go"))
+	if !strings.Contains(string(main), "starting on %s") {
+		t.Error("main.go should print a startup line")
+	}
+	// 先前寫死 0.8.6
+	ctrl, _ := os.ReadFile(filepath.Join("site", "app", "controllers", "home.go"))
+	if !strings.Contains(string(ctrl), `"`+Version+`"`) || strings.Contains(string(ctrl), "0.8.6") {
+		t.Errorf("home controller should report the current version")
+	}
+}
+
+// --force：既有檔案保留，其餘照常生成。先前遇到第一個既有檔案就中斷，重跑卡在別的檔案
+func TestForceKeepsExistingFilesAndFinishes(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	for _, c := range []struct{ kind, name string }{{"api", "ghapi"}, {"web", "ghweb"}, {"cli", "ghcli"}} {
+		os.Mkdir(c.name, 0o755)
+		os.WriteFile(filepath.Join(c.name, "README.md"), []byte("# mine\n"), 0o644)
+		os.WriteFile(filepath.Join(c.name, ".gitignore"), []byte("mine/\n"), 0o644)
+
+		args := []string{"new", c.kind, c.name, "--force"}
+		if c.kind == "api" {
+			args = []string{"api", c.name, "--force"}
+		}
+		for run := 1; run <= 2; run++ { // 重跑也要能完成
+			if err := runHyp(t, args...); err != nil {
+				t.Fatalf("%s run %d: %v", c.name, run, err)
+			}
+		}
+		if data, _ := os.ReadFile(filepath.Join(c.name, ".gitignore")); string(data) != "mine/\n" {
+			t.Errorf("%s: existing .gitignore was overwritten", c.name)
+		}
+		if data, _ := os.ReadFile(filepath.Join(c.name, "README.md")); string(data) != "# mine\n" {
+			t.Errorf("%s: existing README.md was overwritten", c.name)
+		}
+		if !exists(filepath.Join(c.name, "main.go")) || !exists(filepath.Join(c.name, "go.mod")) {
+			t.Errorf("%s: project was not completed", c.name)
+		}
+		// 不加 --force 仍然拒絕
+		if err := runHyp(t, args[:len(args)-1]...); err == nil {
+			t.Errorf("%s: a non-empty directory without --force should fail", c.name)
+		}
+	}
+}
+
+// ── hyp generate ──
+
+func TestGenerateUsesProjectRoot(t *testing.T) {
+	root := airulesProject(t) // 含 go.mod（module x）的暫存專案
+	sub := filepath.Join(root, "app", "services")
+	os.MkdirAll(sub, 0o755)
+	t.Chdir(sub)
+
+	// 先前在子目錄執行會生成到 app/services/app/services/
+	if err := runHyp(t, "generate", "service", "order_item"); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(root, "app", "services", "order_item_service.go")) {
+		t.Error("service was not written under the project root")
+	}
+	if exists(filepath.Join(sub, "app")) {
+		t.Error("generated into a nested app/ directory")
+	}
+
+	if err := runHyp(t, "generate", "controller", "order_item"); err != nil {
+		t.Fatal(err)
+	}
+	ctrl, _ := os.ReadFile(filepath.Join(root, "app", "controllers", "order_item_controller.go"))
+	if !strings.Contains(string(ctrl), `"x/app/models"`) {
+		t.Errorf("controller should import the project's module path:\n%.300s", ctrl)
+	}
+	for _, f := range []string{"order_item.go", "router.go", "middleware.go"} {
+		if !exists(filepath.Join(root, "routers", f)) {
+			t.Errorf("routers/%s missing", f)
+		}
+	}
+	// 第二個資源：既有的 router.go / middleware.go 不動，也不算錯誤
+	if err := runHyp(t, "generate", "controller", "invoice"); err != nil {
+		t.Fatal(err)
+	}
+	// 同名資源仍然回錯
+	if err := runHyp(t, "generate", "service", "order_item"); err == nil {
+		t.Error("an existing file should not be overwritten")
+	}
+}
+
+// 不在專案內：先前用 myapp 當 module 產生一份編不過的程式碼
+func TestGenerateNeedsAProject(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if err := runHyp(t, "generate", "controller", "foo"); err == nil || !strings.Contains(err.Error(), "go.mod") {
+		t.Fatalf("err = %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("files were generated outside a project: %v", entries)
+	}
+}
+
+func TestGeneratorNamesMatchScaffold(t *testing.T) {
+	g := generator{name: "order_item"}
+	if g.camel() != "OrderItem" || g.lower() != "order_item" {
+		t.Errorf("camel=%q lower=%q", g.camel(), g.lower())
+	}
+}
+
+// ── hyp diff-log ──
+
+func TestDiffLogSettingLivesAtProjectRoot(t *testing.T) {
+	root := airulesProject(t)
+	sub := filepath.Join(root, "routers")
+	os.Mkdir(sub, 0o755)
+	os.MkdirAll(filepath.Join(root, ".hyp"), 0o755)
+	cfg := filepath.Join(root, ".hyp", "config.json")
+	os.WriteFile(cfg, []byte(`{"diff_log": false, "other": 1}`), 0o644)
+	t.Chdir(sub)
+
+	if err := runHyp(t, "diff-log", "--on"); err != nil {
+		t.Fatal(err)
+	}
+	// 先前寫到子目錄，hyp ai-rules 讀根目錄的設定而看不到
+	if exists(filepath.Join(sub, ".hyp")) {
+		t.Error("setting was written into the subdirectory")
+	}
+	if !IsDiffLogEnabled(root) {
+		t.Error("diff_log not enabled at the project root")
+	}
+	// 其他鍵要保留
+	if data, _ := os.ReadFile(cfg); !strings.Contains(string(data), `"other": 1`) {
+		t.Errorf("other settings were dropped:\n%s", data)
+	}
+
+	// 不是合法 JSON：回錯，不拿空設定蓋掉
+	os.WriteFile(cfg, []byte("not json"), 0o644)
+	if err := runHyp(t, "diff-log", "--off"); err == nil {
+		t.Error("invalid config.json should be an error")
+	}
+	if data, _ := os.ReadFile(cfg); string(data) != "not json" {
+		t.Error("invalid config.json was overwritten")
+	}
+	os.WriteFile(cfg, []byte(`{"diff_log": false}`), 0o644)
+	if err := runHyp(t, "diff-log", "--on", "--off"); err == nil {
+		t.Error("--on with --off should fail")
+	}
+	if IsDiffLogEnabled(root) {
+		t.Error("--on with --off must not change the setting")
+	}
+}
+
+func TestDiffLogNeedsGitAndSkipsItsOwnLog(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := airulesProject(t)
+	// 先前不在 git repo 時印「No changes to log.」並 exit 0
+	if err := runHyp(t, "diff-log"); err == nil || !strings.Contains(err.Error(), "git repository") {
+		t.Fatalf("err = %v", err)
+	}
+	if exists(filepath.Join(root, "logs")) {
+		t.Error("logs/ created although nothing was logged")
+	}
+
+	git := func(args ...string) {
+		t.Helper()
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("add", "-A")
+	git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+	os.WriteFile(filepath.Join(root, "new.txt"), []byte("x"), 0o644)
+
+	for i := 0; i < 2; i++ {
+		if err := runHyp(t, "diff-log"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs, _ := filepath.Glob(filepath.Join(root, "logs", "ai.diff_*.log"))
+	if len(logs) != 1 {
+		t.Fatalf("logs = %v", logs)
+	}
+	data, _ := os.ReadFile(logs[0])
+	if !strings.Contains(string(data), "+ new.txt") {
+		t.Errorf("untracked file not logged:\n%s", data)
+	}
+	// logs/ 沒被忽略時，第二次執行先前會把上一次的日誌記成新檔案
+	if strings.Contains(string(data), "ai.diff_") {
+		t.Errorf("diff-log recorded its own log file:\n%s", data)
+	}
+}
+
+// ── hyp health ──
+
+// 預設設定檔存在但壞掉：先前靜默改查 :8080，錯誤變成「localhost:8080 連不上」
+func TestHealthReportsBrokenDefaultConfig(t *testing.T) {
+	t.Chdir(t.TempDir())
+	os.Mkdir("config", 0o755)
+	os.WriteFile(filepath.Join("config", "config.yaml"), []byte("server: [\n"), 0o644)
+	err := runHyp(t, "health")
+	if err == nil || !strings.Contains(err.Error(), "config.yaml") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// ── 就地生成（hyp new 不給名稱） ──
+
+// inPlaceProject 建立只有 go.mod 的目錄（等同 mkdir + go mod init）並切過去
+func inPlaceProject(t *testing.T, module string) string {
+	t.Helper()
+	offlineGo(t)
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module "+module+"\n\ngo 1.25.3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	return dir
+}
+
+func TestNewInPlaceUsesExistingGoMod(t *testing.T) {
+	cases := []struct {
+		args            []string
+		file, wantInSrc string
+		requires        []string
+	}{
+		{[]string{"new"}, "main.go", `"github.com/acme/billing/routers"`, []string{hypgoModule}},
+		{[]string{"new", "web"}, "routers/router.go", `"github.com/acme/billing/app/controllers"`, []string{hypgoModule}},
+		{[]string{"api"}, "routers/auth.go", `"github.com/acme/billing/app/services"`, []string{hypgoModule, "golang.org/x/crypto"}},
+		{[]string{"new", "api"}, "app/controllers/user_controller.go", `"github.com/acme/billing/app/models"`, []string{hypgoModule, "golang.org/x/crypto"}},
+		{[]string{"new", "cli"}, "main.go", `"github.com/acme/billing/app/commands"`, []string{hypgoModule, "github.com/spf13/cobra"}},
+		{[]string{"new", "grpc"}, "main.go", `"github.com/acme/billing/app/proto/billingpb"`, []string{hypgoModule, "google.golang.org/grpc"}},
+		{[]string{"new", "desktop"}, "main.go", `"github.com/acme/billing/app/views"`, []string{hypgoModule, "fyne.io/fyne/v2"}},
+	}
+	for _, c := range cases {
+		dir := inPlaceProject(t, "github.com/acme/billing")
+		if err := runHyp(t, c.args...); err != nil {
+			t.Fatalf("%v: %v", c.args, err)
+		}
+		src, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(c.file)))
+		if err != nil {
+			t.Fatalf("%v: %v", c.args, err)
+		}
+		if !strings.Contains(string(src), c.wantInSrc) {
+			t.Errorf("%v: %s should import %s", c.args, c.file, c.wantInSrc)
+		}
+		// go.mod 是使用者的：module 與 go 版本不動，只補上需要的 require
+		gomod, _ := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if !strings.HasPrefix(string(gomod), "module github.com/acme/billing\n") || !strings.Contains(string(gomod), "go 1.25.3") {
+			t.Errorf("%v: module path / go version changed:\n%s", c.args, gomod)
+		}
+		for _, r := range c.requires {
+			if !strings.Contains(string(gomod), r+" v") {
+				t.Errorf("%v: go.mod should require %s:\n%s", c.args, r, gomod)
+			}
+		}
+		// 不能多建一層以名稱命名的目錄
+		if exists(filepath.Join(dir, "billing")) {
+			t.Errorf("%v: created a nested project directory", c.args)
+		}
+	}
+}
+
+// 名稱取 module 最後一段（主版本後綴不算）；Dockerfile 的映像跟著既有 go.mod 的 go 版本
+func TestNewInPlaceNamesAndGoVersion(t *testing.T) {
+	dir := inPlaceProject(t, "github.com/acme/user-service/v2")
+	if err := runHyp(t, "new", "grpc"); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(dir, "app", "proto", "user_servicepb", "user_service.proto")) {
+		t.Error("project name should come from the module path, without the /v2 suffix")
+	}
+
+	dir = inPlaceProject(t, "github.com/acme/shop")
+	if err := runHyp(t, "api"); err != nil {
+		t.Fatal(err)
+	}
+	dockerfile, _ := os.ReadFile(filepath.Join(dir, "Dockerfile"))
+	if !strings.Contains(string(dockerfile), "FROM golang:1.25-alpine") {
+		t.Errorf("Dockerfile should follow the go directive of the existing go.mod:\n%.200s", dockerfile)
+	}
+	makefile, _ := os.ReadFile(filepath.Join(dir, "Makefile"))
+	if !strings.Contains(string(makefile), "APP_NAME=shop\n") {
+		t.Error("Makefile should use the last element of the module path")
+	}
+
+	if moduleBaseName("example.com/a/b") != "b" || moduleBaseName("demo") != "demo" || moduleBaseName("example.com/x/v3") != "x" {
+		t.Error("moduleBaseName")
+	}
+}
+
+// module 最後一段不能當識別字（含 .）：CLI / gRPC / Desktop 退而用目錄名
+func TestNewInPlaceFallsBackToDirectoryName(t *testing.T) {
+	offlineGo(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(base, "mytool")
+	os.Mkdir(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/acme/my.tool\n\ngo 1.24\n"), 0o644)
+	t.Chdir(dir)
+	if err := runHyp(t, "new", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	root, _ := os.ReadFile(filepath.Join(dir, "app", "commands", "root.go"))
+	if !strings.Contains(string(root), `Use:   "mytool"`) {
+		t.Errorf("should fall back to the directory name:\n%.300s", root)
+	}
+}
+
+func TestNewInPlaceNeedsGoMod(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, args := range [][]string{{"new"}, {"new", "cli"}, {"api"}, {"new", "api"}} {
+		err := runHyp(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "go mod init") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("files were generated without a go.mod: %v", entries)
+	}
+}
+
+// 既有專案裡誤下 hyp new 不能倒進一整套骨架；--force 才生成，而且既有檔案保留
+func TestNewInPlaceProtectsExistingProjects(t *testing.T) {
+	dir := inPlaceProject(t, "github.com/acme/billing")
+	// README、LICENSE、.gitignore、.git 不算「已有專案檔案」
+	os.WriteFile(filepath.Join(dir, "README.md"), []byte("# mine\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("mine/\n"), 0o644)
+	os.Mkdir(filepath.Join(dir, ".git"), 0o755)
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644)
+
+	err := runHyp(t, "new", "cli")
+	if err == nil || !strings.Contains(err.Error(), "--force") || !strings.Contains(err.Error(), "main.go") {
+		t.Fatalf("err = %v", err)
+	}
+	if exists(filepath.Join(dir, "app")) {
+		t.Fatal("generated into an existing project without --force")
+	}
+
+	if err := runHyp(t, "new", "cli", "--force"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "main.go")); string(data) != "package main\n\nfunc main() {}\n" {
+		t.Error("existing main.go was overwritten")
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine/\n" {
+		t.Error("existing .gitignore was overwritten")
+	}
+	if !exists(filepath.Join(dir, "app", "commands", "root.go")) {
+		t.Error("project was not generated")
+	}
+
+	// 只有 README 等檔案時不需要 --force
+	dir = inPlaceProject(t, "github.com/acme/fresh")
+	os.WriteFile(filepath.Join(dir, "README.md"), []byte("# mine\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("MIT\n"), 0o644)
+	if err := runHyp(t, "new", "cli"); err != nil {
+		t.Fatalf("a freshly initialised directory should not need --force: %v", err)
+	}
+}
+
+// 既有 go.mod 已有的 require 版本不被改動
+func TestNewInPlaceKeepsExistingRequirements(t *testing.T) {
+	dir := inPlaceProject(t, "github.com/acme/tool")
+	gomod := "module github.com/acme/tool\n\ngo 1.25.3\n\nrequire github.com/spf13/cobra v1.8.0\n"
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644)
+	if err := runHyp(t, "new", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if !strings.Contains(string(data), "github.com/spf13/cobra v1.8.0") || strings.Contains(string(data), "cobra v1.9.1") {
+		t.Errorf("an existing requirement was changed:\n%s", data)
+	}
+	if !strings.Contains(string(data), hypgoModule+" v"+Version) {
+		t.Errorf("hypgo requirement missing:\n%s", data)
+	}
+}
+
+// --force 進入已有 go.mod 的具名目錄：沿用它的 module 路徑（先前拿目錄名當 module，import 全錯）
+func TestForceUsesModulePathOfExistingGoMod(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	os.Mkdir("svc", 0o755)
+	os.WriteFile(filepath.Join("svc", "go.mod"), []byte("module github.com/acme/svc\n\ngo 1.24\n"), 0o644)
+	if err := runHyp(t, "api", "svc", "--force"); err != nil {
+		t.Fatal(err)
+	}
+	main, _ := os.ReadFile(filepath.Join("svc", "main.go"))
+	if !strings.Contains(string(main), `"github.com/acme/svc/routers"`) {
+		t.Errorf("imports should use the module path of the existing go.mod:\n%.400s", main)
+	}
+}
+
+// 型別關鍵字後面多的參數、未知型別
+func TestNewArgumentErrors(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "new", "foo", "bar"); err == nil || !strings.Contains(err.Error(), "unknown project type") {
+		t.Errorf("err = %v", err)
+	}
+	if err := runHyp(t, "new", "cli", "a", "b"); err == nil {
+		t.Error("two names should be rejected")
+	}
+}
+
+// ── scaffold 審查後的修正 ──
+
+// 名稱就是 module 路徑：與 go 指令保留字或標準庫套件同名時專案建得出來，但一編譯就失敗
+func TestNewRejectsReservedModuleNames(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{
+		{"new", "cli", "tool"}, {"new", "log"}, {"api", "net"}, {"new", "grpc", "vendor"}, {"new", "cli", "Cmd"},
+	} {
+		if err := runHyp(t, args...); err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+	if entries, _ := os.ReadDir("."); len(entries) != 0 {
+		t.Errorf("projects were created: %v", entries)
+	}
+	if err := runHyp(t, "new", "cli", "logger"); err != nil {
+		t.Errorf("a name that merely starts with a reserved word should be fine: %v", err)
+	}
+}
+
+// hyp generate controller：缺的 model 與 service 一併生成（controller import 它們，單獨生成編不過）；
+// 要寫的檔案有任何一個已存在就什麼都不寫
+func TestGenerateControllerIsComplete(t *testing.T) {
+	root := airulesProject(t)
+	if err := runHyp(t, "generate", "controller", "order_item"); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{
+		"app/models/order_item.go", "app/services/order_item_service.go",
+		"app/controllers/order_item_controller.go", "routers/order_item.go", "routers/router.go", "routers/middleware.go",
+	} {
+		if !exists(filepath.Join(root, filepath.FromSlash(rel))) {
+			t.Errorf("%s missing", rel)
+		}
+	}
+	svc, _ := os.ReadFile(filepath.Join(root, "app", "services", "order_item_service.go"))
+	if !strings.Contains(string(svc), `"x/app/models"`) {
+		t.Error("service should import the project's models")
+	}
+
+	// 先前 controller 檔寫完才發現 routers/router.go 已存在而失敗，重跑又卡在 controller 已存在
+	for _, name := range []string{"router", "middleware"} {
+		err := runHyp(t, "generate", "controller", name)
+		if err == nil || !strings.Contains(err.Error(), "nothing was generated") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+		for _, rel := range []string{"app/controllers/" + name + "_controller.go", "app/models/" + name + ".go", "app/services/" + name + "_service.go"} {
+			if exists(filepath.Join(root, filepath.FromSlash(rel))) {
+				t.Errorf("%s was written although generation failed", rel)
+			}
+		}
+	}
+
+	// 既有的 model 保留、不算錯誤
+	os.WriteFile(filepath.Join(root, "app", "models", "invoice.go"), []byte("package models\n\n// mine\n"), 0o644)
+	if err := runHyp(t, "generate", "controller", "invoice"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(root, "app", "models", "invoice.go")); !strings.Contains(string(data), "// mine") {
+		t.Error("an existing model was overwritten")
+	}
+}
+
+func TestGenerateRejectsBadNames(t *testing.T) {
+	root := airulesProject(t)
+	for _, args := range [][]string{
+		{"generate", "model", "page_js"}, {"generate", "controller", "load_test"}, {"generate", "command", "help"},
+	} {
+		if err := runHyp(t, args...); err == nil {
+			t.Errorf("%v should fail", args)
+		}
+	}
+	if exists(filepath.Join(root, "app")) {
+		t.Error("files were generated for rejected names")
+	}
+}
+
+// hyp api 的 user 資源：路由複數、README 一致、未實作回 501 的說明
+func TestAPIProjectUserResource(t *testing.T) {
+	offlineGo(t)
+	t.Chdir(t.TempDir())
+	if err := runHyp(t, "api", "shop"); err != nil {
+		t.Fatal(err)
+	}
+	rt, _ := os.ReadFile(filepath.Join("shop", "routers", "user.go"))
+	if !strings.Contains(string(rt), `"/api/users"`) || strings.Contains(string(rt), `"/api/user"`) {
+		t.Error("user routes should be plural")
+	}
+	readme, _ := os.ReadFile(filepath.Join("shop", "README.md"))
+	if !strings.Contains(string(readme), "`/api/users/:id`") || strings.Contains(string(readme), "`/api/user`") || !strings.Contains(string(readme), "501") {
+		t.Error("README should list the plural routes and explain the 501 answers")
+	}
+	ctrl, _ := os.ReadFile(filepath.Join("shop", "app", "controllers", "user_controller.go"))
+	if !strings.Contains(string(ctrl), "services.ErrUserNotImplemented") {
+		t.Error("user controller should delegate to the service")
+	}
+}

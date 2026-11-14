@@ -34,18 +34,18 @@ const (
 // HypConfig 是 .hyp/config.yaml 的結構，存放設計時使用的通用設定。
 // 與 config/config.yaml（runtime 應用設定）分離。
 type HypConfig struct {
-	// Language 控制 hyp CLI / scaffold 模板 / LLM prompt 偏好的語言。
-	// 支援 "zh-cn"（簡中）、"zh-tw"（繁中）、"en"（英文）。預設 "en"。
-	Language string `mapstructure:"language" yaml:"language"`
+	// Language 是語言偏好："zh-cn"（簡中）、"zh-tw"（繁中）、"en"（英文），預設 "en"。
+	// 保留欄位：會驗證，但目前沒有任何工具讀取它（先前的說明寫它會影響 CLI 訊息與模板）。
+	Language string `yaml:"language"`
 
 	// DebugLevel 控制 hyp 工具的輸出層級。
 	// "none" / "debug"（預設） / "info" / "warning" / "error"。
 	// "none" 表示完全不輸出（連 error 也不印），給 CI 安靜模式用。
-	DebugLevel string `mapstructure:"debug_level" yaml:"debug_level"`
+	DebugLevel string `yaml:"debug_level"`
 
-	// Environment 標示此專案目前的執行環境（影響 ai-rules / AutoSync 的口吻與嚴格度）。
-	// "local"（預設）、"dev"、"prod"。
-	Environment string `mapstructure:"environment" yaml:"environment"`
+	// Environment 標示執行環境："local"（預設）、"dev"、"prod"。
+	// 保留欄位：會驗證，但目前沒有任何工具讀取它。
+	Environment string `yaml:"environment"`
 }
 
 // DefaultHypConfig 回傳預設值：英文、debug 級輸出、local 環境
@@ -73,6 +73,9 @@ func LoadHypConfig(path string) (*HypConfig, error) {
 	}
 	if err := LoadYAML(path, cfg); err != nil {
 		return nil, fmt.Errorf("failed to load hyp config from %s: %w", path, err)
+	}
+	if err := checkDesignConfig(path, cfg); err != nil {
+		return nil, err
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -135,8 +138,8 @@ const DefaultHypConfigYAML = `# HypGo 設計時通用設定
 # 這份檔案存放「開發時」hyp CLI 與工具會用到的通用設定。
 # 與 config/config.yaml（伺服器/資料庫等 runtime 設定）分離。
 
-# 語言：影響 hyp CLI 訊息、scaffold 模板與 LLM prompt 的語言偏好。
-# 支援 zh-cn（簡中）、zh-tw（繁中）、en（英文）。預設 en。
+# 語言偏好：zh-cn（簡中）、zh-tw（繁中）、en（英文）。預設 en。
+# 保留欄位：目前沒有工具讀取它。
 language: en
 
 # debug 等級：控制 hyp 工具的輸出量。
@@ -147,7 +150,7 @@ language: en
 # error   — 只印 error
 debug_level: debug
 
-# 環境：標示此專案目前的執行環境，影響 ai-rules / AutoSync 的口吻與嚴格度。
+# 環境：標示此專案目前的執行環境。保留欄位：目前沒有工具讀取它。
 # local — 本機開發（預設）
 # dev   — 開發/測試環境
 # prod  — 正式環境

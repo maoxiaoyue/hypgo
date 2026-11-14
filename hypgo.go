@@ -201,9 +201,15 @@ func resolveConfig(explicit string) *config.Config {
 		}
 		return cfg
 	}
-	// 找不到設定檔 → 使用預設值
+	// 找不到設定檔 → 使用預設值（仍可用 HYPGO_SERVER_ADDR 等環境變數覆寫）
 	cfg := &config.Config{}
+	if err := cfg.ApplyEnv(); err != nil {
+		panic(fmt.Sprintf("hypgo: %v", err))
+	}
 	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("hypgo: invalid settings from environment variables: %v", err))
+	}
 	cfg.Logger.Colors = true // 零配置時預設彩色終端輸出
 	return cfg
 }

@@ -49,8 +49,8 @@ func TestGenerateController(t *testing.T) {
 	if !strings.Contains(s, "hypcontext") {
 		t.Error("should use hypcontext")
 	}
-	if !strings.Contains(s, "errors.Define") {
-		t.Error("should use errors.Define")
+	if !strings.Contains(s, "services.ErrProductNotImplemented") {
+		t.Error("should delegate to the service and use its error catalog")
 	}
 	if !strings.Contains(s, "ProductController") {
 		t.Error("should contain ProductController")
@@ -221,7 +221,7 @@ func TestGenerateModel(t *testing.T) {
 
 func TestGenerateService(t *testing.T) {
 	dir := t.TempDir()
-	if err := GenerateService(dir, "Payment"); err != nil {
+	if err := GenerateService(dir, "Payment", "myapp"); err != nil {
 		t.Fatalf("GenerateService failed: %v", err)
 	}
 
@@ -244,7 +244,7 @@ func TestGenerateService(t *testing.T) {
 
 func TestGenerateServiceWithAIComment(t *testing.T) {
 	dir := projectWithAIComment(t, filepath.Join("app", "services"))
-	if err := GenerateService(dir, "Payment"); err != nil {
+	if err := GenerateService(dir, "Payment", "myapp"); err != nil {
 		t.Fatalf("GenerateService failed: %v", err)
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "payment_service.go"))

@@ -3,13 +3,16 @@ package main
 
 import (
 	"fmt"
+	"go/format"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 )
 
@@ -20,46 +23,72 @@ var newCmd = &cobra.Command{
 
   hyp new <name>              Full-stack web project (default)
   hyp new web <name>          Full-stack web project (explicit)
+  hyp new api <name>          API-only project (same as hyp api <name>)
   hyp new cli <name>          CLI tool project (Cobra + services)
   hyp new desktop <name>      Desktop application (Fyne GUI + services)
   hyp new grpc <name>         gRPC microservice (Protobuf + services)
 
+Without a name the project is generated into the current directory, which must
+already have a go.mod (go mod init). The module path comes from that go.mod,
+existing files are kept, and the requirements the project needs are added to it:
+
+  mkdir billing && cd billing && go mod init github.com/acme/billing
+  hyp new api                 API project in the current directory
+  hyp new cli                 CLI project in the current directory
+  hyp new                     Web project in the current directory
+
+If the directory already holds more than go.mod, go.sum, VCS / editor files, a
+README or a LICENSE, pass --force (existing files are still never overwritten).
+
 Examples:
   hyp new myapp               Full-stack web project
-  hyp new cli mytool           CLI tool project
-  hyp new desktop mydesktop    Desktop application
-  hyp new grpc userservice     gRPC microservice`,
-	Args: cobra.RangeArgs(1, 2),
+  hyp new cli my-tool         CLI tool project
+  hyp new desktop mydesktop   Desktop application
+  hyp new grpc user-service   gRPC microservice`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 1 {
+			return fmt.Errorf("unknown project type: %s (use web, api, cli, desktop, or grpc)", args[0])
+		}
+		return nil
+	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := checkNewProject(cmd, args[len(args)-1]); err != nil {
+		t, err := resolveProjectTarget(cmd, args, false)
+		if err != nil {
 			return err
 		}
-		if len(args) == 1 {
-			// hyp new <name> → web 專案（預設）
-			return runNew(cmd, args)
-		}
-		// hyp new <type> <name>
-		projectType := args[0]
-		projectName := args[1]
-		switch projectType {
-		case "web":
-			return runNew(cmd, []string{projectName})
-		case "cli":
-			return runNewCLI(projectName)
-		case "desktop":
-			return runNewDesktop(projectName, false)
-		case "grpc":
-			return runNewGRPC(projectName)
-		default:
-			return fmt.Errorf("unknown project type: %s (use web, cli, desktop, or grpc)", projectType)
-		}
+		return runNew(t)
 	},
+}
+
+var newWebCmd = &cobra.Command{
+	Use:   "web [project-name]",
+	Short: "Create a new full-stack web project",
+	Long: `Create a new full-stack web project (the same as hyp new <name>).
+Without a name, generate into the current directory (needs a go.mod).`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		t, err := resolveProjectTarget(cmd, args, false)
+		if err != nil {
+			return err
+		}
+		return runNew(t)
+	},
+}
+
+var newAPICmd = &cobra.Command{
+	Use:   "api [project-name]",
+	Short: "Create a new API-only project (same as hyp api)",
+	Long: `Create a new API-only project (the same as hyp api <name>).
+Without a name, generate into the current directory (needs a go.mod).`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runAPI,
 }
 
 var newCLICmd = &cobra.Command{
 	Use:   "cli [project-name]",
 	Short: "Create a new CLI tool project",
 	Long: `Create a new CLI tool project with Cobra command structure.
+Without a name, generate into the current directory (needs a go.mod).
 
 Generated structure:
   mytool/
@@ -78,12 +107,13 @@ After creation:
 Add subcommands:
   hyp generate command process
   hyp generate command export`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := checkNewProject(cmd, args[0]); err != nil {
+		t, err := resolveProjectTarget(cmd, args, true)
+		if err != nil {
 			return err
 		}
-		return runNewCLI(args[0])
+		return runNewCLI(t)
 	},
 }
 
@@ -91,6 +121,7 @@ var newDesktopCmd = &cobra.Command{
 	Use:   "desktop [project-name]",
 	Short: "Create a new Desktop application (Fyne GUI)",
 	Long: `Create a new Desktop application using Fyne GUI toolkit.
+Without a name, generate into the current directory (needs a go.mod).
 
 Generated structure:
   myapp/
@@ -113,13 +144,14 @@ Add views:
 Requires: C compiler (gcc) for CGO (Fyne dependency).
 The toolchain is checked after creation; pass --install-deps to let hyp
 run the platform's install command (winget / xcode-select / apt-get / dnf / pacman).`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		installDeps, _ := cmd.Flags().GetBool("install-deps")
-		if err := checkNewProject(cmd, args[0]); err != nil {
+		t, err := resolveProjectTarget(cmd, args, true)
+		if err != nil {
 			return err
 		}
-		return runNewDesktop(args[0], installDeps)
+		return runNewDesktop(t, installDeps)
 	},
 }
 
@@ -127,6 +159,7 @@ var newGRPCCmd = &cobra.Command{
 	Use:   "grpc [project-name]",
 	Short: "Create a new gRPC microservice project",
 	Long: `Create a new gRPC microservice project with Protobuf definitions.
+Without a name, generate into the current directory (needs a go.mod).
 
 Generated structure:
   myservice/
@@ -149,23 +182,137 @@ Add more services:
   hyp generate proto order
 
 Requires: protoc + protoc-gen-go + protoc-gen-go-grpc`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := checkNewProject(cmd, args[0]); err != nil {
+		t, err := resolveProjectTarget(cmd, args, true)
+		if err != nil {
 			return err
 		}
-		return runNewGRPC(args[0])
+		return runNewGRPC(t)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(newCmd)
+	newCmd.AddCommand(newWebCmd)
+	newCmd.AddCommand(newAPICmd)
 	newCmd.AddCommand(newCLICmd)
 	newCmd.AddCommand(newDesktopCmd)
 	newCmd.AddCommand(newGRPCCmd)
 
 	newDesktopCmd.Flags().Bool("install-deps", false, "Install the C toolchain Fyne needs via the platform package manager")
-	newCmd.PersistentFlags().Bool("force", false, "Generate into an existing non-empty directory (existing files are never overwritten)")
+	newCmd.PersistentFlags().Bool("force", false, "Generate into a directory that already has project files (existing files are never overwritten)")
+}
+
+// projectTarget 一次 hyp new / hyp api 的生成目標
+type projectTarget struct {
+	dir     string // 目標目錄；就地生成時為 "."
+	name    string // 專案名稱：顯示用，CLI / Desktop / gRPC 另用於識別字
+	module  string // go.mod 的 module 路徑（生成程式碼的 import 前綴）
+	inPlace bool   // 不給名稱、生成到目前目錄
+}
+
+// label 是訊息裡顯示的專案目錄
+func (t projectTarget) label() string {
+	if t.inPlace {
+		return "."
+	}
+	return t.dir
+}
+
+// printCD 印出「cd <dir>」步驟；就地生成時不需要
+func (t projectTarget) printCD() {
+	if !t.inPlace {
+		fmt.Printf("   cd %s\n", t.dir)
+	}
+}
+
+// resolveProjectTarget 由參數決定生成目標。strictName 為 true 時（CLI / Desktop / gRPC）
+// 名稱必須能轉成 Go 識別字。
+//
+// 不給名稱 → 就地生成：目前目錄必須已有 go.mod（go mod init 過），module 路徑取自它，
+// 既有檔案一律保留。給名稱 → 建立同名目錄；--force 進入已有 go.mod 的目錄時同樣沿用它的
+// module 路徑（先前一律拿目錄名當 module，與既有 go.mod 不符時生成的 import 全部錯誤）
+func resolveProjectTarget(cmd *cobra.Command, args []string, strictName bool) (projectTarget, error) {
+	if len(args) == 0 {
+		return inPlaceTarget(cmd, strictName)
+	}
+	name := args[0]
+	if err := checkNewProject(cmd, name); err != nil {
+		return projectTarget{}, err
+	}
+	t := projectTarget{dir: name, name: name, module: name}
+	if data, err := os.ReadFile(filepath.Join(name, "go.mod")); err == nil {
+		if mod := modfile.ModulePath(data); mod != "" {
+			t.module = mod
+		}
+	}
+	return t, nil
+}
+
+// inPlaceFresh 是「剛 go mod init 完」的目錄裡可以有的項目；有其他東西時就地生成要加 --force，
+// 避免在既有專案裡誤下 hyp new 而倒進一整套骨架
+var inPlaceFresh = regexp.MustCompile(`(?i)^(go\.mod|go\.sum|go\.work|go\.work\.sum|\.git|\.gitignore|\.gitattributes|\.github|\.idea|\.vscode|\.DS_Store|README(\..*)?|LICENSE(\..*)?)$`)
+
+// inPlaceTarget 處理不給名稱的情況：以目前目錄的 go.mod 為準
+func inPlaceTarget(cmd *cobra.Command, strictName bool) (projectTarget, error) {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		return projectTarget{}, fmt.Errorf("no project name given and no go.mod in the current directory: " +
+			"pass a name (hyp new <name>), or run `go mod init <module>` here first")
+	}
+	module := modfile.ModulePath(data)
+	if module == "" {
+		return projectTarget{}, fmt.Errorf("go.mod has no module directive")
+	}
+
+	name := moduleBaseName(module)
+	if strictName && scaffold.ValidateProjectName(name) != nil {
+		// module 最後一段不能當識別字時退而用目錄名
+		wd, _ := os.Getwd()
+		if alt := filepath.Base(wd); scaffold.ValidateProjectName(alt) == nil {
+			name = alt
+		} else {
+			return projectTarget{}, fmt.Errorf("cannot derive a project name from module %q or directory %q "+
+				"(letters, digits, underscores and hyphens, starting with a letter)", module, alt)
+		}
+	}
+
+	force, _ := cmd.Flags().GetBool("force")
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return projectTarget{}, err
+	}
+	var extra []string
+	for _, e := range entries {
+		if !inPlaceFresh.MatchString(e.Name()) {
+			extra = append(extra, e.Name())
+		}
+	}
+	if len(extra) > 0 && !force {
+		if len(extra) > 5 {
+			extra = append(extra[:5], "...")
+		}
+		return projectTarget{}, fmt.Errorf("the current directory already has project files (%s); "+
+			"pass --force to generate here anyway (existing files are never overwritten)", strings.Join(extra, ", "))
+	}
+
+	// 就地生成一律保留既有檔案
+	keepExisting = true
+	scaffold.KeepExisting = true
+	scaffold.OnKeep = reportKept
+	scaffold.OnMerge = reportMerged
+	return projectTarget{dir: ".", name: name, module: module, inPlace: true}, nil
+}
+
+// moduleBaseName 取 module 路徑的最後一段當專案名稱；結尾的主版本（/v2）不算
+func moduleBaseName(module string) string {
+	parts := strings.Split(module, "/")
+	last := parts[len(parts)-1]
+	if len(parts) > 1 && regexp.MustCompile(`^v[0-9]+$`).MatchString(last) {
+		last = parts[len(parts)-2]
+	}
+	return last
 }
 
 // checkNewProject 建立專案前的共用檢查（hyp new 各類型與 hyp api）：名稱合法、目標目錄可用。
@@ -176,6 +323,12 @@ func checkNewProject(cmd *cobra.Command, name string) error {
 		return err
 	}
 	force, _ := cmd.Flags().GetBool("force")
+	// --force：既有檔案保留並略過。先前遇到第一個既有檔案就中斷（GitHub 新建的 repo 通常已有
+	// README.md、.gitignore），留下寫到一半、重跑卡在別的檔案而無法續完的專案
+	keepExisting = force
+	scaffold.KeepExisting = force
+	scaffold.OnKeep = reportKept
+	scaffold.OnMerge = reportMerged
 	fi, err := os.Stat(name)
 	if os.IsNotExist(err) {
 		return nil
@@ -205,14 +358,69 @@ func validateProjectName(name string) error {
 	if err := module.CheckImportPath(name); err != nil {
 		return fmt.Errorf("invalid project name %q: not a valid Go module path: %w", name, err)
 	}
+	// 名稱就是 module 路徑：與 go 指令的保留字或標準庫套件同名時專案建得出來，但一編譯就失敗
+	//（"tool" is not an importable package / ambiguous import: found package log in multiple modules）
+	if reservedModuleNames[strings.ToLower(name)] {
+		return fmt.Errorf("invalid project name %q: it is reserved by the go command or is a standard library package, "+
+			"so a module of that name cannot be built; choose another name (or go mod init a full module path and run hyp new without a name)", name)
+	}
 	return nil
 }
 
-// writeNewFile 建立新檔案；檔案已存在時回錯，不截斷（hyp new / hyp api --force 不覆寫既有檔案）
+// reservedModuleNames 不能當單段 module 路徑的名稱：go 指令的保留字與標準庫的頂層套件
+var reservedModuleNames = func() map[string]bool {
+	m := map[string]bool{}
+	for _, s := range strings.Fields("all cmd std tool vendor " +
+		"archive bufio builtin bytes cmp compress container context crypto database debug embed encoding errors expvar " +
+		"flag fmt go hash html image index io iter log maps math mime net os path plugin reflect regexp runtime slices " +
+		"sort strconv strings structs sync syscall testing text time unicode unique unsafe weak") {
+		m[s] = true
+	}
+	return m
+}()
+
+// keepExisting 由 checkNewProject 依 --force 設定：為 true 時 writeNewFile 保留既有檔案並略過
+var keepExisting bool
+
+// reportKept 回報被保留的既有檔案（--force 或就地生成）
+func reportKept(path string) {
+	fmt.Printf("  = kept existing %s\n", filepath.ToSlash(path))
+}
+
+// reportMerged 回報既有 go.mod 補上了骨架需要的 require
+func reportMerged(path string) {
+	fmt.Printf("  ~ added requirements to %s\n", filepath.ToSlash(path))
+}
+
+// writeNewFile 建立新檔案，絕不截斷既有檔案：已存在時回錯，--force（keepExisting）時保留並略過。
+// .go 檔先經 gofmt：先前 hyp api 的 auth_service.go、routers/auth.go 過不了 gofmt -l，
+// 新專案的格式檢查一開始就失敗；模板產出不合法的 Go 時也在此回錯
 func writeNewFile(path string, data []byte, perm os.FileMode) error {
+	if strings.HasSuffix(path, ".go") {
+		formatted, err := format.Source(data)
+		if err != nil {
+			return fmt.Errorf("generated invalid Go for %s: %w", path, err)
+		}
+		data = formatted
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		if os.IsExist(err) {
+			if keepExisting {
+				// 既有的 go.mod 是使用者自己的：只補上骨架需要的 require
+				if filepath.Base(path) == "go.mod" {
+					merged, merr := scaffold.MergeGoMod(path, data)
+					if merr != nil {
+						return merr
+					}
+					if merged {
+						reportMerged(path)
+						return nil
+					}
+				}
+				reportKept(path)
+				return nil
+			}
 			return fmt.Errorf("file already exists: %s", path)
 		}
 		return err
@@ -225,16 +433,17 @@ func writeNewFile(path string, data []byte, perm os.FileMode) error {
 }
 
 // runNewCLI 生成 CLI 專案
-func runNewCLI(projectName string) error {
-	if err := scaffold.GenerateCLIProject(projectName, projectName, projectName); err != nil {
+func runNewCLI(t projectTarget) error {
+	if err := scaffold.GenerateCLIProject(t.dir, t.name, t.module); err != nil {
 		return fmt.Errorf("failed to create CLI project: %w", err)
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(t.dir)
+	defer printScaffoldWarning(warn)
 
-	fmt.Printf("\n✨ Successfully created CLI project: %s\n", projectName)
+	fmt.Printf("\n✨ Successfully created CLI project: %s\n", t.name)
 	fmt.Printf("📁 Project structure:\n")
-	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   %s/\n", t.label())
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── commands/\n")
 	fmt.Printf("   │   │   ├── root.go\n")
@@ -248,7 +457,7 @@ func runNewCLI(projectName string) error {
 	fmt.Printf("   ├── main.go\n")
 	fmt.Printf("   └── go.mod\n")
 	fmt.Printf("\n🚀 Get started:\n")
-	fmt.Printf("   cd %s\n", projectName)
+	t.printCD()
 	fmt.Printf("   go mod tidy\n")
 	fmt.Printf("   go run .\n")
 	fmt.Printf("\n📝 Add subcommands:\n")
@@ -262,16 +471,17 @@ func runNewCLI(projectName string) error {
 
 // runNewDesktop 生成 Desktop 專案（Fyne）。
 // installDeps 為 true 時，缺少 C 工具鏈會代為執行平台的安裝命令。
-func runNewDesktop(projectName string, installDeps bool) error {
-	if err := scaffold.GenerateDesktopProject(projectName, projectName, projectName); err != nil {
+func runNewDesktop(t projectTarget, installDeps bool) error {
+	if err := scaffold.GenerateDesktopProject(t.dir, t.name, t.module); err != nil {
 		return fmt.Errorf("failed to create desktop project: %w", err)
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(t.dir)
+	defer printScaffoldWarning(warn)
 
-	fmt.Printf("\n✨ Successfully created Desktop project: %s\n", projectName)
+	fmt.Printf("\n✨ Successfully created Desktop project: %s\n", t.name)
 	fmt.Printf("📁 Project structure:\n")
-	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   %s/\n", t.label())
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── views/\n")
 	fmt.Printf("   │   │   ├── main_view.go\n")
@@ -285,7 +495,7 @@ func runNewDesktop(projectName string, installDeps bool) error {
 	fmt.Printf("   ├── main.go\n")
 	fmt.Printf("   └── go.mod\n")
 	fmt.Printf("\n🚀 Get started:\n")
-	fmt.Printf("   cd %s\n", projectName)
+	t.printCD()
 	fmt.Printf("   go mod tidy\n")
 	fmt.Printf("   go run .\n")
 	fmt.Printf("\n📝 Add views:\n")
@@ -300,17 +510,19 @@ func runNewDesktop(projectName string, installDeps bool) error {
 }
 
 // runNewGRPC 生成 gRPC 微服務專案
-func runNewGRPC(projectName string) error {
-	if err := scaffold.GenerateGRPCProject(projectName, projectName, projectName); err != nil {
+func runNewGRPC(t projectTarget) error {
+	if err := scaffold.GenerateGRPCProject(t.dir, t.name, t.module); err != nil {
 		return fmt.Errorf("failed to create gRPC project: %w", err)
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(t.dir)
+	defer printScaffoldWarning(warn)
 
-	lowerName := strings.ToLower(projectName)
-	fmt.Printf("\n✨ Successfully created gRPC project: %s\n", projectName)
+	// 套件與檔名用識別字形式（user-service → user_service）
+	lowerName := strings.ToLower(scaffold.ProjectIdent(t.name))
+	fmt.Printf("\n✨ Successfully created gRPC project: %s\n", t.name)
 	fmt.Printf("📁 Project structure:\n")
-	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   %s/\n", t.label())
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── proto/%spb/\n", lowerName)
 	fmt.Printf("   │   │   └── %s.proto\n", lowerName)
@@ -325,7 +537,7 @@ func runNewGRPC(projectName string) error {
 	fmt.Printf("   ├── Makefile\n")
 	fmt.Printf("   └── go.mod\n")
 	fmt.Printf("\n🚀 Get started:\n")
-	fmt.Printf("   cd %s\n", projectName)
+	t.printCD()
 	fmt.Printf("   go mod tidy\n")
 	fmt.Printf("   make proto              # compile .proto → Go code\n")
 	fmt.Printf("   go run .                # 啟動時自動寫 .hyp/context.yaml（gRPC schema manifest）\n")
@@ -338,8 +550,8 @@ func runNewGRPC(projectName string) error {
 	return nil
 }
 
-func runNew(cmd *cobra.Command, args []string) error {
-	projectName := args[0]
+func runNew(t projectTarget) error {
+	projectName := t.dir
 
 	// 創建項目目錄結構
 	dirs := []string{
@@ -396,17 +608,17 @@ func runNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// 創建示例 Controller（薄控制器，引用 model）
-	if err := createFullStackController(projectName, today); err != nil {
+	if err := createFullStackController(projectName, t.module, today); err != nil {
 		return err
 	}
 
 	// 創建 Router 入口（routers/router.go，引入 router + schema，串接 controller + model）
-	if err := createRouterSetup(projectName, today); err != nil {
+	if err := createRouterSetup(projectName, t.module, today); err != nil {
 		return err
 	}
 
 	// 創建主程序文件（呼叫 routers.Setup）
-	if err := createMainFile(projectName); err != nil {
+	if err := createMainFile(projectName, t.module); err != nil {
 		return err
 	}
 
@@ -421,15 +633,19 @@ func runNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// 創建 go.mod
-	if err := createGoMod(projectName); err != nil {
+	if err := createGoMod(projectName, t.module); err != nil {
+		return err
+	}
+	if err := writeNewFile(filepath.Join(projectName, ".gitignore"), []byte(scaffold.GitignoreTemplate), 0644); err != nil {
 		return err
 	}
 
-	postScaffoldUpgrade(projectName)
+	warn := postScaffoldUpgrade(projectName)
+	defer printScaffoldWarning(warn)
 
-	fmt.Printf("✨ Successfully created full-stack project: %s\n", projectName)
+	fmt.Printf("✨ Successfully created full-stack project: %s\n", t.name)
 	fmt.Printf("📁 Project structure:\n")
-	fmt.Printf("   %s/\n", projectName)
+	fmt.Printf("   %s/\n", t.label())
 	fmt.Printf("   ├── app/\n")
 	fmt.Printf("   │   ├── controllers/    # home.go（薄控制器）\n")
 	fmt.Printf("   │   ├── models/         # home.go（Schema Input/Output DTO）\n")
@@ -448,7 +664,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Printf("   ├── go.mod\n")
 	fmt.Printf("   └── main.go\n")
 	fmt.Printf("\n🚀 Get started:\n")
-	fmt.Printf("   cd %s\n", projectName)
+	t.printCD()
 	fmt.Printf("   go mod tidy\n")
 	fmt.Printf("   hyp run\n")
 
@@ -464,7 +680,6 @@ server:
   read_timeout: 30
   write_timeout: 30
   idle_timeout: 120
-  keep_alive: 30
   max_handlers: 1000
   max_concurrent_streams: 100
   max_read_frame_size: 1048576
@@ -527,13 +742,18 @@ func createHypConfigFile(configDir string) error {
 	return writeNewFile(filename, []byte(scaffold.HypConfigYamlTemplate), 0644)
 }
 
-func createMainFile(projectName string) error {
+// startupLineSnippet 是生成的 main.go 在 app.Run() 前印的一行。
+// logger 預設寫到 logs/ 下的檔案：先前 go run . 後終端機完全沒有輸出，看不出服務是否啟動、日誌在哪
+const startupLineSnippet = "\t// logger 預設寫檔，終端機另外印一行，方便確認位址與日誌位置\n" +
+	"\tfmt.Printf(\"starting on %s (logs: %s)\\n\", app.Config().Server.Addr, app.Config().Logger.Output)\n\n"
+
+func createMainFile(projectName, module string) error {
 	mainContent := "package main\n\n" +
 		"import (\n" +
 		"\t\"fmt\"\n" +
 		"\t\"os\"\n\n" +
 		"\t\"github.com/maoxiaoyue/hypgo\"\n\n" +
-		"\t\"" + projectName + "/routers\"\n" +
+		"\t\"" + module + "/routers\"\n" +
 		")\n\n" +
 		"// configPath 是 runtime 設定檔位置（專案根目錄 config/；.hyp/ 下的是設計時設定，兩者分離）\n" +
 		"const configPath = \"config/config.yaml\"\n\n" +
@@ -547,6 +767,7 @@ func createMainFile(projectName string) error {
 		"\t}\n\n" +
 		"\t// 所有路由與中間件定義於 routers/router.go\n" +
 		"\trouters.Setup(app.Server().Router())\n\n" +
+		startupLineSnippet +
 		"\t// Run 會阻塞到收到 SIGINT/SIGTERM 並完成優雅關閉（Start() 內建，不必自己處理訊號）\n" +
 		"\tif err := app.Run(); err != nil {\n" +
 		"\t\tapp.Logger().Errorf(\"server error: %v\", err)\n" +
@@ -587,7 +808,7 @@ func createHomeModel(projectName, today string) error {
 
 // createRouterSetup 生成 routers/router.go（專案根目錄）：引入 router + schema，
 // 以 Schema-first 串接 controller 與 model，作為專案路由的唯一入口。
-func createRouterSetup(projectName, today string) error {
+func createRouterSetup(projectName, module, today string) error {
 	content := "// Package routers 集中定義路由與中間件（Schema-first MVC 的 Router 層）。\n" +
 		"//\n" +
 		"// @ai:generated by=hypgo date=" + today + "\n" +
@@ -595,12 +816,12 @@ func createRouterSetup(projectName, today string) error {
 		"import (\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/router\"\n" +
 		"\t\"github.com/maoxiaoyue/hypgo/pkg/schema\"\n\n" +
-		"\t\"" + projectName + "/app/controllers\"\n" +
-		"\t\"" + projectName + "/app/models\"\n" +
-		"\t\"" + projectName + "/templates\"\n" +
+		"\t\"" + module + "/app/controllers\"\n" +
+		"\t\"" + module + "/app/models\"\n" +
+		"\t\"" + module + "/templates\"\n" +
 		")\n\n" +
 		"// Setup 註冊所有路由與中間件。\n" +
-		"// 在 main.go 呼叫：routers.Setup(srv.Router())。\n" +
+		"// 在 main.go 呼叫：routers.Setup(app.Server().Router())。\n" +
 		"func Setup(r *router.Router) {\n" +
 		"\t// Recovery / Logger / RejectEarlyData / Security / CORS 由 server.Start() 自動套用（v0.8.11+），\n" +
 		"\t// 不要再 r.Use(middleware.DefaultMiddleware()...)，否則每個請求會跑兩次。\n" +
@@ -648,14 +869,14 @@ func createGitKeep(dir string) error {
 	return writeNewFile(filepath.Join(dir, ".gitkeep"), nil, 0644)
 }
 
-func createFullStackController(projectName, today string) error {
+func createFullStackController(projectName, module, today string) error {
 	controllerContent := "// Package controllers 承載 HTTP handler（薄控制器：解析輸入 → 呼叫 service → 寫回應）。\n" +
 		"//\n" +
 		"// @ai:generated by=hypgo date=" + today + "\n" +
 		"package controllers\n\n" +
 		"import (\n" +
 		"\thypcontext \"github.com/maoxiaoyue/hypgo/pkg/context\"\n\n" +
-		"\t\"" + projectName + "/app/models\"\n" +
+		"\t\"" + module + "/app/models\"\n" +
 		")\n\n" +
 		"// HomeController 處理首頁與系統狀態相關路由。\n" +
 		"type HomeController struct{}\n\n" +
@@ -679,7 +900,7 @@ func createFullStackController(projectName, today string) error {
 		"\t\tSuccess: true,\n" +
 		"\t\tMessage: \"HypGo Framework\",\n" +
 		"\t\tData: models.InfoDetail{\n" +
-		"\t\t\tVersion:  \"0.8.6\",\n" +
+		"\t\t\tVersion:  \"" + Version + "\",\n" +
 		"\t\t\tProtocol: c.Request.Proto,\n" +
 		"\t\t},\n" +
 		"\t})\n" +
@@ -991,7 +1212,7 @@ body {
 	return writeNewFile(jsFile, []byte(jsContent), 0644)
 }
 
-func createGoMod(projectName string) error {
+func createGoMod(projectName, module string) error {
 	// 版本取自 hyp 本身（version.go），postScaffoldUpgrade 再嘗試升到 @latest。
 	// 先前以 git ls-remote git@github.com:...（SSH，沒有金鑰即失敗）查最新 tag，失敗時退回 v0.8.5——
 	// 該版本沒有根 hypgo 套件，離線或 proxy 失敗時產生的專案永遠編不過
@@ -1000,7 +1221,7 @@ func createGoMod(projectName string) error {
 go 1.24
 
 require github.com/maoxiaoyue/hypgo v%s
-`, projectName, Version)
+`, module, Version)
 
 	filename := filepath.Join(projectName, "go.mod")
 	return writeNewFile(filename, []byte(content), 0644)

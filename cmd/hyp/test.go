@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/maoxiaoyue/hypgo/pkg/testgen"
 	"github.com/spf13/cobra"
@@ -58,15 +60,18 @@ func runTest(cmd *cobra.Command, args []string) error {
 		opts.IncludeUnexported = includeUnexported
 		opts.DryRun = dryRun
 
-		target := "."
-		// 如果使用者指定了單一目錄/package（不是 ./... 之類），用它當 scope
-		if len(pkgs) == 1 && !isWildcardPackage(pkgs[0]) {
-			target = pkgs[0]
+		targets, skipped := testgenTargets(pkgs)
+		for _, s := range skipped {
+			fmt.Printf("(testgen skipped %s: not a directory in this project)\n", s)
 		}
-		fmt.Printf("== hyp testgen (scope=%s) ==\n", target)
-		reports, err := testgen.GenerateForDir(target, opts)
-		if err != nil {
-			return fmt.Errorf("testgen: %w", err)
+		fmt.Printf("== hyp testgen (scope=%s) ==\n", strings.Join(targets, " "))
+		var reports []testgen.Report
+		for _, target := range targets {
+			r, err := testgen.GenerateForDir(target, opts)
+			if err != nil {
+				return fmt.Errorf("testgen: %w", err)
+			}
+			reports = append(reports, r...)
 		}
 		if len(reports) == 0 {
 			fmt.Println("No missing tests.")
@@ -103,9 +108,29 @@ func runTest(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// isWildcardPackage 判斷是否是 ./... 之類的萬用字元 package spec
-func isWildcardPackage(s string) bool {
-	return len(s) >= 3 && s[len(s)-3:] == "..."
+// testgenTargets 把 go test 的套件參數換成 testgen 要掃描的目錄（testgen 本身遞迴）。
+// 先前只有「單一、非 ... 結尾」的參數會限定範圍：hyp test ./app/models/... 或給兩個套件時，
+// 骨架會寫進整個專案的其他套件。不是目錄的參數（import path）不產生骨架，由 skipped 回報
+func testgenTargets(pkgs []string) (targets, skipped []string) {
+	if len(pkgs) == 0 {
+		return []string{"."}, nil
+	}
+	seen := map[string]bool{}
+	for _, p := range pkgs {
+		dir := strings.TrimRight(strings.TrimSuffix(p, "..."), `/\`)
+		if dir == "" {
+			dir = "."
+		}
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			skipped = append(skipped, p)
+			continue
+		}
+		if key := filepath.Clean(dir); !seen[key] {
+			seen[key] = true
+			targets = append(targets, dir)
+		}
+	}
+	return targets, skipped
 }
 
 // joinArgs 把 args 轉成可讀字串（用於 log）

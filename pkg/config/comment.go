@@ -11,14 +11,14 @@ import (
 // 每個欄位代表「AI 在生成程式碼時是否需要寫這類註釋」。
 type CommentConfig struct {
 	// NormalComment 控制是否生成普通註釋（如 godoc、函式說明）。預設 true。
-	NormalComment bool `mapstructure:"normal_comment" yaml:"normal_comment"`
+	NormalComment bool `yaml:"normal_comment"`
 
 	// AIComment 控制是否生成 @ai 系列註釋（@ai:generated、@ai:purpose、
 	// @ai:input、@ai:output、@ai:sideeffect 等）。不包含 @ai:think。預設 false。
-	AIComment bool `mapstructure:"ai_comment" yaml:"ai_comment"`
+	AIComment bool `yaml:"ai_comment"`
 
 	// ThinkComment 控制是否生成 @ai:think 函式體內意圖註釋。預設 false。
-	ThinkComment bool `mapstructure:"think_comment" yaml:"think_comment"`
+	ThinkComment bool `yaml:"think_comment"`
 }
 
 // DefaultCommentConfig 回傳預設值：只開啟普通註釋。
@@ -48,6 +48,10 @@ func LoadCommentConfig(path string) (*CommentConfig, error) {
 	// 先以「不存在 = 預設」處理，再嘗試載入；載入失敗回 error 讓使用者察覺格式問題
 	if err := LoadYAML(path, cfg); err != nil {
 		return nil, fmt.Errorf("failed to load comment config from %s: %w", path, err)
+	}
+	// 先前 ai_coment: true 這種打錯的鍵沒有任何反應，開關等於沒開
+	if err := checkDesignConfig(path, cfg); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil

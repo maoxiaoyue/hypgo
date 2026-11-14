@@ -59,6 +59,7 @@ Examples:
   hyp run                    Build, run and hot reload
   hyp run --watch=false      Build and run once
   hyp run -p ./cmd/server    Main package outside the project root`,
+	Args:         cobra.NoArgs,
 	RunE:         runRun,
 	SilenceUsage: true,
 }
@@ -209,6 +210,7 @@ func startApp(bin string) (*devProcess, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	bindChildLifetime(cmd)
 	p := &devProcess{cmd: cmd, done: make(chan struct{})}
 	go func() {
 		p.err = cmd.Wait()

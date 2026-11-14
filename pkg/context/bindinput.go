@@ -7,9 +7,13 @@
 package context
 
 import (
+	"encoding/json"
 	stderrors "errors"
+	"fmt"
+	"io"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync/atomic"
 
 	"github.com/go-playground/validator/v10"
@@ -67,7 +71,11 @@ func (c *Context) BindInputCalled() bool {
 //
 // 失敗時自動以 Error Catalog 形狀的 JSON 中斷請求並回傳 false：
 //   - 解析失敗 → 400 {"code":"E0002","message":"Bad request"}
-//   - 驗證失敗 → 422 {"code":"E1001","message":"Validation failed","details":{欄位:訊息}}
+//   - 有 body 但 Content-Type 認不得 → 415 {"code":"E0005","message":"Unsupported media type"}
+//   - body 超過上限 → 413 {"code":"E0006","message":"Request body too large"}
+//   - 驗證失敗 → 422 {"code":"E1001","message":"Validation failed","details":{欄位路徑:訊息}}
+//
+// obj 可以是 struct、slice 或 map 的指標；slice / map 的元素逐一驗證。
 //
 // 成功回傳 true，呼叫端可直接使用 obj。典型用法：
 //
@@ -95,19 +103,90 @@ func (c *Context) BindInput(obj interface{}) bool {
 
 	// 2. 依 Content-Type 解析（JSON / form / query 等）
 	if err := c.ShouldBind(obj); err != nil {
-		c.abortBindError(http.StatusBadRequest, "E0002", "Bad request",
-			map[string]interface{}{"reason": err.Error()})
+		var tooBig *http.MaxBytesError
+		switch {
+		case stderrors.Is(err, ErrUnsupportedMediaType):
+			c.abortBindError(http.StatusUnsupportedMediaType, "E0005", "Unsupported media type",
+				map[string]interface{}{"reason": err.Error()})
+		case stderrors.As(err, &tooBig):
+			c.abortBindError(http.StatusRequestEntityTooLarge, "E0006", "Request body too large",
+				map[string]interface{}{"limit": tooBig.Limit})
+		default:
+			c.abortBindError(http.StatusBadRequest, "E0002", "Bad request",
+				map[string]interface{}{"reason": bindReason(err)})
+		}
 		return false
 	}
 
 	// 3. 執行 validate tag 驗證（共用 registry，與 pkg/json 同步生效）
-	if err := hypvalidate.Struct(obj); err != nil {
+	if err := validateBound(obj); err != nil {
 		c.abortBindError(http.StatusUnprocessableEntity, "E1001", "Validation failed",
 			validationDetails(err))
 		return false
 	}
 
 	return true
+}
+
+// validateBound 驗證綁定結果：struct 走 validate tag，slice / array / map 逐一驗證元素。
+// 先前一律呼叫 validator.Struct：綁到 []Item 或 map 時它回 InvalidValidationError，
+// 合法的 JSON 陣列也被當成驗證失敗回 422
+func validateBound(obj interface{}) error {
+	v := reflect.ValueOf(obj)
+	for v.Kind() == reflect.Ptr && !v.IsNil() {
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		return hypvalidate.Struct(obj)
+	case reflect.Slice, reflect.Array, reflect.Map:
+		return hypvalidate.Var(v.Interface(), "dive")
+	}
+	return nil
+}
+
+// bindReason 把綁定錯誤轉成給客戶端看的說明，不帶 Go 的型別名。
+// 先前直接輸出 err.Error()：json: cannot unmarshal string into Go struct field Req.age of type int，
+// 空 body 則只有 "EOF"
+func bindReason(err error) string {
+	var typeErr *json.UnmarshalTypeError
+	var syntaxErr *json.SyntaxError
+	switch {
+	case stderrors.Is(err, io.EOF):
+		return "request body is empty"
+	case stderrors.Is(err, io.ErrUnexpectedEOF):
+		return "request body is truncated"
+	case stderrors.As(err, &typeErr):
+		if typeErr.Field == "" {
+			return fmt.Sprintf("expected %s, got %s", jsonKind(typeErr.Type), typeErr.Value)
+		}
+		return fmt.Sprintf("field %q must be %s, got %s", typeErr.Field, jsonKind(typeErr.Type), typeErr.Value)
+	case stderrors.As(err, &syntaxErr):
+		return fmt.Sprintf("invalid JSON at offset %d", syntaxErr.Offset)
+	}
+	return err.Error()
+}
+
+// jsonKind Go 型別對應的 JSON 型別名稱
+func jsonKind(t reflect.Type) string {
+	if t = derefType(t); t == nil {
+		return "a valid value"
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	case reflect.Struct, reflect.Map:
+		return "an object"
+	}
+	return "a valid value"
 }
 
 // derefType 解開指標層，回傳底層型別
@@ -131,18 +210,36 @@ func (c *Context) abortBindError(status int, code, message string, details map[s
 	c.AbortWithStatusJSON(status, body)
 }
 
-// validationDetails 將 validator 錯誤轉為 欄位 → 可讀訊息 的細節 map
+// validationDetails 將 validator 錯誤轉為 欄位路徑 → 可讀訊息 的細節 map。
+// key 是完整路徑（billing.city、items[1].city）：先前只取最後一段，
+// billing.city 與 shipping.city 同時缺少時互相覆蓋，只剩一筆 city
 func validationDetails(err error) map[string]interface{} {
 	details := map[string]interface{}{}
 	var verrs validator.ValidationErrors
 	if stderrors.As(err, &verrs) {
 		for _, fe := range verrs {
-			details[fe.Field()] = validationMessage(fe)
+			details[fieldPath(fe)] = validationMessage(fe)
 		}
 	} else {
 		details["error"] = err.Error()
 	}
 	return details
+}
+
+// fieldPath 回傳欄位在請求裡的路徑：去掉 validator namespace 開頭的型別名
+// （Order.billing.city → billing.city；slice 的 [1].name 原樣保留）
+func fieldPath(fe validator.FieldError) string {
+	ns := fe.Namespace()
+	if i := strings.IndexAny(ns, ".["); i >= 0 {
+		if ns[i] == '.' {
+			return ns[i+1:]
+		}
+		return ns[i:]
+	}
+	if f := fe.Field(); f != "" {
+		return f
+	}
+	return ns
 }
 
 // validationMessage 依驗證規則產生可讀訊息（對齊 pkg/json 的訊息風格）

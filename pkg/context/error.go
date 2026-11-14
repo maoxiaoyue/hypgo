@@ -4,6 +4,7 @@ package context
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -214,12 +215,22 @@ func (c *Context) AddPrivateError(err error) *Error {
 	return c.AddError(err, ErrorTypePrivate, nil)
 }
 
-// ErrorJSON 返回錯誤的 JSON 響應
+// ErrorJSON 以 JSON 回應公開的錯誤（ErrorTypePublic）；沒有公開錯誤時只回狀態文字。
+// 先前連私有錯誤一起輸出：c.Error(err) 預設是私有的，資料庫的錯誤訊息
+// （pq: password authentication failed for user "app"）就這樣送給客戶端
 func (c *Context) ErrorJSON(code int) {
-	c.JSON(code, c.Errors.JSON())
+	if public := c.Errors.ByType(ErrorTypePublic); len(public) > 0 {
+		c.JSON(code, public.JSON())
+		return
+	}
+	c.JSON(code, map[string]string{"error": http.StatusText(code)})
 }
 
-// ErrorString 返回錯誤的字符串響應
+// ErrorString 以純文字回應公開的錯誤；沒有時只回狀態文字（理由同 ErrorJSON）
 func (c *Context) ErrorString(code int) {
-	c.String(code, c.Errors.String())
+	if public := c.Errors.ByType(ErrorTypePublic); len(public) > 0 {
+		c.String(code, "%s", strings.Join(public.Errors(), "\n"))
+		return
+	}
+	c.String(code, "%s", http.StatusText(code))
 }

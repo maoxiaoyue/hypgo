@@ -103,7 +103,7 @@ func TestLLMConfigAPIBaseURLDefaults(t *testing.T) {
 	}{
 		{"openai", "https://api.openai.com/v1"},
 		{"anthropic", "https://api.anthropic.com/v1"},
-		{"gemini", "https://generativelanguage.googleapis.com/v1beta"},
+		{"gemini", "https://generativelanguage.googleapis.com/v1beta/openai"},
 		{"custom", ""}, // custom 不設預設
 	}
 

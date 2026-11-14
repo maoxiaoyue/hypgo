@@ -5,7 +5,10 @@ package scaffold
 import (
 	"bytes"
 	"fmt"
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,11 +16,69 @@ import (
 	"text/template"
 	"time"
 
+	"golang.org/x/mod/modfile"
 	"gopkg.in/yaml.v3"
 )
 
 // validName 只允許字母、數字、底線（防止目錄穿越和 code injection）
 var validName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+
+// validProjectName 專案名稱另外允許連字號（user-service）：它同時是目錄名與 module 路徑，
+// 識別字則用 ProjectIdent 轉換後的名稱
+var validProjectName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`)
+
+// KeepExisting 為 true 時，目標檔案已存在就保留並略過（透過 OnKeep 回報），不回錯。
+// hyp new / hyp api --force 使用：先前遇到第一個既有檔案（如 README.md、.gitignore）就中斷，
+// 留下寫到一半、重跑也無法續完的專案
+var KeepExisting bool
+
+// errNoModule：生成的程式碼要 import 專案自己的套件，沒有 module 路徑就寫不出來。
+// 先前預設成 "myapp"，產生的 import 一定對不上
+var errNoModule = fmt.Errorf("scaffold: module name is required")
+
+// OnKeep 在 KeepExisting 略過既有檔案時被呼叫（可為 nil）
+var OnKeep func(path string)
+
+// OnMerge 在 KeepExisting 把缺少的 require 併入既有 go.mod 時被呼叫（可為 nil）
+var OnMerge func(path string)
+
+// MergeGoMod 把 rendered（模板產生的 go.mod）裡、既有 go.mod 還沒有的 require 加進去，回報是否有變更。
+// module 路徑、go 版本與既有 require 的版本都不動：就地生成（hyp new 不給名稱）與 --force 時，
+// 專案的 go.mod 是使用者自己的，只補上骨架需要的依賴
+func MergeGoMod(path string, rendered []byte) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	cur, err := modfile.Parse(path, data, nil)
+	if err != nil {
+		return false, fmt.Errorf("scaffold: parse %s: %w", path, err)
+	}
+	want, err := modfile.Parse("go.mod", rendered, nil)
+	if err != nil {
+		return false, fmt.Errorf("scaffold: parse go.mod template: %w", err)
+	}
+	have := map[string]bool{}
+	for _, r := range cur.Require {
+		have[r.Mod.Path] = true
+	}
+	changed := false
+	for _, r := range want.Require {
+		if !have[r.Mod.Path] {
+			cur.AddNewRequire(r.Mod.Path, r.Mod.Version, r.Indirect)
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	cur.Cleanup()
+	out, err := cur.Format()
+	if err != nil {
+		return false, err
+	}
+	return true, os.WriteFile(path, out, 0644)
+}
 
 // GeneratedBy 為生成程式碼 @ai:generated 的 by= 值。程式碼出自模板而非 AI，
 // 先前依 .hyp/llm.yaml 或掃描 *.md 的關鍵字猜測供應商（README 提到 OpenAI 就標 by=openai），出處不實
@@ -25,7 +86,7 @@ const GeneratedBy = "hypgo-scaffold"
 
 // HypgoVersion 為生成的 go.mod require 的 hypgo 版本；hyp CLI 啟動時設為自身版本。
 // 先前 CLI / desktop / gRPC 的 go.mod 模板寫死版本號，升版時容易遺漏
-var HypgoVersion = "v0.9.2"
+var HypgoVersion = "v0.9.3"
 
 // GenerateController 生成 controller（只含 handler 邏輯，路由在 routers/ 中）
 // 目標專案的 .hyp/comment.yaml 開啟 ai_comment 時，每個 struct 與 func 附完整 @ai 區塊
@@ -34,7 +95,7 @@ func GenerateController(dir, name, moduleName string) error {
 		return err
 	}
 	if moduleName == "" {
-		moduleName = "myapp"
+		return errNoModule
 	}
 	data := templateData(name)
 	data["ModuleName"] = moduleName
@@ -47,7 +108,7 @@ func GenerateRouter(dir, name, moduleName string) error {
 		return err
 	}
 	if moduleName == "" {
-		moduleName = "myapp"
+		return errNoModule
 	}
 	data := templateData(name)
 	data["ModuleName"] = moduleName
@@ -61,18 +122,16 @@ func GenerateRouterSetup(dir, name, moduleName string) error {
 		return err
 	}
 	if moduleName == "" {
-		moduleName = "myapp"
+		return errNoModule
 	}
-	data := map[string]string{
-		"Name":       camelName(name),
-		"ModuleName": moduleName,
-	}
+	data := templateData(name)
+	data["ModuleName"] = moduleName
 	return generateFile(dir, "router.go", routerSetupTemplate, data)
 }
 
 // GenerateMiddleware 生成 routers/middleware.go 中間件配置（只在首次執行）
 func GenerateMiddleware(dir string) error {
-	return generateFile(dir, "middleware.go", middlewareTemplate, nil)
+	return generateFile(dir, "middleware.go", middlewareTemplate, templateData("middleware"))
 }
 
 // GenerateModel 生成使用 bun ORM 的 model（含 Request/Response struct）
@@ -81,7 +140,6 @@ func GenerateModel(dir, name string) error {
 		return err
 	}
 	data := templateData(name)
-	data["TableName"] = pluralize(strings.ToLower(name))
 	// 先前取名稱第一個字母：Category 與 Comment 都是 "c"，兩個 model 一起 join 時查詢出錯
 	data["Alias"] = strings.ToLower(name)
 	return generateFile(dir, strings.ToLower(name)+".go", modelTemplate, data)
@@ -93,14 +151,14 @@ func GenerateModel(dir, name string) error {
 
 // GenerateCLIProject 生成完整的 CLI 專案骨架
 func GenerateCLIProject(baseDir, name, moduleName string) error {
-	if err := validateName(name); err != nil {
+	if err := ValidateProjectName(name); err != nil {
 		return err
 	}
 	if moduleName == "" {
 		moduleName = name
 	}
 
-	data := templateData(name)
+	data := projectData(name)
 	data["ModuleName"] = moduleName
 
 	// 建立目錄結構
@@ -132,6 +190,7 @@ func GenerateCLIProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "crypt.yaml", CryptYamlTemplate},
 		{baseDir, "go.mod", cliGoModTemplate},
+		{baseDir, ".gitignore", GitignoreTemplate},
 	}
 
 	for _, f := range files {
@@ -148,6 +207,10 @@ func GenerateCommand(dir, name string) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
+	// help、completion 是 cobra 內建命令：同名的子命令會蓋掉它們
+	if lower := strings.ToLower(name); lower == "help" || lower == "completion" {
+		return fmt.Errorf("scaffold: %q is a built-in cobra command; choose another name", lower)
+	}
 	return generateFile(dir, strings.ToLower(name)+".go", cliCommandTemplate, templateData(name))
 }
 
@@ -157,14 +220,14 @@ func GenerateCommand(dir, name string) error {
 
 // GenerateDesktopProject 生成完整的 Desktop 專案骨架（Fyne）
 func GenerateDesktopProject(baseDir, name, moduleName string) error {
-	if err := validateName(name); err != nil {
+	if err := ValidateProjectName(name); err != nil {
 		return err
 	}
 	if moduleName == "" {
 		moduleName = name
 	}
 
-	data := templateData(name)
+	data := projectData(name)
 	data["ModuleName"] = moduleName
 
 	// 建立目錄結構
@@ -196,6 +259,7 @@ func GenerateDesktopProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, ".hyp"), "config.yaml", HypConfigYamlTemplate},
 		{filepath.Join(baseDir, ".hyp"), "crypt.yaml", CryptYamlTemplate},
 		{baseDir, "go.mod", desktopGoModTemplate},
+		{baseDir, ".gitignore", GitignoreTemplate},
 	}
 
 	for _, f := range files {
@@ -221,19 +285,19 @@ func GenerateView(dir, name string) error {
 
 // GenerateGRPCProject 生成完整的 gRPC 微服務專案骨架
 func GenerateGRPCProject(baseDir, name, moduleName string) error {
-	if err := validateName(name); err != nil {
+	if err := ValidateProjectName(name); err != nil {
 		return err
 	}
 	if moduleName == "" {
 		moduleName = name
 	}
 
-	data := templateData(name)
+	data := projectData(name)
 	data["ModuleName"] = moduleName
 
 	// 建立目錄結構
 	dirs := []string{
-		filepath.Join(baseDir, "app", "proto", strings.ToLower(name)+"pb"),
+		filepath.Join(baseDir, "app", "proto", data["LowerName"]+"pb"),
 		filepath.Join(baseDir, "app", "rpc"),
 		filepath.Join(baseDir, "app", "models"),
 		filepath.Join(baseDir, "app", "services"),
@@ -246,7 +310,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		}
 	}
 
-	lowerName := strings.ToLower(name)
+	lowerName := data["LowerName"]
 
 	// 生成檔案
 	files := []struct {
@@ -263,6 +327,7 @@ func GenerateGRPCProject(baseDir, name, moduleName string) error {
 		{filepath.Join(baseDir, ".hyp"), "crypt.yaml", CryptYamlTemplate},
 		{baseDir, "go.mod", grpcGoModTemplate},
 		{baseDir, "Makefile", grpcMakefileTemplate},
+		{baseDir, ".gitignore", GitignoreTemplate},
 	}
 
 	for _, f := range files {
@@ -280,7 +345,7 @@ func GenerateProto(baseDir, name, moduleName string) error {
 		return err
 	}
 	if moduleName == "" {
-		moduleName = "myapp"
+		return errNoModule
 	}
 
 	data := templateData(name)
@@ -302,11 +367,15 @@ func GenerateProto(baseDir, name, moduleName string) error {
 
 // GenerateService 生成使用 Error Catalog 的 service
 // 目標專案的 .hyp/comment.yaml 開啟 ai_comment 時，每個 struct 與 func 附完整 @ai 區塊
-func GenerateService(dir, name string) error {
+func GenerateService(dir, name, moduleName string) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
+	if moduleName == "" {
+		return errNoModule
+	}
 	data := templateData(name)
+	data["ModuleName"] = moduleName
 	return generateFile(dir, strings.ToLower(name)+"_service.go", serviceTemplate, data)
 }
 
@@ -314,6 +383,38 @@ func GenerateService(dir, name string) error {
 // 供 CLI 在取用名稱前先行檢查（hyp generate 先前對空名稱直接 panic）
 func ValidateName(name string) error {
 	return validateName(name)
+}
+
+// ValidateProjectName 驗證 CLI / Desktop / gRPC 專案名稱：字母開頭，只含字母、數字、底線、連字號。
+// 先前與資源名稱共用規則而拒絕連字號，hyp new / hyp api 卻接受（my-tool、user-service 是常見命名）
+func ValidateProjectName(name string) error {
+	if name == "" {
+		return fmt.Errorf("scaffold: name cannot be empty")
+	}
+	if !validProjectName.MatchString(name) {
+		return fmt.Errorf("scaffold: invalid project name %q (only letters, digits, underscores and hyphens allowed)", name)
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("scaffold: name too long (max 64 chars)")
+	}
+	return nil
+}
+
+// ProjectIdent 把專案名稱轉成可用於識別字、套件名與檔名的形式（user-service → user_service）
+func ProjectIdent(name string) string {
+	return strings.ReplaceAll(name, "-", "_")
+}
+
+// CamelName 回傳生成程式碼使用的 CamelCase 識別字（order_item → OrderItem），供 CLI 顯示實際名稱
+func CamelName(name string) string {
+	return camelName(ProjectIdent(name))
+}
+
+// projectData 建立專案模板資料：識別字用 ProjectIdent 後的名稱，ProjectName 保留原始名稱（顯示、指令名、執行檔名）
+func projectData(name string) map[string]string {
+	data := templateData(ProjectIdent(name))
+	data["ProjectName"] = name
+	return data
 }
 
 // validateName 驗證名稱安全性
@@ -327,8 +428,26 @@ func validateName(name string) error {
 	if len(name) > 64 {
 		return fmt.Errorf("scaffold: name too long (max 64 chars)")
 	}
+	// 名稱直接當檔名（order_item.go）：結尾是 _test 或 _<GOOS> / _<GOARCH> 時，Go 會把它當成測試檔
+	// 或限定平台的檔案而不編譯，其他生成檔引用的型別就找不到
+	lower := strings.ToLower(name)
+	if i := strings.LastIndex(lower, "_"); i >= 0 {
+		if suffix := lower[i+1:]; suffix == "test" || buildSuffixes[suffix] {
+			return fmt.Errorf("scaffold: invalid name %q: a file named %s.go is treated by Go as a test or platform-specific file (the _%s suffix); choose another name", name, lower, suffix)
+		}
+	}
 	return nil
 }
+
+// buildSuffixes 是 Go 視為建置條件的檔名後綴（GOOS 與 GOARCH）
+var buildSuffixes = func() map[string]bool {
+	m := map[string]bool{}
+	for _, s := range strings.Fields("aix android darwin dragonfly freebsd hurd illumos ios js linux nacl netbsd openbsd plan9 solaris wasip1 windows zos " +
+		"386 amd64 amd64p32 arm armbe arm64 arm64be loong64 mips mipsle mips64 mips64le mips64p32 mips64p32le ppc ppc64 ppc64le riscv riscv64 s390 s390x sparc sparc64 wasm") {
+		m[s] = true
+	}
+	return m
+}()
 
 // templateData 建立模板資料。
 // 所有模板共用欄位：
@@ -342,8 +461,18 @@ func validateName(name string) error {
 // gRPC 更會編譯失敗——protoc-gen-go 把 message CreateUser_profileRequest 轉成 Go 型別
 // CreateUserProfileRequest，模板卻引用 pb.CreateUser_profileRequest
 func templateData(name string) map[string]string {
+	camel := camelName(name)
+	plural := pluralize(strings.ToLower(name))
+	service := camel + "Service"
+	if strings.HasSuffix(camel, "Service") {
+		service = camel // user_service → UserService，不是 UserServiceService
+	}
 	return map[string]string{
-		"Name":         camelName(name),
+		"Name":         camel,
+		"VarName":      strings.ToLower(camel[:1]) + camel[1:], // Go 變數名（exportData）
+		"ServiceName":  service,                                // gRPC 服務名
+		"Plural":       plural,                                 // 路由路徑（/api/order_items）
+		"TableName":    plural,                                 // 資料表名
 		"LowerName":    strings.ToLower(name),
 		"Date":         time.Now().Format("2006-01-02"),
 		"AIProvider":   GeneratedBy,
@@ -375,6 +504,12 @@ func generateFile(dir, filename, tmplStr string, data interface{}) error {
 		if content, err = format.Source(content); err != nil {
 			return fmt.Errorf("scaffold: generated invalid Go for %s: %w", path, err)
 		}
+		// 目標檔已存在時交給下面的既有檔案處理（回錯或保留），不必比對
+		if _, statErr := os.Stat(path); statErr != nil {
+			if err := checkCollisions(dir, filename, content); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -382,6 +517,25 @@ func generateFile(dir, filename, tmplStr string, data interface{}) error {
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if os.IsExist(err) {
+		if KeepExisting {
+			// go.mod 不是單純略過：補上骨架需要、既有檔案還沒有的 require
+			if filename == "go.mod" {
+				merged, err := MergeGoMod(path, content)
+				if err != nil {
+					return err
+				}
+				if merged {
+					if OnMerge != nil {
+						OnMerge(path)
+					}
+					return nil
+				}
+			}
+			if OnKeep != nil {
+				OnKeep(path)
+			}
+			return nil
+		}
 		return fmt.Errorf("scaffold: file already exists: %s", path)
 	}
 	if err != nil {
@@ -455,6 +609,15 @@ func camelName(name string) string {
 
 // pluralize 英文名詞複數（資料表名用）。先前一律加 s：categorys、statuss、boxs
 func pluralize(s string) string {
+	// 以最後一段判斷（order_items → items）。不可數、或已經是複數的不再加：
+	// 先前 users → userses、data → datas
+	last := s[strings.LastIndex(s, "_")+1:]
+	if uncountable[last] {
+		return s
+	}
+	if strings.HasSuffix(last, "s") && !strings.HasSuffix(last, "ss") && !strings.HasSuffix(last, "us") && !strings.HasSuffix(last, "is") {
+		return s
+	}
 	switch {
 	case len(s) > 1 && strings.HasSuffix(s, "y") && !strings.ContainsRune("aeiou", rune(s[len(s)-2])):
 		return s[:len(s)-1] + "ies"
@@ -463,6 +626,136 @@ func pluralize(s string) string {
 		return s + "es"
 	}
 	return s + "s"
+}
+
+// uncountable 是單複數同形的常見名稱
+var uncountable = map[string]bool{
+	"data": true, "metadata": true, "info": true, "information": true, "media": true, "equipment": true,
+	"feedback": true, "staff": true, "software": true, "hardware": true, "music": true, "money": true, "audio": true, "video": true,
+}
+
+// ── 撞名檢查 ──
+
+var errorDefine = regexp.MustCompile(`errors\.Define\(\s*"([^"]+)"`)
+
+// checkCollisions 在寫入生成的 .go 檔之前，確認它不會與專案既有的程式碼撞名：
+//   - 套件層級的識別字（型別、函式、變數、常數）不可與同目錄其他檔案重複。
+//     例：已有 user 時生成 user_list，兩邊都宣告 UserListResp，整個套件編不過
+//   - errors.Define 的錯誤碼不可與專案其他地方重複：重複定義編譯會過，但行程一啟動就 panic
+//
+// 讀不到或解析不了的檔案略過（不因為別的檔案有語法錯誤而擋住生成）
+func checkCollisions(dir, filename string, content []byte) error {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filename, content, parser.SkipObjectResolution)
+	if err != nil {
+		return nil // 內容是否合法由 format.Source 把關
+	}
+	want := topLevelNames(file)
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == filename {
+				continue
+			}
+			other, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+			if err != nil || other.Name.Name != file.Name.Name {
+				continue
+			}
+			for id := range topLevelNames(other) {
+				if want[id] {
+					return fmt.Errorf("scaffold: %s would declare %s, which %s already declares; choose another name",
+						filename, id, filepath.Join(dir, name))
+				}
+			}
+		}
+	}
+
+	codes := errorDefine.FindAllSubmatch(content, -1)
+	if len(codes) == 0 {
+		return nil
+	}
+	root := moduleRootOf(dir)
+	if root == "" {
+		return nil
+	}
+	existing := map[string]string{}
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if n := d.Name(); path != root && (strings.HasPrefix(n, ".") || n == "vendor" || n == "testdata" || n == "node_modules") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || path == filepath.Join(dir, filename) {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		for _, m := range errorDefine.FindAllSubmatch(src, -1) {
+			existing[string(m[1])] = path
+		}
+		return nil
+	})
+	for _, m := range codes {
+		if path, ok := existing[string(m[1])]; ok {
+			return fmt.Errorf("scaffold: %s would define error code %s, which %s already defines (a duplicate code panics at startup); choose another name",
+				filename, m[1], path)
+		}
+	}
+	return nil
+}
+
+// topLevelNames 回傳檔案宣告的套件層級識別字（init、_ 與方法不算）
+func topLevelNames(f *ast.File) map[string]bool {
+	names := map[string]bool{}
+	add := func(id *ast.Ident) {
+		if id != nil && id.Name != "_" && id.Name != "init" {
+			names[id.Name] = true
+		}
+	}
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				add(d.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch sp := spec.(type) {
+				case *ast.TypeSpec:
+					add(sp.Name)
+				case *ast.ValueSpec:
+					for _, id := range sp.Names {
+						add(id)
+					}
+				}
+			}
+		}
+	}
+	return names
+}
+
+// moduleRootOf 自 dir 往上找 go.mod 所在目錄；找不到回空字串
+func moduleRootOf(dir string) string {
+	d, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return ""
+		}
+		d = parent
+	}
 }
 
 func capitalize(s string) string {

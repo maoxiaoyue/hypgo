@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -303,10 +304,12 @@ func (c *Context) SaveUploadedFile(file *multipart.FileHeader, dst string) error
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-
-	_, err = io.Copy(out, src)
-	return err
+	if _, err = io.Copy(out, src); err != nil {
+		out.Close()
+		return err
+	}
+	// Close 的錯誤要回報：緩衝的資料在這裡才真正落地，先前磁碟滿時寫入不完整仍回成功
+	return out.Close()
 }
 
 // ===== 客戶端信息 =====
@@ -384,7 +387,7 @@ func (c *Context) ClientIP() string {
 
 	// 來自可信代理：由右往左取第一個「非可信代理」的位址，
 	// 即最靠近我方、且不由我方代理鏈產生的那一跳
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+	if xff := c.forwardedFor(); xff != "" {
 		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
 			s := strings.TrimSpace(parts[i])
@@ -397,11 +400,21 @@ func (c *Context) ClientIP() string {
 		}
 	}
 
-	if xRealIP := c.GetHeader("X-Real-IP"); xRealIP != "" && isValidIP(xRealIP) {
+	// X-Real-IP 沒有「鏈」可以驗證，只能相信代理會覆寫它：代理必須設定 X-Forwarded-For
+	// 或 X-Real-IP 其中之一，否則客戶端自帶的 X-Real-IP 會原樣傳到這裡
+	if xRealIP := strings.TrimSpace(c.GetHeader("X-Real-IP")); xRealIP != "" && isValidIP(xRealIP) {
 		return xRealIP
 	}
 
 	return remote
+}
+
+// forwardedFor 回傳全部 X-Forwarded-For 標頭行依序以逗號接起來的值。
+// 先前只讀第一行（Header.Get）：HAProxy 的 option forwardfor 是另加一行而不是接在後面，
+// 客戶端自帶一行 X-Forwarded-For: 6.6.6.6 就成了「第一行」，ClientIP 回傳偽造的位址，
+// IPWhitelist 與 RateLimiter 都可被繞過
+func (c *Context) forwardedFor() string {
+	return strings.Join(c.Request.Header.Values("X-Forwarded-For"), ",")
 }
 
 // GetClientIP 獲取客戶端 IP（別名）
@@ -411,7 +424,7 @@ func (c *Context) GetClientIP() string {
 
 // GetClientIPFromXForwardedFor 從 X-Forwarded-For 獲取客戶端 IP
 func (c *Context) GetClientIPFromXForwardedFor() string {
-	xff := c.GetHeader("X-Forwarded-For")
+	xff := c.forwardedFor()
 	if xff == "" {
 		return ""
 	}
@@ -584,25 +597,34 @@ func (c *Context) GetPageSize() int {
 	return s
 }
 
-// GetOffset 獲取偏移量
+// GetOffset 獲取偏移量。頁碼大到相乘會溢位時回 math.MaxInt
+// （先前 ?page=9223372036854775807 得到負的 offset，直接進 SQL）
 func (c *Context) GetOffset() int {
 	page := c.GetPage()
 	pageSize := c.GetPageSize()
+	if page-1 > math.MaxInt/pageSize {
+		return math.MaxInt
+	}
 	return (page - 1) * pageSize
 }
 
 // ===== 請求 ID =====
 
-// GetRequestID 獲取請求 ID
+// GetRequestID 獲取請求 ID：SetRequestID / RequestID 中間件設定的值優先，其次是請求的
+// X-Request-Id 標頭，都沒有時產生一個並記住。先前不讀已設定的值，沒有標頭時每次呼叫
+// 都產生新的——同一個請求的兩行日誌拿到不同的 ID
 func (c *Context) GetRequestID() string {
-	if id := c.GetHeader("X-Request-Id"); id != "" {
-		return id
+	if v, ok := c.Get("request_id"); ok {
+		if id, _ := v.(string); id != "" {
+			return id
+		}
 	}
-	if id := c.GetHeader("X-Request-ID"); id != "" {
-		return id
+	id := c.GetHeader("X-Request-Id")
+	if id == "" {
+		id = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	// 生成新的請求 ID
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	c.Set("request_id", id)
+	return id
 }
 
 // SetRequestID 設置請求 ID

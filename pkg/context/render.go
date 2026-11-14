@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -348,14 +349,16 @@ type sseventRender struct {
 	Data  interface{}
 }
 
+// Render 先序列化再寫：先前 event 行已送出才發現資料無法序列化，客戶端收到半個事件。
+// 事件名稱裡的換行會被拿掉——名稱若來自使用者輸入，換行能多塞一行偽造的 data:
 func (r sseventRender) Render(w http.ResponseWriter) error {
-	r.WriteContentType(w)
-	if r.Event != "" {
-		fmt.Fprintf(w, "event: %s\n", r.Event)
-	}
 	jsonBytes, err := json.Marshal(r.Data)
 	if err != nil {
 		return err
+	}
+	r.WriteContentType(w)
+	if event := sseFieldValue.Replace(r.Event); event != "" {
+		fmt.Fprintf(w, "event: %s\n", event)
 	}
 	fmt.Fprintf(w, "data: %s\n\n", jsonBytes)
 
@@ -369,9 +372,13 @@ func (r sseventRender) Render(w http.ResponseWriter) error {
 func (r sseventRender) WriteContentType(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	// 不送 Connection: keep-alive：HTTP/1.1 預設就是，HTTP/2 與 HTTP/3 禁止連線層標頭
+	// （RFC 9114 §4.2，收到的一方應視為格式錯誤），quic-go 不會代為過濾
 	w.Header().Set("X-Accel-Buffering", "no")
 }
+
+// sseFieldValue 移除 SSE 欄位值裡的換行
+var sseFieldValue = strings.NewReplacer("\r", "", "\n", "")
 
 // ===== 輔助函數 =====
 

@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -32,12 +35,20 @@ func (c *Context) SecureJSON(code int, obj interface{}) {
 	c.Render(code, secureJSONRender{Prefix: "while(1);", Data: obj})
 }
 
-// JSONP 回應 JSONP
+// jsonpCallback 合法的 JSONP callback 名稱
+var jsonpCallback = regexp.MustCompile(`^[A-Za-z0-9_$.]+$`)
+
+// JSONP 回應 JSONP。callback 只能由 A-Z a-z 0-9 _ $ . 組成，否則回 400：
+// 先前只做 JS 字串跳脫，?callback=alert(document.cookie)// 會原樣成為可執行的腳本
 func (c *Context) JSONP(code int, obj interface{}) {
 	callback := c.DefaultQuery("callback", "")
 	if callback == "" {
 		c.JSON(code, obj)
+	} else if !jsonpCallback.MatchString(callback) {
+		c.abortBindError(http.StatusBadRequest, "E0002", "Bad request",
+			map[string]interface{}{"reason": "callback may only contain letters, digits, _ $ and ."})
 	} else {
+		c.Header("X-Content-Type-Options", "nosniff")
 		// Callback 與 Data 都要填：舊版把 callback 當成 Data 傳、
 		// Callback 留空，輸出成 ("callback"); —— obj 整包遺失
 		c.Render(code, jsonpJSONRender{Callback: callback, Data: obj})
@@ -127,9 +138,15 @@ func (c *Context) FileFromFS(filepath string, fs http.FileSystem) {
 	http.FileServer(fs).ServeHTTP(c.Writer, c.Request)
 }
 
-// FileAttachment 回應檔案作為附件下載
+// FileAttachment 回應檔案作為附件下載。檔名由 mime.FormatMediaType 編碼：引號與反斜線會跳脫，
+// 非 ASCII 檔名以 filename*=utf-8”… 表示。先前直接塞進 filename="%s"：
+// 檔名裡的引號可以截斷標頭，中文檔名在瀏覽器顯示成亂碼
 func (c *Context) FileAttachment(filepath, filename string) {
-	c.Writer.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	c.Writer.Header().Set("Content-Disposition", disposition)
 	http.ServeFile(c.Writer, c.Request, filepath)
 }
 
@@ -158,6 +175,7 @@ func (c *Context) DataFromReader(code int, contentLength int64, contentType stri
 
 // SSEvent 發送 Server-Sent Event
 func (c *Context) SSEvent(name string, message interface{}) {
+	c.DisableWriteTimeout() // 事件流沒有固定長度，不受 write_timeout 限制
 	c.Render(-1, sseventRender{
 		Event: name,
 		Data:  message,
@@ -212,17 +230,20 @@ func (c *Context) Negotiate(code int, config Negotiate) {
 
 // NegotiateFormat 協商格式
 func (c *Context) NegotiateFormat(offered ...string) string {
-	if c.Accepted == nil {
-		c.Accepted = parseAccept(c.GetHeader("Accept"))
+	if len(offered) == 0 {
+		return ""
 	}
-
-	if len(c.Accepted) == 0 {
-		return offered[0]
+	if c.Accepted == nil {
+		header := c.GetHeader("Accept")
+		if strings.TrimSpace(header) == "" {
+			return offered[0] // 沒有 Accept：什麼都接受
+		}
+		c.Accepted = parseAccept(header) // 全部是 q=0 時為空清單：什麼都不接受
 	}
 
 	for _, accept := range c.Accepted {
 		for _, offer := range offered {
-			if accept == offer || accept == "*/*" {
+			if acceptMatches(accept, offer) {
 				return offer
 			}
 		}
@@ -345,18 +366,20 @@ func (c *Context) SetLastModified(t time.Time) {
 
 // ===== CORS 支援 =====
 
-// SetCORS 設置 CORS 頭
+// SetCORS 設置 CORS 頭。origin 為 "*" 時不送 Allow-Credentials：
+// 瀏覽器不接受「任意來源 + 帶憑證」的組合，整個回應會被擋下
 func (c *Context) SetCORS(origin string) {
 	c.Header("Access-Control-Allow-Origin", origin)
-	c.Header("Access-Control-Allow-Credentials", "true")
+	if origin != "*" {
+		c.Header("Access-Control-Allow-Credentials", "true")
+	}
 }
 
 // SetCORSHeaders 設置完整的 CORS 頭
 func (c *Context) SetCORSHeaders(origin, methods, headers string) {
-	c.Header("Access-Control-Allow-Origin", origin)
+	c.SetCORS(origin)
 	c.Header("Access-Control-Allow-Methods", methods)
 	c.Header("Access-Control-Allow-Headers", headers)
-	c.Header("Access-Control-Allow-Credentials", "true")
 	c.Header("Access-Control-Max-Age", "86400")
 }
 
@@ -366,7 +389,7 @@ func (c *Context) SetCORSHeaders(origin, methods, headers string) {
 func (c *Context) SetSecurityHeaders() {
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("X-Frame-Options", "DENY")
-	c.Header("X-XSS-Protection", "1; mode=block")
+	c.Header("X-XSS-Protection", "0") // 與預設中間件一致：舊瀏覽器的 XSS 過濾器本身可被利用
 	c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
 }
 

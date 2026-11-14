@@ -138,21 +138,25 @@ func New(w http.ResponseWriter, r *http.Request) *Context {
 // Copy 返回當前 Context 的副本（用於 goroutine）
 func (c *Context) Copy() *Context {
 	cp := &Context{
-		Request:  c.Request.Clone(c.Request.Context()),
-		Response: nil,
-		Writer:   nil,
-		Params:   make(Params, len(c.Params)),
-		handlers: nil,
-		index:    c.index,
-		fullPath: c.fullPath,
-		protocol: c.protocol,
+		Request:   c.Request.Clone(c.Request.Context()),
+		Params:    make(Params, len(c.Params)),
+		handlers:  nil,
+		index:     c.index,
+		fullPath:  c.fullPath,
+		protocol:  c.protocol,
+		startTime: c.startTime,
 	}
+	// 副本的 writer 丟棄所有輸出：原請求的 writer 在 handler 返回後就不能再用，
+	// 先前留 nil，背景 goroutine 一呼叫 cp.JSON / cp.Status 就 nil pointer panic
+	cp.ownWriter.ResponseWriter = &discardWriter{header: http.Header{}}
+	cp.ownWriter.status = http.StatusOK
+	cp.Response, cp.Writer = &cp.ownWriter, &cp.ownWriter
 
 	copy(cp.Params, c.Params)
 
 	// 深拷貝 Keys
-	cp.Keys = make(map[string]interface{}, len(c.Keys))
 	c.mu.RLock()
+	cp.Keys = make(map[string]interface{}, len(c.Keys))
 	for k, v := range c.Keys {
 		cp.Keys[k] = v
 	}
@@ -268,8 +272,12 @@ func (c *Context) AbortWithError(code int, err error) *Error {
 	return c.Error(err)
 }
 
-// HandlerName 返回當前處理器的名稱
+// HandlerName 返回當前處理器的名稱；鏈尚未開始或已 Abort 時回空字串
+// （先前 c.Abort() 之後呼叫會 index out of range panic）
 func (c *Context) HandlerName() string {
+	if c.index < 0 || int(c.index) >= len(c.handlers) {
+		return ""
+	}
 	return nameOfFunction(c.handlers[c.index])
 }
 
@@ -399,9 +407,18 @@ func (c *Context) Protocol() string {
 
 // ===== 效能監控 =====
 
-// GetMetrics 獲取請求指標（指向 Context 內部，請求結束後不可再使用）
+// GetMetrics 獲取請求指標（指向 Context 內部，請求結束後不可再使用）。
+// Duration 為到目前為止的耗時；BytesIn / BytesOut 沒有以 RecordBytesIn / RecordBytesOut
+// 記錄時，取請求的 Content-Length 與已寫出的回應大小（先前恆為 0）。
+// StreamsOpened 與 RTT 框架不會填，留給能取得這些數值的呼叫端自行設定
 func (c *Context) GetMetrics() *RequestMetrics {
 	c.metrics.Duration = time.Since(c.startTime)
+	if c.metrics.BytesIn == 0 && c.Request != nil && c.Request.ContentLength > 0 {
+		c.metrics.BytesIn = c.Request.ContentLength
+	}
+	if c.metrics.BytesOut == 0 && c.Writer != nil && c.Writer.Size() > 0 {
+		c.metrics.BytesOut = int64(c.Writer.Size())
+	}
 	return &c.metrics
 }
 

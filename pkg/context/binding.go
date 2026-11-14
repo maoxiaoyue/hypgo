@@ -3,6 +3,7 @@ package context
 
 import (
 	"bytes"
+	"encoding"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -15,7 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/vmihailenco/msgpack/v5"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,7 +27,11 @@ import (
 
 // Bind 綁定請求資料到結構體（會自動選擇綁定器）
 func (c *Context) Bind(obj interface{}) error {
-	b := binding.Default(c.Request.Method, c.ContentType())
+	b, err := binding.For(c.Request)
+	if err != nil {
+		c.AbortWithError(http.StatusUnsupportedMediaType, err).SetType(ErrorTypeBind)
+		return err
+	}
 	return c.MustBindWith(obj, b)
 }
 
@@ -72,7 +80,12 @@ func (c *Context) BindWith(obj interface{}, b Binding) error {
 // MustBindWith 強制綁定（失敗會 abort）
 func (c *Context) MustBindWith(obj interface{}, b Binding) error {
 	if err := c.ShouldBindWith(obj, b); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err).SetType(ErrorTypeBind)
+		status := http.StatusBadRequest
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		c.AbortWithError(status, err).SetType(ErrorTypeBind)
 		return err
 	}
 	return nil
@@ -82,7 +95,10 @@ func (c *Context) MustBindWith(obj interface{}, b Binding) error {
 
 // ShouldBind 嘗試綁定請求資料（不會 abort）
 func (c *Context) ShouldBind(obj interface{}) error {
-	b := binding.Default(c.Request.Method, c.ContentType())
+	b, err := binding.For(c.Request)
+	if err != nil {
+		return err
+	}
 	return c.ShouldBindWith(obj, b)
 }
 
@@ -206,29 +222,67 @@ var binding = defaultBinding{}
 
 type defaultBinding struct{}
 
+// ErrUnsupportedMediaType 請求帶了 body，但 Content-Type 不是任何綁定器認得的型別
+var ErrUnsupportedMediaType = errors.New("unsupported Content-Type")
+
+// Default 依方法與 Content-Type 選綁定器；認不得的型別回 Form（相容舊行為）。
+// ShouldBind / Bind / BindInput 改用 For，它對認不得的型別回錯
 func (defaultBinding) Default(method, contentType string) Binding {
-	// GET / HEAD 沒有 body：綁 query string。Form 綁定器只讀 PostForm（防大量賦值），
-	// 對 GET 永遠是空的，先前 GET 的 ShouldBind / BindInput 會靜默綁出全零值
 	if method == http.MethodGet || method == http.MethodHead {
 		return Query
 	}
+	if b := bindingForMedia(contentType); b != nil {
+		return b
+	}
+	return Form
+}
 
-	switch contentType {
-	case MIMEJSON:
+// For 依請求選綁定器。
+//
+//   - GET / HEAD 沒有 body：綁 query string（Form 綁定器只讀 PostForm，對 GET 永遠是空的）
+//   - 依 Content-Type：不分大小寫、忽略參數，接受 +json / +xml 結尾（application/merge-patch+json）
+//   - 沒有 body：DELETE 綁 query string（先前 DELETE /items?force=true 綁出全零值），其餘走 Form
+//   - 有 body 而型別認不得（含沒帶 Content-Type）：回 ErrUnsupportedMediaType
+//
+// 先前認不得的型別一律當成表單：Application/JSON、application/vnd.api+json、text/plain
+// 送來的 JSON 被當表單解析、什麼都沒綁到，handler 拿著全零值的 struct 回 200
+func (defaultBinding) For(req *http.Request) (Binding, error) {
+	if req.Method == http.MethodGet || req.Method == http.MethodHead {
+		return Query, nil
+	}
+	contentType := req.Header.Get("Content-Type")
+	if b := bindingForMedia(contentType); b != nil {
+		return b, nil
+	}
+	if req.ContentLength == 0 || req.Body == nil || req.Body == http.NoBody {
+		if req.Method == http.MethodDelete {
+			return Query, nil
+		}
+		return Form, nil
+	}
+	return nil, fmt.Errorf("%w %q", ErrUnsupportedMediaType, contentType)
+}
+
+// bindingForMedia 回傳 Content-Type 對應的綁定器；認不得時回 nil
+func bindingForMedia(contentType string) Binding {
+	media := strings.ToLower(strings.TrimSpace(filterFlags(strings.TrimSpace(contentType))))
+	switch {
+	case media == MIMEJSON || strings.HasSuffix(media, "+json"):
 		return JSON
-	case MIMEXML, MIMEXML2:
+	case media == MIMEXML || media == MIMEXML2 || strings.HasSuffix(media, "+xml"):
 		return XML
-	case MIMEPROTOBUF:
+	case media == MIMEPROTOBUF || media == "application/protobuf":
 		return ProtoBuf
-	case MIMEMSGPACK, MIMEMSGPACK2:
+	case media == MIMEMSGPACK || media == MIMEMSGPACK2:
 		return MsgPack
-	case MIMEYAML:
+	case media == MIMEYAML || media == MIMEYAML2 || media == "text/yaml":
 		return YAML
-	case MIMEMultipartPOSTForm:
+	case media == MIMEMultipartPOSTForm:
 		return FormMultipart
-	default:
+	case media == MIMEPOSTForm:
 		return Form
 	}
+	return nil
 }
 
 // 各種綁定器常量
@@ -345,14 +399,22 @@ type bindingProtoBuf struct{}
 
 func (bindingProtoBuf) Name() string { return "protobuf" }
 
-func (bindingProtoBuf) Bind(req *http.Request, obj interface{}) error {
-	// 需要 protobuf 庫支援
-	return fmt.Errorf("protobuf binding not implemented")
+// Bind 把 application/x-protobuf 的 body 解進 obj（必須是 proto.Message）。
+// 先前一律回 "not implemented"
+func (b bindingProtoBuf) Bind(req *http.Request, obj interface{}) error {
+	body, err := readRequestBody(req)
+	if err != nil {
+		return err
+	}
+	return b.BindBody(body, obj)
 }
 
 func (bindingProtoBuf) BindBody(body []byte, obj interface{}) error {
-	// 需要 protobuf 庫支援
-	return fmt.Errorf("protobuf binding not implemented")
+	m, ok := obj.(proto.Message)
+	if !ok {
+		return fmt.Errorf("protobuf binding: %T is not a proto.Message", obj)
+	}
+	return proto.Unmarshal(body, m)
 }
 
 // ===== MsgPack 綁定器 =====
@@ -361,14 +423,28 @@ type bindingMsgPack struct{}
 
 func (bindingMsgPack) Name() string { return "msgpack" }
 
-func (bindingMsgPack) Bind(req *http.Request, obj interface{}) error {
-	// 需要 msgpack 庫支援
-	return fmt.Errorf("msgpack binding not implemented")
+// Bind 把 application/msgpack 的 body 解進 obj；欄位名取 json tag，同一個 struct
+// 可以同時收 JSON 與 MessagePack。先前一律回 "not implemented"
+func (b bindingMsgPack) Bind(req *http.Request, obj interface{}) error {
+	body, err := readRequestBody(req)
+	if err != nil {
+		return err
+	}
+	return b.BindBody(body, obj)
 }
 
 func (bindingMsgPack) BindBody(body []byte, obj interface{}) error {
-	// 需要 msgpack 庫支援
-	return fmt.Errorf("msgpack binding not implemented")
+	dec := msgpack.NewDecoder(bytes.NewReader(body))
+	dec.SetCustomStructTag("json")
+	return dec.Decode(obj)
+}
+
+// readRequestBody 讀完請求 body（供需要整包資料的綁定器使用）
+func readRequestBody(req *http.Request) ([]byte, error) {
+	if req == nil || req.Body == nil {
+		return nil, fmt.Errorf("invalid request")
+	}
+	return readBodyWithHint(req.Body, req.ContentLength)
 }
 
 // ===== YAML 綁定器 =====
@@ -411,15 +487,26 @@ func (bindingHeader) Bind(req *http.Request, obj interface{}) error {
 
 // ===== 輔助函數 =====
 
-// decodeJSON 解碼 JSON
+// errTrailingJSON JSON 值之後還有內容
+var errTrailingJSON = errors.New("unexpected data after the JSON value")
+
+// decodeJSON 解碼 JSON；值之後只能有空白。先前 {"a":1}{"admin":true} 與尾端的雜訊都被接受：
+// 前面的代理或 WAF 若取最後一個值，兩邊看到的內容就不一樣
 func decodeJSON(r io.Reader, obj interface{}) error {
 	decoder := json.NewDecoder(r)
-	return decoder.Decode(obj)
+	if err := decoder.Decode(obj); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errTrailingJSON
+	}
+	return nil
 }
 
 // mapFormToStruct 以反射把表單值填入 struct，依欄位型別做字串轉換。
 //
-// 欄位名優先取 `form` tag，其次 `json` tag，最後用欄位名（不分大小寫）。
+// 欄位名優先取 `form` tag，其次 `json` tag，最後用欄位名（沒有 tag 時不分大小寫：
+// 先前要完全相同，struct{Page int} 配 ?page=2 得到 0）。
 // 舊版用「全部值當字串 → json.Marshal → json.Unmarshal」的中介做法，
 // 導致任何非字串欄位必定失敗（?page=2 綁 int 欄位回
 // "cannot unmarshal string into Go value of type int"），且完全不認 form tag。
@@ -445,6 +532,7 @@ type formFieldInfo struct {
 	index     int
 	name      string
 	anonymous bool // 匿名嵌入 struct：遞迴攤平
+	fold      bool // 沒有 tag：鍵名不分大小寫
 }
 
 // formFieldCache reflect.Type → []formFieldInfo
@@ -467,11 +555,11 @@ func formFieldsOf(rt reflect.Type) []formFieldInfo {
 			fields = append(fields, formFieldInfo{index: i, anonymous: true})
 			continue
 		}
-		name, skip := formFieldName(f)
+		name, tagged, skip := formFieldName(f)
 		if skip {
 			continue
 		}
-		fields = append(fields, formFieldInfo{index: i, name: name})
+		fields = append(fields, formFieldInfo{index: i, name: name, fold: !tagged})
 	}
 	formFieldCache.Store(rt, fields)
 	return fields
@@ -497,6 +585,14 @@ func mapFormToStructValue(values url.Values, rv reflect.Value, keyFn func(string
 			key = keyFn(key)
 		}
 		vs, ok := values[key]
+		if !ok && fi.fold {
+			for k, v := range values {
+				if strings.EqualFold(k, key) {
+					vs, ok = v, true
+					break
+				}
+			}
+		}
 		if !ok || len(vs) == 0 {
 			continue // 沒給值就保持零值，不覆寫
 		}
@@ -509,20 +605,20 @@ func mapFormToStructValue(values url.Values, rv reflect.Value, keyFn func(string
 }
 
 // formFieldName 取欄位對應的表單鍵名：form tag > json tag > 欄位名。
-// tag 為 "-" 時跳過該欄位。
-func formFieldName(f reflect.StructField) (name string, skip bool) {
+// tag 為 "-" 時跳過該欄位；tagged 回報鍵名是否來自 tag。
+func formFieldName(f reflect.StructField) (name string, tagged, skip bool) {
 	for _, tag := range []string{"form", "json"} {
 		if v := f.Tag.Get(tag); v != "" {
 			v = strings.Split(v, ",")[0] // 去掉 ,omitempty 等選項
 			if v == "-" {
-				return "", true
+				return "", true, true
 			}
 			if v != "" {
-				return v, false
+				return v, true, false
 			}
 		}
 	}
-	return f.Name, false
+	return f.Name, false, false
 }
 
 // setFormValue 依目標欄位型別轉換字串值
@@ -548,6 +644,29 @@ func setScalar(fv reflect.Value, s string) error {
 			fv.Set(reflect.New(fv.Type().Elem()))
 		}
 		return setScalar(fv.Elem(), s)
+	}
+
+	// time.Time 與實作 encoding.TextUnmarshaler 的型別（UUID、netip.Addr、自訂列舉…）。
+	// 先前落到最後的 JSON 解析：?since=2026-01-02T03:04:05Z 不是合法 JSON，一律 400
+	if fv.CanAddr() {
+		switch t := fv.Addr().Interface().(type) {
+		case *time.Time:
+			if s == "" {
+				return nil
+			}
+			for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05", "2006-01-02"} {
+				if v, err := time.Parse(layout, s); err == nil {
+					*t = v
+					return nil
+				}
+			}
+			return fmt.Errorf("%q is not a time (RFC 3339 or YYYY-MM-DD)", s)
+		case encoding.TextUnmarshaler:
+			if s == "" {
+				return nil
+			}
+			return t.UnmarshalText([]byte(s))
+		}
 	}
 
 	switch fv.Kind() {

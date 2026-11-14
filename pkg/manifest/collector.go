@@ -58,6 +58,18 @@ func (c *Collector) Collect() *Manifest {
 
 	m.Routes, m.Types = c.collectRoutes()
 
+	// 設定檔的警告（未知的鍵…）也是待處理事項：寫進 lint，AI 讀 manifest 看得到，hyp lint 會擋
+	if c.config != nil {
+		for _, w := range c.config.Warnings() {
+			if m.Lint == nil {
+				m.Lint = &LintReport{}
+			}
+			m.Lint.Warnings = append(m.Lint.Warnings, LintWarning{
+				Route: "config " + w.Key, Kind: "config_warning", Message: w.String(),
+			})
+		}
+	}
+
 	if c.config != nil {
 		m.Server = c.collectServer()
 		m.Database = c.collectDatabase()

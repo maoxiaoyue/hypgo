@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io"
@@ -172,7 +173,8 @@ func TestCleanSummaryExcludesFailedFiles(t *testing.T) {
 	}
 }
 
-// TestFixThinkSkipsUnsafeBraceLines 迴歸測試（A3）：`{` 同行還有程式碼的函式不插入 @ai:think，重跑也不重複插入。
+// TestFixThinkSkipsUnsafeBraceLines 迴歸測試（A3）：`{` 同行還有程式碼時，整個函式體在同一行才展開後插入，
+// 否則（如多行 raw string）不插入；重跑也不重複插入。
 // 歷史 bug：一律插在 `{` 的下一行——單行函式體的 think 行落到函式外（變成下一個函式的 doc），
 // `{` 同行開始的多行 raw string 則被插進字串內容；每次重跑都再插一次。
 func TestFixThinkSkipsUnsafeBraceLines(t *testing.T) {
@@ -194,8 +196,12 @@ func TestFixThinkSkipsUnsafeBraceLines(t *testing.T) {
 	if !strings.Contains(out, "a\nb`") {
 		t.Errorf("raw string content changed:\n%s", out)
 	}
-	if strings.Count(out, "@ai:think") != 1 {
-		t.Errorf("want exactly one @ai:think (in Next), got:\n%s", out)
+	// One 是單行函式：展開成多行後插入（先前一律略過，永遠留在缺漏報告裡）；Raw 的函式體跨行，不動
+	if strings.Count(out, "@ai:think") != 2 || !strings.Contains(out, "func One() {\n\t//@ai:think") || !strings.Contains(out, "\tprintln(\"one\")\n}") {
+		t.Errorf("want @ai:think in One (expanded) and Next only, got:\n%s", out)
+	}
+	if _, err := format.Source([]byte(out)); err != nil {
+		t.Errorf("result is not valid Go: %v", err)
 	}
 	run()
 	if again := readFileString(t, path); again != out {

@@ -38,6 +38,7 @@ Examples:
   hyp secret set db_pass           # value is read from the terminal or stdin
   hyp secret list
   hyp secret rotate --new-key-file new.key`,
+	RunE: requireSubcommand,
 }
 
 func init() {

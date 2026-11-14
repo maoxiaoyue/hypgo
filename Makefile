@@ -1,11 +1,12 @@
-.PHONY: build test clean install docker
+.PHONY: build test clean install
 
 # Variables
 BINARY_NAME=hyp
 MAIN_PATH=cmd/hyp
-VERSION?=0.1.0
-BUILD_TIME=$(shell date +%FT%T%z)
-LDFLAGS=-ldflags "-X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}"
+# 版本以 cmd/hyp/version.go 為單一來源，不以 -X main.Version 覆寫
+BUILD_TIME=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+GIT_COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+LDFLAGS=-ldflags "-X main.BuildTime=${BUILD_TIME} -X main.GitCommit=${GIT_COMMIT}"
 
 # Build
 build:
@@ -33,10 +34,6 @@ clean:
 # Run
 run:
 	go run ./${MAIN_PATH}
-
-# Docker build
-docker:
-	docker build -t hypgo:${VERSION} .
 
 # Lint
 lint:

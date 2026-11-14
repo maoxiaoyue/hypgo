@@ -224,6 +224,9 @@ var (
 	ErrBadRequest       = Define("E0002", http.StatusBadRequest, "Bad request", "general")
 	ErrInternalError    = Define("E0003", http.StatusInternalServerError, "Internal server error", "general")
 	ErrMethodNotAllowed = Define("E0004", http.StatusMethodNotAllowed, "Method not allowed", "general")
+	// c.BindInput：有 body 但 Content-Type 認不得／body 超過 server.max_body_size
+	ErrUnsupportedMediaType = Define("E0005", http.StatusUnsupportedMediaType, "Unsupported media type", "general")
+	ErrBodyTooLarge         = Define("E0006", http.StatusRequestEntityTooLarge, "Request body too large", "general")
 
 	// 驗證
 	ErrValidationFailed = Define("E1001", http.StatusUnprocessableEntity, "Validation failed", "validation")
