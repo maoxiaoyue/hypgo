@@ -46,6 +46,11 @@ func (c *Config) markExplicit(key string) {
 	c.explicit[key] = true
 }
 
+// IsExplicit 回報某個鍵（如 "server.shutdown_timeout"）是否在設定檔或環境變數裡明確寫了
+func (c *Config) IsExplicit(key string) bool {
+	return c.explicit[key]
+}
+
 // unset 回報某個數值鍵是否「沒給」：值為 0 而且設定檔與環境變數都沒有寫它
 func (c *Config) unset(key string, value int) bool {
 	return value == 0 && !c.explicit[key]
@@ -67,6 +72,14 @@ type ServerConfig struct {
 	MaxConcurrentStreams int `yaml:"max_concurrent_streams"`
 	MaxReadFrameSize     int `yaml:"max_read_frame_size"`
 	IdleTimeout          int `yaml:"idle_timeout"` // 秒
+
+	// ShutdownTimeout 優雅關閉等待進行中請求的上限（秒，預設 30）；到期後中斷剩餘連線。
+	// 明確寫 0 代表不等待
+	ShutdownTimeout int `yaml:"shutdown_timeout"`
+
+	// AltSvcPort Alt-Svc 廣告的 HTTP/3 埠（預設＝實際綁定的 UDP 埠）。
+	// 經埠對映（容器 -p 443:8443）對外的埠與本機不同時設定
+	AltSvcPort int `yaml:"alt_svc_port"`
 
 	// 優雅重啟
 	EnableGracefulRestart bool `yaml:"enable_graceful_restart"`
@@ -294,6 +307,9 @@ func (c *Config) ApplyDefaults() {
 	if c.unset("server.idle_timeout", c.Server.IdleTimeout) {
 		c.Server.IdleTimeout = 120 // 120秒
 	}
+	if c.unset("server.shutdown_timeout", c.Server.ShutdownTimeout) {
+		c.Server.ShutdownTimeout = 30
+	}
 
 	// Database 預設值
 	if c.Database.MaxIdleConns == 0 {
@@ -336,12 +352,16 @@ func (c *Config) ApplyDefaults() {
 // normalize 把大小寫與別名統一成內部使用的寫法，並把負數當成 0
 func (c *Config) normalize() {
 	c.Server.Protocol = strings.ToLower(strings.TrimSpace(c.Server.Protocol))
+	if full, ok := map[string]string{"h1": "http1", "h2": "http2", "h3": "http3"}[c.Server.Protocol]; ok {
+		c.Server.Protocol = full // pkg/server 一向接受的簡寫；先前在這裡就被驗證擋下
+	}
 	c.Logger.Level = strings.ToLower(strings.TrimSpace(c.Logger.Level))
 	c.Database.Driver = canonicalDriver(c.Database.Driver)
 
 	for _, n := range []*int{
 		&c.Server.ReadTimeout, &c.Server.WriteTimeout, &c.Server.IdleTimeout, &c.Server.MaxHandlers,
 		&c.Server.MaxConcurrentStreams, &c.Server.MaxReadFrameSize,
+		&c.Server.ShutdownTimeout, &c.Server.AltSvcPort,
 		&c.Database.MaxIdleConns, &c.Database.MaxOpenConns, &c.Logger.Rotation.MaxBackups,
 	} {
 		if *n < 0 {
@@ -404,6 +424,20 @@ func (c *Config) Validate() error {
 		if err := validateAddr(c.Server.Addr); err != nil {
 			return fmt.Errorf("server.addr %q: %w", c.Server.Addr, err)
 		}
+	}
+
+	// 可信代理：先前寫錯一筆要到啟動才發現，而且只是一行警告、整份清單作廢
+	for _, p := range c.Server.TrustedProxies {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
+			return fmt.Errorf("server.trusted_proxies: %q is not an IP address or a CIDR range", p)
+		}
+	}
+	if c.Server.AltSvcPort > 65535 {
+		return fmt.Errorf("server.alt_svc_port %d: must be 0-65535", c.Server.AltSvcPort)
 	}
 
 	// 輪轉：先前 max_size: banana 載入成功，啟動時才由 logger 回錯（或退回 stdout）

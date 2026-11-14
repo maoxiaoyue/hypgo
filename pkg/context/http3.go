@@ -5,6 +5,7 @@ import (
 	stdcontext "context"
 	"io"
 	"net/http"
+	"time"
 )
 
 // ===== 協議判斷 =====
@@ -86,6 +87,14 @@ func (c *Context) IsEarlyData() bool {
 
 // ===== Stream 控制 =====
 
+// DisableWriteTimeout 取消這個回應的寫入期限（server.write_timeout）。長時間的回應
+// （SSE、串流、大檔下載）需要它：期限是從請求開始算的總時間，到期時連線直接中斷，
+// handler 與日誌都看不出來。Stream 與 SSEvent 會自動呼叫。
+// 底層不支援時（如被不透明的 writer 包住）回傳 http.ErrNotSupported
+func (c *Context) DisableWriteTimeout() error {
+	return http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{})
+}
+
 // Stream 串流回應（支援 HTTP/3 優化）。
 // 回傳 true 表示客戶端已中斷連線，false 表示 step 自行結束串流。
 //
@@ -93,6 +102,7 @@ func (c *Context) IsEarlyData() bool {
 // 被永遠呼叫下去（多數 step 實作會忽略 Write 錯誤），goroutine 永不退出、
 // Context 也永不歸還池——每個斷線的客戶端漏一條 goroutine，可被當 DoS 向量。
 func (c *Context) Stream(step func(w io.Writer) bool) bool {
+	c.DisableWriteTimeout()
 	w := c.Writer
 	var done <-chan struct{}
 	if c.Request != nil {

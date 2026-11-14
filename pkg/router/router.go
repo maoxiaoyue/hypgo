@@ -277,6 +277,12 @@ func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
 	r.globalMW = append(r.globalMW, middleware...)
 }
 
+// UseFirst 把中間件放在已註冊的全域中間件之前（最外層）。server.Start 以此安置預設的
+// Recovery / Logger，使它們包住使用者的中間件
+func (r *Router) UseFirst(middleware ...hypcontext.HandlerFunc) {
+	r.globalMW = append(append(make([]hypcontext.HandlerFunc, 0, len(middleware)+len(r.globalMW)), middleware...), r.globalMW...)
+}
+
 // executeHandlers 執行處理器鏈（gin 式洋蔥模型）
 // 順序：全域中間件 → (Group 中間件 + 路由 Handler)，合併進 c.handlers 後由 c.Next() 驅動。
 //

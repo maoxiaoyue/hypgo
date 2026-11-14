@@ -168,6 +168,11 @@ type writerOnly struct {
 	io.Writer
 }
 
+// Unwrap 回傳底層的 ResponseWriter，讓 http.ResponseController 能設定讀寫期限
+func (w *responseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // Flush 實現 http.Flusher 介面
 func (w *responseWriter) Flush() {
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {

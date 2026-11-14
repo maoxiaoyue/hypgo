@@ -158,6 +158,7 @@ func (c *Context) DataFromReader(code int, contentLength int64, contentType stri
 
 // SSEvent 發送 Server-Sent Event
 func (c *Context) SSEvent(name string, message interface{}) {
+	c.DisableWriteTimeout() // 事件流沒有固定長度，不受 write_timeout 限制
 	c.Render(-1, sseventRender{
 		Event: name,
 		Data:  message,
