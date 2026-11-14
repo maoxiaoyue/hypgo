@@ -19,7 +19,18 @@ type CompressionConfig struct {
 	Level         int      // gzip 壓縮等級（1–9；0 = 預設）
 	MinLength     int      // 小於此長度（bytes）不壓縮，預設 1024
 	ExcludedPaths []string // 不壓縮的路徑
-	ExcludedTypes []string // 不壓縮的 Content-Type 前綴（如 "image/"、"video/"）
+	// ExcludedTypes 不壓縮的 Content-Type 前綴；nil 時用 defaultExcludedTypes（已壓縮過的格式）。
+	// 給空的 slice 表示全部都壓
+	ExcludedTypes []string
+}
+
+// defaultExcludedTypes 本身已壓縮的格式：再 gzip 一次只花 CPU，大小幾乎不變。
+// 先前沒有預設值，image/png 也照壓（image/svg+xml 是文字，不在此列）
+var defaultExcludedTypes = []string{
+	"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+	"video/", "audio/", "font/woff",
+	"application/zip", "application/gzip", "application/x-gzip", "application/zstd",
+	"application/x-7z-compressed", "application/x-rar-compressed", "application/x-bzip2",
 }
 
 // Compression 創建 gzip 壓縮中間件。
@@ -27,7 +38,11 @@ type CompressionConfig struct {
 // 先前的實作：Level / MinLength / ExcludedTypes 全未生效（2 bytes 的回應也壓成 26 bytes）、
 // 204 等無 body 回應也帶 Content-Encoding、不支援 Flush（SSE 卡在 gzip 緩衝）、
 // "gzip;q=0" 被當成接受、且每個請求新建一個 gzip.Writer。
-// 現在 body 先緩衝到 MinLength 才決定壓縮；不足即原樣送出
+// 現在 body 先緩衝到 MinLength 才決定壓縮；不足即原樣送出。
+//
+// 帶 Range 的請求與 206 回應不壓縮：先前把切出來的那一段拿去 gzip，Content-Range 講的是
+// 原始位元組、body 卻是壓縮後的，續傳的客戶端拼不回來。壓縮後強 ETag 改成弱 ETag
+// （內容位元組已不同），並拿掉 Accept-Ranges
 func Compression(config CompressionConfig) hypcontext.HandlerFunc {
 	level := config.Level
 	if level == 0 {
@@ -39,6 +54,9 @@ func Compression(config CompressionConfig) hypcontext.HandlerFunc {
 	excludedPaths := make(map[string]bool)
 	for _, path := range config.ExcludedPaths {
 		excludedPaths[path] = true
+	}
+	if config.ExcludedTypes == nil {
+		config.ExcludedTypes = defaultExcludedTypes
 	}
 	excludedTypes := make([]string, len(config.ExcludedTypes))
 	for i, t := range config.ExcludedTypes {
@@ -59,7 +77,7 @@ func Compression(config CompressionConfig) hypcontext.HandlerFunc {
 		}
 		// 回應內容依 Accept-Encoding 而定，無論這次是否壓縮都要告知快取
 		c.Writer.Header().Add("Vary", "Accept-Encoding")
-		if !acceptsGzip(c.GetHeader("Accept-Encoding")) {
+		if !acceptsGzip(c.GetHeader("Accept-Encoding")) || c.GetHeader("Range") != "" {
 			c.Next()
 			return
 		}
@@ -111,11 +129,12 @@ type compressWriter struct {
 // compressible 依狀態碼與已設定的標頭判斷這個回應能否壓縮
 func (w *compressWriter) compressible() bool {
 	switch status := w.Status(); {
-	case status < 200, status == http.StatusNoContent, status == http.StatusNotModified:
+	case status < 200, status == http.StatusNoContent, status == http.StatusNotModified,
+		status == http.StatusPartialContent:
 		return false
 	}
 	h := w.Header()
-	if h.Get("Content-Encoding") != "" {
+	if h.Get("Content-Encoding") != "" || h.Get("Content-Range") != "" {
 		return false
 	}
 	ct := strings.ToLower(h.Get("Content-Type"))
@@ -141,6 +160,10 @@ func (w *compressWriter) startGzip() error {
 	}
 	h.Set("Content-Encoding", "gzip")
 	h.Del("Content-Length")
+	h.Del("Accept-Ranges")
+	if etag := h.Get("ETag"); etag != "" && !strings.HasPrefix(etag, "W/") {
+		h.Set("ETag", "W/"+etag)
+	}
 
 	w.gz = w.pool.Get().(*gzip.Writer)
 	w.gz.Reset(w.ResponseWriter)

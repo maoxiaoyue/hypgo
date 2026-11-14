@@ -59,3 +59,22 @@ func TestMaxBodySize(t *testing.T) {
 		}
 	}
 }
+
+// server.cors：沒寫是 nil（預設任何來源），allow_origins: [] 是空清單（不掛預設 CORS），兩者要分得出來
+func TestCORSConfigKeys(t *testing.T) {
+	cfg, warn, err := loadYAML(t, "server:\n  addr: \":8080\"\n")
+	if err != nil || warn != "" || cfg.Server.CORS.AllowOrigins != nil {
+		t.Errorf("absent: origins = %#v, warn = %q, err = %v", cfg.Server.CORS.AllowOrigins, warn, err)
+	}
+	cfg, warn, err = loadYAML(t, "server:\n  cors:\n    allow_origins: []\n")
+	if err != nil || warn != "" || cfg.Server.CORS.AllowOrigins == nil || len(cfg.Server.CORS.AllowOrigins) != 0 {
+		t.Errorf("empty: origins = %#v, warn = %q, err = %v", cfg.Server.CORS.AllowOrigins, warn, err)
+	}
+	cfg, warn, err = loadYAML(t, "server:\n  cors:\n    allow_origins: [\"https://app.example.com\"]\n    allow_credentials: true\n    max_age: 600\n")
+	if c := cfg.Server.CORS; err != nil || warn != "" || len(c.AllowOrigins) != 1 || !c.AllowCredentials || c.MaxAge != 600 {
+		t.Errorf("cors = %+v, warn = %q, err = %v", c, warn, err)
+	}
+	if _, warn, _ := loadYAML(t, "server:\n  cors:\n    allow_origin: [\"*\"]\n"); !strings.Contains(warn, "allow_origins") {
+		t.Errorf("typo not reported: %q", warn)
+	}
+}

@@ -160,13 +160,6 @@ func TestCORSBehavior(t *testing.T) {
 		t.Errorf("preflight = %d ACAH=%q ACAM=%q", w.Code, w.Header().Get("Access-Control-Allow-Headers"), w.Header().Get("Access-Control-Allow-Methods"))
 	}
 
-	// 帶憑證時不得回 "*"
-	r2 := router.New()
-	r2.Use(CORS(CORSConfig{AllowOrigins: []string{"*"}, AllowCredentials: true}))
-	r2.GET("/c", func(c *hypcontext.Context) {})
-	if w := serve(r2, req); w.Header().Get("Access-Control-Allow-Origin") != "https://a.example" {
-		t.Errorf("with credentials ACAO=%q, want the request origin", w.Header().Get("Access-Control-Allow-Origin"))
-	}
 }
 
 // TestCompressionHonorsConfig 迴歸測試（A7）。

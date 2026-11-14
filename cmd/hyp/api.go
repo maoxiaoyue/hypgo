@@ -729,6 +729,11 @@ server:
   trusted_proxies:
     - 127.0.0.1
     - 10.0.0.0/8
+  # 預設中間件的 CORS：沒寫時允許任何來源（不帶憑證）。
+  # 前端要帶 cookie 或想限制來源時列出來源；allow_origins: [] 表示不掛預設的 CORS。
+  # cors:
+  #   allow_origins: ["https://app.example.com"]
+  #   allow_credentials: true
   tls:
     enabled: false         # make cert 產生自簽憑證後改 true（HTTP/3 必須 TLS）
     cert_file: "certs/server.crt"

@@ -291,10 +291,12 @@ func (s *Server) Start() error {
 		s.router, s.config, s.logger,
 	).Run()
 
-	// 套用預設中間件（Recovery / Logger / RejectEarlyData / Security / CORS；http3 時為 HTTP3Middleware）。
+	// 套用預設中間件（Recovery / Logger / RejectEarlyData / Security / CORS）。
 	// v0.8.11 前僅 ListenAndServeWithGracefulShutdown 會套用（而它無人呼叫），
 	// 主要入口（App.Run / srv.Start）一直跑在無 Recovery、無請求日誌、無安全頭的狀態
-	s.applyDefaultMiddlewares()
+	if err := s.applyDefaultMiddlewares(); err != nil {
+		return err
+	}
 
 	// 監聽 SIGINT / SIGTERM，收到即優雅關閉。
 	// v0.8.11 前主要入口完全沒有訊號處理：Ctrl+C / k8s SIGTERM = 行程直接被殺，
@@ -993,10 +995,35 @@ func (s *Server) waitForChildAlive(child *os.Process, window time.Duration) bool
 // 被它擋下的請求（401、限流）不進存取日誌、沒有安全標頭與 CORS，它 panic 時連線直接中斷。
 // 所有協議用同一組：先前 protocol: http3 換成另一組（沒有 Security / CORS，多了 gzip 與
 // 每 IP 100 req/s 的限流），而該模式同樣服務 TCP——把 auto 改成 http3 行為就變了
-func (s *Server) applyDefaultMiddlewares() {
-	// 請求日誌與 panic 記錄走 server logger（遵守日誌等級與 JSON 格式），不再直接寫 stdout
-	access, errs := logWriter(s.logger.Info), logWriter(s.logger.Error)
-	s.router.UseFirst(middleware.DefaultMiddlewareWithOutput(access, errs)...)
+//
+// CORS 依 server.cors：沒設定時為任何來源；allow_origins 是空清單時不掛（見 config.CORSConfig）
+func (s *Server) applyDefaultMiddlewares() error {
+	var cors hypcontext.HandlerFunc
+	if c := s.config.Server.CORS; c.AllowOrigins == nil || len(c.AllowOrigins) > 0 {
+		mc := middleware.DefaultCORSConfig()
+		if c.AllowOrigins != nil {
+			mc.AllowOrigins = c.AllowOrigins
+		}
+		if len(c.AllowMethods) > 0 {
+			mc.AllowMethods = c.AllowMethods
+		}
+		if len(c.AllowHeaders) > 0 {
+			mc.AllowHeaders = c.AllowHeaders
+		}
+		mc.ExposeHeaders, mc.AllowCredentials, mc.MaxAge = c.ExposeHeaders, c.AllowCredentials, c.MaxAge
+		var err error
+		if cors, err = middleware.NewCORS(mc); err != nil {
+			return fmt.Errorf("server.cors: %w", err)
+		}
+	}
+	// 請求日誌與 panic 記錄走 server logger（遵守日誌等級與 JSON 格式），不再直接寫 stdout；
+	// 請求日誌以結構化欄位記錄（method / path / status / ms…）
+	s.router.UseFirst(middleware.DefaultMiddlewareWith(
+		middleware.LoggerConfig{Log: s.logger.Info},
+		middleware.RecoveryConfig{Output: logWriter(s.logger.Error)},
+		cors,
+	)...)
+	return nil
 }
 
 // logWriter 把中間件寫出的每一行轉成一筆 logger 紀錄

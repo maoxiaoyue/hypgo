@@ -7,17 +7,20 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	hyperrors "github.com/maoxiaoyue/hypgo/pkg/errors"
 )
 
 // ===== 安全頭中間件 =====
 
-// SecurityConfig 安全配置
+// SecurityConfig 安全配置。XSSProtection / ContentTypeNosniff / XFrameOptions 留空時用預設值，
+// 寫 "-" 代表不送該標頭（先前留空一定套預設值，拿不掉）
 type SecurityConfig struct {
 	XSSProtection         string // 預設 "0"（見 Security）
 	ContentTypeNosniff    string
@@ -33,20 +36,18 @@ type SecurityConfig struct {
 func Security(config SecurityConfig) hypcontext.HandlerFunc {
 	// X-XSS-Protection 預設 "0"：舊版瀏覽器的 XSS 過濾器本身可被利用來製造漏洞，
 	// 現代瀏覽器已移除該功能，OWASP 建議送 0 並改用 Content-Security-Policy
-	xss := config.XSSProtection
-	if xss == "" {
-		xss = "0"
+	orDefault := func(v, def string) string {
+		switch v {
+		case "":
+			return def
+		case "-":
+			return ""
+		}
+		return v
 	}
-
-	nosniff := config.ContentTypeNosniff
-	if nosniff == "" {
-		nosniff = "nosniff"
-	}
-
-	frame := config.XFrameOptions
-	if frame == "" {
-		frame = "DENY"
-	}
+	xss := orDefault(config.XSSProtection, "0")
+	nosniff := orDefault(config.ContentTypeNosniff, "nosniff")
+	frame := orDefault(config.XFrameOptions, "DENY")
 
 	// HSTS 值預計算：避免每請求 fmt.Sprintf + 字串拼接
 	var hstsValue string
@@ -61,9 +62,15 @@ func Security(config SecurityConfig) hypcontext.HandlerFunc {
 	referrer := config.ReferrerPolicy
 
 	return func(c *hypcontext.Context) {
-		c.Header("X-XSS-Protection", xss)
-		c.Header("X-Content-Type-Options", nosniff)
-		c.Header("X-Frame-Options", frame)
+		if xss != "" {
+			c.Header("X-XSS-Protection", xss)
+		}
+		if nosniff != "" {
+			c.Header("X-Content-Type-Options", nosniff)
+		}
+		if frame != "" {
+			c.Header("X-Frame-Options", frame)
+		}
 
 		if hstsValue != "" {
 			c.Header("Strict-Transport-Security", hstsValue)
@@ -102,7 +109,7 @@ func BasicAuth(config AuthConfig) hypcontext.HandlerFunc {
 	// 帳密錯誤時瀏覽器不會再次跳出登入框
 	unauthorized := func(c *hypcontext.Context) {
 		c.Header("WWW-Authenticate", challenge)
-		c.AbortWithStatus(http.StatusUnauthorized)
+		abortError(c, http.StatusUnauthorized, hyperrors.ErrUnauthorized)
 	}
 
 	return func(c *hypcontext.Context) {
@@ -154,7 +161,9 @@ type JWTConfig struct {
 	TokenLookup   string                                  // "header:Authorization" or "query:token" or "cookie:token"
 	TokenHeadName string                                  // "Bearer"
 	Validator     func(token string) (interface{}, error) // 必須提供：驗證 token 並回傳 claims
-	ErrorHandler  func(c *hypcontext.Context, err error)
+	// ErrorHandler 自訂錯誤回應；nil 時回 401 的 Error Catalog JSON（E2001，token 過期為 E2003）。
+	// 呼叫後一律中止，不需要自己 Abort
+	ErrorHandler func(c *hypcontext.Context, err error)
 }
 
 // JWT 創建 JWT 中間件。未提供 Validator 時於建立時 panic：
@@ -180,13 +189,13 @@ func JWT(config JWTConfig) hypcontext.HandlerFunc {
 			token = stripAuthScheme(token, config.TokenHeadName)
 		}
 		if token == "" {
-			jwtError(c, config, fmt.Errorf("token not found"))
+			jwtError(c, config, src, fmt.Errorf("token not found"))
 			return
 		}
 
 		claims, err := config.Validator(token)
 		if err != nil {
-			jwtError(c, config, fmt.Errorf("token validation failed: %w", err))
+			jwtError(c, config, src, fmt.Errorf("token validation failed: %w", err))
 			return
 		}
 
@@ -200,22 +209,31 @@ func JWT(config JWTConfig) hypcontext.HandlerFunc {
 	}
 }
 
-// jwtError 統一 JWT 錯誤處理
-func jwtError(c *hypcontext.Context, config JWTConfig, err error) {
+// jwtError 統一 JWT 錯誤處理。自訂 ErrorHandler 之後一律中止：先前它只寫回應而沒有 Abort 時，
+// 後面受保護的 handler 照樣執行（回應是 401 + handler 的輸出）
+func jwtError(c *hypcontext.Context, config JWTConfig, src valueSource, err error) {
 	if config.ErrorHandler != nil {
 		config.ErrorHandler(c, err)
-	} else {
-		c.AbortWithStatus(http.StatusUnauthorized)
+		c.Abort()
+		return
 	}
+	if src.kind == "header" && strings.EqualFold(src.name, "Authorization") {
+		c.Header("WWW-Authenticate", config.TokenHeadName) // RFC 7235：401 要帶 challenge
+	}
+	e := hyperrors.ErrUnauthorized
+	if errors.Is(err, ErrJWTExpired) {
+		e = hyperrors.ErrTokenExpired
+	}
+	abortError(c, http.StatusUnauthorized, e)
 }
 
-// stripAuthScheme 去掉標頭值開頭的驗證方案名稱（"Bearer xxx" → "xxx"）；
-// 方案名稱不分大小寫（RFC 7235），沒有方案前綴時原樣回傳
+// stripAuthScheme 去掉標頭值開頭的驗證方案名稱（"Bearer xxx" → "xxx"）；方案名稱不分大小寫
+// （RFC 7235）。沒有方案前綴時回空字串：先前原樣回傳，Authorization: <token> 也能通過
 func stripAuthScheme(value, scheme string) string {
 	if s, rest, ok := strings.Cut(value, " "); ok && strings.EqualFold(s, scheme) {
-		return rest
+		return strings.TrimLeft(rest, " ")
 	}
-	return value
+	return ""
 }
 
 // ===== API Key 認證中間件 =====
@@ -248,7 +266,7 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 	return func(c *hypcontext.Context) {
 		key := src.get(c)
 		if key == "" {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			abortError(c, http.StatusUnauthorized, hyperrors.ErrUnauthorized)
 			return
 		}
 
@@ -264,7 +282,7 @@ func APIKey(config APIKeyConfig) hypcontext.HandlerFunc {
 		}
 
 		if !valid {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			abortError(c, http.StatusUnauthorized, hyperrors.ErrUnauthorized)
 			return
 		}
 
@@ -281,7 +299,8 @@ type IPWhitelistConfig struct {
 	AllowedCIDRs []string
 	// TrustProxy 為 false 時一律以實際連線來源（RemoteAddr）判斷；為 true 時用 c.ClientIP()，
 	// 只採信 SetTrustedProxies 設定的代理所帶的轉發標頭。先前此欄位完全未被讀取
-	TrustProxy   bool
+	TrustProxy bool
+	// ErrorHandler 自訂錯誤回應；nil 時回 403 的 Error Catalog JSON（E2002）。呼叫後一律中止
 	ErrorHandler func(c *hypcontext.Context)
 }
 
@@ -324,8 +343,9 @@ func IPWhitelist(config IPWhitelistConfig) hypcontext.HandlerFunc {
 
 		if config.ErrorHandler != nil {
 			config.ErrorHandler(c)
+			c.Abort() // 見 jwtError
 		} else {
-			c.AbortWithStatus(http.StatusForbidden)
+			abortError(c, http.StatusForbidden, hyperrors.ErrForbidden)
 		}
 	}
 }
