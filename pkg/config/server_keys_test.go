@@ -42,3 +42,20 @@ func TestProtocolShortNames(t *testing.T) {
 		t.Errorf("protocol = %q, err = %v", cfg.Server.Protocol, err)
 	}
 }
+
+// max_body_size：預設 10MB，必須大於 0（沒有不限的設定）
+func TestMaxBodySize(t *testing.T) {
+	cfg, warn, err := loadYAML(t, "server:\n  addr: \":8080\"\n")
+	if err != nil || warn != "" || cfg.Server.MaxBodyBytes() != 10<<20 {
+		t.Errorf("default = %d, warn = %q, err = %v", cfg.Server.MaxBodyBytes(), warn, err)
+	}
+	cfg, _, err = loadYAML(t, "server:\n  max_body_size: 512KB\n")
+	if err != nil || cfg.Server.MaxBodyBytes() != 512<<10 {
+		t.Errorf("512KB = %d, err = %v", cfg.Server.MaxBodyBytes(), err)
+	}
+	for _, bad := range []string{"0", "0MB", "-1", "lots", `""`} {
+		if _, _, err := loadYAML(t, "server:\n  max_body_size: "+bad+"\n"); err == nil || !strings.Contains(err.Error(), "max_body_size") {
+			t.Errorf("max_body_size %s accepted (err = %v)", bad, err)
+		}
+	}
+}

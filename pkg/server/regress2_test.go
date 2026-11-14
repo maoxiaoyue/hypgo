@@ -20,6 +20,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
+	"github.com/maoxiaoyue/hypgo/pkg/middleware"
 )
 
 // freeTCPPort 回傳目前空閒的 TCP port
@@ -541,5 +542,53 @@ func TestStreamIgnoresWriteTimeout(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	if got := strings.Count(string(body), "data:"); err != nil || got != 6 {
 		t.Errorf("received %d of 6 chunks, err = %v", got, err)
+	}
+}
+
+// TestMaxBodySizeIsEnforced 迴歸測試：server.max_body_size 套用到每個請求，超過時 BindInput 回 413；
+// middleware.BodyLimit 可以為個別路由放寬。歷史 bug：沒有任何預設上限
+func TestMaxBodySizeIsEnforced(t *testing.T) {
+	t.Chdir(t.TempDir())
+	port := freeTCPPort(t)
+	cfg := regressCfg(fmt.Sprintf("127.0.0.1:%d", port))
+	cfg.Server.Protocol = "http1"
+	cfg.Server.MaxBodySize = "1KB"
+	s := New(cfg, logger.NewLogger())
+	type req struct {
+		Name string `json:"name"`
+	}
+	h := func(c *hypcontext.Context) {
+		var v req
+		if c.BindInput(&v) {
+			c.JSON(200, len(v.Name))
+		}
+	}
+	s.router.POST("/u", h)
+	s.router.POST("/upload", middleware.BodyLimit(middleware.BodyLimitConfig{MaxBytes: 1 << 20}), h)
+	startServer(t, s, port)
+	defer s.Shutdown(context.Background())
+
+	send := func(path string, size int) int {
+		t.Helper()
+		body := strings.NewReader(`{"name":"` + strings.Repeat("a", size) + `"}`)
+		resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d%s", port, path), "application/json", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := send("/u", 100); got != 200 {
+		t.Errorf("small body: %d", got)
+	}
+	if got := send("/u", 5000); got != http.StatusRequestEntityTooLarge {
+		t.Errorf("5KB body with a 1KB limit: %d, want 413", got)
+	}
+	if got := send("/upload", 5000); got != 200 {
+		t.Errorf("route with a raised limit: %d", got)
+	}
+	// 程式內建構的 Config 沒有設定時用預設的 10MB，不是不限
+	if got := (&config.Config{}).Server.MaxBodyBytes(); got != 10<<20 {
+		t.Errorf("default MaxBodyBytes = %d", got)
 	}
 }

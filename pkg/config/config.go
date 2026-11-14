@@ -73,6 +73,11 @@ type ServerConfig struct {
 	MaxReadFrameSize     int `yaml:"max_read_frame_size"`
 	IdleTimeout          int `yaml:"idle_timeout"` // 秒
 
+	// MaxBodySize 請求 body 的大小上限（預設 10MB；寫法同 logger.rotation.max_size：100KB、10MB、1GB）。
+	// 超過時讀取端收到錯誤，c.BindInput 回 413。必須大於 0，沒有「不限」的設定；
+	// 個別路由以 c.SetBodyLimit 或 middleware.BodyLimit 調整
+	MaxBodySize string `yaml:"max_body_size"`
+
 	// ShutdownTimeout 優雅關閉等待進行中請求的上限（秒，預設 30）；到期後中斷剩餘連線。
 	// 明確寫 0 代表不等待
 	ShutdownTimeout int `yaml:"shutdown_timeout"`
@@ -307,6 +312,9 @@ func (c *Config) ApplyDefaults() {
 	if c.unset("server.idle_timeout", c.Server.IdleTimeout) {
 		c.Server.IdleTimeout = 120 // 120秒
 	}
+	if strings.TrimSpace(c.Server.MaxBodySize) == "" && !c.explicit["server.max_body_size"] {
+		c.Server.MaxBodySize = DefaultMaxBodySize
+	}
 	if c.unset("server.shutdown_timeout", c.Server.ShutdownTimeout) {
 		c.Server.ShutdownTimeout = 30
 	}
@@ -436,6 +444,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("server.trusted_proxies: %q is not an IP address or a CIDR range", p)
 		}
 	}
+	if n, err := parseByteSize(c.Server.MaxBodySize); err != nil || n <= 0 {
+		return fmt.Errorf("server.max_body_size %q: expected a size greater than 0 such as 512KB or 10MB (there is no unlimited setting)", c.Server.MaxBodySize)
+	}
 	if c.Server.AltSvcPort > 65535 {
 		return fmt.Errorf("server.alt_svc_port %d: must be 0-65535", c.Server.AltSvcPort)
 	}
@@ -468,6 +479,41 @@ func validateAddr(addr string) error {
 		return fmt.Errorf("port %q must be a number from 0 to 65535", port)
 	}
 	return nil
+}
+
+// DefaultMaxBodySize server.max_body_size 的預設值
+const DefaultMaxBodySize = "10MB"
+
+// MaxBodyBytes 回傳 max_body_size 的位元組數；沒設定或無效時（程式內建構的 Config）用預設值
+func (s ServerConfig) MaxBodyBytes() int64 {
+	if n, err := parseByteSize(s.MaxBodySize); err == nil && n > 0 {
+		return n
+	}
+	n, _ := parseByteSize(DefaultMaxBodySize)
+	return n
+}
+
+// parseByteSize 解析大小字串（格式同 rotationSize：數字加可選的 B / K / KB / M / MB / G / GB，1024 進位）
+func parseByteSize(s string) (int64, error) {
+	if !rotationSize.MatchString(s) {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	s = strings.ToUpper(strings.TrimSpace(s))
+	mult := float64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   float64
+	}{{"KB", 1 << 10}, {"MB", 1 << 20}, {"GB", 1 << 30}, {"K", 1 << 10}, {"M", 1 << 20}, {"G", 1 << 30}, {"B", 1}} {
+		if strings.HasSuffix(s, u.suffix) {
+			mult, s = u.mult, strings.TrimSpace(strings.TrimSuffix(s, u.suffix))
+			break
+		}
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	return int64(v * mult), nil
 }
 
 // rotationSize 與 pkg/logger 的 parseSize 接受的格式一致

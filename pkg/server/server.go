@@ -692,16 +692,16 @@ func (s *Server) serveTCP(srv *http.Server, l net.Listener) error {
 	return srv.Serve(l)
 }
 
-// wrapHandler 最外層包裝：限制同時執行的 handler 數（MaxHandlers），
-// TCP 側另在 HTTP/3 可用時加上 Alt-Svc。兩者都不需要時不加包裝層
+// wrapHandler 最外層包裝：套用請求 body 上限（server.max_body_size）、限制同時執行的
+// handler 數（MaxHandlers），TCP 側另在 HTTP/3 可用時加上 Alt-Svc
 func (s *Server) wrapHandler(h http.Handler, tcp bool) http.Handler {
 	// altSvc 只在 HTTP/3 綁定後才有值（auto / http3 模式），其餘模式讀到 nil 不廣告
 	advertise := tcp && s.config.Server.TLS.Enabled
 	sem := s.handlerSem
-	if !advertise && sem == nil {
-		return h
-	}
+	maxBody := s.config.Server.MaxBodyBytes()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 先前沒有任何預設上限：一個 300MB 的 JSON 字串會被整包讀進記憶體
+		hypcontext.LimitRequestBody(r, maxBody)
 		if advertise {
 			if v := s.altSvc.Load(); v != nil {
 				w.Header().Set("Alt-Svc", *v)

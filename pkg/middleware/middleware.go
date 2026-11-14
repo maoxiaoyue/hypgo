@@ -414,7 +414,9 @@ func BodyLimit(config BodyLimitConfig) hypcontext.HandlerFunc {
 			c.String(http.StatusRequestEntityTooLarge, config.ErrorMsg)
 			return
 		}
-		c.Request.Body = http.MaxBytesReader(c.Response, c.Request.Body, config.MaxBytes)
+		// 調整（或建立）這個請求的 body 上限：server 已依 server.max_body_size 套用一層，
+		// 這裡的值取代它——掛在上傳路由上可以放寬，掛在全域可以收緊
+		c.SetBodyLimit(config.MaxBytes)
 		c.Next()
 	}
 }
