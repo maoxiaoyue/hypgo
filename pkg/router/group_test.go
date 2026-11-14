@@ -273,7 +273,7 @@ func TestGroupHandleInvalidMethod(t *testing.T) {
 			t.Error("expected panic for invalid HTTP method")
 		}
 	}()
-	api.Handle("INVALID", "/test", writeOK)
+	api.Handle("in valid", "/test", writeOK) // 含空白不是合法的 HTTP token
 }
 
 // TestGroupReturnObj 測試 returnObj 邏輯

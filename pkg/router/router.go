@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	hyperrors "github.com/maoxiaoyue/hypgo/pkg/errors"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
@@ -21,7 +22,7 @@ type Router struct {
 	globalMW []hypcontext.HandlerFunc // 全域中間件（獨立於 Group 的中間件）
 
 	// 配置
-	strictSlash            bool
+	redirectTrailingSlash  bool
 	handleMethodNotAllowed bool
 	methodOverride         bool
 
@@ -38,11 +39,21 @@ type Param = hypcontext.Param
 // RouterOption 路由器選項
 type RouterOption func(*Router)
 
-// WithStrictSlash 設置嚴格斜線模式
-func WithStrictSlash(enabled bool) RouterOption {
+// WithRedirectTrailingSlash 開啟尾斜線重導向：/users/ 沒有路由而 /users 有時（或反過來）
+// 重導向過去（GET / HEAD 用 301，其餘 308，保留 query）。預設關閉，兩者視為不同路徑。
+// 不論此設定，catch-all 路由少了結尾斜線的根路徑一律重導向（/static → /static/）
+func WithRedirectTrailingSlash(enabled bool) RouterOption {
 	return func(r *Router) {
-		r.strictSlash = enabled
+		r.redirectTrailingSlash = enabled
 	}
+}
+
+// WithStrictSlash 等同 WithRedirectTrailingSlash。
+//
+// Deprecated: 名稱與行為相反（true 是「重導向」而不是「嚴格區分」），改用
+// WithRedirectTrailingSlash；行為不變
+func WithStrictSlash(enabled bool) RouterOption {
+	return WithRedirectTrailingSlash(enabled)
 }
 
 // WithMethodNotAllowed 設置是否處理 405
@@ -64,7 +75,7 @@ func New(opts ...RouterOption) *Router {
 	r := &Router{
 		trees:                  make(map[string]*radixNode),
 		globalMW:               make([]hypcontext.HandlerFunc, 0),
-		strictSlash:            false,
+		redirectTrailingSlash:  false,
 		handleMethodNotAllowed: true,
 	}
 
@@ -96,6 +107,17 @@ func (r *Router) addRoute(method, absolutePath string, handlers []hypcontext.Han
 	}
 	if len(handlers) == 0 {
 		panic("router: must provide at least one handler")
+	}
+	// 先前 nil handler 註冊成功，請求進來才 nil pointer panic
+	for _, h := range handlers {
+		if h == nil {
+			panic("router: nil handler for path '" + absolutePath + "'")
+		}
+	}
+	// catch-all 必須自成一段。先前 /files*rest 註冊成功，但參數值多一個斜線
+	// （/filesabc → "/abc"、/files/abc → "//abc"）
+	if i := strings.IndexByte(absolutePath, '*'); i > 0 && absolutePath[i-1] != '/' {
+		panic("router: catch-all must follow a '/' in path '" + absolutePath + "'")
 	}
 
 	// 獲取或創建方法樹
@@ -154,15 +176,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// 尾部斜線重導向（URL.Path 可能為空，例如 HTTP/2 CONNECT）
-	if r.strictSlash && urlPath != "" {
-		var tryPath string
+	if urlPath != "" {
+		tryPath := urlPath + "/"
 		if urlPath[len(urlPath)-1] == '/' {
 			tryPath = urlPath[:len(urlPath)-1]
-		} else {
-			tryPath = urlPath + "/"
 		}
-		if root := r.trees[method]; root != nil {
-			if handlers, _ := root.search(tryPath, nil); handlers != nil {
+		if r.redirectTrailingSlash {
+			if handlers, _ := r.lookup(method, tryPath); handlers != nil {
+				r.executeHandlers(c, []hypcontext.HandlerFunc{trailingSlashRedirect(method, tryPath, req.URL.RawQuery)})
+				return
+			}
+		} else if len(tryPath) > len(urlPath) {
+			// catch-all 的根路徑少了斜線：/static → /static/（先前 404，/static/ 才有首頁）。
+			// 值為 "/" 的參數只會來自接住空路徑的 catch-all（:param 的值不含斜線）
+			if handlers, ps := r.lookup(method, tryPath); handlers != nil && len(ps) > 0 && ps[len(ps)-1].Value == "/" {
 				r.executeHandlers(c, []hypcontext.HandlerFunc{trailingSlashRedirect(method, tryPath, req.URL.RawQuery)})
 				return
 			}
@@ -185,6 +212,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			if containsString(allow, http.MethodGet) && !containsString(allow, http.MethodHead) {
 				allow = append(allow, http.MethodHead)
 			}
+			// 沒註冊 OPTIONS 的路徑自動回 204 + Allow（先前 405）。經過全域中間件，
+			// CORS preflight 照舊由 CORS 中間件先接走
+			if method == http.MethodOptions {
+				allow = append(allow, http.MethodOptions)
+				sort.Strings(allow)
+				c.Header("Allow", strings.Join(allow, ", "))
+				r.executeHandlers(c, []hypcontext.HandlerFunc{func(c *hypcontext.Context) {
+					c.Status(http.StatusNoContent)
+					c.Writer.WriteHeaderNow()
+				}})
+				return
+			}
 			sort.Strings(allow)
 			c.Header("Allow", strings.Join(allow, ", "))
 			// 走 executeHandlers 讓 405 也經過全域中間件：
@@ -197,6 +236,21 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// 404 Not Found（同樣經過全域中間件）
 	r.executeHandlers(c, []hypcontext.HandlerFunc{r.notFoundHandler()})
+}
+
+// lookup 查 method 的路由樹；HEAD 沒有自己的路由時退回 GET
+func (r *Router) lookup(method, path string) ([]hypcontext.HandlerFunc, []Param) {
+	if root := r.trees[method]; root != nil {
+		if handlers, ps := root.search(path, nil); handlers != nil {
+			return handlers, ps
+		}
+	}
+	if method == http.MethodHead {
+		if root := r.trees[http.MethodGet]; root != nil {
+			return root.search(path, nil)
+		}
+	}
+	return nil, nil
 }
 
 // EnableMethodOverride 讓 POST 請求以 X-HTTP-Method-Override 標頭或查詢參數 _method
@@ -250,10 +304,8 @@ func (r *Router) notFoundHandler() hypcontext.HandlerFunc {
 	if r.notFound != nil {
 		return r.notFound
 	}
-	return func(c *hypcontext.Context) {
-		c.Status(http.StatusNotFound)
-		c.Writer.WriteHeaderNow()
-	}
+	// 先前預設的 404 / 405 沒有 body；改回 Error Catalog 的形狀，與 BindInput 等錯誤一致
+	return func(c *hypcontext.Context) { hyperrors.RespondError(c, hyperrors.ErrNotFound) }
 }
 
 // methodNotAllowedHandler 回傳 405 處理器（自訂或預設）
@@ -261,10 +313,7 @@ func (r *Router) methodNotAllowedHandler() hypcontext.HandlerFunc {
 	if r.methodNotAllowed != nil {
 		return r.methodNotAllowed
 	}
-	return func(c *hypcontext.Context) {
-		c.Status(http.StatusMethodNotAllowed)
-		c.Writer.WriteHeaderNow()
-	}
+	return func(c *hypcontext.Context) { hyperrors.RespondError(c, hyperrors.ErrMethodNotAllowed) }
 }
 
 // Use 添加全域中間件，全域中間件在 executeHandlers 中優先於 Group 中間件執行
@@ -315,12 +364,18 @@ type RouteInfo struct {
 	HandlerNames []string // handler 函式名稱
 }
 
-// Routes 返回已註冊的所有路由信息
+// Routes 返回已註冊的所有路由信息，依路徑、方法排序（先前順序隨 map 走訪每次不同）
 func (r *Router) Routes() []RouteInfo {
 	routes := make([]RouteInfo, 0)
 	for method, root := range r.trees {
 		routes = collectRoutes("", method, routes, root)
 	}
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Path != routes[j].Path {
+			return routes[i].Path < routes[j].Path
+		}
+		return routes[i].Method < routes[j].Method
+	})
 	return routes
 }
 

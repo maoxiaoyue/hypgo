@@ -3,6 +3,7 @@ package router
 
 import (
 	"net/http"
+	"os"
 	"strings"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
@@ -125,7 +126,7 @@ func (g *Group) handle(method, relativePath string, handlers []hypcontext.Handle
 	return g.returnObj()
 }
 
-// Handle 註冊指定 HTTP 方法的路由
+// Handle 註冊指定 HTTP 方法的路由。method 須為大寫，可以是擴充方法（PROPFIND 等）
 func (g *Group) Handle(method, relativePath string, handlers ...hypcontext.HandlerFunc) IRoutes {
 	if !isValidHTTPMethod(method) {
 		panic("router: invalid HTTP method: " + method)
@@ -168,12 +169,13 @@ func (g *Group) HEAD(relativePath string, handlers ...hypcontext.HandlerFunc) IR
 	return g.handle(http.MethodHead, relativePath, handlers)
 }
 
-// Any 註冊所有 HTTP 方法
+// Any 註冊 GET / POST / PUT / PATCH / HEAD / OPTIONS / DELETE。
+// 不含 TRACE 與 CONNECT（先前一併註冊）：TRACE 會把請求原樣回給對方，CONNECT 是代理用的，
+// 一般 handler 不該順便回應它們；需要時以 Handle 個別註冊
 func (g *Group) Any(relativePath string, handlers ...hypcontext.HandlerFunc) IRoutes {
 	for _, method := range []string{
 		http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
 		http.MethodHead, http.MethodOptions, http.MethodDelete,
-		http.MethodConnect, http.MethodTrace,
 	} {
 		g.handle(method, relativePath, handlers)
 	}
@@ -188,7 +190,15 @@ func (g *Group) Match(methods []string, relativePath string, handlers ...hypcont
 	return g.returnObj()
 }
 
-// Static 服務靜態文件目錄。
+// StaticOptions 調整 StaticWith 的檔案服務行為；零值即 Static / StaticFS 的預設（兩者皆關）
+type StaticOptions struct {
+	// ListDirectories 目錄沒有 index.html 時回傳檔案列表；關閉時回 404
+	ListDirectories bool
+	// AllowDotFiles 提供任何一段以 "." 開頭的路徑（.env、.git/config）；關閉時回 404
+	AllowDotFiles bool
+}
+
+// Static 服務靜態文件目錄。不列目錄、不提供點開頭的檔案（見 StaticWith）。
 // 委派給 StaticFS：先前自己拼 relativePath+"/*filepath"，Static("/assets/", …) 會產生
 // "/assets//*filepath" 而全部 404；且每個請求都重建 http.StripPrefix
 func (g *Group) Static(relativePath, dir string) IRoutes {
@@ -205,10 +215,17 @@ func (g *Group) StaticFile(relativePath, filepath string) IRoutes {
 	return g.returnObj()
 }
 
-// StaticFS 使用 http.FileSystem 服務靜態文件
+// StaticFS 使用 http.FileSystem 服務靜態文件。不列目錄、不提供點開頭的檔案（見 StaticWith）
 func (g *Group) StaticFS(relativePath string, fs http.FileSystem) IRoutes {
+	return g.StaticWith(relativePath, fs, StaticOptions{})
+}
+
+// StaticWith 同 StaticFS，可用 opts 開啟目錄列表或點開頭的檔案。
+// 先前 Static / StaticFS 直接交給 http.FileServer：沒有 index.html 的目錄回傳檔案列表，
+// 誤放進靜態目錄的 .env / .git 也照樣送出
+func (g *Group) StaticWith(relativePath string, fs http.FileSystem, opts StaticOptions) IRoutes {
 	absolutePath := joinPaths(g.basePath, relativePath)
-	fileServer := http.StripPrefix(absolutePath, http.FileServer(fs))
+	fileServer := http.StripPrefix(absolutePath, http.FileServer(staticFS{fs, opts}))
 	handler := func(c *hypcontext.Context) {
 		fileServer.ServeHTTP(c.Writer, c.Request)
 	}
@@ -220,6 +237,36 @@ func (g *Group) StaticFS(relativePath string, fs http.FileSystem) IRoutes {
 	g.handle(http.MethodGet, urlPattern, []hypcontext.HandlerFunc{handler})
 	g.handle(http.MethodHead, urlPattern, []hypcontext.HandlerFunc{handler})
 	return g.returnObj()
+}
+
+// staticFS 依 StaticOptions 把不該提供的路徑變成「不存在」，其餘交給底層檔案系統
+type staticFS struct {
+	fs   http.FileSystem
+	opts StaticOptions
+}
+
+func (s staticFS) Open(name string) (http.File, error) {
+	if !s.opts.AllowDotFiles {
+		for _, seg := range strings.Split(name, "/") {
+			if strings.HasPrefix(seg, ".") {
+				return nil, os.ErrNotExist
+			}
+		}
+	}
+	f, err := s.fs.Open(name)
+	if err != nil || s.opts.ListDirectories {
+		return f, err
+	}
+	if st, err := f.Stat(); err == nil && st.IsDir() {
+		// 目錄只有在有 index.html 時才提供（http.FileServer 會接著開它）
+		index, err := s.fs.Open(strings.TrimSuffix(name, "/") + "/index.html")
+		if err != nil {
+			f.Close()
+			return nil, os.ErrNotExist
+		}
+		index.Close()
+	}
+	return f, nil
 }
 
 // Schema 開始 schema-first 路由註冊（Group 版本）
@@ -246,13 +293,21 @@ func (g *Group) combineHandlers(handlers []hypcontext.HandlerFunc) []hypcontext.
 	return merged
 }
 
-// isValidHTTPMethod 驗證 HTTP 方法
+// isValidHTTPMethod 驗證方法名稱：大寫的 HTTP token（RFC 9110 §5.6.2），標準方法與
+// PROPFIND、PURGE 這類擴充方法皆可。先前只收 9 個標準方法，WebDAV 等方法無法註冊。
+// 小寫一律拒絕：net/http 不會轉大寫，"get" 註冊了也永遠對不到
 func isValidHTTPMethod(method string) bool {
-	switch method {
-	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
-		http.MethodHead, http.MethodOptions, http.MethodDelete,
-		http.MethodConnect, http.MethodTrace:
-		return true
+	if method == "" {
+		return false
 	}
-	return false
+	for i := 0; i < len(method); i++ {
+		c := method[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
