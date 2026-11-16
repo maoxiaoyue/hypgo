@@ -6,9 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"github.com/uptrace/bun"
 )
 
 type r2Addr struct {
@@ -220,5 +223,42 @@ func TestTypesAreKeyedByQualifiedName(t *testing.T) {
 	}
 	if strings.Contains(out, "github.com") {
 		t.Errorf("import path leaked into the manifest:\n%s", out)
+	}
+}
+
+type r2Stamp struct {
+	bun.BaseModel `bun:"table:r2_stamps"`
+	ID            int64     `bun:",pk,autoincrement"`
+	At            time.Time `bun:"at"`
+}
+
+// models 區段的型別依專案的資料庫。
+// 歷史 bug：一律用 PostgreSQL 方言，MySQL 專案的 manifest 寫著 BIGSERIAL、TIMESTAMPTZ
+func TestModelTypesFollowDatabaseDriver(t *testing.T) {
+	reg := migrate.NewRegistry()
+	reg.Register((*r2Stamp)(nil))
+	types := func(driver string) string {
+		var cfg *config.Config
+		if driver != "none" {
+			cfg = &config.Config{}
+			cfg.Database.Driver = driver
+		}
+		m := newCollector(router.New(), cfg, reg, DefaultEnrichConfig()).Collect()
+		if len(m.Models) != 1 {
+			t.Fatalf("%s: models = %+v", driver, m.Models)
+		}
+		var out []string
+		for _, f := range m.Models[0].Fields {
+			out = append(out, f.SQLType)
+		}
+		return strings.Join(out, ",")
+	}
+	for driver, want := range map[string]string{
+		"mysql": "BIGINT,DATETIME", "tidb": "BIGINT,DATETIME",
+		"postgres": "BIGSERIAL,TIMESTAMPTZ", "": "BIGSERIAL,TIMESTAMPTZ", "none": "BIGSERIAL,TIMESTAMPTZ",
+	} {
+		if got := types(driver); got != want {
+			t.Errorf("driver %q: types = %s, want %s", driver, got, want)
+		}
 	}
 }

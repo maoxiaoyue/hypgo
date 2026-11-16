@@ -229,7 +229,12 @@ func (c *Collector) collectModels() []ModelManifest {
 	manifests := make([]ModelManifest, 0, len(models))
 
 	for _, model := range models {
-		table := migrate.ScanModel(model)
+		// 型別依專案的資料庫：先前一律用 PostgreSQL 方言，MySQL 專案的 manifest 寫著 BIGSERIAL、TIMESTAMPTZ
+		driver := ""
+		if c.config != nil {
+			driver = c.config.Database.Driver
+		}
+		table := migrate.ScanModelFor(model, migrate.DialectForDriver(driver))
 		if table == nil {
 			continue
 		}

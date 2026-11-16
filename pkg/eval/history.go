@@ -37,6 +37,10 @@ type EvalRecord struct {
 	// Route 為 "METHOD /path" 格式，例如 "POST /api/summarize"
 	Route string `json:"route"`
 
+	// Case 為測試案例的名稱（contract.TestCase.Name）。同一條路由常有多個案例（成功、錯誤路徑…），
+	// hyp eval-report 以它區分；沒有名稱時改用 InputHash
+	Case string `json:"case,omitempty"`
+
 	// Status 為 "pass" 或 "fail"
 	Status string `json:"status"`
 
@@ -48,16 +52,25 @@ type EvalRecord struct {
 	// 舊紀錄沒有這個欄位
 	Attempts int `json:"attempts,omitempty"`
 
-	// LatencyMs 為完整執行時間（含重試），單位毫秒
+	// LatencyMs 為 handler 的執行時間（含重試、不含 Graders），單位毫秒。
+	// 先前把 Graders 呼叫 LLM 的時間也算進來，一次評分就讓 2ms 的 handler 看起來要 900ms
 	LatencyMs int64 `json:"latency_ms"`
+
+	// GraderMs 為 Graders 的執行時間（多半是 LLM 往返），單位毫秒
+	GraderMs int64 `json:"grader_ms,omitempty"`
 
 	// InputHash 為請求 body 的 sha256 前綴（格式 "sha256:abcdef01"）
 	// 只存 hash，不存實際輸入，避免敏感資料洩漏
 	InputHash string `json:"input_hash,omitempty"`
 
-	// FailReason 為失敗原因字串，pass 時為空
+	// FailReason 為失敗原因（最多 MaxFailReason 個位元組），pass 時為空。
+	// 注意：原因可能引用回應內容（"body = …, want …"、欄位名稱、評分理由）；請求輸入只存 hash，回應則沒有
 	FailReason string `json:"fail_reason,omitempty"`
 }
+
+// MaxFailReason 為 EvalRecord.FailReason 的長度上限（位元組）。失敗原因可能引用整份回應，
+// 先前原樣寫進歷史檔
+const MaxFailReason = 200
 
 // historyMu 保護同一進程內對 history 檔案的並行寫入
 var historyMu sync.Mutex
@@ -153,6 +166,10 @@ func AppendHistoryTo(path string, record EvalRecord) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("eval: mkdir %s: %w", dir, err)
+	}
+
+	if len(record.FailReason) > MaxFailReason {
+		record.FailReason = strings.ToValidUTF8(record.FailReason[:MaxFailReason], "") + "…"
 	}
 
 	// 序列化新紀錄為一行 JSON

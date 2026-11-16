@@ -32,6 +32,10 @@ import (
 
 // TestCase 定義單一 contract 測試案例
 type TestCase struct {
+	// Name 案例名稱（選填），RecordHistory 時寫進歷史。同一條路由有多個案例（成功、錯誤路徑…）時，
+	// hyp eval-report 以它分開統計；沒有名稱時以輸入的 hash 區分
+	Name string
+
 	// Route 格式為 "METHOD /path"，例如 "POST /api/users"
 	Route string
 
@@ -101,14 +105,20 @@ func Test(t *testing.T, r *router.Router, tc TestCase) {
 // @ai sideeffect: 無（不呼叫任何 t.* 方法；Graders 可能發出 LLM HTTP 請求）
 // date: 2026-05-23
 func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, scores map[string]float64) {
+	pass, reason, scores, _ = runTestTimed(r, tc)
+	return pass, reason, scores
+}
+
+// runTestTimed 同 runTestOnce，另外回傳 Graders 花的時間（歷史紀錄把它與 handler 的時間分開）
+func runTestTimed(r *router.Router, tc TestCase) (pass bool, reason string, scores map[string]float64, graderTime time.Duration) {
 	method, path := parseRoute(tc.Route)
 	if method == "" || path == "" {
-		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route), nil
+		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route), nil, 0
 	}
 
 	// 什麼都沒要求的案例一律通過（連 404 都是綠的），多半是忘了填
 	if !tc.generated && tc.ExpectStatus == 0 && !tc.ExpectSchema && tc.ExpectBody == "" && len(tc.Graders) == 0 {
-		return false, fmt.Sprintf("[%s] nothing to check: set ExpectStatus, ExpectSchema, ExpectBody or Graders", tc.Route), nil
+		return false, fmt.Sprintf("[%s] nothing to check: set ExpectStatus, ExpectSchema, ExpectBody or Graders", tc.Route), nil, 0
 	}
 
 	req := tc.request(method, path)
@@ -122,12 +132,12 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 	} else if tc.ExpectSchema {
 		s, ok := lookupSchema(method, req.URL.Path)
 		if !ok {
-			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
+			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil, 0
 		}
 		route = *s
 	}
 	if _, ok, why := validateExchange(route, tc, w.Code, w.Header().Get("Content-Type"), w.Body.Bytes()); !ok {
-		return false, fmt.Sprintf("[%s] %s", tc.Route, why), nil
+		return false, fmt.Sprintf("[%s] %s", tc.Route, why), nil, 0
 	}
 
 	// 精確比對 body
@@ -135,17 +145,19 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 		got := strings.TrimSpace(w.Body.String())
 		want := strings.TrimSpace(tc.ExpectBody)
 		if got != want {
-			return false, fmt.Sprintf("[%s] body = %q, want %q", tc.Route, got, want), nil
+			return false, fmt.Sprintf("[%s] body = %q, want %q", tc.Route, got, want), nil, 0
 		}
 	}
 
 	// Probabilistic 評分：deterministic 檢查全數通過後才執行
 	//（結構都不對的回應沒有評分意義）
 	if len(tc.Graders) > 0 {
-		return runGraders(tc, w.Body.String())
+		start := time.Now()
+		pass, reason, scores = runGraders(tc, w.Body.String())
+		return pass, reason, scores, time.Since(start)
 	}
 
-	return true, "", nil
+	return true, "", nil, 0
 }
 
 // request 依 TestCase 組出請求；有 Input 時預設 Content-Type: application/json（Headers 可覆寫）
@@ -272,7 +284,7 @@ func runGraders(tc TestCase, output string) (pass bool, reason string, scores ma
 		scores[res.Name] = res.Score
 	}
 
-	agg := eval.Aggregate(results, nil)
+	agg := eval.Aggregate(results)
 	scores["aggregate"] = agg
 
 	if tc.PassThreshold > 0 && agg < tc.PassThreshold {
@@ -301,7 +313,7 @@ func runGraders(tc TestCase, output string) (pass bool, reason string, scores ma
 func testInternal(t *testing.T, r *router.Router, tc TestCase) {
 	t.Helper()
 	start := time.Now()
-	pass, reason, scores := runTestOnce(r, tc)
+	pass, reason, scores, graderTime := runTestTimed(r, tc)
 	if len(scores) > 0 {
 		t.Logf("eval scores %s: %v", tc.Route, scores)
 	}
@@ -309,7 +321,7 @@ func testInternal(t *testing.T, r *router.Router, tc TestCase) {
 		t.Errorf("contract: %s", reason)
 	}
 	if tc.RecordHistory {
-		recordHistory(t, tc.Route, tc.Input, pass, reason, scores, time.Since(start), 1)
+		recordHistory(t, tc, tc.Route, pass, reason, scores, time.Since(start)-graderTime, graderTime, 1)
 	}
 }
 
@@ -318,7 +330,7 @@ var gitCommit = sync.OnceValue(eval.GitShortCommit)
 
 // recordHistory 寫入一筆 eval history。寫入失敗讓測試失敗：要求記錄卻默默沒記，
 // 使用者要到看趨勢時才發現資料是斷的（通過的測試不顯示 t.Logf，所以不用 Logf）
-func recordHistory(t *testing.T, route, input string, pass bool, reason string, graderScores map[string]float64, latency time.Duration, attempts int) {
+func recordHistory(t *testing.T, tc TestCase, route string, pass bool, reason string, graderScores map[string]float64, latency, graderTime time.Duration, attempts int) {
 	t.Helper()
 	status, score := "fail", 0.0
 	if pass {
@@ -331,11 +343,13 @@ func recordHistory(t *testing.T, route, input string, pass bool, reason string, 
 		Timestamp:  time.Now().UTC(),
 		GitCommit:  gitCommit(),
 		Route:      route,
+		Case:       tc.Name,
 		Status:     status,
 		Scores:     scores,
 		Attempts:   attempts,
 		LatencyMs:  latency.Milliseconds(),
-		InputHash:  eval.HashInput(input),
+		GraderMs:   graderTime.Milliseconds(),
+		InputHash:  eval.HashInput(tc.Input),
 		FailReason: reason,
 	})
 	if err != nil {
@@ -423,6 +437,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 				var pass bool
 				var reason string
 				var graderScores map[string]float64
+				var graderTime time.Duration
 				attempts := 0
 				for attempts <= cfg.RetryCount {
 					if attempts > 0 {
@@ -432,7 +447,9 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 							time.Sleep(cfg.RetryDelay)
 						}
 					}
-					pass, reason, graderScores = runTestOnce(r, tc)
+					var g time.Duration
+					pass, reason, graderScores, g = runTestTimed(r, tc)
+					graderTime += g
 					attempts++
 					if pass {
 						break
@@ -449,7 +466,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 
 				// 歷史記錄：RecordHistory=true 時 append 結果
 				if cfg.RecordHistory {
-					recordHistory(t, route.Method+" "+route.Path, tc.Input, pass, reason, graderScores, latency, attempts)
+					recordHistory(t, tc, route.Method+" "+route.Path, pass, reason, graderScores, latency-graderTime, graderTime, attempts)
 				}
 			})
 		} else {
@@ -476,7 +493,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 					if t.Failed() {
 						reason = "schema incomplete"
 					}
-					recordHistory(t, name, "", !t.Failed(), reason, nil, time.Since(start), 1)
+					recordHistory(t, TestCase{}, name, !t.Failed(), reason, nil, time.Since(start), 0, 1)
 				}
 			})
 		}

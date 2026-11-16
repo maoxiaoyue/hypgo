@@ -117,13 +117,28 @@ func ScanModels(registry *ModelRegistry, dialect string) ([]TableSchema, error) 
 
 // ScanModel 以 PostgreSQL 方言掃描單一 Model struct；無效的 model 回傳 nil
 func ScanModel(model interface{}) *TableSchema {
+	return ScanModelFor(model, DialectPostgres)
+}
+
+// ScanModelFor 以指定方言掃描單一 Model struct；無效的 model 或方言回傳 nil
+func ScanModelFor(model interface{}, dialect string) *TableSchema {
 	r := NewRegistry()
 	r.Register(model)
-	tables, err := ScanModels(r, DialectPostgres)
+	tables, err := ScanModels(r, dialect)
 	if err != nil || len(tables) == 0 {
 		return nil
 	}
 	return &tables[0]
+}
+
+// DialectForDriver 回傳資料庫 driver（config 的 database.driver）對應的 SQL 方言：
+// mysql / mariadb / tidb 為 MySQL，其餘（含未設定）為 PostgreSQL
+func DialectForDriver(driver string) string {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "mysql", "mariadb", "tidb":
+		return DialectMySQL
+	}
+	return DialectPostgres
 }
 
 func newBunDialect(d string) schema.Dialect {

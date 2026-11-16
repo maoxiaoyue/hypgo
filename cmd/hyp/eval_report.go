@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/maoxiaoyue/hypgo/pkg/eval"
@@ -21,10 +22,13 @@ import (
 var evalReportCmd = &cobra.Command{
 	Use:   "eval-report",
 	Short: "Show contract test quality trend from eval history",
-	Long: `Read .hyp/eval_history.jsonl (in the module root) and display a quality trend per route.
+	Long: `Read .hyp/eval_history.jsonl (in the module root) and display a quality trend per test case.
+
+A route with several recorded cases (contract.TestCase.Name, or different inputs)
+gets one row per case, shown as "METHOD /path [name]"; cases are never averaged together.
 
 The report shows:
-  - Route path (METHOD /path)
+  - Route path (METHOD /path), with the case name or input hash when the route has several cases
   - Average score over the last N runs (default: 5): the grader aggregate when recorded, otherwise contract
   - The same average over the previous N runs (N/A until there are 2N runs)
   - Contract: pass rate over the last N runs
@@ -38,7 +42,8 @@ History is generated automatically when using:
 Examples:
   hyp eval-report                       # read .hyp/eval_history.jsonl
   hyp eval-report --path my/history.jsonl
-  hyp eval-report --n 10                # average over last 10 runs`,
+  hyp eval-report --n 10                # average over last 10 runs
+  hyp eval-report --fail-on-regression  # exit 1 when any case dropped more than 0.1 (CI)`,
 	Args:         cobra.NoArgs,
 	SilenceUsage: true,
 	RunE:         runEvalReport,
@@ -47,6 +52,7 @@ Examples:
 var (
 	evalReportPath string
 	evalReportN    int
+	evalReportFail bool
 )
 
 func init() {
@@ -54,6 +60,8 @@ func init() {
 		"Path to the eval history JSONL file (default: .hyp/eval_history.jsonl in the module root)")
 	evalReportCmd.Flags().IntVar(&evalReportN, "n", 5,
 		"Number of recent runs to average for the trend window")
+	evalReportCmd.Flags().BoolVar(&evalReportFail, "fail-on-regression", false,
+		"Exit non-zero when any case's score dropped more than 0.1 vs the previous window")
 }
 
 // runEvalReport 執行 eval-report 命令：讀取 history 並輸出趨勢表格
@@ -87,8 +95,8 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// 按路由分組
-	byRoute := groupByRoute(records)
+	// 按測試案例分組（路由 + 案例名稱 / 輸入 hash）
+	byRoute := groupByCase(records)
 
 	// 取得所有路由並排序（固定輸出順序）
 	routes := make([]string, 0, len(byRoute))
@@ -99,7 +107,7 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 
 	// 輸出報告頭
 	fmt.Fprintf(out, "📊 Eval Report — %s\n", path)
-	fmt.Fprintf(out, "   Total records: %d  |  Routes: %d  |  Window: last %d\n\n",
+	fmt.Fprintf(out, "   Total records: %d  |  Cases: %d  |  Window: last %d\n\n",
 		len(records), len(routes), evalReportN)
 
 	// 使用 tabwriter 對齊欄位
@@ -108,6 +116,7 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(w, "─────\t──────────\t──────────\t────────\t─────\t─────\t────")
 
 	var hasWarning, hasFlaky bool
+	var regressed []string
 	for _, route := range routes {
 		recs := byRoute[route]
 
@@ -123,6 +132,7 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 		if prevAvg >= 0 && lastAvg < prevAvg-0.1 {
 			warn = " ⚠"
 			hasWarning = true
+			regressed = append(regressed, route)
 		}
 
 		flakyStr := ""
@@ -152,6 +162,10 @@ func runEvalReport(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(out, "\nLast recorded commit: %s\n", last.GitCommit)
 	}
 	reportSkipped(cmd, skipped)
+	// 先前不論結果一律 exit 0，CI 只能靠人看報告
+	if evalReportFail && len(regressed) > 0 {
+		return fmt.Errorf("%d case(s) regressed: %s", len(regressed), strings.Join(regressed, "; "))
+	}
 	return nil
 }
 
@@ -162,11 +176,37 @@ func reportSkipped(cmd *cobra.Command, skipped int) {
 	}
 }
 
-// groupByRoute 將 []EvalRecord 按 Route 欄位分組，組內保持時間先後順序
-func groupByRoute(records []eval.EvalRecord) map[string][]eval.EvalRecord {
+// groupByCase 將紀錄按測試案例分組（組內保持時間先後）：同一條路由的不同案例各自一組，
+// 鍵為顯示用的標籤——路由只有一個案例時就是路由本身，否則加上 [案例名稱] 或 [輸入 hash 前 6 碼]。
+//
+// 先前只按路由分組：成功案例的品質從 0.95 掉到 0.30、錯誤路徑案例一直通過，兩者交錯平均後
+// 報告顯示「↑ +0.14」
+func groupByCase(records []eval.EvalRecord) map[string][]eval.EvalRecord {
+	caseOf := func(r eval.EvalRecord) string {
+		if r.Case != "" {
+			return r.Case
+		}
+		hash := strings.TrimPrefix(r.InputHash, "sha256:")
+		return hash[:min(len(hash), 6)]
+	}
+	cases := make(map[string]map[string]bool) // 路由 → 出現過的案例
+	for _, r := range records {
+		if cases[r.Route] == nil {
+			cases[r.Route] = make(map[string]bool)
+		}
+		cases[r.Route][caseOf(r)] = true
+	}
 	result := make(map[string][]eval.EvalRecord)
 	for _, r := range records {
-		result[r.Route] = append(result[r.Route], r)
+		label := r.Route
+		if len(cases[r.Route]) > 1 {
+			name := caseOf(r)
+			if name == "" {
+				name = "no input"
+			}
+			label += " [" + name + "]"
+		}
+		result[label] = append(result[label], r)
 	}
 	return result
 }

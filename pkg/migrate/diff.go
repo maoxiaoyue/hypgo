@@ -257,8 +257,29 @@ func (c Change) Destructive() string {
 	return ""
 }
 
+// Risky 回傳此變更可能在既有資料上失敗的原因（不會遺失資料）；其餘回傳空字串。
+// hyp migrate diff 遇到此類變更時，未加 --allow-risky 即失敗。
+//
+// 先前這兩種變更不需要任何旗標：PostgreSQL 的 migration 包在交易裡，失敗會整個回滾；
+// MySQL 的 DDL 不能回滾，中途失敗時前面的陳述式已經生效
+func (c Change) Risky() string {
+	switch c.Type {
+	case AlterColumn:
+		if c.OldCol != nil && c.Column != nil && !c.OldCol.NotNull && c.Column.NotNull {
+			return fmt.Sprintf("sets %s.%s NOT NULL (fails when the column holds NULLs; backfill it first)", c.Table, c.Column.Name)
+		}
+	case AddUnique:
+		if c.Unique != nil {
+			return fmt.Sprintf("adds a UNIQUE constraint on %s (%s) (fails when existing rows have duplicates)",
+				c.Table, strings.Join(c.Unique.Columns, ", "))
+		}
+	}
+	return ""
+}
+
 var (
 	spaceRe   = regexp.MustCompile(`\s+`)
+	decimalRe = regexp.MustCompile(`^(?:DECIMAL|NUMERIC|DEC)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$`)
 	varcharRe = regexp.MustCompile(`^(?:VARCHAR|CHARACTER VARYING)(?:\((\d+)\))?$`)
 )
 
@@ -312,6 +333,15 @@ func typeWidens(old, new string) bool {
 	}
 	if to, tn := textRank(o), textRank(n); to != 0 && tn != 0 {
 		return tn == -1 || (to != -1 && tn >= to)
+	}
+	// decimal(p,s)：小數位不變少、整數位（p-s）也不變少時是加寬
+	// （先前 decimal(10,2) → decimal(12,2) 被判成可能截斷）
+	if mo, mn := decimalRe.FindStringSubmatch(o), decimalRe.FindStringSubmatch(n); mo != nil && mn != nil {
+		po, _ := strconv.Atoi(mo[1])
+		so, _ := strconv.Atoi(mo[2])
+		pn, _ := strconv.Atoi(mn[1])
+		sn, _ := strconv.Atoi(mn[2])
+		return sn >= so && pn-sn >= po-so
 	}
 	return false
 }

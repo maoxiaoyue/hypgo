@@ -36,8 +36,12 @@ func httpClientFor(cfg *config.LLMConfig) *http.Client {
 	return &http.Client{Timeout: time.Duration(timeout) * time.Second}
 }
 
-// completeText 送出 prompt 並回傳模型的文字回應
-func completeText(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string) (string, error) {
+// defaultMaxTokens 設定沒有 max_tokens（程式內建構、沒經過 LoadLLMConfig 的 LLMConfig）時
+// Anthropic 用的值；它的 max_tokens 必填
+const defaultMaxTokens = 256
+
+// completeText 送出 prompt 並回傳模型的文字回應。temperature 為 nil 時不送這個參數
+func completeText(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string, temperature *float64) (string, error) {
 	if cfg == nil || !cfg.IsEnabled() {
 		return "", fmt.Errorf("eval: LLM config is nil or mode=none (set .hyp/llm.yaml or the Config field)")
 	}
@@ -47,28 +51,35 @@ func completeText(ctx context.Context, cfg *config.LLMConfig, client *http.Clien
 
 	switch cfg.Mode {
 	case config.LLMModeOllama:
-		return ollamaGenerate(ctx, cfg, client, prompt)
+		return ollamaGenerate(ctx, cfg, client, prompt, temperature)
 	case config.LLMModeAPI:
 		if cfg.API.Provider == "anthropic" {
-			return anthropicComplete(ctx, cfg, client, prompt)
+			return anthropicComplete(ctx, cfg, client, prompt, temperature)
 		}
 		// openai / gemini(openai 相容端點) / custom 一律走 chat/completions
-		return openAIComplete(ctx, cfg, client, prompt)
+		return openAIComplete(ctx, cfg, client, prompt, temperature)
 	default:
 		return "", fmt.Errorf("eval: unsupported llm mode %q", cfg.Mode)
 	}
 }
 
 // ollamaGenerate 呼叫 Ollama /api/generate（format=json 強制 JSON 輸出）
-func ollamaGenerate(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string) (string, error) {
+func ollamaGenerate(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string, temperature *float64) (string, error) {
 	payload := map[string]interface{}{
 		"model":  cfg.Ollama.Model,
 		"prompt": prompt,
 		"stream": false,
 		"format": "json",
 	}
+	options := map[string]interface{}{}
 	if cfg.Ollama.MaxTokens > 0 {
-		payload["options"] = map[string]int{"num_predict": cfg.Ollama.MaxTokens}
+		options["num_predict"] = cfg.Ollama.MaxTokens
+	}
+	if temperature != nil {
+		options["temperature"] = *temperature
+	}
+	if len(options) > 0 {
+		payload["options"] = options
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", cfg.Ollama.URL+"/api/generate", bytes.NewReader(body))
@@ -87,14 +98,21 @@ func ollamaGenerate(ctx context.Context, cfg *config.LLMConfig, client *http.Cli
 }
 
 // openAIComplete 呼叫 OpenAI 相容的 /chat/completions
-func openAIComplete(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string) (string, error) {
-	body, _ := json.Marshal(map[string]interface{}{
+func openAIComplete(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string, temperature *float64) (string, error) {
+	payload := map[string]interface{}{
 		"model": cfg.API.Model,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"max_tokens": cfg.API.MaxTokens,
-	})
+	}
+	// 0 表示沒有設定：不送（先前送出 "max_tokens": 0，供應商回 400）
+	if cfg.API.MaxTokens > 0 {
+		payload["max_tokens"] = cfg.API.MaxTokens
+	}
+	if temperature != nil {
+		payload["temperature"] = *temperature
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", cfg.API.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -119,14 +137,18 @@ func openAIComplete(ctx context.Context, cfg *config.LLMConfig, client *http.Cli
 }
 
 // anthropicComplete 呼叫 Anthropic /messages
-func anthropicComplete(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string) (string, error) {
-	body, _ := json.Marshal(map[string]interface{}{
+func anthropicComplete(ctx context.Context, cfg *config.LLMConfig, client *http.Client, prompt string, temperature *float64) (string, error) {
+	payload := map[string]interface{}{
 		"model":      cfg.API.Model,
-		"max_tokens": cfg.API.MaxTokens,
+		"max_tokens": cmp.Or(cfg.API.MaxTokens, defaultMaxTokens),
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-	})
+	}
+	if temperature != nil {
+		payload["temperature"] = *temperature
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", cfg.API.BaseURL+"/messages", bytes.NewReader(body))
 	if err != nil {
 		return "", err

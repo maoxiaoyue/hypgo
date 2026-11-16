@@ -77,6 +77,10 @@ When a table has a dropped and an added column of the same type, diff prints a h
 Destructive changes (DROP TABLE, DROP COLUMN, narrowing or incompatible type
 changes, adding a NOT NULL column without DEFAULT to an existing table) make diff
 fail without writing anything unless --allow-destructive is given.
+Risky changes lose no data but fail when existing rows do not satisfy them
+(SET NOT NULL on a column holding NULLs, ADD UNIQUE over duplicates); they need
+--allow-risky. On MySQL a failed statement leaves the earlier ones applied (DDL
+cannot be rolled back there), so check the data before running the migration.
 Changes that cannot be expressed in SQL (primary key changes, adding/removing
 SERIAL on PostgreSQL) also fail; the snapshot is only updated when every change
 produced SQL.
@@ -91,10 +95,12 @@ Flags:
   -p, --pkg                 Main package to run (default: .)
   -n, --name                Migration name used in the file names (default: auto)
       --allow-destructive   Allow DROP TABLE / DROP COLUMN / narrowing type changes
+      --allow-risky         Allow SET NOT NULL / ADD UNIQUE on existing tables
 
 Exit codes: non-zero when the project cannot be run or never calls server.Start(),
 when the snapshot was taken with another dialect or an older hyp, on destructive
-changes without --allow-destructive, and on changes that cannot be expressed.
+changes without --allow-destructive, on risky changes without --allow-risky, and
+on changes that cannot be expressed.
 
 Examples:
   hyp migrate diff                              PostgreSQL, default paths
@@ -143,6 +149,7 @@ func init() {
 	migrateDiffCmd.Flags().StringP("pkg", "p", ".", "Main package to run")
 	migrateDiffCmd.Flags().StringP("name", "n", "auto", "Migration name used in the file names")
 	migrateDiffCmd.Flags().Bool("allow-destructive", false, "Allow DROP TABLE / DROP COLUMN / narrowing type changes")
+	migrateDiffCmd.Flags().Bool("allow-risky", false, "Allow SET NOT NULL / ADD UNIQUE on existing tables")
 
 	migrateSnapshotCmd.Flags().StringP("dialect", "d", "postgres", "SQL dialect: postgres or mysql")
 	migrateSnapshotCmd.Flags().StringP("snapshot", "s", ".hyp/schema_snapshot.json", "Snapshot file path")
@@ -159,6 +166,7 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 	pkg, _ := cmd.Flags().GetString("pkg")
 	name, _ := cmd.Flags().GetString("name")
 	allowDestructive, _ := cmd.Flags().GetBool("allow-destructive")
+	allowRisky, _ := cmd.Flags().GetBool("allow-risky")
 	out := cmd.OutOrStdout()
 
 	// 先前未驗證：pg 會產生 PostgreSQL 引號搭配 MySQL 型別
@@ -228,6 +236,25 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 	}
 
 	// 儲存到檔案
+	var risky []string
+	for _, c := range changes {
+		if reason := c.Risky(); reason != "" {
+			risky = append(risky, reason)
+		}
+	}
+	if len(risky) > 0 {
+		note := ""
+		if dialect == migrate.DialectMySQL {
+			note = "\nMySQL cannot roll back DDL: if one statement fails, the statements before it stay applied"
+		}
+		if !allowRisky {
+			return fmt.Errorf("refusing to generate a migration that can fail on existing data (nothing was written):\n  - %s%s\n"+
+				"check or backfill the data first, then re-run with --allow-risky",
+				strings.Join(risky, "\n  - "), note)
+		}
+		fmt.Fprintf(out, "Warning: changes that fail on non-conforming data, allowed by --allow-risky:\n  - %s%s\n", strings.Join(risky, "\n  - "), note)
+	}
+
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
@@ -237,19 +264,23 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// migration 檔與快照要一起成功：任一步失敗就把已寫的 migration 檔刪掉。
+	// 先前存快照失敗時檔案留著、快照沒更新，下次 diff 再產生一份相同的 migration
+	undo := func() { os.Remove(upFile); os.Remove(downFile) }
 	if err := os.WriteFile(upFile, []byte(up), 0644); err != nil {
+		undo()
 		return fmt.Errorf("failed to write up migration: %w", err)
 	}
 	if err := os.WriteFile(downFile, []byte(down), 0644); err != nil {
+		undo()
 		return fmt.Errorf("failed to write down migration: %w", err)
+	}
+	if err := migrate.SaveSnapshot(snapshotPath, tables, dialect); err != nil {
+		undo()
+		return fmt.Errorf("failed to save snapshot (the migration files were removed): %w", err)
 	}
 
 	fmt.Fprintf(out, "\nMigration files generated:\n  UP:   %s\n  DOWN: %s\n", upFile, downFile)
-
-	// 更新快照
-	if err := migrate.SaveSnapshot(snapshotPath, tables, dialect); err != nil {
-		return fmt.Errorf("failed to save snapshot: %w", err)
-	}
 	fmt.Fprintf(out, "Snapshot updated: %s\n", snapshotPath)
 
 	return nil
