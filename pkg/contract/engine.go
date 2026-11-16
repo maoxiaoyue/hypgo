@@ -103,6 +103,9 @@ func (cfg RunConfig) skips(route schema.Route) bool {
 	full := route.Method + " " + route.Path
 	for _, pat := range cfg.Skip {
 		pat = strings.TrimSpace(pat)
+		if m, rest, ok := strings.Cut(pat, " "); ok { // "delete /x" 與 "DELETE /x" 相同
+			pat = strings.ToUpper(m) + " " + strings.TrimSpace(rest)
+		}
 		if prefix, ok := strings.CutSuffix(pat, "*"); ok {
 			if strings.HasPrefix(full, prefix) || strings.HasPrefix(route.Path, prefix) {
 				return true

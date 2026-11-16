@@ -48,7 +48,7 @@ func TestManifestCompactYAML(t *testing.T) {
 	out := buf.String()
 
 	for _, want := range []string{
-		"types:\n  fmtErr:\n    code: string!\n  fmtUser:\n    id: integer!\n    email: string!\n    age: integer\n  fmtUserReq:\n    email: string!\n",
+		"types:\n  manifest.fmtErr:\n    code: string!\n  manifest.fmtUser:\n    id: integer!\n    email: string!\n    age: integer\n  manifest.fmtUserReq:\n    email: string!\n",
 		"    handler_names: [manifest.listOrdersHandler]\n",
 		"    tags: [users]\n",
 	} {
@@ -61,7 +61,7 @@ func TestManifestCompactYAML(t *testing.T) {
 			t.Errorf("output should not contain %q:\n%s", unwanted, out)
 		}
 	}
-	if n := strings.Count(out, "fmtUser:"); n != 1 {
+	if n := strings.Count(out, "manifest.fmtUser:"); n != 1 {
 		t.Errorf("fmtUser listed %d times, want once", n)
 	}
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
@@ -77,8 +77,8 @@ func TestManifestTypesRoundTrip(t *testing.T) {
 	defer schema.Global().Reset()
 	m := NewCollector(compactRouter(), nil).Collect()
 	want := TypeFields{{Name: "id", Type: "integer", Required: true}, {Name: "email", Type: "string", Required: true}, {Name: "age", Type: "integer"}}
-	if !reflect.DeepEqual(m.Types["fmtUser"], want) {
-		t.Fatalf("collected fmtUser = %+v, want %+v", m.Types["fmtUser"], want)
+	if !reflect.DeepEqual(m.Types["manifest.fmtUser"], want) {
+		t.Fatalf("collected fmtUser = %+v, want %+v", m.Types["manifest.fmtUser"], want)
 	}
 
 	var y bytes.Buffer
@@ -94,7 +94,7 @@ func TestManifestTypesRoundTrip(t *testing.T) {
 	if err := WriteJSON(&j, m); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(j.String(), `"fmtUser": {
+	if !strings.Contains(j.String(), `"manifest.fmtUser": {
       "id": "integer!",
       "email": "string!",
       "age": "integer"
@@ -122,7 +122,7 @@ func TestManifestKeepsNonRESTProtocol(t *testing.T) {
 	if len(m.Routes) != 1 || m.Routes[0].Protocol != "grpc" {
 		t.Fatalf("routes = %+v, want one grpc route", m.Routes)
 	}
-	if _, ok := m.Types["fmtUser"]; !ok {
+	if _, ok := m.Types["manifest.fmtUser"]; !ok {
 		t.Error("types of non-REST routes should be collected too")
 	}
 }

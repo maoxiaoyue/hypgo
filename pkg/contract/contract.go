@@ -522,7 +522,7 @@ func testSchemaCompleteness(t *testing.T, route schema.Route) {
 func TestRoute(t *testing.T, r *router.Router, method, path string, expectStatus int) {
 	t.Helper()
 
-	req := httptest.NewRequest(method, path, nil)
+	req := httptest.NewRequest(strings.ToUpper(strings.TrimSpace(method)), path, nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -595,5 +595,6 @@ func parseRoute(route string) (method, path string) {
 	if len(parts) != 2 {
 		return "", ""
 	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	// 方法轉大寫，與 schema / router 的註冊一致（先前 "get /ok" 送出小寫方法而 405）
+	return strings.ToUpper(strings.TrimSpace(parts[0])), strings.TrimSpace(parts[1])
 }

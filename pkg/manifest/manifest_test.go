@@ -103,11 +103,11 @@ func TestCollectorRoutes(t *testing.T) {
 			if route.Summary != "Create user" {
 				t.Errorf("Summary = %q, want %q", route.Summary, "Create user")
 			}
-			if route.InputType != "createUserReq" {
-				t.Errorf("InputType = %q, want %q", route.InputType, "createUserReq")
+			if route.InputType != "manifest.createUserReq" {
+				t.Errorf("InputType = %q, want %q", route.InputType, "manifest.createUserReq")
 			}
-			if route.OutputType != "userResp" {
-				t.Errorf("OutputType = %q, want %q", route.OutputType, "userResp")
+			if route.OutputType != "manifest.userResp" {
+				t.Errorf("OutputType = %q, want %q", route.OutputType, "manifest.userResp")
 			}
 			if len(route.Tags) != 1 || route.Tags[0] != "users" {
 				t.Errorf("Tags = %v, want [users]", route.Tags)

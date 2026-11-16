@@ -121,15 +121,28 @@ func TestEmptyParamDoesNotMatch(t *testing.T) {
 	}
 }
 
-// TestMatchValidatesMethods 迴歸測試：Match 與 Handle 一樣驗證方法名稱。
-// 歷史 bug：Match([]string{"get"}, …) 建出 "get" 路由樹，真正的 GET 請求 404
+// TestMatchValidatesMethods 迴歸測試：Match 與 Handle 把方法名稱轉成大寫再註冊（與 r.Schema 一致），
+// 不合法的名稱在註冊時 panic。
+// 歷史 bug：Match([]string{"get"}, …) 建出 "get" 路由樹，真正的 GET 請求 404；
+// 之後改成小寫直接 panic，而 r.Schema(schema.Route{Method: "get"}) 卻接受
 func TestMatchValidatesMethods(t *testing.T) {
+	r := New()
+	r.Match([]string{"get", " Post "}, "/x", func(c *hypcontext.Context) { c.Status(204) })
+	r.Handle("delete", "/y", func(c *hypcontext.Context) { c.Status(204) })
+	for _, rt := range []string{"GET /x", "POST /x", "DELETE /y"} {
+		method, path, _ := strings.Cut(rt, " ")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(method, path, nil))
+		if w.Code != 204 {
+			t.Errorf("%s = %d, want 204", rt, w.Code)
+		}
+	}
 	defer func() {
 		if recover() == nil {
 			t.Error("Match with an invalid method name did not panic")
 		}
 	}()
-	New().Match([]string{"get"}, "/x", func(c *hypcontext.Context) {})
+	New().Match([]string{"in valid"}, "/x", func(c *hypcontext.Context) {})
 }
 
 // TestMethodOverrideRoutesBeforeMatching 迴歸測試：方法覆寫在路由比對之前生效，且只允許 PUT / PATCH / DELETE。

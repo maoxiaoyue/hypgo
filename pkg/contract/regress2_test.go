@@ -122,7 +122,7 @@ func TestStrictFields(t *testing.T) {
 		t.Errorf("extra fields should pass by default: %s", reason)
 	}
 	pass, reason, _ := runTestOnce(r, TestCase{Route: "GET /x", ExpectStatus: 200, ExpectSchema: true, StrictFields: true})
-	if pass || !strings.Contains(reason, "password_hash is not declared in r2Out") || !strings.Contains(reason, "profile.secret is not declared in r2Profile") {
+	if pass || !strings.Contains(reason, "password_hash is not declared in contract.r2Out") || !strings.Contains(reason, "profile.secret is not declared in contract.r2Profile") {
 		t.Errorf("strict: pass = %v, reason = %s", pass, reason)
 	}
 }
@@ -272,5 +272,47 @@ func TestUnsupportedRuleIsReportedAsGeneratorLimit(t *testing.T) {
 		if pass || !strings.Contains(reason, w) {
 			t.Errorf("pass = %v, reason %q does not mention %q", pass, reason, w)
 		}
+	}
+}
+
+type r2Node struct {
+	Val  int       `json:"val"`
+	Next *r2Node   `json:"next"`
+	Kids []r2Node  `json:"kids" validate:"min=1"`
+	Tree r2SelfRef `json:"tree"`
+}
+
+type r2SelfRef []r2SelfRef
+
+// 自我參照的 Input 不能讓產生器無限遞迴。
+// 歷史 bug：type Node struct{ Next *Node } 當 Input 時 TestAll stack overflow
+func TestGeneratorHandlesSelfReferentialTypes(t *testing.T) {
+	raw := generateMinimalJSON(r2Node{})
+	var got map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("%v: %s", err, raw)
+	}
+	if got["val"] == nil || got["next"] != nil {
+		t.Errorf("generated %s, want val set and next null", raw)
+	}
+	var n r2Node
+	if err := json.Unmarshal([]byte(raw), &n); err != nil {
+		t.Errorf("generated input does not decode into its own type: %v (%s)", err, raw)
+	}
+}
+
+// 方法名稱不分大小寫：Route 寫 "get /ok"、Skip 寫 "delete /x"、TestRoute 給 "get" 都與大寫相同。
+// 歷史 bug："get /ok" 送出小寫的方法而得到 405
+func TestMethodNamesAreCaseInsensitive(t *testing.T) {
+	r := r2Router(t, map[string]string{"/ok": r2Good})
+	if pass, reason, _ := runTestOnce(r, TestCase{Route: "get /ok", ExpectStatus: 200, ExpectSchema: true}); !pass {
+		t.Errorf("lowercase method in Route: %s", reason)
+	}
+	if !(RunConfig{Skip: []string{"delete /admin/wipe"}}).skips(schema.Route{Method: "DELETE", Path: "/admin/wipe"}) ||
+		!(RunConfig{Skip: []string{"delete /adm*"}}).skips(schema.Route{Method: "DELETE", Path: "/admin/wipe"}) {
+		t.Error("Skip should match the method case-insensitively")
+	}
+	if !t.Run("TestRoute", func(t *testing.T) { TestRoute(t, r, "get", "/ok", 200) }) {
+		t.Error("TestRoute with a lowercase method failed")
 	}
 }

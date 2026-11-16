@@ -95,7 +95,6 @@ func (f *TypeFields) UnmarshalJSON(data []byte) error {
 }
 
 // collectTypes 收集 schema 宣告的 Input / Output / Responses 型別欄位，以型別名稱為鍵。
-// ponytail: 以短型別名為鍵，不同套件的同名型別只留第一個（路由的 input_type 等本來就只有短名稱）
 func collectTypes(types map[string]TypeFields, s *schema.Route) {
 	add := func(v interface{}) {
 		if v != nil {
@@ -113,20 +112,29 @@ func collectTypes(types map[string]TypeFields, s *schema.Route) {
 // 先前只登錄最外層：欄位寫成 addr: object、items: array，Addr 的欄位不在任何地方，
 // 讀 manifest 的人組不出請求 body。已登錄的型別直接返回，互相引用的型別不會無限遞迴
 func registerType(types map[string]TypeFields, t reflect.Type) {
+	// seen：type Tree []Tree 的元素就是它自己，先前這個迴圈永遠不會結束（啟動時卡住）
+	seen := map[reflect.Type]bool{}
 	for t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice || t.Kind() == reflect.Array || t.Kind() == reflect.Map {
+		if seen[t] {
+			return
+		}
+		seen[t] = true
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct || t.Name() == "" {
 		return
 	}
-	if _, ok := types[t.Name()]; ok {
+	// 鍵帶套件名（models.User）：不同套件的同名型別各自一份（先前以短名稱為鍵，後者被丟掉）
+	zero := reflect.Zero(t).Interface()
+	name := schema.TypeName(zero)
+	if _, ok := types[name]; ok {
 		return
 	}
-	fields := schema.FieldsOf(reflect.Zero(t).Interface())
+	fields := schema.FieldsOf(zero)
 	if fields == nil { // time.Time 等自訂序列化的型別不是欄位的組合
 		return
 	}
-	types[t.Name()] = fields
+	types[name] = fields
 	for _, f := range schema.JSONFields(t) {
 		registerType(types, f.Type)
 	}

@@ -126,8 +126,11 @@ func (g *Group) handle(method, relativePath string, handlers []hypcontext.Handle
 	return g.returnObj()
 }
 
-// Handle 註冊指定 HTTP 方法的路由。method 須為大寫，可以是擴充方法（PROPFIND 等）
+// Handle 註冊指定 HTTP 方法的路由，可以是擴充方法（PROPFIND 等）。
+// 方法名稱轉成大寫再註冊，與 r.Schema(...) 一致（schema 一向接受 "get"；先前這裡遇到小寫直接 panic，
+// 兩條註冊路徑對同一個寫法的反應不同）
 func (g *Group) Handle(method, relativePath string, handlers ...hypcontext.HandlerFunc) IRoutes {
+	method = strings.ToUpper(strings.TrimSpace(method))
 	if !isValidHTTPMethod(method) {
 		panic("router: invalid HTTP method: " + method)
 	}
@@ -295,7 +298,7 @@ func (g *Group) combineHandlers(handlers []hypcontext.HandlerFunc) []hypcontext.
 
 // isValidHTTPMethod 驗證方法名稱：大寫的 HTTP token（RFC 9110 §5.6.2），標準方法與
 // PROPFIND、PURGE 這類擴充方法皆可。先前只收 9 個標準方法，WebDAV 等方法無法註冊。
-// 小寫一律拒絕：net/http 不會轉大寫，"get" 註冊了也永遠對不到
+// 只收大寫（net/http 不會轉大寫，"get" 註冊了也永遠對不到）；Handle 已先轉成大寫
 func isValidHTTPMethod(method string) bool {
 	if method == "" {
 		return false

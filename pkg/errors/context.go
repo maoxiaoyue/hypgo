@@ -12,10 +12,21 @@ import (
 //
 //	errors.AbortWithAppError(c, errors.ErrUserNotFound.With("id", 42))
 func AbortWithAppError(c *hypcontext.Context, err *AppError) {
+	reportCause(c, err)
 	c.AbortWithStatusJSON(err.HTTPStatus, err.JSON())
 }
 
 // RespondError 回傳錯誤但不中斷 middleware 鏈
 func RespondError(c *hypcontext.Context, err *AppError) {
+	reportCause(c, err)
 	c.JSON(err.HTTPStatus, err.JSON())
+}
+
+// reportCause 把帶有底層錯誤（Wrap）的 AppError 交給 c.Error：server 會記一行
+// （method、path、錯誤碼與底層錯誤）。先前底層錯誤不在回應裡、也沒有任何地方記錄，
+// ErrInternalError.Wrap(dbErr) 的原因就此消失
+func reportCause(c *hypcontext.Context, err *AppError) {
+	if err.cause != nil {
+		c.Error(err)
+	}
 }
