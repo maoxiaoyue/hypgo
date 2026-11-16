@@ -604,8 +604,7 @@ func floatValue(rules validateRules, name string) float64 {
 	return v
 }
 
-// floatLowerBound 由 gte / min / gt 推導浮點下界。gt 是開區間：有上界時取兩者中點，否則邊界 +1。
-// 先前一律 +1 再被上界夾回去：gt=0,lt=1 得到 0，本身就不合格
+// floatLowerBound 由 gte / min / gt 推導浮點下界（gt 取邊界 +1；超過上界時由上界夾回）
 func floatLowerBound(rules validateRules) (float64, bool) {
 	switch {
 	case rules.gte != nil:
@@ -613,15 +612,13 @@ func floatLowerBound(rules validateRules) (float64, bool) {
 	case rules.min != nil:
 		return *rules.min, true
 	case rules.gt != nil:
-		if hi, ok := closedOrOpenUpper(rules); ok {
-			return (*rules.gt + hi) / 2, true
-		}
 		return *rules.gt + 1, true
 	}
 	return 0, false
 }
 
-// floatUpperBound 由 lte / max / lt 推導浮點上界。lt 是開區間：有下界時取兩者中點，否則邊界 -1
+// floatUpperBound 由 lte / max / lt 推導浮點上界。lt 是開區間：有下界時取兩者中點，否則邊界 -1。
+// 先前一律 -1：gt=0,lt=1 的下界 1 被夾到上界 0，本身就不合格
 func floatUpperBound(rules validateRules) (float64, bool) {
 	switch {
 	case rules.lte != nil:
@@ -637,16 +634,7 @@ func floatUpperBound(rules validateRules) (float64, bool) {
 	return 0, false
 }
 
-// closedOrOpenUpper / closedOrOpenLower 回傳 tag 寫的上 / 下邊界值本身（不論開閉）
-func closedOrOpenUpper(rules validateRules) (float64, bool) {
-	for _, p := range []*float64{rules.lte, rules.max, rules.lt} {
-		if p != nil {
-			return *p, true
-		}
-	}
-	return 0, false
-}
-
+// closedOrOpenLower 回傳 tag 寫的下邊界值本身（不論開閉）
 func closedOrOpenLower(rules validateRules) (float64, bool) {
 	for _, p := range []*float64{rules.gte, rules.min, rules.gt} {
 		if p != nil {
