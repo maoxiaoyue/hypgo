@@ -19,7 +19,7 @@ import (
 type Manifest struct {
 	Version   string          `json:"version" yaml:"version"`
 	Framework string          `json:"framework" yaml:"framework"`
-	Server    ServerInfo      `json:"server" yaml:"server"`
+	Server    *ServerInfo     `json:"server,omitempty" yaml:"server,omitempty"` // 沒有設定檔時省略（先前輸出三個空值）
 	Database  *DatabaseInfo   `json:"database,omitempty" yaml:"database,omitempty"`
 	Routes    []RouteManifest `json:"routes" yaml:"routes"`
 	// Types 路由引用的型別欄位，每個型別只列一次（EnrichConfig.IncludeFields）
@@ -42,7 +42,7 @@ type LintReport struct {
 // LintWarning 單一缺漏項目
 type LintWarning struct {
 	Route   string `json:"route" yaml:"route"` // "POST /api/orders"
-	Kind    string `json:"kind" yaml:"kind"`   // no_schema | missing_input | missing_output | missing_summary
+	Kind    string `json:"kind" yaml:"kind"`   // no_schema | missing_input | missing_output | missing_summary | unregistered_schema | config_warning
 	Message string `json:"message" yaml:"message"`
 }
 

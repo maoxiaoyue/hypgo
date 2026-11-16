@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
@@ -51,28 +52,25 @@ func RegisterSampleValue(tag string, value interface{}) {
 }
 
 // sampleForTag 檢查 validate tag 是否含有已註冊範例值的 token（取第一個命中者）
-func sampleForTag(tag string) (interface{}, bool) {
+func sampleForTag(tag string) (value interface{}, key string, ok bool) {
 	if tag == "" || tag == "-" {
-		return nil, false
+		return nil, "", false
 	}
 	sampleMu.RLock()
 	defer sampleMu.RUnlock()
 	for _, tok := range strings.Split(tag, ",") {
-		key := tok
-		if eq := strings.IndexByte(tok, '='); eq >= 0 {
-			key = tok[:eq]
-		}
-		if v, ok := sampleValues[strings.TrimSpace(key)]; ok {
-			return v, true
+		k, _, _ := strings.Cut(strings.TrimSpace(tok), "=")
+		if v, found := sampleValues[k]; found {
+			return v, k, true
 		}
 	}
-	return nil, false
+	return nil, "", false
 }
 
-// generateTestCase 根據 Route schema 自動生成測試案例
-func generateTestCase(route schema.Route) TestCase {
+// generateTestCase 根據 Route schema 自動生成測試案例；params 指定路徑參數的值（見 RunConfig.Params）
+func generateTestCase(route schema.Route, params map[string]string) TestCase {
 	tc := TestCase{
-		Route:        route.Method + " " + resolvePath(route.Path),
+		Route:        route.Method + " " + resolvePath(route.Path, params),
 		ExpectSchema: route.Output != nil,
 	}
 
@@ -196,19 +194,84 @@ func queryString(v interface{}) (string, bool) {
 func generateFieldValue(f reflect.StructField, jsonName string) interface{} {
 	tag := f.Tag.Get("validate")
 
-	// 格式類 / 自訂規則：若某個 validate token 有註冊範例值，優先採用
-	if v, ok := sampleForTag(tag); ok {
+	rules := parseValidateTag(tag)
+
+	// 格式類 / 自訂規則：若某個 validate token 有註冊範例值，優先採用；
+	// 字串再依 len / min / max 調整（先前直接回範例值，"alpha,min=4" 得到 "abc"、"email,max=12" 得到 16 個字元）
+	if v, key, ok := sampleForTag(tag); ok {
+		if s, isString := v.(string); isString {
+			return fitSample(key, s, rules)
+		}
 		return v
 	}
-
-	rules := parseValidateTag(tag)
 
 	// oneof：直接採用第一個合法選項（轉成欄位實際型別）
 	if len(rules.oneOf) > 0 {
 		return coerceString(rules.oneOf[0], f.Type)
 	}
 
-	return valueForType(f.Type, rules, strings.ToLower(jsonName))
+	v := valueForType(f.Type, rules, strings.ToLower(jsonName))
+	// ne：剛好產生出被排除的值時換一個
+	if rules.ne != "" {
+		switch x := v.(type) {
+		case string:
+			if x == rules.ne {
+				v = x + "x"
+			}
+		case int64:
+			if strconv.FormatInt(x, 10) == rules.ne {
+				v = x + 1
+			}
+		case uint64:
+			if strconv.FormatUint(x, 10) == rules.ne {
+				v = x + 1
+			}
+		case float64:
+			if n, err := strconv.ParseFloat(rules.ne, 64); err == nil && n == x {
+				v = x + 1
+			}
+		}
+	}
+	return v
+}
+
+// stringLengthBounds 回傳 len / min / max 對字串長度的要求；hi < 0 表示沒有上限
+func stringLengthBounds(rules validateRules) (lo, hi int) {
+	hi = -1
+	if rules.length != nil {
+		return *rules.length, *rules.length
+	}
+	if rules.min != nil {
+		lo = int(*rules.min)
+	}
+	if rules.max != nil {
+		hi = int(*rules.max)
+	}
+	return lo, hi
+}
+
+// fitSample 把格式範例值調整到長度要求內，同時保持格式：email 改變 @ 前面的長度，
+// 其餘（alpha / numeric / hexadecimal…）重複最後一個字元或截短。調不動的格式（uuid、url…）原樣回傳
+func fitSample(key, s string, rules validateRules) string {
+	lo, hi := stringLengthBounds(rules)
+	if len(s) >= lo && (hi < 0 || len(s) <= hi) {
+		return s
+	}
+	target := lo
+	if hi >= 0 && len(s) > hi {
+		target = hi
+	}
+	switch key {
+	case "email":
+		const domain = "@b.co"
+		return strings.Repeat("a", max(1, target-len(domain))) + domain
+	case "alpha", "alphanum", "number", "numeric", "hexadecimal":
+		if len(s) > target {
+			return s[:target]
+		}
+		return s + strings.Repeat(s[len(s)-1:], target-len(s))
+	}
+	return s
 }
 
 // validateRules 為解析後的 validate: tag 約束集合（contract 生成/驗證所需子集）
@@ -222,6 +285,12 @@ type validateRules struct {
 	gt       *float64
 	lt       *float64
 	length   *int
+
+	ne         string // ne=
+	startsWith string // startswith=
+	endsWith   string // endswith=
+	contains   string // contains=
+	datetime   string // datetime= 的 Go 時間格式
 }
 
 // parseValidateTag 解析 go-playground/validator 風格的 validate: tag
@@ -266,6 +335,16 @@ func parseValidateTag(tag string) validateRules {
 			r.gt = parseFloatPtr(val)
 		case "lt":
 			r.lt = parseFloatPtr(val)
+		case "ne":
+			r.ne = val
+		case "startswith":
+			r.startsWith = val
+		case "endswith":
+			r.endsWith = val
+		case "contains":
+			r.contains = val
+		case "datetime":
+			r.datetime = val
 		}
 	}
 	return r
@@ -343,6 +422,14 @@ func valueForType(t reflect.Type, rules validateRules, name string) interface{} 
 
 // stringValue 依約束與欄位名稱生成字串
 func stringValue(rules validateRules, name string) string {
+	if rules.datetime != "" {
+		return time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC).Format(rules.datetime)
+	}
+	// startswith / endswith / contains：把要求的片段放進去，中間補到長度要求
+	if fixed := rules.startsWith + rules.contains + rules.endsWith; fixed != "" {
+		lo, _ := stringLengthBounds(rules)
+		return rules.startsWith + rules.contains + strings.Repeat("x", max(0, lo-len(fixed))) + rules.endsWith
+	}
 	if v, ok := stringByName(name); ok {
 		return clampString(v, rules)
 	}
@@ -517,7 +604,8 @@ func floatValue(rules validateRules, name string) float64 {
 	return v
 }
 
-// floatLowerBound 由 gte / min / gt 推導浮點下界（gt 取邊界 +1 以維持嚴格大於）
+// floatLowerBound 由 gte / min / gt 推導浮點下界。gt 是開區間：有上界時取兩者中點，否則邊界 +1。
+// 先前一律 +1 再被上界夾回去：gt=0,lt=1 得到 0，本身就不合格
 func floatLowerBound(rules validateRules) (float64, bool) {
 	switch {
 	case rules.gte != nil:
@@ -525,12 +613,15 @@ func floatLowerBound(rules validateRules) (float64, bool) {
 	case rules.min != nil:
 		return *rules.min, true
 	case rules.gt != nil:
+		if hi, ok := closedOrOpenUpper(rules); ok {
+			return (*rules.gt + hi) / 2, true
+		}
 		return *rules.gt + 1, true
 	}
 	return 0, false
 }
 
-// floatUpperBound 由 lte / max / lt 推導浮點上界（lt 取邊界 -1 以維持嚴格小於）
+// floatUpperBound 由 lte / max / lt 推導浮點上界。lt 是開區間：有下界時取兩者中點，否則邊界 -1
 func floatUpperBound(rules validateRules) (float64, bool) {
 	switch {
 	case rules.lte != nil:
@@ -538,7 +629,29 @@ func floatUpperBound(rules validateRules) (float64, bool) {
 	case rules.max != nil:
 		return *rules.max, true
 	case rules.lt != nil:
+		if lo, ok := closedOrOpenLower(rules); ok {
+			return (lo + *rules.lt) / 2, true
+		}
 		return *rules.lt - 1, true
+	}
+	return 0, false
+}
+
+// closedOrOpenUpper / closedOrOpenLower 回傳 tag 寫的上 / 下邊界值本身（不論開閉）
+func closedOrOpenUpper(rules validateRules) (float64, bool) {
+	for _, p := range []*float64{rules.lte, rules.max, rules.lt} {
+		if p != nil {
+			return *p, true
+		}
+	}
+	return 0, false
+}
+
+func closedOrOpenLower(rules validateRules) (float64, bool) {
+	for _, p := range []*float64{rules.gte, rules.min, rules.gt} {
+		if p != nil {
+			return *p, true
+		}
 	}
 	return 0, false
 }
@@ -590,14 +703,17 @@ func coerceString(s string, t reflect.Type) interface{} {
 
 // resolvePath 將路徑中的參數替換為測試值
 // :id → 1, :name → test, *filepath → /test.txt
-func resolvePath(path string) string {
+func resolvePath(path string, params map[string]string) string {
 	parts := strings.Split(path, "/")
 	for i, part := range parts {
-		if strings.HasPrefix(part, ":") {
-			name := part[1:]
-			parts[i] = guessParamValue(name)
-		} else if strings.HasPrefix(part, "*") {
-			parts[i] = "test.txt"
+		if strings.HasPrefix(part, ":") || strings.HasPrefix(part, "*") {
+			if v, ok := params[part[1:]]; ok {
+				parts[i] = v
+			} else if part[0] == ':' {
+				parts[i] = guessParamValue(part[1:])
+			} else {
+				parts[i] = "test.txt"
+			}
 		}
 	}
 	return strings.Join(parts, "/")

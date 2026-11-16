@@ -17,12 +17,20 @@ var lintCmd = &cobra.Command{
 	Long: `Check Schema completeness using the lint section of the project manifest,
 and optionally run a static (compile-time) Schema↔handler alignment check.
 
-SHALLOW (default) — reads the manifest produced by the server's AutoSync on
-Server.Start() (.hyp/context.yaml) and reports declaration-level gaps:
-  no_schema        Route registered without r.Schema(...)
-  missing_input    POST/PUT/PATCH with a Schema but no Input declared
-  missing_output   Non-DELETE with a Schema but no Output declared
-  missing_summary  Schema present but Summary empty (info level)
+SHALLOW (default) — runs the project to collect its current routes (the same
+way as hyp context: go run with HYPGO_MANIFEST_OUT, nothing is listened on and
+no file is written) and reports declaration-level gaps:
+  no_schema            Route registered without r.Schema(...)
+  missing_input        POST/PUT/PATCH with a Schema but no Input declared
+                       (set NoInput: true when there is no request body)
+  missing_output       Non-DELETE with a Schema but no Output declared
+                       (declare a 204 in Responses when nothing is returned)
+  missing_summary      Schema present but Summary empty (info level)
+  unregistered_schema  Schema registered but the router has no such route (info level)
+
+With --no-refresh (or -f) the check reads an existing manifest file instead of
+running the project. That file is only as fresh as the last server start or
+hyp context run: routes added since then are not seen.
 
 DEEP (--deep) — statically analyzes Go source (go/types), no running server or
 traffic required. For every route registered with r.Schema(...).Handle(h) or
@@ -37,7 +45,8 @@ skipped (never silently counted as passing).
 
 Exit codes:
   0   no actionable warnings
-  1   one or more warnings (info-level missing_summary only fails with --strict);
+  1   one or more warnings (info-level ones only fail with --strict); the project
+      could not be run to collect its routes;
       any deep finding or package load error (compile errors, patterns matching
       nothing); skipped routes with --strict; a manifest with no lint section;
       a manifest named with -f that cannot be read; package arguments without --deep
@@ -47,13 +56,16 @@ Paths: the manifest and the default ./... scan are relative to the module root
 A -f path and package patterns are relative to the current directory.
 
 Flags:
-  -f, --file     Manifest file for the shallow check (default: .hyp/context.yaml)
+  -f, --file     Read this manifest file instead of running the project
+  --no-refresh   Read .hyp/context.yaml instead of running the project
+  -p, --pkg      Main package to run (default: .)
   --deep         Also run the static source-level Schema↔handler check
-  --strict       Also fail on info-level findings (missing_summary) and skipped routes
+  --strict       Also fail on info-level findings and skipped routes
   --quiet        Print only the shallow coverage summary line
 
 Examples:
-  hyp lint                      Shallow check of .hyp/context.yaml
+  hyp lint                      Run the project and check its routes
+  hyp lint --no-refresh         Check the existing .hyp/context.yaml
   hyp lint --deep               Shallow + deep (deep scans the whole module)
   hyp lint --deep ./pkg/api/... Deep check restricted to a package pattern
   hyp lint --deep --strict      Also fail when any route could not be verified`,
@@ -63,7 +75,9 @@ Examples:
 }
 
 func init() {
-	lintCmd.Flags().StringP("file", "f", ".hyp/context.yaml", "Manifest file to lint")
+	lintCmd.Flags().StringP("file", "f", ".hyp/context.yaml", "Read this manifest file instead of running the project")
+	lintCmd.Flags().Bool("no-refresh", false, "Read .hyp/context.yaml instead of running the project")
+	lintCmd.Flags().StringP("pkg", "p", ".", "Main package to run")
 	lintCmd.Flags().Bool("deep", false, "Run static (compile-time) Schema↔handler alignment check")
 	lintCmd.Flags().Bool("strict", false, "Also fail on info-level findings and routes --deep could not verify")
 	lintCmd.Flags().Bool("quiet", false, "Print only the coverage summary line")
@@ -88,10 +102,23 @@ func runLint(cmd *cobra.Command, args []string) error {
 	}
 
 	hardFailures := 0
+	noRefresh, _ := cmd.Flags().GetBool("no-refresh")
+	pkg, _ := cmd.Flags().GetString("pkg")
 
 	// ── 淺層（manifest）檢查 ──
-	data, err := os.ReadFile(file)
-	if err != nil {
+	// 預設實際執行專案取得目前的路由。先前只讀磁碟上的 .hyp/context.yaml：它只在 server 啟動或
+	// hyp context 時更新，新增一條沒有 Schema 的路由後沒重跑，CI 用的是舊檔而照樣通過
+	if !explicitFile && !noRefresh {
+		m, cerr := collectManifest(cmd, root, pkg)
+		if cerr != nil {
+			return fmt.Errorf("cannot collect the project's routes: %w\n  hint: -p <pkg> selects the main package; --no-refresh checks the existing %s instead", cerr, file)
+		}
+		n, perr := shallowReport(m, "the manifest collected from the project", strict, quiet)
+		if perr != nil {
+			return perr
+		}
+		hardFailures += n
+	} else if data, err := os.ReadFile(file); err != nil {
 		// 明確指定的 -f 讀不到一定是打錯：先前帶 --deep 時只印一行就略過
 		if !deep || explicitFile {
 			return fmt.Errorf("cannot read manifest %q: %w\n  hint: start the server once so AutoSync writes %s, or run `hyp context -o %s`", file, err, file, file)
@@ -130,7 +157,7 @@ func runLint(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runShallow 解析 manifest、印出淺層報告，回傳 hard failure 數（missing_summary 僅 --strict 計入）。
+// runShallow 解析 manifest 檔並印出淺層報告，回傳 hard failure 數。
 // @ai:generated by=claude-opus-4-8 date=2026-06-15
 func runShallow(data []byte, file string, strict, quiet bool) (int, error) {
 	// yaml.Unmarshal 同時可解析 JSON（YAML 為 JSON 超集）
@@ -138,10 +165,14 @@ func runShallow(data []byte, file string, strict, quiet bool) (int, error) {
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return 0, fmt.Errorf("invalid manifest %q: %w", file, err)
 	}
+	return shallowReport(&m, fmt.Sprintf("manifest %q", file), strict, quiet)
+}
 
+// shallowReport 印出 manifest 的 lint 區段，回傳 hard failure 數（資訊級的警告僅 --strict 計入）
+func shallowReport(m *manifest.Manifest, source string, strict, quiet bool) (int, error) {
 	// 先前印「Nothing to check」並 exit 0：manifest 過舊或不完整時 CI gate 靜默通過
 	if m.Lint == nil {
-		return 0, fmt.Errorf("manifest %q has no lint section (generated by an older hypgo, or not by AutoSync); regenerate it with `hyp context -o %s` or by starting the server once", file, file)
+		return 0, fmt.Errorf("%s has no lint section (generated by an older hypgo, or not by AutoSync); regenerate it with `hyp context -o .hyp/context.yaml` or by starting the server once", source)
 	}
 
 	if quiet {
@@ -152,7 +183,7 @@ func runShallow(data []byte, file string, strict, quiet bool) (int, error) {
 
 	hard := 0
 	for _, w := range m.Lint.Warnings {
-		if w.Kind != "missing_summary" {
+		if !manifest.InfoKind(w.Kind) {
 			hard++
 		}
 	}

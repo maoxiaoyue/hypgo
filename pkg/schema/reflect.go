@@ -249,9 +249,17 @@ func goTypeToSchemaType(t reflect.Type) string {
 		return "number"
 	case reflect.Bool:
 		return "boolean"
+	// 複合型別寫出元素與具名 struct 的名稱（"[]Addr"、"map[string]integer"、"Addr"）：
+	// 先前一律是 array / object，讀 manifest 的人看不出裡面是什麼，只能回頭讀原始碼。
+	// 具名 struct 的欄位另列在 manifest 的 types 區段
 	case reflect.Slice, reflect.Array:
-		return "array"
-	case reflect.Map, reflect.Struct:
+		return "[]" + goTypeToSchemaType(t.Elem())
+	case reflect.Map:
+		return "map[string]" + goTypeToSchemaType(t.Elem()) // JSON object 的鍵一律是字串
+	case reflect.Struct:
+		if t.Name() != "" {
+			return t.Name()
+		}
 		return "object"
 	default:
 		return t.String()

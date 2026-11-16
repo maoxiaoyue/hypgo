@@ -18,6 +18,9 @@ import (
 // defaultLintIgnore 預設忽略的路由前綴（本來就不需要 Schema，避免警告疲勞）
 var defaultLintIgnore = []string{
 	"/health",
+	"/healthz",
+	"/readyz",
+	"/livez",
 	"/_debug",
 	"/metrics",
 	"/favicon.ico",
@@ -62,10 +65,12 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 
 	rep := &LintReport{}
 	seen := make(map[string]bool)
+	registered := make(map[string]bool)
 
 	for _, ri := range r.Routes() {
-		if ri.Method == "HEAD" {
-			continue // HEAD 自動回應，不需 schema
+		registered[ri.Method+" "+ri.Path] = true
+		if ri.Method == "HEAD" || ri.Method == "OPTIONS" {
+			continue // HEAD / OPTIONS 回的是標頭，不需 schema（r.Any 帶出的 OPTIONS 先前被報 no_schema）
 		}
 		if isLintIgnored(ri.Path) || isStaticRoute(ri.HandlerNames) {
 			continue
@@ -89,18 +94,18 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 
 		rep.WithSchema++
 
-		if isWritableMethod(ri.Method) && s.InputName == "" {
+		if isWritableMethod(ri.Method) && s.InputName == "" && !s.NoInput {
 			rep.Warnings = append(rep.Warnings, LintWarning{
 				Route:   key,
 				Kind:    "missing_input",
-				Message: "可寫方法未宣告 Input，無法驗證請求 body",
+				Message: "可寫方法未宣告 Input，無法驗證請求 body（本來就沒有 body 時在 Schema 設 NoInput: true）",
 			})
 		}
-		if ri.Method != "DELETE" && s.OutputName == "" {
+		if ri.Method != "DELETE" && s.OutputName == "" && !declaresResponse(s) {
 			rep.Warnings = append(rep.Warnings, LintWarning{
 				Route:   key,
 				Kind:    "missing_output",
-				Message: "未宣告 Output，Contract Testing 無法驗證回應",
+				Message: "未宣告 Output，Contract Testing 無法驗證回應（不回 body 時在 Responses 宣告 204）",
 			})
 		}
 		if s.Summary == "" {
@@ -108,6 +113,18 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 				Route:   key,
 				Kind:    "missing_summary",
 				Message: "未填 Summary，manifest 中此路由沒有描述",
+			})
+		}
+	}
+
+	// 只在 registry、router 上沒有的 REST Schema：多半是路徑或方法寫錯，或路由被移除而宣告留著。
+	// 先前不出現在 manifest 也沒有任何提示。資訊級：同一個行程有多個 router 時屬正常
+	for _, s := range reg.All() {
+		if key := s.Method + " " + s.Path; s.IsREST() && !registered[key] {
+			rep.Warnings = append(rep.Warnings, LintWarning{
+				Route:   key,
+				Kind:    "unregistered_schema",
+				Message: "Schema 已註冊，但這個 router 沒有對應的路由",
 			})
 		}
 	}
@@ -121,6 +138,22 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 
 	rep.Coverage = fmt.Sprintf("%d/%d", rep.WithSchema, rep.Total)
 	return rep
+}
+
+// declaresResponse 回報 Schema 是否已用 Responses 說明成功回應：宣告了 204（不回 body），
+// 或某個 2xx 帶有型別。這時沒有 Output 不算缺漏（先前回 204 的 PUT 一定被報 missing_output）
+func declaresResponse(s *schema.Route) bool {
+	for code, resp := range s.Responses {
+		if code == 204 || (code >= 200 && code < 300 && resp.Type != nil) {
+			return true
+		}
+	}
+	return false
+}
+
+// InfoKind 回報 lint 警告是否為資訊級（hyp lint 只在 --strict 時因它失敗）
+func InfoKind(kind string) bool {
+	return kind == "missing_summary" || kind == "unregistered_schema"
 }
 
 // FormatLint 將 LintReport 格式化為可讀的多行報告（供 go run . 啟動時輸出）。
@@ -144,7 +177,7 @@ func FormatLint(rep *LintReport) string {
 	} else {
 		for _, w := range rep.Warnings {
 			icon := "⚠"
-			if w.Kind == "missing_summary" {
+			if InfoKind(w.Kind) {
 				icon = "ℹ"
 			}
 			b.WriteString(fmt.Sprintf("  %s [%s] %s — %s\n", icon, w.Kind, w.Route, w.Message))

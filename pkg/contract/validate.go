@@ -2,10 +2,12 @@
 package contract
 
 import (
+	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 
@@ -14,19 +16,23 @@ import (
 	hypvalidate "github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
-// validateResponse 驗證回應 body 是否符合 Output schema
-func validateResponse(body []byte, outputType interface{}) error {
-	return validateBody(body, outputType, "response", "Output")
+// validateResponse 驗證回應 body 是否符合 Output schema；strict 時未宣告的欄位也算不符
+func validateResponse(body []byte, outputType interface{}, strict bool) error {
+	return validateBody(body, outputType, "response", "Output", strict)
 }
 
 // validateRequest 驗證請求 body 是否符合 Input schema
 func validateRequest(body []byte, inputType interface{}) error {
-	return validateBody(body, inputType, "request", "Input")
+	return validateBody(body, inputType, "request", "Input", false)
 }
 
-// validateBody 三層檢查：可反序列化 → 必填欄位存在 → validate: 約束（格式 / 範圍 / 列舉）。
-// kind / schemaName 只用於錯誤訊息（"response" / "Output"）
-func validateBody(body []byte, typ interface{}, kind, schemaName string) error {
+// validateBody 三層檢查：可反序列化 → 形狀（必填欄位存在且不是 null，逐層進入巢狀 struct 與
+// slice / map 的元素）→ validate: 約束（格式 / 範圍 / 列舉，同樣逐層）。
+// kind / schemaName 只用於錯誤訊息（"response" / "Output"）。
+//
+// 先前形狀只看最外層的 struct：宣告 []User 而回 [{"wrong":1}]、巢狀必填欄位缺漏、
+// 必填欄位是 null 都通過
+func validateBody(body []byte, typ interface{}, kind, schemaName string, strict bool) error {
 	if typ == nil {
 		return nil
 	}
@@ -38,55 +44,148 @@ func validateBody(body []byte, typ interface{}, kind, schemaName string) error {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
+	name := schema.TypeName(typ)
 
 	instance := reflect.New(t).Interface()
 	if err := json.Unmarshal(body, instance); err != nil {
-		return fmt.Errorf("%s does not match %s schema %s: %w", kind, schemaName, t.Name(), err)
+		return fmt.Errorf("%s does not match %s schema %s: %w", kind, schemaName, name, err)
 	}
-	if err := validateRequiredFields(body, t); err != nil {
-		return err
+
+	var decoded interface{}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil // 上面已成功解碼，不會到這裡
+	}
+	if decoded == nil {
+		return fmt.Errorf("%s body is null, want %s", kind, name)
+	}
+	var problems []string
+	checkShape(decoded, t, "", strict, &problems)
+	if len(problems) > 0 {
+		return fmt.Errorf("%s does not match %s schema %s: %s", kind, schemaName, name, joinProblems(problems))
 	}
 	return validateConstraints(instance)
 }
 
-// validateRequiredFields 檢查必填欄位是否存在於 JSON 中
-// 「必填」的判定不依賴 validate: tag：非 omitempty 且非 pointer 的欄位即視為必填
-// 這是不需任何標註即可運作的結構性基準檢查
-func validateRequiredFields(body []byte, t reflect.Type) error {
-	if t.Kind() != reflect.Struct {
-		return nil
+// maxProblems 一次回報的問題數上限：list 回應每個元素都缺同一個欄位時不必全部列出
+const maxProblems = 8
+
+func joinProblems(problems []string) string {
+	if extra := len(problems) - maxProblems; extra > 0 {
+		return strings.Join(problems[:maxProblems], "; ") + fmt.Sprintf("; (+%d more)", extra)
 	}
-	required := requiredJSONNames(t)
-	if len(required) == 0 {
-		return nil // 沒有必填欄位就不必再解一次 body
+	return strings.Join(problems, "; ")
+}
+
+var (
+	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
+	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
+
+// customDecoded 回報 t 是否以自訂方法解碼（time.Time、uuid…）：它的 JSON 形狀不是欄位的組合，不往下檢查
+func customDecoded(t reflect.Type) bool {
+	p := reflect.PointerTo(t)
+	return p.Implements(jsonUnmarshalerType) || p.Implements(textUnmarshalerType)
+}
+
+// nullable 回報 Go 會把這種型別的零值序列化成 null（nil slice / map / interface / 指標）：
+// 必填欄位是這些型別時，null 不算缺漏
+func nullable(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Slice, reflect.Map, reflect.Interface, reflect.Ptr:
+		return true
+	}
+	return false
+}
+
+// checkShape 依宣告的型別 t 逐層檢查解碼後的 JSON 值 v，把問題連同欄位路徑（"[0].profile.bio"）加進 out：
+// 必填欄位（見 schema.JSONFields：非指標、無 omitempty）缺漏或為 null；strict 時另回報未宣告的欄位。
+// 型別對不上（該是 object 卻是字串）已由 json.Unmarshal 回報，這裡略過
+func checkShape(v interface{}, t reflect.Type, path string, strict bool, out *[]string) {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if v == nil || customDecoded(t) {
+		return
+	}
+	at := func(name string) string {
+		if path == "" {
+			return name
+		}
+		return path + "." + name
 	}
 
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil
-	}
-	// encoding/json 比對鍵名不分大小寫：{"Name":…} 也會填進 json:"name"。
-	// 先前精確比對，這種回應型別解碼成功、必填檢查卻判全部欄位缺漏
-	present := make(map[string]struct{}, len(raw))
-	for k := range raw {
-		present[strings.ToLower(k)] = struct{}{}
-	}
+	switch t.Kind() {
+	case reflect.Struct:
+		obj, ok := v.(map[string]interface{})
+		if !ok {
+			return
+		}
+		// encoding/json 比對鍵名不分大小寫：{"Name":…} 也會填進 json:"name"
+		folded := make(map[string]string, len(obj))
+		for k := range obj {
+			folded[strings.ToLower(k)] = k
+		}
+		declared := make(map[string]bool, len(obj))
+		for _, f := range jsonFields(t) {
+			key, present := f.Name, false
+			if _, present = obj[key]; !present {
+				key, present = folded[strings.ToLower(f.Name)]
+			}
+			if !present {
+				if f.Required {
+					*out = append(*out, at(f.Name)+" is missing")
+				}
+				continue
+			}
+			declared[key] = true
+			if obj[key] == nil {
+				if f.Required && !nullable(f.Type) {
+					*out = append(*out, at(f.Name)+" is null")
+				}
+				continue
+			}
+			checkShape(obj[key], f.Type, at(f.Name), strict, out)
+		}
+		if strict {
+			var extra []string
+			for k := range obj {
+				if !declared[k] {
+					extra = append(extra, k)
+				}
+			}
+			sort.Strings(extra)
+			for _, k := range extra {
+				*out = append(*out, fmt.Sprintf("%s is not declared in %s", at(k), schema.TypeName(reflect.Zero(t).Interface())))
+			}
+		}
 
-	var missing []string
-	for _, name := range required {
-		if _, ok := present[strings.ToLower(name)]; !ok {
-			missing = append(missing, name)
+	case reflect.Slice, reflect.Array:
+		arr, ok := v.([]interface{})
+		if !ok {
+			return
+		}
+		for i, elem := range arr {
+			checkShape(elem, t.Elem(), fmt.Sprintf("%s[%d]", path, i), strict, out)
+		}
+
+	case reflect.Map:
+		obj, ok := v.(map[string]interface{})
+		if !ok {
+			return
+		}
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			checkShape(obj[k], t.Elem(), fmt.Sprintf("%s[%s]", path, k), strict, out)
 		}
 	}
-
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
-	}
-	return nil
 }
 
 // jsonFields 回傳 t 的 JSON 欄位（規則見 schema.JSONFields；與 manifest 的 FieldsOf 同一套），
-// 必填檢查與測試資料生成共用
+// 形狀檢查與測試資料生成共用
 func jsonFields(t reflect.Type) []schema.JSONField {
 	if v, ok := jsonFieldCache.Load(t); ok {
 		return v.([]schema.JSONField)
@@ -100,51 +199,98 @@ func jsonFields(t reflect.Type) []schema.JSONField {
 // 先前每次驗證 / 生成都重新走一遍反射
 var jsonFieldCache sync.Map
 
-// requiredJSONNames 回傳必填欄位的 JSON 名稱
-func requiredJSONNames(t reflect.Type) []string {
-	var names []string
-	for _, f := range jsonFields(t) {
-		if f.Required {
-			names = append(names, f.Name)
+// validateConstraints 以 go-playground/validator 執行 validate: tag 的語意/格式約束檢查。
+// 無 validate: tag 的 struct 直接通過。validator 自己會進入巢狀 struct，但不進入沒有 dive 的
+// slice / map；這裡逐層走訪，讓 list 回應的每個元素都被檢查（先前頂層是 slice 時完全不檢查）
+func validateConstraints(instance interface{}) error {
+	var msgs []string
+	seen := map[string]bool{}
+	walkConstraints(reflect.ValueOf(instance), "", true, func(msg string) {
+		if !seen[msg] {
+			seen[msg] = true
+			msgs = append(msgs, msg)
 		}
+	})
+	if len(msgs) > 0 {
+		return fmt.Errorf("constraint validation failed: %s", joinProblems(msgs))
 	}
-	return names
+	return nil
 }
 
-// validateConstraints 以 go-playground/validator 執行 validate: tag 的語意/格式約束檢查
-// 無 validate: tag 的 struct 會直接通過（向後相容）；非 struct 型別不檢查
-func validateConstraints(instance interface{}) error {
-	rv := reflect.ValueOf(instance)
-	for rv.Kind() == reflect.Ptr {
+// walkConstraints 走訪 rv：遇到 struct 且 validateHere 時交給 validator（它涵蓋直接的巢狀 struct），
+// 再往 slice / map 的元素裡找 struct。path 為目前位置的 JSON 路徑
+func walkConstraints(rv reflect.Value, path string, validateHere bool, add func(string)) {
+	for rv.Kind() == reflect.Ptr || rv.Kind() == reflect.Interface {
 		if rv.IsNil() {
-			return nil
+			return
 		}
 		rv = rv.Elem()
 	}
-	if rv.Kind() != reflect.Struct {
-		return nil
-	}
-
-	// 使用 pkg/validate 的共用 registry，讓 app 註冊的自訂規則同樣生效
-	err := hypvalidate.Default().Struct(instance)
-	if err == nil {
-		return nil
-	}
-
-	var verrs validator.ValidationErrors
-	if errors.As(err, &verrs) {
-		msgs := make([]string, 0, len(verrs))
-		for _, fe := range verrs {
-			msgs = append(msgs, formatConstraintError(fe))
+	switch rv.Kind() {
+	case reflect.Struct:
+		if customDecoded(rv.Type()) {
+			return
 		}
-		return fmt.Errorf("constraint validation failed: %s", strings.Join(msgs, "; "))
+		if validateHere {
+			// 使用 pkg/validate 的共用 registry，讓 app 註冊的自訂規則同樣生效
+			err := hypvalidate.Default().Struct(rv.Interface())
+			var verrs validator.ValidationErrors
+			switch {
+			case errors.As(err, &verrs):
+				for _, fe := range verrs {
+					add(formatConstraintError(path, fe))
+				}
+			case err != nil:
+				add(err.Error())
+			}
+		}
+		t := rv.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			if name == "-" {
+				continue
+			}
+			sub := path
+			if !(f.Anonymous && name == "") { // 內嵌 struct 的欄位在 JSON 裡是攤平的
+				if name == "" {
+					name = f.Name
+				}
+				sub = joinPath(path, name)
+			}
+			walkConstraints(rv.Field(i), sub, false, add)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < rv.Len(); i++ {
+			walkConstraints(rv.Index(i), fmt.Sprintf("%s[%d]", path, i), true, add)
+		}
+	case reflect.Map:
+		keys := rv.MapKeys()
+		sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j]) })
+		for _, k := range keys {
+			walkConstraints(rv.MapIndex(k), fmt.Sprintf("%s[%v]", path, k), true, add)
+		}
 	}
-	return fmt.Errorf("constraint validation failed: %w", err)
 }
 
-// formatConstraintError 將單一欄位的驗證錯誤轉為可讀訊息
-func formatConstraintError(fe validator.FieldError) string {
+func joinPath(path, name string) string {
+	if path == "" {
+		return name
+	}
+	return path + "." + name
+}
+
+// formatConstraintError 將單一欄位的驗證錯誤轉為可讀訊息；欄位以完整路徑表示（"[0].profile.bio"）
+func formatConstraintError(path string, fe validator.FieldError) string {
+	// Namespace 為 "Type.a.b"：去掉開頭的型別名稱
 	field := fe.Field()
+	if _, rest, ok := strings.Cut(fe.Namespace(), "."); ok {
+		field = rest
+	}
+	field = joinPath(path, field)
 	switch fe.Tag() {
 	case "required":
 		return field + " is required"
@@ -171,6 +317,9 @@ func formatConstraintError(fe validator.FieldError) string {
 	case "lt":
 		return field + " must be < " + fe.Param()
 	default:
+		if fe.Param() != "" {
+			return field + " failed " + fe.Tag() + "=" + fe.Param() + " validation"
+		}
 		return field + " failed " + fe.Tag() + " validation"
 	}
 }

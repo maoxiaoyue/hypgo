@@ -155,10 +155,10 @@ func TestExtractJSON(t *testing.T) {
 }
 
 func TestSanitizeResponse(t *testing.T) {
-	// HTML 標籤清理
-	got := sanitizeResponse("<script>alert('xss')</script>")
-	if containsStr(got, "<script>") {
-		t.Error("should sanitize HTML tags")
+	// 控制字元換成空白；< > 原樣保留（manifest 是 YAML，先前被換成 &lt; &gt;）
+	got := sanitizeResponse("Returns List<User>\nsecond\tline")
+	if got != "Returns List<User> second line" {
+		t.Errorf("sanitized = %q", got)
 	}
 
 	// 長度限制

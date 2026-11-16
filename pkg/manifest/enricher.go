@@ -77,6 +77,10 @@ func enrichSummaries(routes []RouteManifest, cfg EnrichConfig) {
 
 	if cfg.InferSummary {
 		for i := range routes {
+			// /health、/metrics 這類不需要 Schema 的路由不推斷（先前得到 "List Health"）
+			if routes[i].Protocol == "" && isLintIgnored(routes[i].Path) {
+				continue
+			}
 			if routes[i].Summary == "" {
 				routes[i].Summary = inferSummary(&routes[i])
 			}
@@ -126,7 +130,9 @@ func inferRESTSummary(rm *RouteManifest) string {
 				p = strings.Trim(p, "(*)")
 				if strings.HasSuffix(p, "Controller") {
 					resource := strings.TrimSuffix(p, "Controller")
-					return method + " " + resource
+					// 資源名接在動詞後面："Get By ID" + "User" → "Get User By ID"（先前是 "Get By ID User"）
+					verb, rest, _ := strings.Cut(method, " ")
+					return strings.TrimSpace(verb + " " + resource + " " + rest)
 				}
 			}
 			return method

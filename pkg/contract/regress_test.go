@@ -42,16 +42,16 @@ type embPtr struct {
 // 歷史 bug：必填檢查要求 JSON 有 "EmbBase" 鍵（正確回應被判失敗）、未匯出的內嵌型別整個跳過
 // （缺欄位照樣通過）；生成端產生 {"EmbBase":{...}}，handler 解不到必填欄位而回 422。
 func TestEmbeddedStructsFollowJSONRules(t *testing.T) {
-	if err := validateResponse([]byte(`{"name":"a","extra":"x"}`), embPublic{}); err != nil {
+	if err := validateResponse([]byte(`{"name":"a","extra":"x"}`), embPublic{}, false); err != nil {
 		t.Errorf("valid flattened body rejected: %v", err)
 	}
-	if err := validateResponse([]byte(`{"extra":"x"}`), embPublic{}); err == nil {
+	if err := validateResponse([]byte(`{"extra":"x"}`), embPublic{}, false); err == nil {
 		t.Error("missing promoted field \"name\" not detected")
 	}
-	if err := validateResponse([]byte(`{}`), embPrivate{}); err == nil {
+	if err := validateResponse([]byte(`{}`), embPrivate{}, false); err == nil {
 		t.Error("missing field of unexported embedded type not detected")
 	}
-	if err := validateResponse([]byte(`{"extra":"x"}`), embPtr{}); err != nil {
+	if err := validateResponse([]byte(`{"extra":"x"}`), embPtr{}, false); err != nil {
 		t.Errorf("fields under embedded pointer must be optional: %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestGeneratedCasesPassForCorrectHandlers(t *testing.T) {
 		Handle(func(c *hypcontext.Context) { c.JSON(200, listItem{ID: 1}) })
 
 	for _, rt := range schema.Global().All() {
-		tc := generateTestCase(rt)
+		tc := generateTestCase(rt, nil)
 		tc.schemaRoute = &rt
 		if pass, reason, _ := runTestOnce(r, tc); !pass {
 			t.Errorf("%s %s: %s (query=%v)", rt.Method, rt.Path, reason, tc.Query)
@@ -143,7 +143,7 @@ func TestObserveReportsFailuresToT(t *testing.T) {
 		N int `json:"n" validate:"min=5"`
 	}
 	tc := TestCase{ExpectStatus: 200, Input: `{"n":1}`}
-	_, pass, reason := validateExchange(schema.Route{Input: in{}}, tc, 200, nil)
+	_, pass, reason := validateExchange(schema.Route{Input: in{}}, tc, 200, "application/json", nil)
 	if pass {
 		t.Error("Input schema violation must fail the observe result")
 	} else if !strings.Contains(reason, "request schema") {
@@ -216,7 +216,7 @@ func TestResolvePathUUIDParam(t *testing.T) {
 		"/files/:guid": "/files/" + uuid,
 		"/users/:id":   "/users/1",
 	} {
-		if got := resolvePath(path); got != want {
+		if got := resolvePath(path, nil); got != want {
 			t.Errorf("resolvePath(%q) = %q, want %q", path, got, want)
 		}
 	}
@@ -225,10 +225,10 @@ func TestResolvePathUUIDParam(t *testing.T) {
 // TestRequiredFieldsMatchKeysLikeEncodingJSON 回歸測試：必填檢查的鍵名比對與 encoding/json 相同（不分大小寫）。
 // 歷史 bug：{"Name":"a"} 能解碼進 json:"name"，必填檢查卻精確比對、判定欄位缺漏。
 func TestRequiredFieldsMatchKeysLikeEncodingJSON(t *testing.T) {
-	if err := validateResponse([]byte(`{"ID":1,"Name":"a","EMAIL":"a@b.co"}`), userResp{}); err != nil {
+	if err := validateResponse([]byte(`{"ID":1,"Name":"a","EMAIL":"a@b.co"}`), userResp{}, false); err != nil {
 		t.Errorf("case-insensitive keys rejected: %v", err)
 	}
-	if err := validateResponse([]byte(`{"ID":1,"Name":"a"}`), userResp{}); err == nil {
+	if err := validateResponse([]byte(`{"ID":1,"Name":"a"}`), userResp{}, false); err == nil {
 		t.Error("missing email not detected")
 	}
 }
@@ -286,18 +286,18 @@ func TestResponseSchemaChosenByStatus(t *testing.T) {
 	}
 	tc := TestCase{ExpectStatus: 404}
 
-	if _, pass, reason := validateExchange(route, tc, 404, []byte(`{"code":"E404"}`)); !pass {
+	if _, pass, reason := validateExchange(route, tc, 404, "application/json", []byte(`{"code":"E404"}`)); !pass {
 		t.Errorf("404 body matching Responses[404].Type rejected: %s", reason)
 	}
-	if _, pass, _ := validateExchange(route, tc, 404, []byte(`{"id":1}`)); pass {
+	if _, pass, _ := validateExchange(route, tc, 404, "application/json", []byte(`{"id":1}`)); pass {
 		t.Error("404 body not matching Responses[404].Type accepted")
 	}
 	// 未宣告型別的錯誤狀態碼不驗 body
-	if _, pass, reason := validateExchange(route, TestCase{ExpectStatus: 500}, 500, []byte(`oops`)); !pass {
+	if _, pass, reason := validateExchange(route, TestCase{ExpectStatus: 500}, 500, "application/json", []byte(`oops`)); !pass {
 		t.Errorf("undeclared 500 body must not be checked against Output: %s", reason)
 	}
 	// 2xx 仍用 Output
-	if _, pass, _ := validateExchange(route, TestCase{ExpectStatus: 200}, 200, []byte(`{"code":"x"}`)); pass {
+	if _, pass, _ := validateExchange(route, TestCase{ExpectStatus: 200}, 200, "application/json", []byte(`{"code":"x"}`)); pass {
 		t.Error("200 body must still be validated against Output")
 	}
 }

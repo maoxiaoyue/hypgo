@@ -154,7 +154,7 @@ func Observe(t *testing.T, r *hypRouter.Router, funcName string, opts ...Observe
 // @ai sideeffect: 可能建立 .hyp/ 目錄並寫入 HTML 檔案
 // date: 2026-05-23
 func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOptions) []ObserveResult {
-	routes := schema.Global().All()
+	routes := routesOf(r)
 	if len(routes) == 0 {
 		if t != nil {
 			t.Skip("no schema-registered routes found — SKIP")
@@ -162,10 +162,12 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		return nil
 	}
 
+	cfg := mergeRunConfig([]RunConfig{opt.Run})
+
 	// 過濾出符合條件的 REST 路由
 	var targets []schema.Route
 	for _, route := range routes {
-		if !route.IsREST() {
+		if !route.IsREST() || cfg.skips(route) {
 			continue
 		}
 		if filter != "" && !observeRouteMatchesFilter(route, filter) {
@@ -180,8 +182,6 @@ func runObserve(t *testing.T, r *hypRouter.Router, filter string, opt ObserveOpt
 		}
 		return nil
 	}
-
-	cfg := mergeRunConfig([]RunConfig{opt.Run})
 
 	// ── 並行路徑 ──────────────────────────────────────────────────────────
 	if cfg.Parallel && len(targets) > 1 {
@@ -283,7 +283,7 @@ func captureWithRetry(r *hypRouter.Router, route schema.Route, cfg RunConfig) Ob
 		if attempt > 0 && cfg.RetryDelay > 0 {
 			time.Sleep(cfg.RetryDelay)
 		}
-		result = captureRouteExchange(r, route, measure)
+		result = captureRouteExchange(r, route, cfg, measure)
 		if result.Pass {
 			break
 		}
@@ -351,8 +351,8 @@ func reportObserveFailures(errorf func(format string, args ...interface{}), resu
 // @ai sideeffect: 無（httptest 模式，不開真實 port）；measure 時呼叫 runtime.ReadMemStats（STW）
 // date: 2026-05-23
 // @ai:modified by=claude-opus-4-8 date=2026-06-15 reason=新增記憶體/CPU/資源使用量測（measure 參數）
-func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool) ObserveResult {
-	tc := generateTestCase(route)
+func captureRouteExchange(r *hypRouter.Router, route schema.Route, cfg RunConfig, measure bool) ObserveResult {
+	tc := cfg.testCase(route)
 
 	// 解析 Route 字串（格式："METHOD /path"）
 	method, urlPath := parseRoute(tc.Route)
@@ -415,7 +415,7 @@ func captureRouteExchange(r *hypRouter.Router, route schema.Route, measure bool)
 	}
 
 	// 逐步驗證
-	steps, pass, failReason := validateExchange(route, tc, w.Code, respBody)
+	steps, pass, failReason := validateExchange(route, tc, w.Code, w.Header().Get("Content-Type"), respBody)
 
 	return ObserveResult{
 		Route:      route,

@@ -175,35 +175,35 @@ func TestTestRoute(t *testing.T) {
 
 func TestValidateResponseValid(t *testing.T) {
 	body := `{"id":1,"name":"test","email":"test@test.com"}`
-	if err := validateResponse([]byte(body), userResp{}); err != nil {
+	if err := validateResponse([]byte(body), userResp{}, false); err != nil {
 		t.Errorf("valid response should pass: %v", err)
 	}
 }
 
 func TestValidateResponseMissingField(t *testing.T) {
 	body := `{"id":1}`
-	err := validateResponse([]byte(body), userResp{})
+	err := validateResponse([]byte(body), userResp{}, false)
 	if err == nil {
 		t.Error("missing required fields should fail")
 	}
 }
 
 func TestValidateResponseEmpty(t *testing.T) {
-	err := validateResponse([]byte{}, userResp{})
+	err := validateResponse([]byte{}, userResp{}, false)
 	if err == nil {
 		t.Error("empty body should fail")
 	}
 }
 
 func TestValidateResponseNilType(t *testing.T) {
-	if err := validateResponse([]byte(`{}`), nil); err != nil {
+	if err := validateResponse([]byte(`{}`), nil, false); err != nil {
 		t.Errorf("nil type should pass: %v", err)
 	}
 }
 
 func TestValidateResponseOptionalFields(t *testing.T) {
 	body := `{"id":1}`
-	if err := validateResponse([]byte(body), partialResp{}); err != nil {
+	if err := validateResponse([]byte(body), partialResp{}, false); err != nil {
 		t.Errorf("optional fields missing should pass: %v", err)
 	}
 }
@@ -236,7 +236,7 @@ func TestGenerateTestCase(t *testing.T) {
 		},
 	}
 
-	tc := generateTestCase(route)
+	tc := generateTestCase(route, nil)
 
 	if tc.Route != "POST /api/users" {
 		t.Errorf("Route = %q, want %q", tc.Route, "POST /api/users")
@@ -259,7 +259,7 @@ func TestGenerateTestCaseWithParams(t *testing.T) {
 		Output: userResp{},
 	}
 
-	tc := generateTestCase(route)
+	tc := generateTestCase(route, nil)
 	if tc.Route != "GET /api/users/1" {
 		t.Errorf("Route = %q, want %q (should resolve :id to 1)", tc.Route, "GET /api/users/1")
 	}
@@ -324,7 +324,7 @@ func TestResolvePath(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := resolvePath(tt.input)
+		got := resolvePath(tt.input, nil)
 		if got != tt.want {
 			t.Errorf("resolvePath(%q) = %q, want %q", tt.input, got, tt.want)
 		}

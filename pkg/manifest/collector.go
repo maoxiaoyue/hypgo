@@ -89,8 +89,8 @@ func collectErrors() []ErrorManifest {
 }
 
 // collectServer 收集伺服器配置
-func (c *Collector) collectServer() ServerInfo {
-	return ServerInfo{
+func (c *Collector) collectServer() *ServerInfo {
+	return &ServerInfo{
 		Addr:     c.config.Server.Addr,
 		Protocol: c.config.Server.Protocol,
 		TLS:      c.config.Server.TLS.Enabled,
@@ -116,6 +116,12 @@ func (c *Collector) collectRoutes() ([]RouteManifest, map[string]TypeFields) {
 	if c.router != nil {
 		routeInfos := c.router.Routes()
 		for _, ri := range routeInfos {
+			// 靜態檔案與沒有自己 Schema 的 HEAD（router 以 GET 的 handler 回應）不是 API，不列入：
+			// 先前 /static/*filepath 被列成 "List Static"，每條 r.Any / r.Static 多出一條 HEAD
+			_, hasSchema := c.registry.Get(ri.Method, ri.Path)
+			if isStaticRoute(ri.HandlerNames) || (ri.Method == "HEAD" && !hasSchema) {
+				continue
+			}
 			rm := RouteManifest{ // Protocol 留空即 REST（省略輸出）
 				Method:       ri.Method,
 				Path:         ri.Path,

@@ -184,12 +184,15 @@ func extractJSON(s string, open, close byte) string {
 	return s[start : end+1]
 }
 
-// sanitizeResponse 清理 LLM 回覆，防止注入
+// sanitizeResponse 清理 LLM 回覆：控制字元（含換行）換成空白、限制長度。
+// 先前另把 < > 換成 &lt; &gt;——manifest 是 YAML 不是 HTML，"List<User>" 變成 "List&lt;User&gt;"
 func sanitizeResponse(s string) string {
-	s = strings.TrimSpace(s)
-	// 移除潛在的 HTML/script 標籤
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s))
 	// 限制長度（退到字元邊界：中文約 166 字就超過 500 bytes，先前會切出不合法的 UTF-8）
 	if len(s) > 500 {
 		cut := 500

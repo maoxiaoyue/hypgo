@@ -9,7 +9,10 @@ package contract
 
 import (
 	"runtime"
+	"strings"
 	"time"
+
+	"github.com/maoxiaoyue/hypgo/pkg/schema"
 )
 
 // RunConfig 控制 TestAll / ObserveAll / Observe 的執行策略
@@ -51,6 +54,22 @@ type RunConfig struct {
 	// 並行模式下：已啟動的 goroutine 會繼續完成，新的不再啟動
 	FailFast bool
 
+	// Headers 每個自動產生的請求都帶上的標頭，例如需要授權的路由：
+	//
+	//	contract.TestAll(t, r, contract.RunConfig{Headers: map[string]string{"Authorization": "Bearer " + token}})
+	//
+	// 先前無法帶標頭，掛了 JWT 的路由在 TestAll 一律 401
+	Headers map[string]string
+
+	// Params 路徑參數的值（鍵為參數名稱，不含冒號）：{"id": "42"} 讓 /users/:id 打 /users/42。
+	// 沒列的參數依名稱猜（:id → 1）；測試資料的 id 不是 1 時用它指定
+	Params map[string]string
+
+	// Skip 不自動測試的路由（TestAll 以 t.Skip 標示，Observe 不列入）。每一項是
+	// "METHOD /path"、只寫路徑（所有方法），或以 * 結尾的前綴（"/admin/*"、"DELETE /api/*"）；
+	// 路徑用註冊時的樣式（"/users/:id"）。這些路由另以 contract.Test 個別撰寫
+	Skip []string
+
 	// RecordHistory 將每次測試結果 append 到 .hyp/eval_history.jsonl
 	// true 時自動記錄（含路由、狀態、執行次數、延遲、git commit、輸入 hash），寫入失敗時測試失敗。
 	// TestAll 不能掛 Graders（自動產生的輸入評不出品質）；要記錄評分請用 Test 與 TestCase.RecordHistory
@@ -73,5 +92,33 @@ func mergeRunConfig(cfgs []RunConfig) RunConfig {
 	if cfg.MaxWorkers <= 0 {
 		cfg.MaxWorkers = runtime.GOMAXPROCS(0)
 	}
+	if cfg.RetryCount < 0 {
+		cfg.RetryCount = 0 // 先前負數讓重試迴圈一次都不跑，每條路由以空的原因失敗
+	}
 	return cfg
+}
+
+// skips 回報 route 是否在 Skip 清單內
+func (cfg RunConfig) skips(route schema.Route) bool {
+	full := route.Method + " " + route.Path
+	for _, pat := range cfg.Skip {
+		pat = strings.TrimSpace(pat)
+		if prefix, ok := strings.CutSuffix(pat, "*"); ok {
+			if strings.HasPrefix(full, prefix) || strings.HasPrefix(route.Path, prefix) {
+				return true
+			}
+		} else if pat == full || pat == route.Path {
+			return true
+		}
+	}
+	return false
+}
+
+// testCase 依 schema 產生這條路由的測試案例，套上 Headers / Params
+func (cfg RunConfig) testCase(route schema.Route) TestCase {
+	tc := generateTestCase(route, cfg.Params)
+	tc.Headers = cfg.Headers
+	tc.schemaRoute = &route
+	tc.generated = true
+	return tc
 }

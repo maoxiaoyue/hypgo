@@ -42,21 +42,21 @@ func TestLintDeepExitCodes(t *testing.T) {
 	migrateProject(t)
 
 	writeLintProject(t, lintRouteRight)
-	if err := runHyp(t, "lint", "--deep"); err != nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err != nil {
 		t.Errorf("clean project: %v", err)
 	}
 
 	writeLintProject(t, lintRouteWrong)
-	if err := runHyp(t, "lint", "--deep"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err == nil {
 		t.Error("a finding should fail")
 	}
 
 	// 略過的路由只有 --strict 才失敗
 	writeLintProject(t, lintRouteSkipped)
-	if err := runHyp(t, "lint", "--deep"); err != nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err != nil {
 		t.Errorf("skipped without --strict: %v", err)
 	}
-	if err := runHyp(t, "lint", "--deep", "--strict"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep", "--strict"); err == nil {
 		t.Error("skipped routes should fail with --strict")
 	}
 }
@@ -66,25 +66,25 @@ func TestLintDeepLoadErrorsFail(t *testing.T) {
 	migrateProject(t)
 	writeLintProject(t, lintRouteRight)
 
-	if err := runHyp(t, "lint", "--deep", "./typo/..."); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep", "./typo/..."); err == nil {
 		t.Error("a mistyped package pattern should fail")
 	}
 
 	os.Mkdir("empty", 0o755)
-	if err := runHyp(t, "lint", "--deep", "./empty/..."); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep", "./empty/..."); err == nil {
 		t.Error("a pattern matching no packages should fail")
 	}
 
 	// 路由綁定正確但編譯不過：不加 --strict 也要失敗
 	writeLintProject(t, lintRouteRight+"\n\tundefinedThing()")
-	if err := runHyp(t, "lint", "--deep"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err == nil {
 		t.Error("a compile error should fail")
 	}
 }
 
 func TestLintDeepOutsideModuleFails(t *testing.T) {
 	t.Chdir(t.TempDir())
-	if err := runHyp(t, "lint", "--deep"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err == nil {
 		t.Error("--deep outside a module should fail")
 	}
 }
@@ -99,18 +99,18 @@ func TestLintUsesModuleRootFromSubdir(t *testing.T) {
 	os.WriteFile(filepath.Join(sub, "s.go"), []byte("package routers\n"), 0o644)
 	t.Chdir(sub)
 
-	if err := runHyp(t, "lint", "--deep"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err == nil {
 		t.Error("should find the problem at the module root")
 	}
 	// 明確給的套件樣式仍相對於當前目錄
-	if err := runHyp(t, "lint", "--deep", "."); err != nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep", "."); err != nil {
 		t.Errorf("explicit pattern should stay relative to the current directory: %v", err)
 	}
 
 	// manifest 也從根目錄讀
 	os.MkdirAll(filepath.Join(root, ".hyp"), 0o755)
 	os.WriteFile(filepath.Join(root, ".hyp", "context.yaml"), []byte("lint:\n  total: 0\n  with_schema: 0\n  coverage: 0/0\n"), 0o644)
-	if err := runHyp(t, "lint"); err != nil {
+	if err := runHyp(t, "lint", "--no-refresh"); err != nil {
 		t.Errorf("manifest at the module root not used: %v", err)
 	}
 }
@@ -120,10 +120,52 @@ func TestLintDeepExplicitManifestMustExist(t *testing.T) {
 	migrateProject(t)
 	writeLintProject(t, lintRouteRight)
 
-	if err := runHyp(t, "lint", "--deep", "-f", "typo.yaml"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep", "-f", "typo.yaml"); err == nil {
 		t.Error("a mistyped -f should fail")
 	}
-	if err := runHyp(t, "lint", "--deep"); err != nil {
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err != nil {
 		t.Errorf("default manifest missing: %v", err)
+	}
+}
+
+// hyp lint 預設實際執行專案取得目前的路由；--no-refresh 才讀磁碟上的 manifest。
+// 歷史 bug：只讀 .hyp/context.yaml——新增一條沒有 Schema 的路由後沒重新產生，CI 用舊檔照樣通過
+func TestLintRefreshesFromProject(t *testing.T) {
+	migrateProject(t)
+	src := `package main
+
+import (
+	"github.com/maoxiaoyue/hypgo"
+	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+)
+
+func main() {
+	app := hypgo.New()
+	app.GET("/no-schema", func(c *hypcontext.Context) {})
+	app.Run()
+}
+`
+	if err := os.WriteFile("main.go", []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 磁碟上是一份過期而乾淨的 manifest
+	stale := []byte("lint:\n  total: 0\n  with_schema: 0\n  coverage: 0/0\n")
+	os.MkdirAll(".hyp", 0o755)
+	os.WriteFile(filepath.Join(".hyp", "context.yaml"), stale, 0o644)
+
+	if err := runHyp(t, "lint"); err == nil {
+		t.Error("the route without a Schema was not seen: the stale manifest was used")
+	}
+	if err := runHyp(t, "lint", "--no-refresh"); err != nil {
+		t.Errorf("--no-refresh should read the existing manifest: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(".hyp", "context.yaml")); string(got) != string(stale) {
+		t.Error("hyp lint must not rewrite .hyp/context.yaml")
+	}
+
+	// 跑不起來的專案：不能靜默通過
+	os.WriteFile("main.go", []byte("package main\n\nfunc main() {}\n"), 0o644)
+	if err := runHyp(t, "lint"); err == nil {
+		t.Error("a project whose routes cannot be collected should fail")
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	"github.com/maoxiaoyue/hypgo/pkg/eval"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
@@ -25,8 +26,15 @@ import (
 // 超出後僅累積計數，最終一次 summary。避免大型專案 enricher 全部失敗時刷屏。
 const maxEnricherErrorsReported = 5
 
-// DefaultContextPath 預設的 context 檔案路徑
+// DefaultContextPath 預設的 context 檔案路徑（相對於 module 根目錄，見 ContextPath）
 const DefaultContextPath = ".hyp/context.yaml"
+
+// ContextPath 回傳 context 檔案的實際位置：module 根目錄（往上找 go.mod）的 .hyp/context.yaml，
+// 找不到 go.mod 時為工作目錄下的 .hyp/context.yaml。
+// 先前一律相對於工作目錄：從子目錄啟動或執行 go test 時寫到別處，hyp lint / hyp eval-report 讀的是根目錄的那一份
+func ContextPath() string {
+	return filepath.Join(eval.HypDir(), "context.yaml")
+}
 
 // ManifestOutEnv 設定此環境變數時，server.Start() 在路由註冊完成後把 manifest（JSON）
 // 寫到該路徑並直接返回、不開始監聽。hyp context 以此執行使用者專案取得真實路由
@@ -40,7 +48,7 @@ type AutoSyncConfig struct {
 	// Enabled 是否啟用自動同步（預設 true）
 	Enabled bool
 
-	// Path 輸出路徑（預設 .hyp/context.yaml）
+	// Path 輸出路徑（預設為 ContextPath()：module 根目錄的 .hyp/context.yaml）
 	Path string
 
 	// Format 輸出格式（"yaml" 或 "json"，預設 "yaml"）
@@ -69,7 +77,7 @@ type AutoSync struct {
 // NewAutoSync 建立新的 AutoSync 實例
 func NewAutoSync(cfg AutoSyncConfig, r *router.Router, appCfg *config.Config, log *logger.Logger) *AutoSync {
 	if cfg.Path == "" {
-		cfg.Path = DefaultContextPath
+		cfg.Path = ContextPath()
 	}
 	if cfg.Format == "" {
 		cfg.Format = "yaml"
