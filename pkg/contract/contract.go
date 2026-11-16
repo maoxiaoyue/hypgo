@@ -50,6 +50,10 @@ type TestCase struct {
 	// ExpectSchema 為 true 時，驗證回應 body 是否符合 Output schema
 	ExpectSchema bool
 
+	// StrictFields 與 ExpectSchema 併用：回應裡出現 schema 沒有宣告的欄位也算不符
+	// （例如把 password_hash 一起回出去）。預設不檢查，多回的欄位不算違約
+	StrictFields bool
+
 	// ExpectBody 為非空時，精確比對回應 body
 	ExpectBody string
 
@@ -70,6 +74,10 @@ type TestCase struct {
 	// schemaRoute 為內部欄位：TestAll / Observe 已持有路由宣告，直接帶入，
 	// 不必再以路徑查 registry（手動 Test 為 nil，改以實際路徑比對路由樣式）
 	schemaRoute *schema.Route
+
+	// generated 表示這個案例是 TestAll / Observe 依 schema 自動產生的：
+	// 輸入不合規則時問題在產生器而不是使用者，錯誤訊息要這樣說
+	generated bool
 }
 
 // Test 執行單一 contract 測試
@@ -98,23 +106,27 @@ func runTestOnce(r *router.Router, tc TestCase) (pass bool, reason string, score
 		return false, fmt.Sprintf("invalid route format: %q (expected \"METHOD /path\")", tc.Route), nil
 	}
 
+	// 什麼都沒要求的案例一律通過（連 404 都是綠的），多半是忘了填
+	if !tc.generated && tc.ExpectStatus == 0 && !tc.ExpectSchema && tc.ExpectBody == "" && len(tc.Graders) == 0 {
+		return false, fmt.Sprintf("[%s] nothing to check: set ExpectStatus, ExpectSchema, ExpectBody or Graders", tc.Route), nil
+	}
+
 	req := tc.request(method, path)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// 要驗 schema 時取得路由宣告；否則用零值，validateExchange 只檢查狀態碼
+	// 取得路由宣告：TestAll 已帶入；手動 Test 要驗 schema 時以路徑查。都沒有就用零值，只檢查狀態碼
 	var route schema.Route
-	if tc.ExpectSchema {
-		s := tc.schemaRoute
-		if s == nil {
-			var ok bool
-			if s, ok = lookupSchema(method, req.URL.Path); !ok {
-				return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
-			}
+	if tc.schemaRoute != nil {
+		route = *tc.schemaRoute
+	} else if tc.ExpectSchema {
+		s, ok := lookupSchema(method, req.URL.Path)
+		if !ok {
+			return false, fmt.Sprintf("[%s] no schema registered for validation", tc.Route), nil
 		}
 		route = *s
 	}
-	if _, ok, why := validateExchange(route, tc, w.Code, w.Body.Bytes()); !ok {
+	if _, ok, why := validateExchange(route, tc, w.Code, w.Header().Get("Content-Type"), w.Body.Bytes()); !ok {
 		return false, fmt.Sprintf("[%s] %s", tc.Route, why), nil
 	}
 
@@ -145,10 +157,10 @@ func (tc TestCase) request(method, path string) *http.Request {
 	return req
 }
 
-// validateExchange 依序檢查一次 HTTP 交換：狀態碼 → 回應 body 非空 → Input schema → 回應 schema。
+// validateExchange 依序檢查一次 HTTP 交換：Input schema → 狀態碼 → 回應 body 非空 → Content-Type → 回應 schema。
 // runTestOnce（Test / TestAll）與 Observe 共用，兩邊判定才不會分歧；reason 為第一個失敗步驟的原因。
 // route 沒有 Input / Output 時只檢查狀態碼；tc.ExpectStatus 為 0 時不檢查狀態碼
-func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (steps []ValidationStep, pass bool, reason string) {
+func validateExchange(route schema.Route, tc TestCase, code int, contentType string, body []byte) (steps []ValidationStep, pass bool, reason string) {
 	pass = true
 	step := func(name, okDetail string, err error) {
 		s := ValidationStep{Name: name, Pass: err == nil, Detail: okDetail}
@@ -159,6 +171,22 @@ func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (s
 			}
 		}
 		steps = append(steps, s)
+	}
+
+	// 送出的 Input 要符合宣告——但只在期望成功時：測錯誤路徑就是要送不合格的輸入
+	// （先前期望 422 並開 ExpectSchema 時，測試被自己的 Input 檢查判失敗，宣告的錯誤型別永遠驗不到）。
+	// 排在最前面：輸入不合格時，後面的狀態碼不符只是結果
+	expectOK := tc.ExpectStatus == 0 || (tc.ExpectStatus >= 200 && tc.ExpectStatus < 300)
+	if route.Input != nil && tc.Input != "" && expectOK {
+		var err error
+		if e := validateRequest([]byte(tc.Input), route.Input); e != nil {
+			err = fmt.Errorf("request schema validation failed: %w", e)
+			if tc.generated {
+				err = fmt.Errorf("the auto-generated input does not satisfy %s (%w); teach the generator with "+
+					"contract.RegisterSampleValue(tag, value), or skip this route (RunConfig.Skip) and cover it with contract.Test", route.InputName, e)
+			}
+		}
+		step(fmt.Sprintf("Input Schema (%s)", route.InputName), "matches schema", err)
 	}
 
 	if tc.ExpectStatus > 0 {
@@ -188,22 +216,28 @@ func validateExchange(route schema.Route, tc TestCase, code int, body []byte) (s
 		step("Response Body", "body present", err)
 	}
 
-	if route.Input != nil && tc.Input != "" {
+	if bodyType != nil && hasBody {
+		// 宣告了 JSON 型別的回應要以 JSON 送出：先前 text/html 的 JSON 也通過，瀏覽器與多數客戶端不會當 JSON 解
 		var err error
-		if e := validateRequest([]byte(tc.Input), route.Input); e != nil {
-			err = fmt.Errorf("request schema validation failed: %w", e)
+		if mt, _, _ := strings.Cut(contentType, ";"); !isJSONType(strings.ToLower(strings.TrimSpace(mt))) {
+			err = fmt.Errorf("response Content-Type is %q, want application/json", contentType)
 		}
-		step(fmt.Sprintf("Input Schema (%s)", route.InputName), "matches schema", err)
+		step("Content-Type", "application/json", err)
 	}
 
 	if bodyType != nil && hasBody {
 		var err error
-		if e := validateResponse(body, bodyType); e != nil {
+		if e := validateResponse(body, bodyType, tc.StrictFields); e != nil {
 			err = fmt.Errorf("response schema validation failed: %w", e)
 		}
 		step(fmt.Sprintf("Output Schema (%s)", bodyName), "matches schema", err)
 	}
 	return steps, pass, reason
+}
+
+// isJSONType 回報媒體類型是否為 JSON（application/json 或 +json 結尾，如 application/problem+json）
+func isJSONType(mediaType string) bool {
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
 }
 
 // runGraders 依序執行 TestCase 的評判器並聚合分數（等權平均）。
@@ -331,7 +365,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 
 	cfg := mergeRunConfig(cfgs)
 
-	routes := schema.Global().All()
+	routes := routesOf(r)
 	if len(routes) == 0 {
 		t.Skip("no schema-registered routes found")
 	}
@@ -360,6 +394,10 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 					t.Skip("skipped: FailFast abort")
 					return
 				}
+				if cfg.skips(route) {
+					t.Skip("skipped: RunConfig.Skip")
+					return
+				}
 
 				if cfg.Parallel {
 					t.Parallel()
@@ -378,8 +416,7 @@ func TestAll(t *testing.T, r *router.Router, cfgs ...RunConfig) {
 					<-limiterCh
 				}
 
-				tc := generateTestCase(route)
-				tc.schemaRoute = &route
+				tc := cfg.testCase(route)
 
 				// 重試迴圈（含計時，用於 RecordHistory）
 				start := time.Now()
@@ -492,6 +529,23 @@ func TestRoute(t *testing.T, r *router.Router, method, path string, expectStatus
 	if w.Code != expectStatus {
 		t.Errorf("%s %s: status = %d, want %d", method, path, w.Code, expectStatus)
 	}
+}
+
+// routesOf 回傳要測的路由：REST 只取 r 上有註冊的，其餘協議取全域 registry 的全部。
+// 先前 REST 也取全域 registry：同一個測試行程裡別的 router 註冊的路由（admin 與 public 兩個 router、
+// 其他測試建的 router）會被拿來打 r，全部 404
+func routesOf(r *router.Router) []schema.Route {
+	registered := make(map[string]bool)
+	for _, ri := range r.Routes() {
+		registered[ri.Method+" "+ri.Path] = true
+	}
+	var out []schema.Route
+	for _, route := range schema.Global().All() {
+		if !route.IsREST() || registered[route.Method+" "+route.Path] {
+			out = append(out, route)
+		}
+	}
+	return out
 }
 
 // lookupSchema 依實際請求路徑找 REST schema：先精確查表（靜態路由），再比對 :param / *wildcard 樣式。

@@ -168,8 +168,8 @@ func TestCollectorNilConfig(t *testing.T) {
 	c := NewCollector(r, nil)
 	m := c.Collect()
 
-	if m.Server.Addr != "" {
-		t.Error("nil config should produce empty server info")
+	if m.Server != nil {
+		t.Error("nil config should omit server info")
 	}
 	if m.Database != nil {
 		t.Error("nil config should produce nil database")

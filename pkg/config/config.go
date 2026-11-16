@@ -95,9 +95,32 @@ type ServerConfig struct {
 	// 服務位於 nginx / LB 之後時務必設定，否則 ClientIP 會是代理的位址。
 	TrustedProxies []string `yaml:"trusted_proxies"`
 
+	// CORS 預設中間件裡的 CORS（server.Start() 自動套用的那一個）。
+	// 先前寫死為任何來源，使用者再掛自己的 CORS 也收不緊：preflight 被預設的先回掉
+	CORS CORSConfig `yaml:"cors"`
+
 	// DisableAutoSync 關閉啟動時自動產生 .hyp/context.yaml（預設 false＝開啟）。
 	// 正式環境建議設為 true：不寫檔、不呼叫 LLM，唯讀檔案系統也不會出現寫入警告
 	DisableAutoSync bool `yaml:"disable_auto_sync"`
+}
+
+// CORSConfig 對應 server.cors。整段沒寫時為任何來源（"*"）、不帶憑證。
+//
+//	server:
+//	  cors:
+//	    allow_origins: ["https://app.example.com"]
+//	    allow_credentials: true
+//
+// allow_origins: [] 表示不掛預設的 CORS（自行 r.Use(middleware.CORS(...))，或完全不要 CORS）。
+// allow_methods / allow_headers 沒寫時用預設清單。"*" 不能與 allow_credentials 併用，
+// 來源須為 scheme://host[:port]；寫錯時啟動失敗
+type CORSConfig struct {
+	AllowOrigins     []string `yaml:"allow_origins"`
+	AllowMethods     []string `yaml:"allow_methods"`
+	AllowHeaders     []string `yaml:"allow_headers"`
+	ExposeHeaders    []string `yaml:"expose_headers"`
+	AllowCredentials bool     `yaml:"allow_credentials"`
+	MaxAge           int      `yaml:"max_age"` // preflight 快取秒數；0 不送
 }
 
 type TLSConfig struct {

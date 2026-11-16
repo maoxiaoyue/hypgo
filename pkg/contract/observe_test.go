@@ -244,7 +244,7 @@ func TestCaptureRouteExchange_CapturesRequest(t *testing.T) {
 		t.Fatal("未找到 POST /orders 路由")
 	}
 
-	res := captureRouteExchange(r, postRoute, true)
+	res := captureRouteExchange(r, postRoute, RunConfig{}, true)
 
 	if res.Request.Method != "POST" {
 		t.Errorf("Method 預期 POST，得到 %s", res.Request.Method)
@@ -286,7 +286,7 @@ func TestCaptureRouteExchange_ParallelSkipsMeasurement(t *testing.T) {
 	}
 
 	// measure=false 模擬並行模式：不量測資源/效能，但功能仍正常
-	res := captureRouteExchange(r, postRoute, false)
+	res := captureRouteExchange(r, postRoute, RunConfig{}, false)
 	if res.Measured {
 		t.Error("Measured 應為 false（並行模式不量測）")
 	}
@@ -323,7 +323,7 @@ func TestCaptureRouteExchange_RecordsResourceUsage(t *testing.T) {
 		}
 	}
 
-	res := captureRouteExchange(r, route, true)
+	res := captureRouteExchange(r, route, RunConfig{}, true)
 	if res.Resources.DB < 1 {
 		t.Errorf("Resources.DB 應 >= 1，得到 %d", res.Resources.DB)
 	}
@@ -344,7 +344,7 @@ func TestRunObserveValidation_StatusCodeStep(t *testing.T) {
 	route := schema.Route{Path: "/orders"}
 	tc := TestCase{ExpectStatus: 201}
 
-	steps, pass, reason := validateExchange(route, tc, 200, []byte(`{"id":1}`))
+	steps, pass, reason := validateExchange(route, tc, 200, "application/json", []byte(`{"id":1}`))
 
 	if len(steps) == 0 {
 		t.Fatal("Steps 不應為空")
@@ -372,7 +372,7 @@ func TestRunObserveValidation_AllPass(t *testing.T) {
 	tc := TestCase{ExpectStatus: 200}
 	body := []byte(`{"id":1,"name":"test","email":"x@x.com"}`)
 
-	steps, pass, _ := validateExchange(route, tc, 200, body)
+	steps, pass, _ := validateExchange(route, tc, 200, "application/json", body)
 
 	for _, s := range steps {
 		if !s.Pass {

@@ -5,11 +5,14 @@ import (
 	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	hyperrors "github.com/maoxiaoyue/hypgo/pkg/errors"
 )
 
 // ===== CSRF 中間件 =====
@@ -24,8 +27,12 @@ type CSRFConfig struct {
 	CookieMaxAge   int
 	CookieSecure   bool
 	CookieHTTPOnly bool
-	ErrorHandler   func(c *hypcontext.Context)
-	Skipper        func(c *hypcontext.Context) bool
+	// CookieSameSite 預設 http.SameSiteLaxMode（先前 cookie 沒有 SameSite 屬性）。
+	// 前端與 API 不同站時設 http.SameSiteNoneMode 並開啟 CookieSecure
+	CookieSameSite http.SameSite
+	// ErrorHandler 自訂錯誤回應；nil 時回 403 的 Error Catalog JSON（E2002）。呼叫後一律中止
+	ErrorHandler func(c *hypcontext.Context)
+	Skipper      func(c *hypcontext.Context) bool
 }
 
 // CSRF 創建 CSRF 保護中間件（double-submit cookie）。
@@ -43,6 +50,9 @@ func CSRF(config CSRFConfig) hypcontext.HandlerFunc {
 	}
 	if config.CookiePath == "" {
 		config.CookiePath = "/"
+	}
+	if config.CookieSameSite == 0 {
+		config.CookieSameSite = http.SameSiteLaxMode
 	}
 	src := parseValueSource(config.TokenLookup, "header", "form", "query")
 
@@ -105,23 +115,26 @@ func validateCSRFToken(token, cookie string) bool {
 
 // setCSRFCookie 設置 CSRF cookie
 func setCSRFCookie(c *hypcontext.Context, config CSRFConfig, token string) {
-	c.SetCookie(
-		config.CookieName,
-		token,
-		config.CookieMaxAge,
-		config.CookiePath,
-		config.CookieDomain,
-		config.CookieSecure,
-		config.CookieHTTPOnly,
-	)
+	// 不經 c.SetCookie：它的 SameSite 取自 c.SetSameSite，會連帶改到 handler 之後設的 cookie
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     config.CookieName,
+		Value:    url.QueryEscape(token),
+		MaxAge:   config.CookieMaxAge,
+		Path:     config.CookiePath,
+		Domain:   config.CookieDomain,
+		Secure:   config.CookieSecure,
+		HttpOnly: config.CookieHTTPOnly,
+		SameSite: config.CookieSameSite,
+	})
 }
 
 // handleCSRFError 處理 CSRF 錯誤
 func handleCSRFError(c *hypcontext.Context, config CSRFConfig) {
 	if config.ErrorHandler != nil {
 		config.ErrorHandler(c)
+		c.Abort() // 見 jwtError
 	} else {
-		c.AbortWithStatus(http.StatusForbidden)
+		abortError(c, http.StatusForbidden, hyperrors.ErrForbidden)
 	}
 }
 
@@ -129,6 +142,8 @@ func handleCSRFError(c *hypcontext.Context, config CSRFConfig) {
 
 // CORSConfig CORS 配置
 type CORSConfig struct {
+	// AllowOrigins 允許的來源："*" 或 scheme://host[:port]。比對前正規化（scheme 與 host 轉小寫、
+	// 去掉結尾斜線）；帶路徑等其他寫法在建立時報錯
 	AllowOrigins     []string
 	AllowMethods     []string
 	AllowHeaders     []string // 空時回應 preflight 請求的 Access-Control-Request-Headers
@@ -141,16 +156,47 @@ type CORSConfig struct {
 //
 // 先前的實作：沒帶 Origin 的一般 OPTIONS 也一律回 204（使用者註冊的 OPTIONS 路由永遠到不了）；
 // 反射 Origin 卻沒有 Vary: Origin（中間快取可能把 A 網域的回應給 B 網域）；
-// 設定 "*" 時也回傳請求的 Origin 而非字面的 "*"
+// 設定 "*" 時也回傳請求的 Origin 而非字面的 "*"。
+//
+// 設定錯誤時 panic（見 NewCORS）
 func CORS(config CORSConfig) hypcontext.HandlerFunc {
+	h, err := NewCORS(config)
+	if err != nil {
+		panic("middleware: " + err.Error())
+	}
+	return h
+}
+
+// normalizeOrigin 把設定裡的來源整理成瀏覽器 Origin 標頭的寫法（scheme://host[:port]，小寫、無結尾斜線）
+func normalizeOrigin(origin string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || u.Scheme == "" || u.Host == "" || (u.Path != "" && u.Path != "/") ||
+		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", fmt.Errorf("CORS: invalid origin %q (want scheme://host[:port], or \"*\")", origin)
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
+}
+
+// NewCORS 同 CORS，設定錯誤時回 error 而不是 panic：
+//   - AllowOrigins 含 "*" 又開 AllowCredentials：先前會反射任何來源並帶 Allow-Credentials，
+//     等於任何網站都能帶著使用者的 cookie 讀回應。要帶憑證請逐一列出來源
+//   - 來源不是 scheme://host[:port]：先前 "https://Example.com/" 這類寫法永遠比對不到，也沒有提示
+func NewCORS(config CORSConfig) (hypcontext.HandlerFunc, error) {
 	allowAll := false
 	allowOrigins := make(map[string]bool)
 	for _, origin := range config.AllowOrigins {
-		if origin == "*" {
+		if strings.TrimSpace(origin) == "*" {
 			allowAll = true
-		} else {
-			allowOrigins[origin] = true
+			continue
 		}
+		o, err := normalizeOrigin(origin)
+		if err != nil {
+			return nil, err
+		}
+		allowOrigins[o] = true
+	}
+	if allowAll && config.AllowCredentials {
+		return nil, fmt.Errorf(`CORS: AllowOrigins "*" cannot be combined with AllowCredentials; list the origins explicitly`)
 	}
 	// 標頭值預先算好，不在每個 preflight 重新 Join
 	methods := strings.Join(config.AllowMethods, ", ")
@@ -161,7 +207,7 @@ func CORS(config CORSConfig) hypcontext.HandlerFunc {
 		maxAge = strconv.Itoa(config.MaxAge)
 	}
 
-	return func(c *hypcontext.Context) {
+	return hypcontext.HandlerFunc(func(c *hypcontext.Context) {
 		origin := c.GetHeader("Origin")
 		if origin == "" {
 			c.Next() // 非 CORS 請求（含一般 OPTIONS）不處理
@@ -175,8 +221,8 @@ func CORS(config CORSConfig) hypcontext.HandlerFunc {
 			return
 		}
 
-		// 允許所有來源且不帶憑證時回字面 "*"；帶憑證時規範禁止 "*"，只能反射 Origin
-		if allowAll && !config.AllowCredentials {
+		// 允許所有來源時回字面 "*"（此時不會有憑證，見 NewCORS）；其餘反射比對到的 Origin
+		if allowAll {
 			h.Set("Access-Control-Allow-Origin", "*")
 		} else {
 			h.Set("Access-Control-Allow-Origin", origin)
@@ -206,5 +252,5 @@ func CORS(config CORSConfig) hypcontext.HandlerFunc {
 		}
 
 		c.Next()
-	}
+	}), nil
 }

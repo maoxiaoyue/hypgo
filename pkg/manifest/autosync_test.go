@@ -106,9 +106,22 @@ func TestAutoSyncSafe(t *testing.T) {
 }
 
 func TestAutoSyncDefaultPath(t *testing.T) {
+	// 預設寫到 module 根目錄的 .hyp（往上找 go.mod），不是工作目錄。
+	// 歷史 bug：從子目錄啟動或 go test 時寫到該目錄，hyp lint 讀的卻是根目錄那一份
+	root := t.TempDir()
+	sub := filepath.Join(root, "cmd", "app")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
 	a := NewAutoSync(AutoSyncConfig{Enabled: true}, router.New(), nil, nil)
-	if a.config.Path != DefaultContextPath {
-		t.Errorf("default path = %q, want %q", a.config.Path, DefaultContextPath)
+	want, _ := filepath.EvalSymlinks(root)
+	got, _ := filepath.EvalSymlinks(filepath.Dir(filepath.Dir(a.config.Path)))
+	if got != want || filepath.Base(a.config.Path) != "context.yaml" {
+		t.Errorf("default path = %q, want %s/.hyp/context.yaml", a.config.Path, root)
 	}
 }
 

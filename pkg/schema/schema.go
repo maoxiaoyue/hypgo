@@ -64,6 +64,9 @@ type Route struct {
 	Output      interface{} `json:"-" yaml:"-"`
 	InputName   string      `json:"input_type,omitempty" yaml:"input_type,omitempty"`
 	OutputName  string      `json:"output_type,omitempty" yaml:"output_type,omitempty"`
+	// NoInput 表明這條 POST / PUT / PATCH 路由本來就沒有請求 body（登出、啟用…）：
+	// Schema Lint 不回報 missing_input。先前只能宣告一個假的 Input 才過得了 hyp lint
+	NoInput bool `json:"no_input,omitempty" yaml:"no_input,omitempty"`
 
 	// REST 專用（向後相容）
 	Method    string                 `json:"method,omitempty" yaml:"method,omitempty"`

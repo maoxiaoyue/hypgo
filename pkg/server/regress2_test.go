@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -317,6 +318,90 @@ func TestHTTP3ModeUsesSameDefaultMiddlewares(t *testing.T) {
 		if i == 0 && w.Header().Get("X-Frame-Options") != "DENY" {
 			t.Error("security headers missing in http3 mode")
 		}
+	}
+}
+
+// TestServerCORSConfig 迴歸測試：預設中間件的 CORS 依 server.cors。
+// 歷史 bug：寫死為任何來源；使用者再掛自己的 CORS 也收不緊（preflight 被預設的先回掉，
+// 合法前端帶憑證的請求拿不到 Allow-Credentials）
+func TestServerCORSConfig(t *testing.T) {
+	build := func(cors config.CORSConfig) *Server {
+		cfg := regressCfg("127.0.0.1:0")
+		cfg.Server.CORS = cors
+		log, _ := bufLogger()
+		s := New(cfg, log)
+		s.router.GET("/x", func(c *hypcontext.Context) { c.String(200, "ok") })
+		if err := s.applyDefaultMiddlewares(); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	do := func(s *Server, method, origin string, extra ...string) http.Header {
+		req := httptest.NewRequest(method, "/x", nil)
+		req.Header.Set("Origin", origin)
+		for i := 0; i+1 < len(extra); i += 2 {
+			req.Header.Set(extra[i], extra[i+1])
+		}
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		return w.Header()
+	}
+
+	if h := do(build(config.CORSConfig{}), "GET", "https://any.example"); h.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("default: %v", h)
+	}
+
+	s := build(config.CORSConfig{AllowOrigins: []string{"https://app.example.com"}, AllowCredentials: true})
+	if h := do(s, "GET", "https://evil.example"); h.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("evil origin allowed: %v", h)
+	}
+	h := do(s, "OPTIONS", "https://app.example.com", "Access-Control-Request-Method", "GET")
+	if h.Get("Access-Control-Allow-Origin") != "https://app.example.com" || h.Get("Access-Control-Allow-Credentials") != "true" ||
+		!strings.Contains(h.Get("Access-Control-Allow-Headers"), "Authorization") {
+		t.Errorf("preflight from the app: %v", h)
+	}
+
+	// allow_origins: [] → 不掛預設 CORS，使用者自己的 CORS 說了算
+	s = build(config.CORSConfig{AllowOrigins: []string{}})
+	if h := do(s, "GET", "https://any.example"); h.Get("Access-Control-Allow-Origin") != "" || h.Get("Vary") != "" || h.Get("X-Frame-Options") != "DENY" {
+		t.Errorf("disabled: %v", h)
+	}
+}
+
+// TestInvalidCORSFailsStart 迴歸測試：server.cors 寫錯時啟動失敗（"*" 加憑證、來源不是 scheme://host）
+func TestInvalidCORSFailsStart(t *testing.T) {
+	for _, cors := range []config.CORSConfig{
+		{AllowOrigins: []string{"*"}, AllowCredentials: true},
+		{AllowOrigins: []string{"app.example.com"}},
+	} {
+		t.Chdir(t.TempDir())
+		cfg := regressCfg("127.0.0.1:0")
+		cfg.Server.CORS = cors
+		err := startExpectingError(t, New(cfg, logger.NewLogger()))
+		if err == nil || !strings.Contains(err.Error(), "server.cors") {
+			t.Errorf("%+v: err = %v", cors, err)
+		}
+	}
+}
+
+// TestAccessLogIsStructured 迴歸測試：存取日誌以欄位記錄。
+// 歷史 bug：整行塞在 msg 裡，JSON 格式下狀態碼、耗時、路徑都不是獨立欄位
+func TestAccessLogIsStructured(t *testing.T) {
+	cfg := regressCfg("127.0.0.1:0")
+	log, buf := bufLogger()
+	log.SetFormat("json")
+	s := New(cfg, log)
+	s.router.GET("/x", func(c *hypcontext.Context) { c.String(201, "ok") })
+	if err := s.applyDefaultMiddlewares(); err != nil {
+		t.Fatal(err)
+	}
+	s.router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x?a=1", nil))
+	var entry map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &entry); err != nil {
+		t.Fatalf("%v: %q", err, buf.String())
+	}
+	if entry["msg"] != "request" || entry["method"] != "GET" || entry["path"] != "/x?a=1" || entry["status"] != float64(201) {
+		t.Errorf("entry = %v", entry)
 	}
 }
 

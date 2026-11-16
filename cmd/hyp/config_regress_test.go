@@ -65,7 +65,7 @@ func TestConfigWarningsReachManifestAndLint(t *testing.T) {
 	if err := manifest.SaveToFile(filepath.Join(".hyp", "context.yaml"), m, "yaml"); err != nil {
 		t.Fatal(err)
 	}
-	if err := runHyp(t, "lint"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh"); err == nil {
 		t.Error("hyp lint should fail when the config has warnings")
 	}
 
@@ -74,7 +74,7 @@ func TestConfigWarningsReachManifestAndLint(t *testing.T) {
 	cfg, _ = config.LoadConfig("config.yaml")
 	m = manifest.NewCollector(router.New(), cfg).Collect()
 	manifest.SaveToFile(filepath.Join(".hyp", "context.yaml"), m, "yaml")
-	if err := runHyp(t, "lint"); err != nil {
+	if err := runHyp(t, "lint", "--no-refresh"); err != nil {
 		t.Errorf("a clean config should not fail lint: %v", err)
 	}
 }

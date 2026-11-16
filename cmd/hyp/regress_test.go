@@ -517,7 +517,7 @@ func TestLintFailsWithoutLintSection(t *testing.T) {
 	t.Chdir(t.TempDir())
 	os.MkdirAll(".hyp", 0755)
 	os.WriteFile(filepath.Join(".hyp", "context.yaml"), []byte("routes: []\n"), 0644)
-	if err := runHyp(t, "lint"); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh"); err == nil {
 		t.Error("hyp lint should fail when the manifest has no lint section")
 	}
 }
@@ -528,7 +528,7 @@ func TestLintRejectsPackagesWithoutDeep(t *testing.T) {
 	t.Chdir(t.TempDir())
 	os.MkdirAll(".hyp", 0755)
 	os.WriteFile(filepath.Join(".hyp", "context.yaml"), []byte("lint:\n  total: 0\n  with_schema: 0\n  coverage: 0/0\n"), 0644)
-	if err := runHyp(t, "lint", "./pkg/..."); err == nil {
+	if err := runHyp(t, "lint", "--no-refresh", "./pkg/..."); err == nil {
 		t.Error("hyp lint ./pkg/... without --deep should fail")
 	}
 }

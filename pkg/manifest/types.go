@@ -95,46 +95,39 @@ func (f *TypeFields) UnmarshalJSON(data []byte) error {
 }
 
 // collectTypes 收集 schema 宣告的 Input / Output / Responses 型別欄位，以型別名稱為鍵。
-// slice / map 型別登錄其元素型別：list 回應的 output_type 是 "[]UserResp"，types 要有 UserResp
-// （先前 FieldsOf(slice) 為 nil，list 回應在 types 區段沒有任何定義）。
 // ponytail: 以短型別名為鍵，不同套件的同名型別只留第一個（路由的 input_type 等本來就只有短名稱）
 func collectTypes(types map[string]TypeFields, s *schema.Route) {
-	add := func(name string, v interface{}) {
-		if name == "" || v == nil {
-			return
-		}
-		if t := elemType(reflect.TypeOf(v)); t != nil {
-			v = reflect.Zero(t).Interface()
-			name = schema.TypeName(v)
-		}
-		if _, ok := types[name]; ok {
-			return
-		}
-		if fields := schema.FieldsOf(v); fields != nil {
-			types[name] = fields
+	add := func(v interface{}) {
+		if v != nil {
+			registerType(types, reflect.TypeOf(v))
 		}
 	}
-	add(s.InputName, s.Input)
-	add(s.OutputName, s.Output)
+	add(s.Input)
+	add(s.Output)
 	for _, resp := range s.Responses {
-		add(resp.TypeName, resp.Type)
+		add(resp.Type)
 	}
 }
 
-// elemType 回傳 slice / array / map（可巢狀、可為指標）最內層的元素型別；t 不是這些型別時回 nil
-func elemType(t reflect.Type) reflect.Type {
-	unwrapped := false
-	for {
-		switch t.Kind() {
-		case reflect.Ptr:
-			t = t.Elem()
-		case reflect.Slice, reflect.Array, reflect.Map:
-			t, unwrapped = t.Elem(), true
-		default:
-			if unwrapped {
-				return t
-			}
-			return nil
-		}
+// registerType 登錄 t 及它引用到的具名 struct：slice / map / 指標取元素型別，欄位的型別遞迴登錄。
+// 先前只登錄最外層：欄位寫成 addr: object、items: array，Addr 的欄位不在任何地方，
+// 讀 manifest 的人組不出請求 body。已登錄的型別直接返回，互相引用的型別不會無限遞迴
+func registerType(types map[string]TypeFields, t reflect.Type) {
+	for t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice || t.Kind() == reflect.Array || t.Kind() == reflect.Map {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || t.Name() == "" {
+		return
+	}
+	if _, ok := types[t.Name()]; ok {
+		return
+	}
+	fields := schema.FieldsOf(reflect.Zero(t).Interface())
+	if fields == nil { // time.Time 等自訂序列化的型別不是欄位的組合
+		return
+	}
+	types[t.Name()] = fields
+	for _, f := range schema.JSONFields(t) {
+		registerType(types, f.Type)
 	}
 }

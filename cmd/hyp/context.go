@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
@@ -74,11 +75,7 @@ func runContext(cmd *cobra.Command, args []string) error {
 
 	// 先前以空的 router.New() 收集，輸出裡沒有任何使用者路由（hyp 與專案是不同行程）。
 	// 改為實際執行專案，由 server.Start() 在路由註冊完成後寫出 manifest
-	collect := collectProjectManifest
-	if st, err := os.Stat("tools/genctx"); pkg == "." && err == nil && st.IsDir() {
-		collect = func(cmd *cobra.Command, _ string) (*manifest.Manifest, error) { return runGenctx(cmd) }
-	}
-	m, err := collect(cmd, pkg)
+	m, err := collectManifest(cmd, "", pkg)
 	if err != nil {
 		return err
 	}
@@ -97,9 +94,18 @@ func runContext(cmd *cobra.Command, args []string) error {
 	return manifest.WriteYAML(os.Stdout, m)
 }
 
+// collectManifest 在 dir（空字串為目前目錄）執行專案取得 manifest：有 tools/genctx 的 CLI / Desktop 專案跑它，
+// 其餘以 HYPGO_MANIFEST_OUT 跑 go run <pkg>。hyp context 與 hyp lint 共用
+func collectManifest(cmd *cobra.Command, dir, pkg string) (*manifest.Manifest, error) {
+	if st, err := os.Stat(filepath.Join(dir, "tools", "genctx")); pkg == "." && err == nil && st.IsDir() {
+		return runGenctx(cmd, dir)
+	}
+	return collectProjectManifest(cmd, dir, pkg)
+}
+
 // collectProjectManifest 以 HYPGO_MANIFEST_OUT 執行 go run <pkg>，讀回 server.Start() 寫出的 manifest。
 // 專案輸出一律導到 stderr，讓 stdout 只有 manifest
-func collectProjectManifest(cmd *cobra.Command, pkg string) (*manifest.Manifest, error) {
+func collectProjectManifest(cmd *cobra.Command, dir, pkg string) (*manifest.Manifest, error) {
 	tmp, err := os.CreateTemp("", "hypgo-manifest-*.json")
 	if err != nil {
 		return nil, err
@@ -110,6 +116,7 @@ func collectProjectManifest(cmd *cobra.Command, pkg string) (*manifest.Manifest,
 	defer os.Remove(out)
 
 	run := exec.CommandContext(cmd.Context(), "go", "run", pkg)
+	run.Dir = dir
 	// 只為取得路由，不解密 ${secret:name}：CI 不需要持有解密金鑰
 	run.Env = append(os.Environ(), manifest.ManifestOutEnv+"="+out, secret.OptionalEnv+"=1")
 	run.Stdout, run.Stderr = os.Stderr, os.Stderr
@@ -133,19 +140,21 @@ func collectProjectManifest(cmd *cobra.Command, pkg string) (*manifest.Manifest,
 }
 
 // runGenctx 執行 CLI / Desktop 模板自帶的 tools/genctx（它把 manifest 寫到 .hyp/context.yaml）後讀回
-func runGenctx(cmd *cobra.Command) (*manifest.Manifest, error) {
+func runGenctx(cmd *cobra.Command, dir string) (*manifest.Manifest, error) {
 	run := exec.CommandContext(cmd.Context(), "go", "run", "./tools/genctx")
+	run.Dir = dir
 	run.Stdout, run.Stderr = os.Stderr, os.Stderr
 	if err := run.Run(); err != nil {
 		return nil, fmt.Errorf("go run ./tools/genctx: %w", err)
 	}
-	data, err := os.ReadFile(manifest.DefaultContextPath)
+	path := filepath.Join(dir, manifest.DefaultContextPath)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	var m manifest.Manifest
 	if err := yaml.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", manifest.DefaultContextPath, err)
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &m, nil
 }

@@ -319,9 +319,10 @@ import (
 // @ai:sideeffect none
 func APIMiddleware() []hypcontext.HandlerFunc {
 	return []hypcontext.HandlerFunc{
-		middleware.Logger(middleware.LoggerConfig{}),
-		// middleware.JWT(middleware.JWTConfig{...}),
-		// middleware.RateLimit(100),
+		// 請求日誌、Recovery、安全標頭、CORS 已由 server.Start() 套用，不必再加
+		middleware.RequestID(middleware.RequestIDConfig{}),
+		// middleware.JWT(middleware.JWTConfig{Validator: middleware.HS256Validator(secret)}),
+		// middleware.RateLimiter(middleware.RateLimiterConfig{Rate: 100}),
 	}
 }
 
@@ -334,8 +335,8 @@ func APIMiddleware() []hypcontext.HandlerFunc {
 // @ai:sideeffect none
 func WebMiddleware() []hypcontext.HandlerFunc {
 	return []hypcontext.HandlerFunc{
-		middleware.Logger(middleware.LoggerConfig{}),
-		// middleware.CSRF(middleware.CSRFConfig{...}),
+		middleware.RequestID(middleware.RequestIDConfig{}),
+		// middleware.CSRF(middleware.CSRFConfig{}),
 	}
 }
 `

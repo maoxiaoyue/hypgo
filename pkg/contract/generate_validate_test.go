@@ -90,7 +90,7 @@ func TestValidateConstraintsBackwardCompat(t *testing.T) {
 	if err := validateRequest([]byte(`{"name":"x","email":"y"}`), createReq{}); err != nil {
 		t.Errorf("tag-less struct should pass constraint check: %v", err)
 	}
-	if err := validateResponse([]byte(`{"id":1,"name":"x","email":"y"}`), userResp{}); err != nil {
+	if err := validateResponse([]byte(`{"id":1,"name":"x","email":"y"}`), userResp{}, false); err != nil {
 		t.Errorf("tag-less struct should pass constraint check: %v", err)
 	}
 }

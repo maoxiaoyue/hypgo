@@ -151,7 +151,7 @@ func TestFieldsOfJSONShapes(t *testing.T) {
 	}
 	want := map[string]string{
 		"at": "string", "at_ptr": "string", "blob": "string", "raw": "any",
-		"any": "any", "quoted": "string", "ip": "string", "tags": "array",
+		"any": "any", "quoted": "string", "ip": "string", "tags": "[]string",
 	}
 	for k, w := range want {
 		if got[k] != w {

@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	hyperrors "github.com/maoxiaoyue/hypgo/pkg/errors"
 )
 
 // JWT（HS256）簽發／驗證。
@@ -39,16 +41,26 @@ var (
 	ErrJWTSignature = errors.New("jwt: invalid signature")
 	ErrJWTExpired   = errors.New("jwt: token expired")
 	ErrJWTNoSecret  = errors.New("jwt: empty secret")
+	ErrJWTTTL       = errors.New("jwt: negative ttl")
 )
+
+// jwtEncoding 嚴格解碼：最後一個字元未使用的位元必須是 0。先前同一個 token 改掉簽章尾端的
+// 位元仍能通過，以 token 字串做撤銷名單或快取鍵時會被繞過
+var jwtEncoding = base64.RawURLEncoding.Strict()
 
 // hs256Header 固定 header；VerifyHS256 只接受 alg=HS256，杜絕 alg=none / 演算法混淆攻擊
 const hs256Header = `{"alg":"HS256","typ":"JWT"}`
 
 // SignHS256 以 HS256 簽發 token。ttl > 0 且 claims.ExpiresAt 未設時自動計算到期；
-// IssuedAt 未設時自動填現在
+// IssuedAt 未設時自動填現在。ttl 為 0 表示不過期，負數回 ErrJWTTTL（先前負數簽出不過期的 token）。
+//
+// secret 應為至少 32 bytes 的隨機值（HS256 的強度取決於它）；長度不在這裡強制
 func SignHS256(claims JWTClaims, secret []byte, ttl time.Duration) (string, error) {
 	if len(secret) == 0 {
 		return "", ErrJWTNoSecret
+	}
+	if ttl < 0 {
+		return "", ErrJWTTTL
 	}
 	now := time.Now()
 	if claims.IssuedAt == 0 {
@@ -73,11 +85,15 @@ func VerifyHS256(token string, secret []byte) (*JWTClaims, error) {
 	if len(secret) == 0 {
 		return nil, ErrJWTNoSecret
 	}
+	// encoding/base64 會略過換行，嚴格模式也一樣；先前 token 後面多一個換行仍能通過
+	if strings.ContainsAny(token, "\r\n") {
+		return nil, ErrJWTMalformed
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil, ErrJWTMalformed
 	}
-	enc := base64.RawURLEncoding
+	enc := jwtEncoding
 
 	headerJSON, err := enc.DecodeString(parts[0])
 	if err != nil {
@@ -150,8 +166,8 @@ var (
 type RequireRoleConfig struct {
 	// Roles 允許的角色，符合任一即放行（OR）
 	Roles []string
-	// ErrorHandler 自訂錯誤回應；nil 時未認證回 401、角色不符回 403（無 body）。
-	// err 為 ErrRoleUnauthenticated 或 ErrRoleForbidden
+	// ErrorHandler 自訂錯誤回應；nil 時未認證回 401（E2001）、角色不符回 403（E2002）。
+	// err 為 ErrRoleUnauthenticated 或 ErrRoleForbidden。呼叫後一律中止
 	ErrorHandler func(c *hypcontext.Context, err error)
 }
 
@@ -164,18 +180,23 @@ func RequireRole(roles ...string) hypcontext.HandlerFunc {
 	return RequireRoleWith(RequireRoleConfig{Roles: roles})
 }
 
-// RequireRoleWith 帶設定的 RequireRole（可自訂錯誤回應）
+// RequireRoleWith 帶設定的 RequireRole（可自訂錯誤回應）。
+// 沒有給任何角色時 panic：先前建立成功，之後每個請求（含 admin）都是 403
 func RequireRoleWith(config RequireRoleConfig) hypcontext.HandlerFunc {
+	if len(config.Roles) == 0 {
+		panic("middleware: RequireRole needs at least one role")
+	}
 	fail := func(c *hypcontext.Context, err error) {
 		if config.ErrorHandler != nil {
 			config.ErrorHandler(c, err)
+			c.Abort() // 見 jwtError
 			return
 		}
 		if errors.Is(err, ErrRoleUnauthenticated) {
-			c.AbortWithStatus(401)
+			abortError(c, http.StatusUnauthorized, hyperrors.ErrUnauthorized)
 			return
 		}
-		c.AbortWithStatus(403)
+		abortError(c, http.StatusForbidden, hyperrors.ErrForbidden)
 	}
 
 	return func(c *hypcontext.Context) {

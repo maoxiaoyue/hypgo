@@ -197,9 +197,12 @@ func TestGoTypeToSchemaType(t *testing.T) {
 		{42, "integer"},
 		{3.14, "number"},
 		{true, "boolean"},
-		{[]int{}, "array"},
-		{map[string]int{}, "object"},
-		{testUser{}, "object"},
+		// 複合型別寫出元素與具名 struct 的名稱（先前一律 array / object）
+		{[]int{}, "[]integer"},
+		{map[string]int{}, "map[string]integer"},
+		{testUser{}, "testUser"},
+		{[]*testUser{}, "[]testUser"},
+		{struct{ A int }{}, "object"},
 	}
 
 	for _, tt := range tests {

@@ -55,12 +55,11 @@ func TestDefaultMiddleware(t *testing.T) {
 	}
 }
 
-// TestDefaultMiddlewareRejectsEarlyData DefaultMiddleware 與 HTTP3Middleware 都必須
+// TestDefaultMiddlewareRejectsEarlyData DefaultMiddleware 必須
 // 對非安全方法的早期資料回 425，且 handler 不得執行；安全方法照常放行。
 func TestDefaultMiddlewareRejectsEarlyData(t *testing.T) {
 	for name, chain := range map[string][]context.HandlerFunc{
 		"Default": DefaultMiddleware(),
-		"HTTP3":   HTTP3Middleware(),
 	} {
 		r := router.New()
 		r.Use(chain...)

@@ -6,11 +6,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,8 +22,18 @@ import (
 	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	hyperrors "github.com/maoxiaoyue/hypgo/pkg/errors"
 	"golang.org/x/time/rate"
 )
+
+// abortError 以 Error Catalog 的 JSON 中止請求（與 router 的 404 / 405、c.BindInput 同一種格式）。
+// 先前各中間件的預設錯誤回應都沒有 body。回應已開始寫出時只中止
+func abortError(c *hypcontext.Context, status int, e *hyperrors.AppError) {
+	c.Abort()
+	if !c.Writer.Written() {
+		c.JSON(status, e.JSON())
+	}
+}
 
 // ===== 核心工具函數 =====
 
@@ -70,7 +84,23 @@ func (s valueSource) get(c *hypcontext.Context) string {
 type LoggerConfig struct {
 	TimeFormat string
 	SkipPaths  []string
-	Output     io.Writer // nil 時寫到 os.Stdout；server 會接到自己的 logger
+	Output     io.Writer // nil 時寫到 os.Stdout
+	// Log 非 nil 時改以結構化欄位記錄（訊息 "request"，欄位 method / path / status / ms /
+	// bytes / ip / proto / ua），不寫 Output。server 以此接到自己的 logger：
+	// 先前整行塞在 msg 裡，JSON 格式下狀態碼、耗時都不是獨立欄位
+	Log func(msg string, keysAndValues ...interface{})
+}
+
+// logSafe 把控制字元跳脫成 \n、\x1b 這類寫法。路徑是解碼後的，/x%0A... 會在日誌裡變成
+// 另起一行、看起來像另一筆紀錄
+func logSafe(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			q := strconv.Quote(s)
+			return q[1 : len(q)-1]
+		}
+	}
+	return s
 }
 
 // sensitiveQueryKeys 記錄日誌時遮蔽值的 query 參數（不分大小寫）。
@@ -89,7 +119,16 @@ func redactQuery(raw string) string {
 	parts := strings.Split(raw, "&")
 	changed := false
 	for i, p := range parts {
-		if k, _, ok := strings.Cut(p, "="); ok && sensitiveQueryKeys[strings.ToLower(k)] {
+		k, _, ok := strings.Cut(p, "=")
+		if !ok {
+			continue
+		}
+		// 鍵先解碼再比對：c.Query("token") 讀得到 %74oken=，先前這種寫法不會被遮蔽
+		name, err := url.QueryUnescape(k)
+		if err != nil {
+			name = k
+		}
+		if sensitiveQueryKeys[strings.ToLower(name)] {
 			parts[i] = k + "=REDACTED"
 			changed = true
 		}
@@ -136,17 +175,30 @@ func Logger(config LoggerConfig) hypcontext.HandlerFunc {
 			}
 			// 協議取自請求本身（HTTP/1.1、HTTP/2.0、HTTP/3.0）：先前讀 c.Get("protocol")，
 			// 這個 key 從來沒有人設，所有請求都被記成 HTTP/1.1
-			fmt.Fprintf(out, "[%s] %s | %s | %d | %v | %d bytes | %s %s | %s\n",
-				c.Request.Proto,
-				time.Now().Format(config.TimeFormat),
-				c.ClientIP(),
-				status,
-				time.Since(start),
-				c.Response.Size(),
-				c.Request.Method,
-				path,
-				c.GetHeader("User-Agent"),
-			)
+			if config.Log != nil {
+				config.Log("request",
+					"method", c.Request.Method,
+					"path", path,
+					"status", status,
+					"ms", float64(time.Since(start).Microseconds())/1000,
+					"bytes", c.Response.Size(),
+					"ip", c.ClientIP(),
+					"proto", c.Request.Proto,
+					"ua", c.GetHeader("User-Agent"),
+				)
+			} else {
+				fmt.Fprintf(out, "[%s] %s | %s | %d | %v | %d bytes | %s %s | %s\n",
+					c.Request.Proto,
+					time.Now().Format(config.TimeFormat),
+					c.ClientIP(),
+					status,
+					time.Since(start),
+					c.Response.Size(),
+					logSafe(c.Request.Method),
+					logSafe(path),
+					logSafe(c.GetHeader("User-Agent")),
+				)
+			}
 			if p != nil {
 				panic(p)
 			}
@@ -160,11 +212,22 @@ func Logger(config LoggerConfig) hypcontext.HandlerFunc {
 
 // RateLimiterConfig 速率限制配置
 type RateLimiterConfig struct {
-	Rate       int     // 每秒請求數
-	Burst      int     // 突發請求數
-	KeyFunc    KeyFunc // 獲取限制鍵的函數
-	ErrorMsg   string  // 錯誤訊息
-	StatusCode int     // 狀態碼
+	Rate       int     // 每秒請求數（必填，須大於 0）
+	Burst      int     // 突發請求數；0 時等於 Rate
+	KeyFunc    KeyFunc // 獲取限制鍵的函數；nil 時為客戶端 IP（IPv6 以 /64 為單位）
+	ErrorMsg   string  // 設定時以純文字回應；空時回 Error Catalog 的 JSON（E0007）
+	StatusCode int     // 狀態碼，預設 429
+}
+
+// rateLimitKey 預設的限流鍵：IPv4 用位址本身，IPv6 用 /64。
+// 一個 IPv6 用戶通常拿到整個 /64，先前以完整位址為鍵，換位址就能繞過限流
+func rateLimitKey(ip string) string {
+	if a, err := netip.ParseAddr(ip); err == nil && a.Is6() && !a.Is4In6() {
+		if p, err := a.Prefix(64); err == nil {
+			return p.String()
+		}
+	}
+	return ip
 }
 
 // KeyFunc 獲取速率限制鍵的函數
@@ -181,13 +244,20 @@ const (
 	rateLimiterIdleTTL    = 10 * time.Minute // 多久未見的 key 會被清掉
 )
 
-// RateLimiter 創建速率限制中間件
+// RateLimiter 創建速率限制中間件。Rate 必須大於 0（否則 panic）；Burst 沒給時等於 Rate。
+// 先前 RateLimiterConfig{Rate: 100} 的 Burst 是 0，第一個請求起全部 429
 func RateLimiter(config RateLimiterConfig) hypcontext.HandlerFunc {
+	if config.Rate <= 0 {
+		panic(fmt.Sprintf("middleware: RateLimiterConfig.Rate must be greater than 0 (got %d)", config.Rate))
+	}
+	if config.Burst <= 0 {
+		config.Burst = config.Rate
+	}
 	limiters := &sync.Map{}
 
 	if config.KeyFunc == nil {
 		config.KeyFunc = func(c *hypcontext.Context) string {
-			return c.ClientIP()
+			return rateLimitKey(c.ClientIP())
 		}
 	}
 	if config.StatusCode == 0 {
@@ -231,12 +301,14 @@ func RateLimiter(config RateLimiterConfig) hypcontext.HandlerFunc {
 			c.Header("X-RateLimit-Remaining", "0")
 			c.Header("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Second).Unix(), 10))
 
-			if config.ErrorMsg != "" {
-				c.String(config.StatusCode, config.ErrorMsg)
-			}
 			// 一律 Abort：先前帶 ErrorMsg 時只寫了 429 沒中止，後面的 handler 照樣執行，
 			// 回應變成「錯誤訊息 + handler 輸出」，限流形同虛設
-			c.AbortWithStatus(config.StatusCode)
+			if config.ErrorMsg != "" {
+				c.Abort()
+				c.String(config.StatusCode, config.ErrorMsg)
+			} else {
+				abortError(c, config.StatusCode, hyperrors.ErrTooManyRequests)
+			}
 			return
 		}
 
@@ -248,9 +320,33 @@ func RateLimiter(config RateLimiterConfig) hypcontext.HandlerFunc {
 
 // TimeoutConfig 超時配置
 type TimeoutConfig struct {
-	Timeout      time.Duration
-	ErrorMessage string
-	ErrorCode    int // 預設 503（逾時是伺服器端處理太久；408 是指客戶端送請求太慢）
+	Timeout      time.Duration // 必填，須大於 0
+	ErrorMessage string        // 設定時以純文字回應；空時回 Error Catalog 的 JSON（E0008）
+	ErrorCode    int           // 預設 503（逾時是伺服器端處理太久；408 是指客戶端送請求太慢）
+}
+
+// PanicError 是 Timeout 把 handler 的 panic 轉交給外層時用的包裝：handler 在另一個 goroutine
+// 執行，panic 在主 goroutine 重拋後堆疊裡已沒有出事的函式，所以在原處先擷取。
+// Recovery 會解開它、印出 Stack
+type PanicError struct {
+	Value interface{} // 原本的 panic 值
+	Stack []byte      // panic 當下 handler goroutine 的堆疊
+}
+
+func (p *PanicError) Error() string { return fmt.Sprintf("%v\n%s", p.Value, p.Stack) }
+
+// Unwrap 回傳原本的 panic 值（它是 error 時）
+func (p *PanicError) Unwrap() error {
+	err, _ := p.Value.(error)
+	return err
+}
+
+// repanic 把 handler goroutine 的 panic 交給外層；http.ErrAbortHandler 維持原值（net/http 以它辨認）
+func repanic(v interface{}, stack []byte) {
+	if v == http.ErrAbortHandler {
+		panic(v)
+	}
+	panic(&PanicError{Value: v, Stack: stack})
 }
 
 // Timeout 創建超時中間件。
@@ -261,16 +357,26 @@ type TimeoutConfig struct {
 // Context。先前逾時即返回，handler 與主 goroutine 同時寫 Context / ResponseWriter（data race），
 // 並在 Context 被下一個請求取用後繼續寫入。
 //
-// 因此 handler 應觀察 c.Request.Context()（逾時即 Done）盡快結束；串流回應會被緩衝到結束才送出
+// 因此 handler 應觀察 c.Request.Context()（逾時即 Done）盡快結束；串流回應會被緩衝到結束才送出。
+//
+// Timeout 必須大於 0（否則 panic）：先前 TimeoutConfig{} 讓每個請求立刻逾時、全部 503
 func Timeout(config TimeoutConfig) hypcontext.HandlerFunc {
+	if config.Timeout <= 0 {
+		panic(fmt.Sprintf("middleware: TimeoutConfig.Timeout must be greater than 0 (got %v)", config.Timeout))
+	}
 	if config.ErrorCode == 0 {
 		config.ErrorCode = http.StatusServiceUnavailable
 	}
+	timeoutJSON, _ := json.Marshal(hyperrors.ErrTimeout.JSON())
 
 	return func(c *hypcontext.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), config.Timeout)
+		orig := c.Request
+		ctx, cancel := context.WithTimeout(orig.Context(), config.Timeout)
+		// 返回時換回原本的請求：外層（Recovery）以請求的 context 判斷客戶端是否已斷線，
+		// 留著這個已被 cancel 的 context 會讓每個 panic 都被當成斷線
+		defer func() { c.Request = orig }()
 		defer cancel()
-		c.Request = c.Request.WithContext(ctx)
+		c.Request = orig.WithContext(ctx)
 
 		real := c.Writer
 		tw := &timeoutWriter{ResponseWriter: real, h: real.Header().Clone(), code: http.StatusOK}
@@ -278,9 +384,14 @@ func Timeout(config TimeoutConfig) hypcontext.HandlerFunc {
 
 		done := make(chan struct{})
 		var panicVal interface{}
+		var panicStack []byte
 		go func() {
 			defer close(done)
-			defer func() { panicVal = recover() }()
+			defer func() {
+				if panicVal = recover(); panicVal != nil {
+					panicStack = debug.Stack() // 在這裡才看得到出事的函式（見 PanicError）
+				}
+			}()
 			c.Next()
 		}()
 
@@ -288,7 +399,7 @@ func Timeout(config TimeoutConfig) hypcontext.HandlerFunc {
 		case <-done:
 			c.Writer, c.Response = real, real
 			if panicVal != nil {
-				panic(panicVal) // 交給外層 Recovery
+				repanic(panicVal, panicStack) // 交給外層 Recovery
 			}
 			tw.copyTo(real)
 		case <-ctx.Done():
@@ -296,9 +407,14 @@ func Timeout(config TimeoutConfig) hypcontext.HandlerFunc {
 			tw.timedOut = true
 			tw.mu.Unlock()
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) { // 客戶端斷線時不必回應
-				real.WriteHeader(config.ErrorCode)
+				// 直接寫 real：handler 可能還在用 Context，不能經過 c.JSON
 				if config.ErrorMessage != "" {
+					real.WriteHeader(config.ErrorCode)
 					real.WriteString(config.ErrorMessage)
+				} else {
+					real.Header().Set("Content-Type", "application/json; charset=utf-8")
+					real.WriteHeader(config.ErrorCode)
+					real.Write(timeoutJSON)
 				}
 				real.WriteHeaderNow()
 				real.Flush()
@@ -309,7 +425,7 @@ func Timeout(config TimeoutConfig) hypcontext.HandlerFunc {
 			// 逾時後的寫入回傳 http.ErrHandlerTimeout，c.String / c.JSON 會因此 panic——預期中，吞掉；
 			// 其餘 panic 仍交給外層 Recovery 記錄（回應已送出，狀態碼不會再變）
 			if e, ok := panicVal.(error); panicVal != nil && !(ok && errors.Is(e, http.ErrHandlerTimeout)) {
-				panic(panicVal)
+				repanic(panicVal, panicStack)
 			}
 		}
 	}
@@ -396,7 +512,7 @@ func (w *timeoutWriter) copyTo(real hypcontext.ResponseWriter) {
 // BodyLimitConfig 請求 body 大小限制配置
 type BodyLimitConfig struct {
 	MaxBytes int64  // 最大 body 大小（bytes），預設 1MB
-	ErrorMsg string // 自訂錯誤訊息
+	ErrorMsg string // 設定時以純文字回應；空時回 Error Catalog 的 JSON（E0006，與 c.BindInput 相同）
 }
 
 // BodyLimit 限制請求 body 大小，防止大 payload 攻擊
@@ -404,14 +520,15 @@ func BodyLimit(config BodyLimitConfig) hypcontext.HandlerFunc {
 	if config.MaxBytes <= 0 {
 		config.MaxBytes = 1 << 20 // 1MB
 	}
-	if config.ErrorMsg == "" {
-		config.ErrorMsg = "Request body too large"
-	}
 
 	return func(c *hypcontext.Context) {
 		if c.Request.ContentLength > config.MaxBytes {
-			c.AbortWithStatus(http.StatusRequestEntityTooLarge)
-			c.String(http.StatusRequestEntityTooLarge, config.ErrorMsg)
+			if config.ErrorMsg != "" {
+				c.Abort()
+				c.String(http.StatusRequestEntityTooLarge, config.ErrorMsg)
+			} else {
+				abortError(c, http.StatusRequestEntityTooLarge, hyperrors.ErrBodyTooLarge)
+			}
 			return
 		}
 		// 調整（或建立）這個請求的 body 上限：server 已依 server.max_body_size 套用一層，
@@ -450,19 +567,29 @@ func DefaultMiddleware() []hypcontext.HandlerFunc {
 }
 
 // DefaultMiddlewareWithOutput 同 DefaultMiddleware，但請求日誌寫到 access、panic 記錄寫到 errs
-// （nil 時為 os.Stdout）。server 以此把兩者接到自己的 logger，遵守日誌等級與 JSON 格式
+// （nil 時為 os.Stdout）
 func DefaultMiddlewareWithOutput(access, errs io.Writer) []hypcontext.HandlerFunc {
-	return []hypcontext.HandlerFunc{
+	return DefaultMiddlewareWith(LoggerConfig{Output: access}, RecoveryConfig{Output: errs}, CORS(DefaultCORSConfig()))
+}
+
+// DefaultCORSConfig 預設組合用的 CORS 設定：任何來源、不帶憑證
+func DefaultCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		// Authorization：內建 JWT 需要；先前未列入，瀏覽器帶 Bearer token 的跨來源請求 preflight 失敗
+		AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With", "X-CSRF-Token"},
+	}
+}
+
+// DefaultMiddlewareWith 以指定的日誌、Recovery 設定與 CORS 中間件組出預設組合；cors 為 nil 時不含 CORS。
+// server 以此接上自己的 logger 與 server.cors 設定
+func DefaultMiddlewareWith(log LoggerConfig, rec RecoveryConfig, cors hypcontext.HandlerFunc) []hypcontext.HandlerFunc {
+	mws := []hypcontext.HandlerFunc{
 		// 錯誤恢復
-		Recovery(RecoveryConfig{
-			StackSize: 4 << 10,
-			Output:    errs,
-		}),
+		Recovery(rec),
 		// 日誌
-		Logger(LoggerConfig{
-			TimeFormat: time.RFC3339,
-			Output:     access,
-		}),
+		Logger(log),
 		// 0-RTT 重放保護（auto 模式同時服務 HTTP/3；經代理的早期資料在任何協議都可能出現）
 		RejectEarlyData(),
 		// 安全頭（X-XSS-Protection: 0——舊版瀏覽器的 XSS 過濾器本身可被利用，OWASP 建議關閉）
@@ -471,45 +598,9 @@ func DefaultMiddlewareWithOutput(access, errs io.Writer) []hypcontext.HandlerFun
 			ContentTypeNosniff: "nosniff",
 			XFrameOptions:      "DENY",
 		}),
-		// CORS
-		CORS(CORSConfig{
-			AllowOrigins: []string{"*"},
-			AllowMethods: []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-			// Authorization：內建 JWT 需要；先前未列入，瀏覽器帶 Bearer token 的跨來源請求 preflight 失敗
-			AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With", "X-CSRF-Token"},
-		}),
 	}
-}
-
-// HTTP3Middleware 創建 HTTP/3 模式的中間件組合（另加壓縮與限流）
-func HTTP3Middleware() []hypcontext.HandlerFunc {
-	return HTTP3MiddlewareWithOutput(nil, nil)
-}
-
-// HTTP3MiddlewareWithOutput 同 HTTP3Middleware，輸出規則同 DefaultMiddlewareWithOutput
-func HTTP3MiddlewareWithOutput(access, errs io.Writer) []hypcontext.HandlerFunc {
-	return []hypcontext.HandlerFunc{
-		// 錯誤恢復
-		Recovery(RecoveryConfig{
-			StackSize: 4 << 10,
-			Output:    errs,
-		}),
-		// 日誌
-		Logger(LoggerConfig{
-			TimeFormat: time.RFC3339,
-			Output:     access,
-		}),
-		// 0-RTT 重放保護
-		RejectEarlyData(),
-		// 壓縮（gzip）
-		Compression(CompressionConfig{
-			Level:     6,
-			MinLength: 1024,
-		}),
-		// 速率限制
-		RateLimiter(RateLimiterConfig{
-			Rate:  100,
-			Burst: 50,
-		}),
+	if cors != nil {
+		mws = append(mws, cors)
 	}
+	return mws
 }
