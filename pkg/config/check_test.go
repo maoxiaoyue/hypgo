@@ -35,7 +35,7 @@ func TestUnknownKeysAreReported(t *testing.T) {
 		{"sever", "sever:\n  addr: :9443\n", []string{"sever", `did you mean "server"`}},
 		{"adress", "server:\n  adress: :9443\n", []string{"server.adress", "unknown key"}},
 		{"wrong indentation", "server:\naddr: :9443\n", []string{"addr", "indentation"}},
-		{"wrong indentation, unique key", "server:\nread_timeout: 5\n", []string{"did you mean server.read_timeout", "indentation"}},
+		{"wrong indentation, unique key", "server:\nidle_timeout: 5\n", []string{"did you mean server.idle_timeout", "indentation"}},
 		{"nested key at top level, ambiguous", "max_open_conns: 5\n", []string{"max_open_conns", "indentation"}},
 		{"trusted_proxy", "server:\n  trusted_proxy: [10.0.0.0/8]\n", []string{"server.trusted_proxy", "trusted_proxies"}},
 		{"unknown nested without suggestion", "logger:\n  flavour: spicy\n", []string{"logger.flavour", "unknown key"}},

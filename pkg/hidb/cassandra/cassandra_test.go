@@ -749,14 +749,16 @@ func TestParseConsistencyStrict(t *testing.T) {
 	}
 }
 
-func TestParseConsistencyFallbackLocalOne(t *testing.T) {
-	// 非嚴格模式：拼錯不回 Quorum，cluster 設為 LocalOne
-	c := &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}, Consistency: "typo"}}
-	if err := c.init(); err != nil {
-		t.Fatal(err)
+// 打錯的 consistency 一律回錯（不論 StrictConsistency）；沒設定時仍是 LocalOne。
+// 歷史 bug：預設靜默退回 LocalOne，"qourum" 得到的一致性比預期弱而沒有任何提示
+func TestInitRejectsUnknownConsistency(t *testing.T) {
+	c := &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}, Consistency: "qourum"}}
+	if err := c.init(); err == nil || !strings.Contains(err.Error(), "qourum") {
+		t.Fatalf("err = %v, want it to name the bad value", err)
 	}
-	if got := c.cluster.Consistency; got != gocql.LocalOne {
-		t.Errorf("expected LocalOne fallback, got %v", got)
+	c = &CassandraDB{config: Config{Hosts: []string{"127.0.0.1"}}}
+	if err := c.init(); err != nil || c.cluster.Consistency != gocql.LocalOne {
+		t.Errorf("unset consistency: err = %v, level = %v", err, c.cluster.Consistency)
 	}
 }
 

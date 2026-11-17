@@ -632,7 +632,7 @@ func createAPIMainFile(projectName, module string) error {
 		"\tdefault:\n" +
 		"\t\tdialect = pg.New()\n" +
 		"\t}\n\n" +
-		"\tdb, err := hidb.NewWithInterface(&cfg.Database, hidb.WithDialect(dialect))\n" +
+		"\tdb, err := hidb.NewWithInterface(&cfg.Database, hidb.WithDialect(dialect), hidb.WithLogger(log))\n" +
 		"\tif err != nil {\n" +
 		"\t\tlog.Errorf(\"database init failed: %v\", err)\n" +
 		"\t\tos.Exit(1)\n" +
@@ -744,6 +744,10 @@ database:
   dsn: ""                  # 留空 = 不連資料庫；例：postgres://user:pass@localhost:5432/app?sslmode=disable
   max_idle_conns: 10
   max_open_conns: 100
+  # 以下沒寫時用預設值，明確寫 0 代表關閉：
+  # slow_query: 500          # 毫秒；超過即記一行慢查詢日誌
+  # replicas:                # 讀取副本：db.ReadHypDB() 的查詢會輪詢它們
+  #   - dsn: ""
   redis:                   # 需要時在 main.go 加上 hidb.WithRedis(redis.New())
     addr: "localhost:6379"
     password: ""

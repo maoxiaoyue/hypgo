@@ -1,6 +1,7 @@
 package hidb
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -64,24 +65,16 @@ func TestCheckAllMarksDownAfterThresholdAndRecovers(t *testing.T) {
 		t.Error("replica with nil sqlDB should never be marked down (skipped)")
 	}
 
-	// 直接驗證門檻語義（等價於 checkAll 的失敗分支）
-	for i := 0; i < healthFailThreshold-1; i++ {
-		h.fails++
+	// 門檻與恢復的語義（真正走 checkAll 的版本見 regress2_test.go）
+	if !h.markDown(errors.New("probe failed")) || !h.down.Load() {
+		t.Error("markDown should report the transition and mark the replica down")
 	}
-	if h.fails >= healthFailThreshold {
-		t.Fatal("test setup error")
+	if h.markDown(errors.New("again")) {
+		t.Error("markDown on a replica that is already down is not a transition")
 	}
-	h.fails++
-	if h.fails >= healthFailThreshold {
-		h.down.Store(true)
+	if !h.markUp() || h.fails.Load() != 0 {
+		t.Error("markUp should report the transition and reset the failure count")
 	}
-	if !h.down.Load() {
-		t.Error("expected down after reaching fail threshold")
-	}
-
-	// 恢復語義：成功一次即歸零並解除摘除
-	h.fails = 0
-	h.down.Store(false)
 	if pool.HealthyCount() != 1 {
 		t.Errorf("HealthyCount() = %d, want 1 after recovery", pool.HealthyCount())
 	}
