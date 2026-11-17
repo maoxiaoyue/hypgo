@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,8 +17,10 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/resource"
+	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/schema"
@@ -263,7 +266,7 @@ func TestHooksAndCountingCoverEveryQuery(t *testing.T) {
 	}
 }
 
-// ReadHypDB：唯讀查詢走副本，寫入走主庫。
+// ReadHypDB：唯讀查詢走副本，寫入與 UseMaster 走主庫。
 func TestReadHandleRouting(t *testing.T) {
 	db, _ := openNodes(t, []string{"r1"})
 	ctx := context.Background()
@@ -277,8 +280,9 @@ func TestReadHandleRouting(t *testing.T) {
 		t.Errorf("select: r1 = %d, master = %d", nodes.count("r1"), nodes.count("master"))
 	}
 	read.NewInsert().Model(&r2User{ID: 1}).Exec(ctx)
-	if nodes.count("r1") != 1 || nodes.count("master") != 1 {
-		t.Errorf("write: r1 = %d, master = %d, want 1 and 1", nodes.count("r1"), nodes.count("master"))
+	selectUsers(UseMaster(ctx), read)
+	if nodes.count("r1") != 1 || nodes.count("master") != 2 {
+		t.Errorf("write + UseMaster: r1 = %d, master = %d, want 1 and 2", nodes.count("r1"), nodes.count("master"))
 	}
 
 	// 沒有副本時就是主庫
@@ -367,6 +371,199 @@ func TestOnlyConnectionErrorsEjectReplicas(t *testing.T) {
 	}
 }
 
+// 寫後讀：同一個請求寫入之後的讀取走主庫；時間內同一位使用者的下一個請求也是；其他使用者與過期後走副本。
+// 歷史 bug：寫入後立刻 ReadHypDB() 讀到副本，複寫有延遲時讀不到剛寫的資料
+func TestReadYourWrites(t *testing.T) {
+	db, _ := openNodes(t, []string{"r1"}, WithReadYourWrites(150*time.Millisecond))
+	r := router.New()
+	r.Use(db.Middleware(func(c *hypcontext.Context) string { return c.GetHeader("X-User") }))
+	r.POST("/write-then-read", func(c *hypcontext.Context) {
+		selectUsers(c, db.ReadHypDB()) // 寫入前：副本
+		db.WriteHypDB().NewInsert().Model(&r2User{ID: 1}).Exec(c)
+		selectUsers(c, db.ReadHypDB())                   // 寫入後：主庫
+		selectUsers(c.Request.Context(), db.ReadHypDB()) // 用 Request.Context() 也一樣
+	})
+	r.GET("/read", func(c *hypcontext.Context) { selectUsers(c, db.ReadHypDB()) })
+	r.GET("/read-twice", func(c *hypcontext.Context) {
+		selectUsers(c, db.ReadHypDB())
+		selectUsers(c, db.ReadHypDB())
+	})
+	call := func(method, path, user string) (master, replica int) {
+		m, rp := nodes.count("master"), nodes.count("r1")
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("X-User", user)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+		return nodes.count("master") - m, nodes.count("r1") - rp
+	}
+
+	// 讀取不算寫入：同一個請求的第二次讀取仍走副本
+	if m, rp := call("GET", "/read-twice", "carol"); m != 0 || rp != 2 {
+		t.Errorf("two reads: master = %d, replica = %d, want both on the replica", m, rp)
+	}
+	if m, rp := call("POST", "/write-then-read", "alice"); m != 3 || rp != 1 {
+		t.Errorf("write-then-read: master = %d, replica = %d, want 3 and 1", m, rp)
+	}
+	if m, rp := call("GET", "/read", "alice"); m != 1 || rp != 0 {
+		t.Errorf("alice right after her write: master = %d, replica = %d, want the master", m, rp)
+	}
+	if m, rp := call("GET", "/read", "bob"); m != 0 || rp != 1 {
+		t.Errorf("bob: master = %d, replica = %d, want the replica", m, rp)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if m, rp := call("GET", "/read", "alice"); m != 0 || rp != 1 {
+		t.Errorf("alice after the window: master = %d, replica = %d, want the replica", m, rp)
+	}
+
+	// 關閉跨請求的部分：同一個請求內仍然有效
+	off, _ := openNodes(t, []string{"r1"}, WithReadYourWrites(0))
+	r2 := router.New()
+	r2.Use(off.Middleware())
+	r2.POST("/w", func(c *hypcontext.Context) {
+		off.WriteHypDB().NewInsert().Model(&r2User{ID: 1}).Exec(c)
+		selectUsers(c, off.ReadHypDB())
+	})
+	r2.GET("/r", func(c *hypcontext.Context) { selectUsers(c, off.ReadHypDB()) })
+	r2.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/w", nil))
+	if nodes.count("master") != 2 || nodes.count("r1") != 0 {
+		t.Errorf("same request with the window off: master = %d, replica = %d", nodes.count("master"), nodes.count("r1"))
+	}
+	r2.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/r", nil))
+	if nodes.count("r1") != 1 {
+		t.Error("with the window off the next request should read from the replica")
+	}
+}
+
+// 複寫延遲超過上限的副本移出輪詢，追上後加回；量不到延遲時不摘除。
+func TestLaggingReplicaIsSkipped(t *testing.T) {
+	db, logs := openNodes(t, []string{"r1", "r2"}, WithMaxReplicaLag(time.Second))
+	nodes.set(func() { nodes.lag["r2"] = 5 * time.Second })
+	db.replicaPool.checkAll()
+	s := db.ReplicaStatus()
+	if !s[0].Healthy || s[1].Healthy || s[1].Lag != 5*time.Second || !strings.Contains(s[1].LastError, "replication lag") {
+		t.Errorf("status = %+v", s)
+	}
+	ctx := context.Background()
+	for i := 0; i < 6; i++ {
+		selectUsers(ctx, db.ReadHypDB())
+	}
+	if nodes.count("r2") != 0 || nodes.count("r1") != 6 {
+		t.Errorf("lagging replica served %d reads, healthy one %d", nodes.count("r2"), nodes.count("r1"))
+	}
+
+	nodes.set(func() { nodes.lag["r2"] = 200 * time.Millisecond })
+	db.replicaPool.checkAll()
+	if s := db.ReplicaStatus(); !s[1].Healthy || s[1].Lag != 200*time.Millisecond {
+		t.Errorf("after catching up: %+v", s)
+	}
+
+	nodes.set(func() { nodes.lagErr = errors.New("access denied; need REPLICATION CLIENT") })
+	db.replicaPool.checkAll()
+	if s := db.ReplicaStatus(); !s[0].Healthy || !s[1].Healthy {
+		t.Errorf("an unmeasurable lag must not remove replicas: %+v", s)
+	}
+	if !strings.Contains(logs.String(), "cannot measure replication lag") {
+		t.Errorf("no log about the failed measurement:\n%s", logs)
+	}
+
+	// 沒設定上限時不檢查
+	plain, _ := openNodes(t, []string{"r1"})
+	nodes.set(func() { nodes.lag["r1"] = time.Hour })
+	plain.replicaPool.checkAll()
+	if s := plain.ReplicaStatus(); !s[0].Healthy || s[0].Lag != -1 {
+		t.Errorf("without max_replica_lag: %+v", s)
+	}
+}
+
+type fakeDBError struct{ code string }
+
+func (e *fakeDBError) Error() string { return "db error " + e.code }
+
+func init() {
+	RegisterErrorClassifier(func(err error) error {
+		var fe *fakeDBError
+		if !errors.As(err, &fe) {
+			return nil
+		}
+		switch fe.code {
+		case "dup":
+			return ErrDuplicate
+		case "fk":
+			return ErrForeignKey
+		case "deadlock":
+			return ErrDeadlock
+		}
+		return nil
+	})
+}
+
+// Classify 把 driver 的錯誤對應到分類，並保留原本的錯誤
+func TestClassify(t *testing.T) {
+	dup := &fakeDBError{"dup"}
+	got := Classify(fmt.Errorf("insert user: %w", dup))
+	var fe *fakeDBError
+	if !errors.Is(got, ErrDuplicate) || !errors.As(got, &fe) || fe != dup || got.Error() != "insert user: db error dup" {
+		t.Errorf("Classify(dup) = %v", got)
+	}
+	if errors.Is(got, ErrForeignKey) || errors.Is(got, ErrNotFound) {
+		t.Error("a duplicate error matched another kind")
+	}
+	if !errors.Is(Classify(sql.ErrNoRows), ErrNotFound) || !errors.Is(Classify(sql.ErrNoRows), sql.ErrNoRows) {
+		t.Error("sql.ErrNoRows should classify as ErrNotFound and stay itself")
+	}
+	if !errors.Is(Classify(&fakeDBError{"fk"}), ErrForeignKey) || !errors.Is(Classify(&fakeDBError{"deadlock"}), ErrDeadlock) {
+		t.Error("fk / deadlock not classified")
+	}
+	other := errors.New("syntax error")
+	if Classify(other) != other || Classify(nil) != nil || Classify(got) != got {
+		t.Error("unknown, nil and already classified errors should come back unchanged")
+	}
+}
+
+// 交易遇到死結時重試（預設 1 次）；其他錯誤不重試。
+func TestTransactionRetriesDeadlocks(t *testing.T) {
+	deadlock := &fakeDBError{"deadlock"}
+	run := func(db *Database, failures int, err error) (calls int, result error) {
+		result = db.Transaction(context.Background(), func(*sql.Tx) error {
+			calls++
+			if calls <= failures {
+				return err
+			}
+			return nil
+		})
+		return calls, result
+	}
+	db, _ := openNodes(t, nil)
+	if calls, err := run(db, 1, deadlock); calls != 2 || err != nil {
+		t.Errorf("one deadlock: %d call(s), err = %v, want 2 calls and success", calls, err)
+	}
+	if calls, err := run(db, 5, deadlock); calls != 2 || !errors.Is(err, deadlock) {
+		t.Errorf("persistent deadlock: %d call(s), err = %v, want 2 calls and the error", calls, err)
+	}
+	if calls, err := run(db, 1, errors.New("constraint")); calls != 1 || err == nil {
+		t.Errorf("other error: %d call(s), err = %v, want no retry", calls, err)
+	}
+
+	bunCalls := 0
+	err := db.HypDBTransaction(context.Background(), func(context.Context, bun.Tx) error {
+		if bunCalls++; bunCalls == 1 {
+			return deadlock
+		}
+		return nil
+	})
+	if bunCalls != 2 || err != nil {
+		t.Errorf("HypDBTransaction: %d call(s), err = %v", bunCalls, err)
+	}
+
+	noRetry, _ := openNodes(t, nil, WithTxRetries(0))
+	if calls, err := run(noRetry, 1, deadlock); calls != 1 || err == nil {
+		t.Errorf("retries off: %d call(s), err = %v", calls, err)
+	}
+	three, _ := openNodes(t, nil, WithTxRetries(3))
+	if calls, err := run(three, 3, deadlock); calls != 4 || err != nil {
+		t.Errorf("three retries: %d call(s), err = %v", calls, err)
+	}
+}
+
 // 查詢結果多出 model 沒有的欄位預設忽略；strict_columns 時回錯。
 // 歷史 bug：bun 預設回錯而 hidb 不接受任何 bun 選項——先加欄位再滾動更新的期間，舊版服務的 SELECT * 全部失敗
 func TestUnknownColumnsAreIgnoredByDefault(t *testing.T) {
@@ -423,6 +620,36 @@ func TestSlowQueryLog(t *testing.T) {
 	}
 	if got := truncateSQL(strings.Repeat("x", maxLoggedSQL*2)); len(got) > maxLoggedSQL+len("…") {
 		t.Errorf("logged SQL is %d bytes", len(got))
+	}
+}
+
+// 行為設定：設定檔的 0 是沒設定（用預設值）、負數是關閉；Option 優先
+func TestSettingsResolution(t *testing.T) {
+	resolve := func(cfg *config.DatabaseConfig, opts ...Option) settings {
+		d := &Database{config: cfg}
+		for _, o := range opts {
+			o(d)
+		}
+		d.resolveSettings()
+		return d.set
+	}
+	def := resolve(&config.DatabaseConfig{})
+	if def.slowQuery != 500*time.Millisecond || def.readYourWrites != time.Second || def.txRetries != 1 ||
+		def.maxReplicaLag != 0 || def.connMaxLifetime != 30*time.Minute || def.connMaxIdleTime != 0 || def.strictColumns {
+		t.Errorf("defaults = %+v", def)
+	}
+	off := resolve(&config.DatabaseConfig{SlowQuery: -1, ReadYourWrites: -1, TxRetries: -1, ConnMaxLifetime: -1})
+	if off.slowQuery != 0 || off.readYourWrites != 0 || off.txRetries != 0 || off.connMaxLifetime != 0 {
+		t.Errorf("disabled = %+v", off)
+	}
+	custom := resolve(&config.DatabaseConfig{SlowQuery: 200, ReadYourWrites: 300, MaxReplicaLag: 2000, TxRetries: 4, ConnMaxLifetime: 60, ConnMaxIdleTime: 30})
+	if custom.slowQuery != 200*time.Millisecond || custom.readYourWrites != 300*time.Millisecond || custom.maxReplicaLag != 2*time.Second ||
+		custom.txRetries != 4 || custom.connMaxLifetime != time.Minute || custom.connMaxIdleTime != 30*time.Second {
+		t.Errorf("custom = %+v", custom)
+	}
+	over := resolve(&config.DatabaseConfig{SlowQuery: 200, TxRetries: 4}, WithSlowQuery(time.Second), WithTxRetries(0), WithMaxReplicaLag(-time.Second))
+	if over.slowQuery != time.Second || over.txRetries != 0 || over.maxReplicaLag != 0 {
+		t.Errorf("options should win: %+v", over)
 	}
 }
 

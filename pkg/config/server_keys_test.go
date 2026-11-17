@@ -85,13 +85,13 @@ func TestDatabaseOptionKeys(t *testing.T) {
 	if o := cfg.Database.GetDatabaseOptions(); err != nil || warn != "" || o != (DatabaseOptions{}) {
 		t.Errorf("absent: %+v, warn = %q, err = %v", o, warn, err)
 	}
-	cfg, warn, err = loadYAML(t, "database:\n  driver: postgres\n  dsn: x\n  slow_query: 0\n"+
-		"  conn_max_lifetime: 600\n  conn_max_idle_time: 0\n  strict_columns: true\n"+
+	cfg, warn, err = loadYAML(t, "database:\n  driver: postgres\n  dsn: x\n  slow_query: 0\n  read_your_writes: 250\n  tx_retries: 0\n"+
+		"  max_replica_lag: 2000\n  conn_max_lifetime: 600\n  conn_max_idle_time: 0\n  strict_columns: true\n"+
 		"  redis:\n    username: app\n    tls: true\n    pool_size: 20\n    dial_timeout: 2\n    read_timeout: 1\n    write_timeout: 1\n")
 	if err != nil || warn != "" {
 		t.Fatalf("warn = %q, err = %v", warn, err)
 	}
-	want := DatabaseOptions{SlowQuery: -1, ConnMaxLifetime: 600, ConnMaxIdleTime: -1, StrictColumns: true}
+	want := DatabaseOptions{SlowQuery: -1, ReadYourWrites: 250, MaxReplicaLag: 2000, TxRetries: -1, ConnMaxLifetime: 600, ConnMaxIdleTime: -1, StrictColumns: true}
 	if o := cfg.Database.GetDatabaseOptions(); o != want {
 		t.Errorf("options = %+v, want %+v", o, want)
 	}

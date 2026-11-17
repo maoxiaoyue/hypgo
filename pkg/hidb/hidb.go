@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -39,6 +40,11 @@ type Dialect interface {
 // 由 hidb/redis 子套件實現；KeyDB 兼容 Redis 協議，同樣適用。
 // 子套件只負責驅動身分與 client 建構，連線參數組裝、ping 驗證、
 // 資源追蹤 hook 由 core 的 initRedis 統一處理（對稱 initSQL）
+// DSNChecker 由方言選擇性實作：檢查 DSN 裡常見的設定疏漏，回傳要提示的訊息（不擋啟動）
+type DSNChecker interface {
+	CheckDSN(dsn string) []string
+}
+
 type RedisDriver interface {
 	Name() string                               // 驅動名稱（"redis"）
 	NewClient(opt *redis.Options) *redis.Client // 建立 client
@@ -78,9 +84,10 @@ type Database struct {
 	readDB     *bun.DB
 	bunDialect schema.Dialect
 
-	over overrides      // Option 指定的值
-	set  settings       // 解析後的行為設定
-	log  *logger.Logger // 慢查詢、副本狀態
+	over   overrides      // Option 指定的值
+	set    settings       // 解析後的行為設定
+	log    *logger.Logger // 慢查詢、副本狀態、設定提示
+	recent recentWrites   // 跨請求的寫後讀
 }
 
 // NewWithInterface 使用接口創建數據庫實例
@@ -151,6 +158,12 @@ func (d *Database) initSQL() (*Database, error) {
 		return nil, fmt.Errorf("failed to open %s: %w", d.dialect.DriverName(), err)
 	}
 
+	if checker, ok := d.dialect.(DSNChecker); ok {
+		for _, hint := range checker.CheckDSN(dsn) {
+			d.log.Warning("database DSN", "hint", hint)
+		}
+	}
+
 	d.tunePool(db, d.config.GetMaxIdleConns(), d.config.GetMaxOpenConns())
 
 	// 測試連接
@@ -211,6 +224,8 @@ func (d *Database) initReplicas() error {
 	}
 
 	d.replicaPool = NewReplicaPool()
+	d.replicaPool.maxLag = d.set.maxReplicaLag
+	d.replicaPool.prober, _ = d.dialect.(LagProber)
 	d.replicaPool.notify = func(index int, up bool, reason string) {
 		switch {
 		case up && reason != "":
@@ -220,6 +235,9 @@ func (d *Database) initReplicas() error {
 		default:
 			d.log.Warning("read replica removed from rotation", "replica", index, "err", reason)
 		}
+	}
+	if d.set.maxReplicaLag > 0 && d.replicaPool.prober == nil {
+		d.log.Warning("max_replica_lag is set but this dialect cannot measure replication lag; it is not enforced")
 	}
 
 	for i, replicaCfg := range replicas {
@@ -297,6 +315,7 @@ func (d *Database) HypDB() *bun.DB {
 
 // ReadHypDB 獲取讀取用的 HypDB ORM 實例。有讀取副本時，經由它執行的唯讀查詢輪詢健康的副本：
 //   - 副本連不上時這次查詢改用下一個副本或主庫，並立刻把該副本移出輪詢
+//   - 寫入後的讀取（同一個請求、或同一位使用者在 read_your_writes 時間內）與 UseMaster(ctx) 走主庫
 //   - 經由它執行的寫入一律走主庫
 //
 // 沒有副本時就是主庫。回傳的是同一個實例，可以保存下來重複使用
@@ -424,8 +443,21 @@ func (d *Database) Type() string {
 	return ""
 }
 
+// withRetry 執行 run；遇到死結 / 序列化失敗時重試（最多 tx_retries 次，預設 1）。
+// 這類錯誤是資料庫要求「請重做一次」，整個交易已回滾。其餘錯誤不重試
+func (d *Database) withRetry(ctx context.Context, run func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := run()
+		if err == nil || attempt >= d.set.txRetries || !errors.Is(Classify(err), ErrDeadlock) || ctx.Err() != nil {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+}
+
 // Transaction 執行事務（僅支持 SQL 數據庫，使用原始 sql.Tx）
-// 接受任何 context.Context，包括 HypGo *context.Context（因其實現 context.Context 介面）
+// 接受任何 context.Context，包括 HypGo *context.Context（因其實現 context.Context 介面）。
+// 遇到死結 / 序列化失敗時 fn 會被重新執行（見 WithTxRetries）
 func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	if d.sqlDB == nil {
 		return fmt.Errorf("no SQL database connection")
@@ -433,8 +465,12 @@ func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	resource.MarkDB() // 原始 sql.Tx 不經過查詢 hook
-	return d.runTx(ctx, fn)
+	resource.MarkDB()
+	err := d.withRetry(ctx, func() error { return d.runTx(ctx, fn) })
+	if err == nil {
+		d.markWrite(ctx) // 原始 sql.Tx 不經過查詢 hook
+	}
+	return err
 }
 
 func (d *Database) runTx(ctx context.Context, fn func(*sql.Tx) error) error {
@@ -466,7 +502,8 @@ func (d *Database) runTx(ctx context.Context, fn func(*sql.Tx) error) error {
 
 // HypDBTransaction 使用 HypDB ORM 執行事務
 // 透過 bun.Tx 提供完整的 ORM 查詢能力
-// 接受任何 context.Context，包括 HypGo *context.Context
+// 接受任何 context.Context，包括 HypGo *context.Context。
+// 遇到死結 / 序列化失敗時 fn 會被重新執行（見 WithTxRetries）
 func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context, bun.Tx) error) error {
 	if d.hypDB == nil {
 		return fmt.Errorf("no HypDB database connection")
@@ -476,7 +513,7 @@ func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context
 		ctx = context.Background()
 	}
 
-	return d.hypDB.RunInTx(ctx, nil, fn)
+	return d.withRetry(ctx, func() error { return d.hypDB.RunInTx(ctx, nil, fn) })
 }
 
 // HealthCheck 健康檢查：主庫與 Redis。讀取副本不算在內——副本掛掉時讀取會改走其他副本或主庫，

@@ -188,6 +188,9 @@ type DatabaseConfig struct {
 	// 以下為 pkg/hidb 的行為設定。沒寫時用預設值；明確寫 0 代表關閉
 	// （載入後以負數表示「關閉」、0 表示「沒設定」，見 ApplyDefaults）
 	SlowQuery       int  `yaml:"slow_query"`         // 毫秒，超過即記一行慢查詢日誌；預設 500
+	ReadYourWrites  int  `yaml:"read_your_writes"`   // 毫秒，寫入後同一使用者的讀取走主庫的時間；預設 1000
+	MaxReplicaLag   int  `yaml:"max_replica_lag"`    // 毫秒，副本複寫延遲超過即暫不使用；預設 0（不檢查）
+	TxRetries       int  `yaml:"tx_retries"`         // 交易遇到死結 / 序列化失敗時的重試次數；預設 1
 	ConnMaxLifetime int  `yaml:"conn_max_lifetime"`  // 秒，連線最長存活時間；預設 1800
 	ConnMaxIdleTime int  `yaml:"conn_max_idle_time"` // 秒，閒置連線保留時間；預設 0（不限）
 	StrictColumns   bool `yaml:"strict_columns"`     // true 時查詢結果出現 model 沒有的欄位即回錯；預設 false（忽略）
@@ -387,9 +390,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	// hidb 的行為設定：明確寫 0 代表關閉，存成 -1；沒寫維持 0，由 hidb 套用預設值
 	for key, v := range map[string]*int{
-		"database.slow_query":         &c.Database.SlowQuery,
-		"database.conn_max_lifetime":  &c.Database.ConnMaxLifetime,
-		"database.conn_max_idle_time": &c.Database.ConnMaxIdleTime,
+		"database.slow_query": &c.Database.SlowQuery, "database.read_your_writes": &c.Database.ReadYourWrites,
+		"database.max_replica_lag": &c.Database.MaxReplicaLag, "database.tx_retries": &c.Database.TxRetries,
+		"database.conn_max_lifetime": &c.Database.ConnMaxLifetime, "database.conn_max_idle_time": &c.Database.ConnMaxIdleTime,
 	} {
 		if *v <= 0 && c.explicit[key] {
 			*v = -1
@@ -725,9 +728,10 @@ func (d *DatabaseConfig) GetRedisConfig() RedisConfigInterface {
 // DatabaseOptions 為 pkg/hidb 的行為設定（見 DatabaseConfig 同名欄位）。
 // 數值欄位：0 表示沒設定（hidb 用預設值），負數表示關閉
 type DatabaseOptions struct {
-	SlowQuery                        int // 毫秒
-	ConnMaxLifetime, ConnMaxIdleTime int // 秒
-	StrictColumns                    bool
+	SlowQuery, ReadYourWrites, MaxReplicaLag int // 毫秒
+	TxRetries                                int
+	ConnMaxLifetime, ConnMaxIdleTime         int // 秒
+	StrictColumns                            bool
 }
 
 // DatabaseOptionsProvider 為 DatabaseConfigInterface 的可選擴充；未實作時 hidb 全部用預設值
@@ -738,7 +742,8 @@ type DatabaseOptionsProvider interface {
 // GetDatabaseOptions 實作 DatabaseOptionsProvider
 func (d *DatabaseConfig) GetDatabaseOptions() DatabaseOptions {
 	return DatabaseOptions{
-		SlowQuery: d.SlowQuery, ConnMaxLifetime: d.ConnMaxLifetime, ConnMaxIdleTime: d.ConnMaxIdleTime,
+		SlowQuery: d.SlowQuery, ReadYourWrites: d.ReadYourWrites, MaxReplicaLag: d.MaxReplicaLag,
+		TxRetries: d.TxRetries, ConnMaxLifetime: d.ConnMaxLifetime, ConnMaxIdleTime: d.ConnMaxIdleTime,
 		StrictColumns: d.StrictColumns,
 	}
 }

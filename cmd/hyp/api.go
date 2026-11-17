@@ -746,6 +746,9 @@ database:
   max_open_conns: 100
   # 以下沒寫時用預設值，明確寫 0 代表關閉：
   # slow_query: 500          # 毫秒；超過即記一行慢查詢日誌
+  # tx_retries: 1            # 交易遇到死結時重跑交易函式的次數
+  # read_your_writes: 1000   # 毫秒；寫入後同一位使用者的讀取走主庫（有 replicas 並掛上 db.Middleware() 時生效）
+  # max_replica_lag: 0       # 毫秒；副本落後超過即暫不使用（0 = 不檢查）
   # replicas:                # 讀取副本：db.ReadHypDB() 的查詢會輪詢它們
   #   - dsn: ""
   redis:                   # 需要時在 main.go 加上 hidb.WithRedis(redis.New())

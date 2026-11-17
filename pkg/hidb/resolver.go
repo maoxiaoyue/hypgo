@@ -13,7 +13,7 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// ---- 查詢 hook：計數、慢查詢 ----
+// ---- 查詢 hook：計數、慢查詢、寫入標記 ----
 
 // queryHook 掛在主庫與讀取用的 bun.DB 上。
 // 先前資源計數算的是「取用 ReadHypDB / WriteHypDB 的次數」：取一次跑 5 個查詢算 1 次，
@@ -22,12 +22,15 @@ type queryHook struct{ d *Database }
 
 func (queryHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context { return ctx }
 
-func (h queryHook) AfterQuery(_ context.Context, e *bun.QueryEvent) {
+func (h queryHook) AfterQuery(ctx context.Context, e *bun.QueryEvent) {
 	resource.MarkDB()
 	d := h.d
 	if took := time.Since(e.StartTime); d.set.slowQuery > 0 && took >= d.set.slowQuery {
 		d.log.Warning("slow query",
 			"ms", took.Milliseconds(), "operation", e.Operation(), "query", truncateSQL(e.Query), "err", errText(e.Err))
+	}
+	if e.Err == nil && !bun.IsReadOnlyQuery(e.IQuery) {
+		d.markWrite(ctx)
 	}
 }
 
@@ -69,12 +72,12 @@ func (d *Database) AddQueryHook(hook bun.QueryHook) {
 // ---- 讀取用連線的選擇 ----
 
 // readResolver 為 ReadHypDB 回傳的 bun.DB 選擇每個查詢要用的連線（bun.ConnResolver）：
-// 唯讀查詢輪詢健康的副本；其餘（寫入、沒有健康的副本）回 nil，bun 改用主庫
+// 唯讀查詢輪詢健康的副本；其餘（寫入、需要主庫的讀取、沒有健康的副本）回 nil，bun 改用主庫
 type readResolver struct{ d *Database }
 
-func (r readResolver) ResolveConn(_ context.Context, query bun.Query) bun.IConn {
+func (r readResolver) ResolveConn(ctx context.Context, query bun.Query) bun.IConn {
 	d := r.d
-	if d.replicaPool == nil || !bun.IsReadOnlyQuery(query) {
+	if d.replicaPool == nil || !bun.IsReadOnlyQuery(query) || d.needsMaster(ctx) {
 		return nil
 	}
 	replica := d.replicaPool.next()
