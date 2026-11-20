@@ -154,3 +154,19 @@ func TestRateLimiterKeyFuncAndSharedBudget(t *testing.T) {
 		t.Errorf("bob has his own budget: err = %v", err)
 	}
 }
+
+// TestAuthDoesNotLeakErrorText：authFn 的一般錯誤不把內容送給客戶端。
+// 先前回應的描述就是 err.Error()：驗證時查資料庫失敗，連線位址與帳號就出現在回應裡
+func TestAuthDoesNotLeakErrorText(t *testing.T) {
+	authFn := func(ctx context.Context, token string) (interface{}, error) {
+		return nil, errors.New(`pq: password authentication failed for user "app" at 10.0.3.7:5432`)
+	}
+	_, err := Auth(authFn)(withToken("x"), nil, testInfo, mockHandler)
+	st, _ := status.FromError(err)
+	if st.Code() != codes.Unauthenticated {
+		t.Errorf("code = %v, want Unauthenticated", st.Code())
+	}
+	if st.Message() != "invalid token" {
+		t.Errorf("message = %q, want a fixed message without the underlying error", st.Message())
+	}
+}

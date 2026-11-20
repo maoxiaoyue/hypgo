@@ -82,6 +82,10 @@ type Server struct {
 	forceChan chan struct{}
 	forceOnce sync.Once
 
+	// onShutdown 關閉時要執行的函式（OnShutdown 登錄；hookMu 保護）
+	hookMu     sync.Mutex
+	onShutdown []func()
+
 	// lastBusyLog 上次記錄「handler 名額用完」的時間（UnixNano），每秒至多一筆
 	lastBusyLog atomic.Int64
 }
@@ -830,6 +834,18 @@ func (s *Server) forceShutdown() {
 	s.forceOnce.Do(func() { close(s.forceChan) })
 }
 
+// OnShutdown 登錄關閉時要執行的函式，用來關掉 server 管不到的東西：WebSocket 連線升級後
+// 已脫離 HTTP server，Shutdown 不會關閉它們，要靠這裡呼叫 hub.Shutdown()。
+// 各函式在 Shutdown 一開始並行執行，Shutdown 等它們返回（最多等到 ctx 到期）
+func (s *Server) OnShutdown(fn func()) {
+	if fn == nil {
+		return
+	}
+	s.hookMu.Lock()
+	s.onShutdown = append(s.onShutdown, fn)
+	s.hookMu.Unlock()
+}
+
 // Shutdown 優雅關閉伺服器（並行處理 HTTP/1+2 和 HTTP/3）。
 // 冪等：重複呼叫不會 panic（v0.8.11 前二次呼叫會 close 已關閉的 channel），
 // 首次之後的呼叫回傳 nil。
@@ -857,6 +873,28 @@ func (s *Server) doShutdown(ctx context.Context) error {
 		}
 	}()
 
+	s.hookMu.Lock()
+	hooks := s.onShutdown
+	s.hookMu.Unlock()
+	hooksDone := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for _, fn := range hooks {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						s.logger.Errorf("panic in OnShutdown hook: %v", r)
+					}
+				}()
+				fn()
+			}()
+		}
+		wg.Wait()
+		close(hooksDone)
+	}()
+
 	// 注意：不手動 Close listener——http.Server.Shutdown 的第一步就是關閉
 	// 所有 listener；搶先手動關會讓 Serve 的 Accept 以 net.ErrClosed 收場
 	// （"use of closed network connection"），而非預期的 http.ErrServerClosed
@@ -876,6 +914,10 @@ func (s *Server) doShutdown(ctx context.Context) error {
 		if e := <-errs; e != nil && err == nil {
 			err = e
 		}
+	}
+	select {
+	case <-hooksDone:
+	case <-ctx.Done():
 	}
 	if ctx.Err() != nil {
 		s.logger.Warning("Shutdown timed out, forcing close")

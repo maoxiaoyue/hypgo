@@ -9,9 +9,11 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/grpc/interceptor"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -54,7 +56,13 @@ type Config struct {
 
 	// KeepaliveTimeout ping 後等多久沒回應即判定連線死亡（建議 20s）
 	KeepaliveTimeout time.Duration
-
+	// KeepaliveMinTime 允許客戶端送 keepalive ping 的最短間隔。
+	// grpc-go 預設 5 分鐘：客戶端設得比它頻繁（例如常見的每 10 秒）時，伺服器在幾次之後回
+	// GOAWAY too_many_pings 並關閉連線，進行中的 stream 一起中斷。應設成不大於客戶端的間隔
+	KeepaliveMinTime time.Duration
+	// KeepalivePermitWithoutStream 允許客戶端在沒有進行中的 RPC 時也送 ping
+	// （客戶端開了 PermitWithoutStream 時需要，否則同樣被當成過於頻繁）
+	KeepalivePermitWithoutStream bool
 	// InitialWindowSize 每個 stream 的初始流量窗口（bytes）。
 	// grpc-go 從 64KB 起由 BDP 探測自動放大；已知高吞吐 × 高延遲
 	// 的部署可直接給大窗口，省掉大型串流回應的爬升期
@@ -90,6 +98,8 @@ type Server struct {
 	listener     atomic.Value
 	healthServer *health.Server
 	shuttingDown atomic.Bool
+	stopped      chan struct{} // 底層 server 停止完成時關閉
+	stoppedOnce  sync.Once
 	initErr      error // New 階段的設定錯誤（如 TLS 憑證載入失敗），由 Start 回傳
 }
 
@@ -105,8 +115,9 @@ func (s *Server) getListener() net.Listener {
 // New 建立新的 gRPC Server
 func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 	s := &Server{
-		config: cfg,
-		logger: log,
+		config:  cfg,
+		logger:  log,
+		stopped: make(chan struct{}),
 	}
 
 	// 預設值
@@ -148,6 +159,12 @@ func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 			Timeout:           cfg.KeepaliveTimeout,
 		}))
 	}
+	if cfg.KeepaliveMinTime > 0 || cfg.KeepalivePermitWithoutStream {
+		serverOpts = append(serverOpts, grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             cfg.KeepaliveMinTime, // 0 = grpc-go 預設的 5 分鐘
+			PermitWithoutStream: cfg.KeepalivePermitWithoutStream,
+		}))
+	}
 	if cfg.InitialWindowSize > 0 {
 		serverOpts = append(serverOpts, grpc.InitialWindowSize(cfg.InitialWindowSize))
 	}
@@ -160,6 +177,14 @@ func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 	if cfg.MaxConcurrentStreams > 0 {
 		serverOpts = append(serverOpts, grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams))
 	}
+
+	// Recovery 預設掛在最外層（與 HTTP 的預設中間件一致）。grpc-go 不會 recover handler 的 panic：
+	// 先前沒有自己掛 interceptor.Recovery 的服務，任何一個 handler panic 整個行程就結束。
+	// 使用者再掛一次也無妨（panic 由較內層的那個處理）
+	serverOpts = append(serverOpts,
+		grpc.ChainUnaryInterceptor(interceptor.Recovery(log)),
+		grpc.ChainStreamInterceptor(interceptor.StreamRecovery(log)),
+	)
 
 	// 使用者自訂 options（interceptor 等）
 	serverOpts = append(serverOpts, opts...)
@@ -238,11 +263,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// GracefulStop 優雅關閉（等待進行中的 RPC 完成，沒有逾時；需要逾時請用 Shutdown）
+// GracefulStop 優雅關閉（等待進行中的 RPC 完成，沒有逾時；需要逾時請用 Shutdown）。
+// 已在關閉中時等它完成才返回：先前立刻返回，第二個呼叫端（含 Shutdown）會以為已經關完
 func (s *Server) GracefulStop() {
 	if s.shuttingDown.Swap(true) {
-		return // 已在關閉中
+		<-s.stopped
+		return
 	}
+	defer s.markStopped()
 
 	if s.logger != nil {
 		s.logger.Info("gRPC server shutting down gracefully...")
@@ -268,6 +296,11 @@ func (s *Server) Stop() {
 		s.healthServer.Shutdown()
 	}
 	s.grpcServer.Stop()
+	s.markStopped()
+}
+
+func (s *Server) markStopped() {
+	s.stoppedOnce.Do(func() { close(s.stopped) })
 }
 
 // IsShuttingDown 是否正在關閉
