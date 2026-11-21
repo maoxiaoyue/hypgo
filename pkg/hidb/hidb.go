@@ -3,11 +3,14 @@ package hidb
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
+	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/resource"
 	"github.com/redis/go-redis/v9"
 	"github.com/uptrace/bun"
@@ -37,6 +40,11 @@ type Dialect interface {
 // 由 hidb/redis 子套件實現；KeyDB 兼容 Redis 協議，同樣適用。
 // 子套件只負責驅動身分與 client 建構，連線參數組裝、ping 驗證、
 // 資源追蹤 hook 由 core 的 initRedis 統一處理（對稱 initSQL）
+// DSNChecker 由方言選擇性實作：檢查 DSN 裡常見的設定疏漏，回傳要提示的訊息（不擋啟動）
+type DSNChecker interface {
+	CheckDSN(dsn string) []string
+}
+
 type RedisDriver interface {
 	Name() string                               // 驅動名稱（"redis"）
 	NewClient(opt *redis.Options) *redis.Client // 建立 client
@@ -71,6 +79,15 @@ type Database struct {
 
 	// 讀寫分離
 	replicaPool *ReplicaPool // 讀取副本池
+	// readDB 為 ReadHypDB 回傳的實例：連的是主庫，另以 readResolver 把唯讀查詢分到健康的副本。
+	// 沒有副本時就是 hypDB。它與 hypDB、各副本共用 bunDialect（model 註冊表）與查詢 hook
+	readDB     *bun.DB
+	bunDialect schema.Dialect
+
+	over   overrides      // Option 指定的值
+	set    settings       // 解析後的行為設定
+	log    *logger.Logger // 慢查詢、副本狀態、設定提示
+	recent recentWrites   // 跨請求的寫後讀
 }
 
 // NewWithInterface 使用接口創建數據庫實例
@@ -86,8 +103,15 @@ func NewWithInterface(cfg config.DatabaseConfigInterface, opts ...Option) (*Data
 		opt(db)
 	}
 
+	db.resolveSettings()
+
 	driver := cfg.GetDriver()
 	if driver == "" {
+		// 給了 WithDialect / WithRedis 卻沒有 driver：先前照樣回傳沒有任何連線的實例，
+		// HypDB() 是 nil，要到第一個查詢才 nil pointer
+		if db.dialect != nil || db.redisDriver != nil {
+			return nil, fmt.Errorf("database.driver is empty but WithDialect / WithRedis was given; set database.driver (and dsn) in the config")
+		}
 		// 允許沒有數據庫配置
 		return db, nil
 	}
@@ -134,20 +158,13 @@ func (d *Database) initSQL() (*Database, error) {
 		return nil, fmt.Errorf("failed to open %s: %w", d.dialect.DriverName(), err)
 	}
 
-	// 設置連接池參數
-	maxIdleConns := d.config.GetMaxIdleConns()
-	if maxIdleConns > 0 {
-		db.SetMaxIdleConns(maxIdleConns)
+	if checker, ok := d.dialect.(DSNChecker); ok {
+		for _, hint := range checker.CheckDSN(dsn) {
+			d.log.Warning("database DSN", "hint", hint)
+		}
 	}
 
-	maxOpenConns := d.config.GetMaxOpenConns()
-	if maxOpenConns > 0 {
-		db.SetMaxOpenConns(maxOpenConns)
-	}
-
-	// GC 優化：設定連線最大存活時間，防止持有過期狀態的長連線
-	// 預設 30 分鐘，確保連線定期回收
-	db.SetConnMaxLifetime(30 * time.Minute)
+	d.tunePool(db, d.config.GetMaxIdleConns(), d.config.GetMaxOpenConns())
 
 	// 測試連接
 	if err := pingWithTimeout(db); err != nil {
@@ -156,17 +173,37 @@ func (d *Database) initSQL() (*Database, error) {
 	}
 
 	d.sqlDB = db
-	d.hypDB = bun.NewDB(db, d.dialect.BunDialect())
+	d.bunDialect = d.dialect.BunDialect() // 只建立一次，主庫與副本共用（見 initReplica）
+	d.hypDB = bun.NewDB(db, d.bunDialect, d.bunOptions()...)
+	d.hypDB.AddQueryHook(queryHook{d})
+	d.readDB = d.hypDB
 
 	// 初始化讀取副本；失敗時一併關閉主庫：NewWithInterface 只回 error，
 	// 呼叫端拿不到可 Close 的實例，先前主庫連線池就此洩漏
 	if err := d.initReplicas(); err != nil {
 		d.hypDB.Close()
-		d.hypDB, d.sqlDB = nil, nil
+		d.hypDB, d.readDB, d.sqlDB = nil, nil, nil
 		return nil, err
+	}
+	if d.replicaPool != nil {
+		d.readDB = bun.NewDB(db, d.bunDialect, append(d.bunOptions(), bun.WithConnResolver(readResolver{d}))...)
+		d.readDB.AddQueryHook(queryHook{d})
 	}
 
 	return d, nil
+}
+
+// tunePool 套用連線池設定（主庫與副本共用）
+func (d *Database) tunePool(db *sql.DB, maxIdle, maxOpen int) {
+	if maxIdle > 0 {
+		db.SetMaxIdleConns(maxIdle)
+	}
+	if maxOpen > 0 {
+		db.SetMaxOpenConns(maxOpen)
+	}
+	// 連線定期回收，不讓長連線一直留著過期的狀態（預設 30 分鐘；database.conn_max_lifetime）
+	db.SetConnMaxLifetime(d.set.connMaxLifetime)
+	db.SetConnMaxIdleTime(d.set.connMaxIdleTime)
 }
 
 // initReplicas 初始化讀取副本（在主庫初始化後調用）
@@ -187,15 +224,31 @@ func (d *Database) initReplicas() error {
 	}
 
 	d.replicaPool = NewReplicaPool()
+	d.replicaPool.maxLag = d.set.maxReplicaLag
+	d.replicaPool.prober, _ = d.dialect.(LagProber)
+	d.replicaPool.notify = func(index int, up bool, reason string) {
+		switch {
+		case up && reason != "":
+			d.log.Warning("read replica", "replica", index, "note", reason)
+		case up:
+			d.log.Info("read replica back in rotation", "replica", index)
+		default:
+			d.log.Warning("read replica removed from rotation", "replica", index, "err", reason)
+		}
+	}
+	if d.set.maxReplicaLag > 0 && d.replicaPool.prober == nil {
+		d.log.Warning("max_replica_lag is set but this dialect cannot measure replication lag; it is not enforced")
+	}
 
 	for i, replicaCfg := range replicas {
-		replica, err := initReplica(d.dialect, replicaCfg)
+		replica, err := d.initReplica(replicaCfg)
 		if err != nil {
 			// 關閉已初始化的副本
 			d.replicaPool.Close()
 			d.replicaPool = nil
 			return fmt.Errorf("failed to init read replica %d: %w", i, err)
 		}
+		replica.hypDB.AddQueryHook(queryHook{d})
 		d.replicaPool.Add(replica)
 	}
 
@@ -219,16 +272,31 @@ func (d *Database) initRedis() (*Database, error) {
 		addr = "localhost:6379"
 	}
 
-	client := d.redisDriver.NewClient(&redis.Options{
+	opt := &redis.Options{
 		Addr:     addr,
 		Password: redisConfig.GetPassword(),
 		DB:       redisConfig.GetDB(),
-	})
+	}
+	// 進階設定（ACL 使用者、TLS、連線池、逾時）：先前只有位址、密碼與 DB，
+	// 需要 TLS 或 ACL 的託管 Redis 連不上
+	if p, ok := redisConfig.(config.RedisOptionsProvider); ok {
+		o := p.GetRedisOptions()
+		opt.Username = o.Username
+		opt.PoolSize = o.PoolSize
+		opt.DialTimeout = time.Duration(o.DialTimeout) * time.Second
+		opt.ReadTimeout = time.Duration(o.ReadTimeout) * time.Second
+		opt.WriteTimeout = time.Duration(o.WriteTimeout) * time.Second
+		if o.TLS {
+			opt.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+	}
+	client := d.redisDriver.NewClient(opt)
 	// 掛上資源追蹤 hook：每條命令自動累計操作數與觸及的 key 數量
 	client.AddHook(redisResourceHook{})
 
-	// 測試連接
-	ctx := context.Background()
+	// 測試連接（有期限：先前用不帶期限的 context）
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to ping redis: %w", err)
@@ -245,10 +313,17 @@ func (d *Database) HypDB() *bun.DB {
 	return d.hypDB
 }
 
-// ReadHypDB 獲取讀取用的 HypDB ORM 實例
-// 如果有配置讀取副本，則從副本池中輪詢選擇；否則回退到主庫
+// ReadHypDB 獲取讀取用的 HypDB ORM 實例。有讀取副本時，經由它執行的唯讀查詢輪詢健康的副本：
+//   - 副本連不上時這次查詢改用下一個副本或主庫，並立刻把該副本移出輪詢
+//   - 寫入後的讀取（同一個請求、或同一位使用者在 read_your_writes 時間內）與 UseMaster(ctx) 走主庫
+//   - 經由它執行的寫入一律走主庫
+//
+// 沒有副本時就是主庫。回傳的是同一個實例，可以保存下來重複使用
 func (d *Database) ReadHypDB() *bun.DB {
-	resource.MarkDB()
+	if d.readDB != nil {
+		return d.readDB
+	}
+	// 以下為不經 NewWithInterface 建立的 Database（測試）：直接取一個副本
 	if d.replicaPool != nil {
 		if db := d.replicaPool.Next(); db != nil {
 			return db
@@ -259,7 +334,6 @@ func (d *Database) ReadHypDB() *bun.DB {
 
 // WriteHypDB 獲取寫入用的 HypDB ORM 實例（始終返回主庫）
 func (d *Database) WriteHypDB() *bun.DB {
-	resource.MarkDB()
 	return d.hypDB
 }
 
@@ -339,12 +413,21 @@ func (d *Database) Close() error {
 	return nil
 }
 
-// IsConnected 檢查數據庫是否已連接
+// ReplicaStatus 回傳每個讀取副本目前的狀態（是否在輪詢內、複寫延遲、最近的錯誤）；沒有副本時為 nil
+func (d *Database) ReplicaStatus() []ReplicaStatus {
+	if d.replicaPool == nil {
+		return nil
+	}
+	return d.replicaPool.Status()
+}
+
+// IsConnected 檢查數據庫是否已連接（最多等 connectTimeout；先前主庫不回應時永遠不返回）
 func (d *Database) IsConnected() bool {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
 
 	if d.sqlDB != nil {
-		return d.sqlDB.Ping() == nil
+		return d.sqlDB.PingContext(ctx) == nil
 	}
 	if d.redisDB != nil {
 		return d.redisDB.Ping(ctx).Err() == nil
@@ -360,17 +443,37 @@ func (d *Database) Type() string {
 	return ""
 }
 
+// withRetry 執行 run；遇到死結 / 序列化失敗時重試（最多 tx_retries 次，預設 1）。
+// 這類錯誤是資料庫要求「請重做一次」，整個交易已回滾。其餘錯誤不重試
+func (d *Database) withRetry(ctx context.Context, run func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := run()
+		if err == nil || attempt >= d.set.txRetries || !errors.Is(Classify(err), ErrDeadlock) || ctx.Err() != nil {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+}
+
 // Transaction 執行事務（僅支持 SQL 數據庫，使用原始 sql.Tx）
-// 接受任何 context.Context，包括 HypGo *context.Context（因其實現 context.Context 介面）
+// 接受任何 context.Context，包括 HypGo *context.Context（因其實現 context.Context 介面）。
+// 遇到死結 / 序列化失敗時 fn 會被重新執行（見 WithTxRetries）
 func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	if d.sqlDB == nil {
 		return fmt.Errorf("no SQL database connection")
 	}
-
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	resource.MarkDB()
+	err := d.withRetry(ctx, func() error { return d.runTx(ctx, fn) })
+	if err == nil {
+		d.markWrite(ctx) // 原始 sql.Tx 不經過查詢 hook
+	}
+	return err
+}
 
+func (d *Database) runTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := d.sqlDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -399,9 +502,9 @@ func (d *Database) Transaction(ctx context.Context, fn func(*sql.Tx) error) erro
 
 // HypDBTransaction 使用 HypDB ORM 執行事務
 // 透過 bun.Tx 提供完整的 ORM 查詢能力
-// 接受任何 context.Context，包括 HypGo *context.Context
+// 接受任何 context.Context，包括 HypGo *context.Context。
+// 遇到死結 / 序列化失敗時 fn 會被重新執行（見 WithTxRetries）
 func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context, bun.Tx) error) error {
-	resource.MarkDB()
 	if d.hypDB == nil {
 		return fmt.Errorf("no HypDB database connection")
 	}
@@ -410,10 +513,12 @@ func (d *Database) HypDBTransaction(ctx context.Context, fn func(context.Context
 		ctx = context.Background()
 	}
 
-	return d.hypDB.RunInTx(ctx, nil, fn)
+	return d.withRetry(ctx, func() error { return d.hypDB.RunInTx(ctx, nil, fn) })
 }
 
-// HealthCheck 健康檢查（主庫 + 讀取副本 + Redis）
+// HealthCheck 健康檢查：主庫與 Redis。讀取副本不算在內——副本掛掉時讀取會改走其他副本或主庫，
+// 服務仍然正常；先前一個副本不通就回錯，接到 /health 會讓編排系統把健康的實例重啟。
+// 副本的狀態見 ReplicaStatus。
 // 接受任何 context.Context，包括 HypGo *context.Context
 func (d *Database) HealthCheck(ctx context.Context) error {
 	if ctx == nil {
@@ -424,13 +529,6 @@ func (d *Database) HealthCheck(ctx context.Context) error {
 	if d.sqlDB != nil {
 		if err := d.sqlDB.PingContext(ctx); err != nil {
 			return fmt.Errorf("SQL database unhealthy: %w", err)
-		}
-	}
-
-	// 檢查讀取副本
-	if d.replicaPool != nil {
-		if replicaErrs := d.replicaPool.PingAll(ctx); len(replicaErrs) > 0 {
-			return fmt.Errorf("read replicas unhealthy: %v", replicaErrs)
 		}
 	}
 

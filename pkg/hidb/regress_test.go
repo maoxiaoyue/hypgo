@@ -88,23 +88,28 @@ func TestStartupPingTimesOut(t *testing.T) {
 	}
 }
 
-// TestHealthCheckHonorsContext 迴歸測試：HealthCheck 對副本的 ping 遵守呼叫端的 ctx 期限。
-// 歷史 bug：PingAll 用不帶 ctx 的 Ping()，卡住的副本讓 HealthCheck 超過期限
+// TestHealthCheckHonorsContext 迴歸測試：健康檢查的 ping 遵守呼叫端的 ctx 期限（主庫，以及 PingAll 的副本）。
+// 歷史 bug：PingAll 用不帶 ctx 的 Ping()，卡住的節點讓檢查超過期限
 func TestHealthCheckHonorsContext(t *testing.T) {
 	db, err := sql.Open("hidbfake", "hang")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	d := &Database{replicaPool: NewReplicaPool()}
-	d.replicaPool.Add(ReadReplica{sqlDB: db})
+	pool := NewReplicaPool()
+	pool.Add(ReadReplica{sqlDB: db})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	err = d.HealthCheck(ctx)
-	if dur := time.Since(start); err == nil || dur > time.Second {
-		t.Errorf("HealthCheck returned %v after %v, want an error within the 100ms deadline", err, dur)
+	for name, check := range map[string]func(context.Context) error{
+		"master":   (&Database{sqlDB: db}).HealthCheck,
+		"replicas": func(ctx context.Context) error { return errors.Join(pool.PingAll(ctx)...) },
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		start := time.Now()
+		err := check(ctx)
+		cancel()
+		if dur := time.Since(start); err == nil || dur > time.Second {
+			t.Errorf("%s: returned %v after %v, want an error within the 100ms deadline", name, err, dur)
+		}
 	}
 }
 

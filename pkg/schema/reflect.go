@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 )
 
@@ -16,30 +17,38 @@ type FieldInfo struct {
 	Required bool   `json:"required" yaml:"required"`
 }
 
-// TypeName 返回型別的短名稱（指標去掉，複合型別的元素也用短名稱）
-// 例如：TypeName(MyStruct{}) → "MyStruct"、TypeName([]*MyStruct{}) → "[]MyStruct"。
-// 先前複合型別回 t.String()，帶套件前綴（"[]main.MyStruct"），與 struct 的命名不一致
+// TypeName 返回型別的名稱：具名型別一律帶套件名（指標去掉），複合型別的元素亦同。
+// 例如：TypeName(models.User{}) → "models.User"、TypeName([]*models.User{}) → "[]models.User"、
+// TypeName(Page[models.User]{}) → "api.Page[models.User]"；string、int 等內建型別沒有套件名。
+//
+// 先前 struct 用不帶套件的短名稱：users.CreateReq 與 orders.CreateReq 在 manifest 都是 CreateReq，
+// types 區段只留其中一份，另一條路由的欄位是錯的。泛型的型別參數則帶完整匯入路徑
+// （"Page[github.com/x/app/models.User]"）
 func TypeName(v interface{}) string {
 	if v == nil {
 		return ""
 	}
-	return shortTypeName(reflect.TypeOf(v))
+	return typeName(reflect.TypeOf(v))
 }
 
-func shortTypeName(t reflect.Type) string {
+// importPathPrefix 比對型別字串裡的匯入路徑前綴（"github.com/x/app/"），只留最後一段套件名
+var importPathPrefix = regexp.MustCompile(`[\w.~-]+/`)
+
+func typeName(t reflect.Type) string {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	if name := t.Name(); name != "" {
-		return name
+	if t.Name() != "" {
+		// String() 為 "pkg.Name"；泛型的型別參數帶完整路徑（"pkg.Page[a/b/pkg.User]"），去掉路徑
+		return importPathPrefix.ReplaceAllString(t.String(), "")
 	}
 	switch t.Kind() {
 	case reflect.Slice:
-		return "[]" + shortTypeName(t.Elem())
+		return "[]" + typeName(t.Elem())
 	case reflect.Array:
-		return fmt.Sprintf("[%d]%s", t.Len(), shortTypeName(t.Elem()))
+		return fmt.Sprintf("[%d]%s", t.Len(), typeName(t.Elem()))
 	case reflect.Map:
-		return "map[" + shortTypeName(t.Key()) + "]" + shortTypeName(t.Elem())
+		return "map[" + typeName(t.Key()) + "]" + typeName(t.Elem())
 	}
 	return t.String()
 }
@@ -60,7 +69,7 @@ func FieldsOf(v interface{}) []FieldInfo {
 	fields := JSONFields(t)
 	out := make([]FieldInfo, len(fields))
 	for i, f := range fields {
-		typ := goTypeToSchemaType(f.Type)
+		typ := goTypeToSchemaType(f.Type, nil)
 		if _, opts, _ := strings.Cut(f.Tag.Get("json"), ","); hasTagOpt(opts, "string") && quotable(f.Type) {
 			typ = "string" // json:",string"：數字 / bool 以字串輸出
 		}
@@ -221,9 +230,18 @@ func quotable(t reflect.Type) bool {
 }
 
 // goTypeToSchemaType 將 Go 型別轉為 schema 型別字串（描述的是 JSON 形狀，不是 Go 型別）。
-// 先前只看 Kind：time.Time 寫成 object、[]byte 與 json.RawMessage 寫成 array（實際是字串 / 任意 JSON）
-func goTypeToSchemaType(t reflect.Type) string {
+// 先前只看 Kind：time.Time 寫成 object、[]byte 與 json.RawMessage 寫成 array（實際是字串 / 任意 JSON）。
+//
+// onPath 記錄展開中的具名 slice / map 型別：type Tree []Tree 的元素就是它自己，
+// 再遇到時寫名稱而不是繼續展開（v0.9.3 開發期間曾在這裡無限遞迴，啟動時 stack overflow）
+func goTypeToSchemaType(t reflect.Type, onPath map[reflect.Type]bool) string {
 	for t.Kind() == reflect.Ptr {
+		if onPath[t] {
+			return typeName(t)
+		}
+		if t.Name() != "" { // type P *P
+			onPath = withType(onPath, t)
+		}
 		t = t.Elem()
 	}
 	switch {
@@ -252,16 +270,33 @@ func goTypeToSchemaType(t reflect.Type) string {
 	// 複合型別寫出元素與具名 struct 的名稱（"[]Addr"、"map[string]integer"、"Addr"）：
 	// 先前一律是 array / object，讀 manifest 的人看不出裡面是什麼，只能回頭讀原始碼。
 	// 具名 struct 的欄位另列在 manifest 的 types 區段
-	case reflect.Slice, reflect.Array:
-		return "[]" + goTypeToSchemaType(t.Elem())
-	case reflect.Map:
-		return "map[string]" + goTypeToSchemaType(t.Elem()) // JSON object 的鍵一律是字串
+	case reflect.Slice, reflect.Array, reflect.Map:
+		if onPath[t] {
+			return typeName(t)
+		}
+		if t.Name() != "" {
+			onPath = withType(onPath, t)
+		}
+		if t.Kind() == reflect.Map {
+			return "map[string]" + goTypeToSchemaType(t.Elem(), onPath) // JSON object 的鍵一律是字串
+		}
+		return "[]" + goTypeToSchemaType(t.Elem(), onPath)
 	case reflect.Struct:
 		if t.Name() != "" {
-			return t.Name()
+			return typeName(t)
 		}
 		return "object"
 	default:
 		return t.String()
 	}
+}
+
+// withType 回傳加入 t 的新集合（不改動呼叫端的）
+func withType(set map[reflect.Type]bool, t reflect.Type) map[reflect.Type]bool {
+	out := make(map[reflect.Type]bool, len(set)+1)
+	for k := range set {
+		out[k] = true
+	}
+	out[t] = true
+	return out
 }

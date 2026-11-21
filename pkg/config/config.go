@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"gopkg.in/yaml.v3"
 )
@@ -134,6 +135,32 @@ type RedisConfig struct {
 	Addr     string `yaml:"addr"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
+
+	Username     string `yaml:"username"`      // Redis 6+ ACL 使用者
+	TLS          bool   `yaml:"tls"`           // 以 TLS 連線（雲端託管的 Redis 多半必須）
+	PoolSize     int    `yaml:"pool_size"`     // 連線池大小；0 用 go-redis 的預設（每個 CPU 10 條）
+	DialTimeout  int    `yaml:"dial_timeout"`  // 秒；0 用預設 5
+	ReadTimeout  int    `yaml:"read_timeout"`  // 秒；0 用預設 3
+	WriteTimeout int    `yaml:"write_timeout"` // 秒；0 用預設（同 read_timeout）
+}
+
+// RedisOptions 為 Redis 的進階連線設定（見 RedisConfig 同名欄位）
+type RedisOptions struct {
+	Username                               string
+	TLS                                    bool
+	PoolSize                               int
+	DialTimeout, ReadTimeout, WriteTimeout int // 秒
+}
+
+// RedisOptionsProvider 為 RedisConfigInterface 的可選擴充；未實作時用 go-redis 的預設值
+type RedisOptionsProvider interface {
+	GetRedisOptions() RedisOptions
+}
+
+// GetRedisOptions 實作 RedisOptionsProvider
+func (r *RedisConfig) GetRedisOptions() RedisOptions {
+	return RedisOptions{Username: r.Username, TLS: r.TLS, PoolSize: r.PoolSize,
+		DialTimeout: r.DialTimeout, ReadTimeout: r.ReadTimeout, WriteTimeout: r.WriteTimeout}
 }
 
 // ReplicaConfig 讀取副本配置
@@ -158,6 +185,16 @@ type DatabaseConfig struct {
 	Redis RedisConfig `yaml:"redis"`
 	// 讀取副本配置（讀寫分離）
 	Replicas []ReplicaConfig `yaml:"replicas"`
+
+	// 以下為 pkg/hidb 的行為設定。沒寫時用預設值；明確寫 0 代表關閉
+	// （載入後以負數表示「關閉」、0 表示「沒設定」，見 ApplyDefaults）
+	SlowQuery       int  `yaml:"slow_query"`         // 毫秒，超過即記一行慢查詢日誌；預設 500
+	ReadYourWrites  int  `yaml:"read_your_writes"`   // 毫秒，寫入後同一使用者的讀取走主庫的時間；預設 1000
+	MaxReplicaLag   int  `yaml:"max_replica_lag"`    // 毫秒，副本複寫延遲超過即暫不使用；預設 0（不檢查）
+	TxRetries       int  `yaml:"tx_retries"`         // 交易遇到死結 / 序列化失敗時的重試次數；預設 1
+	ConnMaxLifetime int  `yaml:"conn_max_lifetime"`  // 秒，連線最長存活時間；預設 1800
+	ConnMaxIdleTime int  `yaml:"conn_max_idle_time"` // 秒，閒置連線保留時間；預設 0（不限）
+	StrictColumns   bool `yaml:"strict_columns"`     // true 時查詢結果出現 model 沒有的欄位即回錯；預設 false（忽略）
 }
 
 // ServerConfigInterface 服務器配置接口
@@ -180,8 +217,9 @@ type DatabaseConfigInterface interface {
 }
 
 type LoggerConfig struct {
-	Level    string               `yaml:"level"` // debug, info, notice, warning, emergency
-	Output   string               `yaml:"output"`
+	Level    string               `yaml:"level"`  // debug, info, notice, warning, error, emergency
+	Output   string               `yaml:"output"` // stdout、stderr 或檔案路徑
+	Format   string               `yaml:"format"` // text（預設）或 json
 	Colors   bool                 `yaml:"colors"`
 	Rotation LoggerRotationConfig `yaml:"rotation"`
 }
@@ -352,6 +390,16 @@ func (c *Config) ApplyDefaults() {
 	if c.Database.Redis.Addr == "" {
 		c.Database.Redis.Addr = "localhost:6379"
 	}
+	// hidb 的行為設定：明確寫 0 代表關閉，存成 -1；沒寫維持 0，由 hidb 套用預設值
+	for key, v := range map[string]*int{
+		"database.slow_query": &c.Database.SlowQuery, "database.read_your_writes": &c.Database.ReadYourWrites,
+		"database.max_replica_lag": &c.Database.MaxReplicaLag, "database.tx_retries": &c.Database.TxRetries,
+		"database.conn_max_lifetime": &c.Database.ConnMaxLifetime, "database.conn_max_idle_time": &c.Database.ConnMaxIdleTime,
+	} {
+		if *v <= 0 && c.explicit[key] {
+			*v = -1
+		}
+	}
 	// 讀取副本預設值：繼承主庫的連接池參數
 	for i := range c.Database.Replicas {
 		if c.Database.Replicas[i].MaxIdleConns == 0 {
@@ -368,6 +416,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Logger.Output == "" {
 		c.Logger.Output = "stdout"
+	}
+	if c.Logger.Format == "" {
+		c.Logger.Format = "text"
 	}
 	if c.Logger.Rotation.MaxSize == "" {
 		c.Logger.Rotation.MaxSize = "100MB"
@@ -387,6 +438,12 @@ func (c *Config) normalize() {
 		c.Server.Protocol = full // pkg/server 一向接受的簡寫；先前在這裡就被驗證擋下
 	}
 	c.Logger.Level = strings.ToLower(strings.TrimSpace(c.Logger.Level))
+	c.Logger.Format = strings.ToLower(strings.TrimSpace(c.Logger.Format))
+	// 先前 output: "STDOUT" 被當成檔名，工作目錄多出一個叫 STDOUT 的日誌檔
+	c.Logger.Output = strings.TrimSpace(c.Logger.Output)
+	if lower := strings.ToLower(c.Logger.Output); lower == "stdout" || lower == "stderr" {
+		c.Logger.Output = lower
+	}
 	c.Database.Driver = canonicalDriver(c.Database.Driver)
 
 	for _, n := range []*int{
@@ -429,6 +486,9 @@ func (c *Config) Validate() error {
 	// 驗證日誌級別
 	if err := ValidateLogLevel(c.Logger.Level); err != nil {
 		return err
+	}
+	if f := c.Logger.Format; f != "" && f != "text" && f != "json" {
+		return fmt.Errorf("logger.format %q: must be text or json", f)
 	}
 
 	// 驗證數據庫驅動
@@ -544,12 +604,34 @@ var rotationSize = regexp.MustCompile(`(?i)^\s*\d+(\.\d+)?\s*(B|K|KB|M|MB|G|GB)?
 
 // validRotationAge 與 pkg/logger 的 parseAge 接受的格式一致：<n>h / <n>d / <n>w，或 time.ParseDuration 的寫法
 func validRotationAge(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "M") { // 月或分鐘無法分辨；pkg/logger 的 parseAge 也拒絕
+		return false
+	}
+	s = strings.ToLower(s)
 	if n := len(s); n > 1 && strings.ContainsRune("hdw", rune(s[n-1])) && strings.Trim(s[:n-1], "0123456789") == "" {
 		return true
 	}
 	d, err := time.ParseDuration(s)
 	return err == nil && d >= 0
+}
+
+// NewLogger 依 logger 區段建立 Logger：level、output、format、colors 與 rotation 都會生效。
+// 先前只有 hypgo.New 套用 rotation；模板以 logger.New 建立的 CLI / gRPC / desktop 專案一律是預設的輪轉設定。
+// 回傳錯誤時 Logger 仍可用（見 logger.NewWithOptions）
+func (c *Config) NewLogger() (*logger.Logger, error) {
+	return logger.NewWithOptions(logger.Options{
+		Level:  c.Logger.Level,
+		Output: c.Logger.Output,
+		Format: c.Logger.Format,
+		Colors: c.Logger.Colors,
+		Rotation: &logger.RotationConfig{
+			MaxSize:    c.Logger.Rotation.MaxSize,
+			MaxAge:     c.Logger.Rotation.MaxAge,
+			MaxBackups: c.Logger.Rotation.MaxBackups,
+			Compress:   c.Logger.Rotation.Compress,
+		},
+	})
 }
 
 // GetServerConfig 實現 ConfigInterface
@@ -677,6 +759,29 @@ func (d *DatabaseConfig) GetMaxOpenConns() int {
 // GetRedisConfig 獲取 Redis 配置
 func (d *DatabaseConfig) GetRedisConfig() RedisConfigInterface {
 	return &d.Redis
+}
+
+// DatabaseOptions 為 pkg/hidb 的行為設定（見 DatabaseConfig 同名欄位）。
+// 數值欄位：0 表示沒設定（hidb 用預設值），負數表示關閉
+type DatabaseOptions struct {
+	SlowQuery, ReadYourWrites, MaxReplicaLag int // 毫秒
+	TxRetries                                int
+	ConnMaxLifetime, ConnMaxIdleTime         int // 秒
+	StrictColumns                            bool
+}
+
+// DatabaseOptionsProvider 為 DatabaseConfigInterface 的可選擴充；未實作時 hidb 全部用預設值
+type DatabaseOptionsProvider interface {
+	GetDatabaseOptions() DatabaseOptions
+}
+
+// GetDatabaseOptions 實作 DatabaseOptionsProvider
+func (d *DatabaseConfig) GetDatabaseOptions() DatabaseOptions {
+	return DatabaseOptions{
+		SlowQuery: d.SlowQuery, ReadYourWrites: d.ReadYourWrites, MaxReplicaLag: d.MaxReplicaLag,
+		TxRetries: d.TxRetries, ConnMaxLifetime: d.ConnMaxLifetime, ConnMaxIdleTime: d.ConnMaxIdleTime,
+		StrictColumns: d.StrictColumns,
+	}
 }
 
 // GetReplicas 獲取讀取副本配置（實現 ReplicaConfigProvider 介面）

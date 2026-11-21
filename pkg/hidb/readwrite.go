@@ -20,13 +20,33 @@ const (
 	healthFailThreshold = 3               // 連續失敗 N 次後摘除
 )
 
+// LagProber 由方言選擇性實作：回報副本落後主庫多久（複寫延遲）。
+// hidb/pg 與 hidb/mysql 都有實作；設定了 database.max_replica_lag 時健康檢查會用它
+type LagProber interface {
+	ReplicaLag(ctx context.Context, db *sql.DB) (time.Duration, error)
+}
+
 // replicaHealth 單一副本的健康狀態
-// 以指標共享：ReadReplica 以值複製進 copy-on-write slice，
-// 狀態必須跨副本存活。down 用 atomic 供無鎖讀路徑判斷；
-// fails 只由健康檢查 goroutine 單執行緒讀寫，不需同步
+// 以指標共享：ReadReplica 以值複製進 copy-on-write slice，狀態必須跨副本存活。
+// 全部欄位皆為 atomic：健康檢查 goroutine 與查詢路徑（連線失敗時即時摘除）都會寫
 type replicaHealth struct {
-	down  atomic.Bool
-	fails int
+	down    atomic.Bool
+	fails   atomic.Int32
+	lagNs   atomic.Int64 // 最近一次量到的複寫延遲；-1 = 沒量過
+	lastErr atomic.Value // string：最近一次失敗或被摘除的原因
+}
+
+// markDown 把副本標成不健康並記下原因；回報這次是否由健康變成不健康
+func (h *replicaHealth) markDown(reason error) bool {
+	h.lastErr.Store(reason.Error())
+	h.fails.Store(healthFailThreshold)
+	return !h.down.Swap(true)
+}
+
+// markUp 把副本標成健康；回報這次是否由不健康變成健康
+func (h *replicaHealth) markUp() bool {
+	h.fails.Store(0)
+	return h.down.Swap(false)
 }
 
 // ReadReplica 讀取副本連接
@@ -34,14 +54,23 @@ type ReadReplica struct {
 	sqlDB  *sql.DB
 	hypDB  *bun.DB
 	health *replicaHealth
+	index  int
 }
 
-// ReplicaPool 讀取副本連接池（支持輪詢負載均衡 + 被動健康剔除）
+// ReplicaStatus 單一副本的狀態（見 Database.ReplicaStatus）
+type ReplicaStatus struct {
+	Index     int           `json:"index"`
+	Healthy   bool          `json:"healthy"`              // false = 目前不在輪詢內
+	Lag       time.Duration `json:"lag"`                  // 最近一次量到的複寫延遲；沒有檢查時為 -1
+	LastError string        `json:"last_error,omitempty"` // 最近一次失敗或被摘除的原因
+}
+
+// ReplicaPool 讀取副本連接池（支持輪詢負載均衡 + 健康剔除）
 // GC 優化：讀路徑使用 atomic.Pointer 避免 RWMutex 競爭
 // 寫操作（Add/Close）仍使用 Mutex 保護
 //
-// 健康剔除：StartHealthCheck 啟動背景探測，連續 ping 失敗達門檻的
-// 副本被標記 down，Next/NextSQL 輪詢時跳過（一次成功即恢復）。
+// 健康剔除有兩個來源：StartHealthCheck 的背景探測（連續 ping 失敗達門檻，或複寫延遲超過上限），
+// 以及查詢遇到連線層錯誤時的即時摘除。被摘除的副本在 Next/NextSQL 輪詢時跳過，探測成功即恢復。
 // 全部副本 down 時回傳 nil，呼叫端（ReadHypDB/ReadSQL）自然回退主庫。
 // 未啟動健康檢查時行為與舊版相同（全部視為健康）
 type ReplicaPool struct {
@@ -50,6 +79,12 @@ type ReplicaPool struct {
 	mu       sync.Mutex // 僅保護寫操作
 	stopOnce sync.Once
 	stopCh   chan struct{} // nil = 健康檢查未啟動
+
+	// 以下由 Database 在啟動健康檢查前設定
+	prober LagProber                               // nil = 不量延遲
+	maxLag time.Duration                           // 0 = 不檢查延遲
+	notify func(index int, up bool, reason string) // 副本被摘除 / 恢復時呼叫（寫日誌）
+	lagErr sync.Once                               // 量不到延遲的原因只記一次
 }
 
 // NewReplicaPool 創建讀取副本池
@@ -68,9 +103,11 @@ func (rp *ReplicaPool) Add(replica ReadReplica) {
 
 	if replica.health == nil {
 		replica.health = &replicaHealth{}
+		replica.health.lagNs.Store(-1)
 	}
 
 	old := rp.replicas.Load()
+	replica.index = len(*old)
 	newSlice := make([]ReadReplica, len(*old)+1)
 	copy(newSlice, *old)
 	newSlice[len(*old)] = replica
@@ -138,8 +175,10 @@ func (rp *ReplicaPool) healthLoop(stop <-chan struct{}) {
 	}
 }
 
-// checkAll 對所有副本做一輪 ping：連續失敗達門檻標記 down，一次成功即恢復。
-// 只由 healthLoop 單一 goroutine 呼叫（fails 因此不需同步）
+// checkAll 對所有副本做一輪探測：
+//   - ping 連續失敗達門檻標記 down，一次成功即恢復
+//   - 設定了 maxLag 且方言能量延遲時，延遲超過上限即標記 down（資料太舊，比連不上更難察覺），
+//     追上後恢復。量不到延遲（權限不足…）不摘除副本，原因只記一次
 func (rp *ReplicaPool) checkAll() {
 	for _, r := range *rp.replicas.Load() {
 		if r.sqlDB == nil {
@@ -147,18 +186,59 @@ func (rp *ReplicaPool) checkAll() {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), healthPingTimeout)
 		err := r.sqlDB.PingContext(ctx)
+		var lag time.Duration
+		var lagErr error
+		measured := false
+		if err == nil && rp.maxLag > 0 && rp.prober != nil {
+			lag, lagErr = rp.prober.ReplicaLag(ctx, r.sqlDB)
+			measured = lagErr == nil
+		}
 		cancel()
 
-		if err != nil {
-			r.health.fails++
-			if r.health.fails >= healthFailThreshold {
-				r.health.down.Store(true)
+		switch {
+		case err != nil:
+			r.health.lastErr.Store(err.Error())
+			if r.health.fails.Add(1) >= healthFailThreshold && r.health.markDown(err) {
+				rp.report(r.index, false, err.Error())
 			}
-		} else {
-			r.health.fails = 0
-			r.health.down.Store(false)
+		case measured && lag > rp.maxLag:
+			r.health.lagNs.Store(int64(lag))
+			reason := fmt.Errorf("replication lag %s exceeds %s", lag.Round(time.Millisecond), rp.maxLag)
+			if r.health.markDown(reason) {
+				rp.report(r.index, false, reason.Error())
+			}
+		default:
+			if measured {
+				r.health.lagNs.Store(int64(lag))
+			} else if lagErr != nil {
+				rp.lagErr.Do(func() {
+					rp.report(r.index, true, "cannot measure replication lag (max_replica_lag is not enforced): "+lagErr.Error())
+				})
+			}
+			if r.health.markUp() {
+				rp.report(r.index, true, "")
+			}
 		}
 	}
+}
+
+func (rp *ReplicaPool) report(index int, up bool, reason string) {
+	if rp.notify != nil {
+		rp.notify(index, up, reason)
+	}
+}
+
+// Status 回傳每個副本目前的狀態
+func (rp *ReplicaPool) Status() []ReplicaStatus {
+	replicas := *rp.replicas.Load()
+	out := make([]ReplicaStatus, len(replicas))
+	for i, r := range replicas {
+		out[i] = ReplicaStatus{Index: i, Healthy: !r.health.down.Load(), Lag: time.Duration(r.health.lagNs.Load())}
+		if s, _ := r.health.lastErr.Load().(string); s != "" && !out[i].Healthy {
+			out[i].LastError = s
+		}
+	}
+	return out
 }
 
 // HealthyCount 回傳目前健康（未被摘除）的副本數量
@@ -215,27 +295,28 @@ func (rp *ReplicaPool) PingAll(ctx context.Context) []error {
 	return errs
 }
 
-// initReplica 初始化單個讀取副本（使用 Dialect）
-func initReplica(dialect Dialect, replicaCfg config.ReplicaConfig) (ReadReplica, error) {
+// initReplica 初始化單個讀取副本。與主庫共用同一個 bun 方言實例與選項：
+// bun 的 model 註冊表掛在方言上，共用之後 RegisterModel 一次，所有節點都看得到
+// （先前每個副本各有一個方言實例，m2m 關聯的查詢走副本時 panic）
+func (d *Database) initReplica(replicaCfg config.ReplicaConfig) (ReadReplica, error) {
 	if replicaCfg.DSN == "" {
 		return ReadReplica{}, fmt.Errorf("replica DSN is required")
 	}
 
-	db, err := sql.Open(dialect.DriverName(), replicaCfg.DSN)
+	db, err := sql.Open(d.dialect.DriverName(), replicaCfg.DSN)
 	if err != nil {
 		return ReadReplica{}, fmt.Errorf("failed to open read replica: %w", err)
 	}
 
-	// 設置連接池參數
-	if replicaCfg.MaxIdleConns > 0 {
-		db.SetMaxIdleConns(replicaCfg.MaxIdleConns)
+	// 連接池參數：沒設定時沿用主庫的（先前程式內建構的設定下，副本的連線數沒有上限）
+	maxIdle, maxOpen := replicaCfg.MaxIdleConns, replicaCfg.MaxOpenConns
+	if maxIdle <= 0 {
+		maxIdle = d.config.GetMaxIdleConns()
 	}
-	if replicaCfg.MaxOpenConns > 0 {
-		db.SetMaxOpenConns(replicaCfg.MaxOpenConns)
+	if maxOpen <= 0 {
+		maxOpen = d.config.GetMaxOpenConns()
 	}
-
-	// GC 優化：Replica 也設定 ConnMaxLifetime，防止長連線持有過期狀態
-	db.SetConnMaxLifetime(30 * time.Minute)
+	d.tunePool(db, maxIdle, maxOpen)
 
 	// 測試連接
 	if err := pingWithTimeout(db); err != nil {
@@ -243,11 +324,8 @@ func initReplica(dialect Dialect, replicaCfg config.ReplicaConfig) (ReadReplica,
 		return ReadReplica{}, fmt.Errorf("failed to ping read replica: %w", err)
 	}
 
-	// 創建 HypDB ORM 實例
-	hypDB := bun.NewDB(db, dialect.BunDialect())
-
 	return ReadReplica{
 		sqlDB: db,
-		hypDB: hypDB,
+		hypDB: bun.NewDB(db, d.bunDialect, d.bunOptions()...),
 	}, nil
 }

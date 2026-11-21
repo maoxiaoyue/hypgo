@@ -39,19 +39,11 @@ func TestAggregate(t *testing.T) {
 		{Name: "a", Score: 1.0},
 		{Name: "b", Score: 0.5},
 	}
-	if got := Aggregate(results, nil); math.Abs(got-0.75) > 1e-9 {
-		t.Errorf("equal weights: got %v, want 0.75", got)
+	if got := Aggregate(results); math.Abs(got-0.75) > 1e-9 {
+		t.Errorf("average: got %v, want 0.75", got)
 	}
-	// a 權重 3、b 權重 1 → (3.0+0.5)/4 = 0.875
-	if got := Aggregate(results, map[string]float64{"a": 3}); math.Abs(got-0.875) > 1e-9 {
-		t.Errorf("weighted: got %v, want 0.875", got)
-	}
-	if got := Aggregate(nil, nil); got != 0 {
+	if got := Aggregate(nil); got != 0 {
 		t.Errorf("empty: got %v, want 0", got)
-	}
-	// 權重 0 的評判器不計入
-	if got := Aggregate(results, map[string]float64{"b": 0}); got != 1.0 {
-		t.Errorf("zero weight excluded: got %v, want 1.0", got)
 	}
 }
 

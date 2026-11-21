@@ -130,3 +130,45 @@ func TestWithLogger(t *testing.T) {
 		t.Error("WithLogger was not applied")
 	}
 }
+
+// 先前 output: "STDOUT" 被當成檔名（工作目錄多出一個日誌檔）；logger.format 讓 JSON 輸出可由設定檔開啟，
+// WithJSONLogs 優先
+func TestLoggerFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	write := func(logger string) string {
+		p := filepath.Join(dir, "c.yaml")
+		if err := os.WriteFile(p, []byte("server:\n  addr: \"127.0.0.1:0\"\nlogger:\n"+logger), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	app, err := NewWithConfig(write("  output: \"STDOUT\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Logger().Close()
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("output STDOUT created a file: %v", entries)
+	}
+
+	for name, c := range map[string]struct {
+		yaml string
+		opts []Option
+		json bool
+	}{
+		"text by default":   {"  output: text.log\n", nil, false},
+		"format json":       {"  output: json.log\n  format: json\n", nil, true},
+		"WithJSONLogs wins": {"  output: opt.log\n  format: text\n", []Option{WithJSONLogs()}, true},
+	} {
+		app := New(append([]Option{WithConfigPath(write(c.yaml))}, c.opts...)...)
+		app.Logger().Info("hello")
+		app.Logger().Close()
+		file := strings.TrimSpace(strings.TrimPrefix(strings.SplitN(c.yaml, "\n", 2)[0], "  output:"))
+		data, _ := os.ReadFile(filepath.Join(dir, file))
+		if got := strings.HasPrefix(string(data), `{"time":`); got != c.json || !strings.Contains(string(data), "hello") {
+			t.Errorf("%s: json=%v, content=%q", name, got, data)
+		}
+	}
+}

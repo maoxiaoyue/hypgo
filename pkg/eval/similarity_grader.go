@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 )
@@ -43,7 +45,11 @@ func (g SimilarityGrader) Grade(ctx context.Context, s Sample) (GraderResult, er
 		return GraderResult{}, fmt.Errorf("eval: SimilarityGrader.Golden is empty")
 	}
 
-	goldenVec, err := embedText(ctx, g.Config, g.Client, g.EmbeddingModel, g.Golden)
+	// 空的回應沒有內容可比：直接 0 分（先前照樣送出 {"input": ""}，得到的是 API 錯誤而不是分數）
+	if strings.TrimSpace(s.Output) == "" {
+		return GraderResult{Name: g.Name(), Score: 0, Reason: "empty response"}, nil
+	}
+	goldenVec, err := g.goldenEmbedding(ctx)
 	if err != nil {
 		return GraderResult{}, err
 	}
@@ -62,6 +68,27 @@ func (g SimilarityGrader) Grade(ctx context.Context, s Sample) (GraderResult, er
 		Score:  clampScore(cos),
 		Reason: fmt.Sprintf("cosine similarity to golden: %.4f", cos),
 	}, nil
+}
+
+// goldenCache 快取 Golden 的 embedding（同一個行程內）：它每次都一樣，
+// 先前每次評分都重新請求一次，一個測試兩個請求
+var goldenCache sync.Map // 連線設定 + 模型 + Golden → []float64
+
+// goldenEmbedding 回傳 Golden 的 embedding；注入了 Client（測試）時不快取
+func (g SimilarityGrader) goldenEmbedding(ctx context.Context) ([]float64, error) {
+	if g.Client != nil || g.Config == nil {
+		return embedText(ctx, g.Config, g.Client, g.EmbeddingModel, g.Golden)
+	}
+	key := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s", g.Config.Mode, g.Config.Ollama.URL, g.Config.Ollama.Model,
+		g.Config.API.BaseURL, g.Config.API.Model, g.EmbeddingModel, g.Golden)
+	if v, ok := goldenCache.Load(key); ok {
+		return v.([]float64), nil
+	}
+	vec, err := embedText(ctx, g.Config, g.Client, g.EmbeddingModel, g.Golden)
+	if err == nil {
+		goldenCache.Store(key, vec)
+	}
+	return vec, err
 }
 
 // cosineSimilarity 兩向量的餘弦相似度（-1～1）

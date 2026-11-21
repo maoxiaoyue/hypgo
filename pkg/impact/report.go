@@ -30,6 +30,7 @@ func FormatReport(report *ImpactReport) string {
 
 	if !report.IsTestFile {
 		writeAPI(&sb, report.API)
+		writeSamePackage(&sb, report.SamePackage)
 		writeDependents(&sb, report)
 		writeRoutes(&sb, report)
 	}
@@ -94,6 +95,22 @@ func writeAPI(sb *strings.Builder, api []SymbolUsage) {
 	sb.WriteString("\n")
 }
 
+// writeSamePackage 列出同套件內用到這個檔案的其他檔案
+func writeSamePackage(sb *strings.Builder, uses []FileUse) {
+	if len(uses) == 0 {
+		return
+	}
+	fmt.Fprintf(sb, "Used by other files in this package (%d):\n", len(uses))
+	for i, u := range uses {
+		if i == reportListLimit {
+			fmt.Fprintf(sb, "  ... and %d more\n", len(uses)-i)
+			break
+		}
+		fmt.Fprintf(sb, "  → %s  uses: %s\n", u.File, limitList(u.Uses, 6))
+	}
+	sb.WriteString("\n")
+}
+
 func writeDependents(sb *strings.Builder, report *ImpactReport) {
 	if len(report.Dependents) == 0 {
 		sb.WriteString("Direct dependents: none\n\n")
@@ -122,7 +139,11 @@ func writeDependents(sb *strings.Builder, report *ImpactReport) {
 				fmt.Fprintf(sb, "  ... and %d more\n", len(report.Transitive)-i)
 				break
 			}
-			fmt.Fprintf(sb, "  → %s (via %s)\n", dep.Path, dep.Via)
+			if dep.TestsImport {
+				fmt.Fprintf(sb, "  → %s (via %s; its tests also import this package directly)\n", dep.Path, dep.Via)
+			} else {
+				fmt.Fprintf(sb, "  → %s (via %s)\n", dep.Path, dep.Via)
+			}
 		}
 		sb.WriteString("\n")
 	}
@@ -144,7 +165,7 @@ func writeRoutes(sb *strings.Builder, report *ImpactReport) {
 			fmt.Fprintf(sb, "  ... and %d more\n", len(report.Routes)-i)
 			break
 		}
-		if route.Direct {
+		if route.Direct || strings.HasPrefix(route.Reason, "possibly") {
 			fmt.Fprintf(sb, "  → %s  (%s)\n", route.Route, route.Reason)
 		} else {
 			fmt.Fprintf(sb, "  → %s\n", route.Route)

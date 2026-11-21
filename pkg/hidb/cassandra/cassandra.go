@@ -65,8 +65,8 @@ type Config struct {
 	// 注意：此欄位不從 YAML 解析，僅供程式碼直接設定。
 	QueryObserver gocql.QueryObserver `mapstructure:"-" yaml:"-"`
 
-	// StrictConsistency=true 時，Consistency 字串無法解析會直接回 error。
-	// 預設 false → 無法解析時 fallback 為 LocalOne（並非 Quorum，更利於單節點 dev）。
+	// Deprecated: 無法解析的 Consistency 現在一律回 error，此欄位不再有作用。
+	// 先前預設靜默退回 LocalOne："qourum" 這類打錯字得到的一致性比預期弱，而且沒有任何提示
 	StrictConsistency bool `mapstructure:"strict_consistency" yaml:"strict_consistency"`
 }
 
@@ -139,10 +139,7 @@ func (c *CassandraDB) init() error {
 	// Consistency — 嚴格模式下拼錯直接 error，非嚴格 fallback 至 LocalOne
 	cl, err := parseConsistencyStrict(c.config.Consistency)
 	if err != nil {
-		if c.config.StrictConsistency {
-			return err
-		}
-		cl = gocql.LocalOne
+		return err
 	}
 	cluster.Consistency = cl
 

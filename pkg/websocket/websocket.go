@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -93,6 +94,16 @@ type Config struct {
 	// join_room / leave_room 為房間 ID；broadcast 會送給全部連線。
 	// nil 表示全部允許——任何已連線的客戶端都能廣播、發布到任何頻道、加入任何房間
 	Authorize func(client *Client, msg *Message) bool
+
+	// MaxSubscriptions 每條連線經由客戶端訊息（subscribe / join_room）能持有的頻道加房間數
+	// （預設 100，負數不限）；超過的請求被拒絕並回一則 type 為 "error" 的訊息。
+	// 伺服器端直接呼叫 Client.Subscribe / JoinRoom 不受限。
+	// 先前沒有上限：一條連線 2 秒內訂閱 20 萬個頻道，佔掉約 90MB
+	MaxSubscriptions int
+
+	// MaxInvalidMessages 連續這麼多則無法解密、驗證或解析的訊息後，以 1008 關閉連線
+	// （預設 10，負數不限）。先前照單全收，每則記一行警告
+	MaxInvalidMessages int
 }
 
 // DefaultConfig 預設配置
@@ -117,11 +128,18 @@ func (c Config) withDefaults() Config {
 	if c.MaxMessageSize <= 0 {
 		c.MaxMessageSize = DefaultConfig.MaxMessageSize
 	}
-	if c.PingInterval <= 0 {
-		c.PingInterval = DefaultConfig.PingInterval
-	}
 	if c.PongTimeout <= 0 {
 		c.PongTimeout = DefaultConfig.PongTimeout
+	}
+	if c.PingInterval <= 0 {
+		// 只設了較短的 PongTimeout 時，ping 要趕在它之前送出
+		c.PingInterval = min(DefaultConfig.PingInterval, c.PongTimeout*9/10)
+	}
+	if c.MaxSubscriptions == 0 {
+		c.MaxSubscriptions = 100
+	}
+	if c.MaxInvalidMessages == 0 {
+		c.MaxInvalidMessages = 10
 	}
 	if c.WriteTimeout <= 0 {
 		c.WriteTimeout = DefaultConfig.WriteTimeout
@@ -243,6 +261,10 @@ type Client struct {
 	aead    cipher.AEAD
 	hmacKey []byte
 
+	// replay 重放保護的狀態（SecurityConfig.ReplayProtection；nil = 未開啟）。
+	// 開啟時出站訊息以明文進入 Send，由 writePump 依寫入順序編號並加密
+	replay *replayState
+
 	done      chan struct{} // 斷線、被同 ID 新連線取代或 Hub 關閉時關閉
 	closeOnce sync.Once
 	gone      bool // 已完成注銷（Hub.mu 保護）
@@ -262,6 +284,9 @@ func newClient(id string, conn *websocket.Conn, hub *Hub, codec Codec) *Client {
 		done:        make(chan struct{}),
 	}
 	c.lastActivity.Store(time.Now().UnixNano())
+	if hub != nil && hub.security != nil && hub.security.ReplayProtection {
+		c.replay = newReplayState()
+	}
 	return c
 }
 
@@ -305,6 +330,10 @@ func (c *Client) trySend(data []byte) bool {
 	case c.Send <- data:
 		return true
 	default:
+		// 佇列滿：這則訊息不會送到這條連線。先前沒有任何紀錄
+		if c.Hub != nil {
+			c.Hub.stats.MessagesDropped.Add(1)
+		}
 		return false
 	}
 }
@@ -375,6 +404,7 @@ type Hub struct {
 		MessagesReceived  atomic.Int64
 		BytesSent         atomic.Int64
 		BytesReceived     atomic.Int64
+		MessagesDropped   atomic.Int64 // 因連線的出站佇列已滿而丟掉的訊息
 	}
 
 	// 回調函數
@@ -383,13 +413,26 @@ type Hub struct {
 	onMessage    func(*Client, *Message)
 }
 
-// NewHub 創建新的 Hub。Security.AESKey 不是 32 bytes 時 panic（設定錯誤應在啟動時發現）
+// NewHub 創建新的 Hub。設定錯誤時 panic（應在啟動時發現）：Security.AESKey 不是 32 bytes、
+// PingInterval 不小於 PongTimeout、開了 ReplayProtection 卻沒有金鑰
 func NewHub(logger *logger.Logger, config Config) *Hub {
 	config = config.withDefaults()
+	if config.PingInterval >= config.PongTimeout {
+		// 先前照常啟動：ping 還沒送出讀取就逾時，正常的閒置連線每隔 PongTimeout 被斷一次
+		panic(fmt.Sprintf("websocket: PingInterval (%s) must be shorter than PongTimeout (%s)",
+			config.PingInterval, config.PongTimeout))
+	}
 	if config.Security != nil {
 		if _, err := config.Security.cipher(); err != nil {
 			panic(fmt.Sprintf("websocket: SecurityConfig.AESKey: %v", err))
 		}
+		if config.Security.ReplayProtection && len(config.Security.AESKey) == 0 && len(config.Security.HMACKey) == 0 {
+			panic("websocket: SecurityConfig.ReplayProtection needs AESKey or HMACKey")
+		}
+	}
+	if config.Authorize == nil && logger != nil {
+		logger.Warning("websocket: Config.Authorize is not set: any connected client can broadcast to everyone, " +
+			"publish to any channel, and subscribe to any channel or room")
 	}
 	return &Hub{
 		clients:   make(map[string]*Client),
@@ -646,9 +689,35 @@ func (c *Client) readPump() {
 	if hub.onConnect != nil {
 		hub.onConnect(c)
 	}
-
+	// closeWith 送出 close frame 後結束（WriteControl 可與 writePump 並行）
+	closeWith := func(code int, reason string) {
+		c.Conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
+	}
+	limit := hub.config.MaxMessageSize
+	invalid := 0
+	// rejected 記一則無效訊息；連續太多則時關閉連線並回傳 true
+	rejected := func() bool {
+		invalid++
+		if max := hub.config.MaxInvalidMessages; max > 0 && invalid >= max {
+			hub.logger.Warningf("Closing client %s: %d consecutive invalid messages", c.ID, invalid)
+			closeWith(websocket.ClosePolicyViolation, "too many invalid messages")
+			return true
+		}
+		return false
+	}
 	for {
-		_, data, err := c.Conn.ReadMessage()
+		_, r, err := c.Conn.NextReader()
+		var data []byte
+		if err == nil {
+			// SetReadLimit 算的是線上（壓縮後）的位元組：協商了 permessage-deflate 的客戶端送
+			// 幾百 KB 就能解壓成幾百 MB。先前以 ReadMessage 全部讀進記憶體，這裡在解壓後再限一次
+			data, err = io.ReadAll(io.LimitReader(r, limit+1))
+			if err == nil && int64(len(data)) > limit {
+				hub.logger.Warningf("Closing client %s: message larger than MaxMessageSize (%d bytes)", c.ID, limit)
+				closeWith(websocket.CloseMessageTooBig, "message too big")
+				return
+			}
+		}
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				hub.logger.Warningf("WebSocket error for client %s: %v", c.ID, err)
@@ -666,6 +735,9 @@ func (c *Client) readPump() {
 			data, secErr = applySecurityIn(data, c, hub.security)
 			if secErr != nil {
 				hub.logger.Warningf("Security verification failed for client %s: %v", c.ID, secErr)
+				if rejected() {
+					return
+				}
 				continue
 			}
 		}
@@ -674,13 +746,20 @@ func (c *Client) readPump() {
 		if err := c.codec.Unmarshal(data, msg); err != nil {
 			hub.logger.Warningf("Invalid message format from client %s: %v", c.ID, err)
 			msg.Release()
+			if rejected() {
+				return
+			}
 			continue
 		}
 		if !withinSkew(hub.security, msg.Timestamp) {
 			hub.logger.Warningf("Message from client %s rejected: timestamp outside MaxClockSkew", c.ID)
 			msg.Release()
+			if rejected() {
+				return
+			}
 			continue
 		}
+		invalid = 0
 
 		msg.ClientID = c.ID
 		c.resolveTarget(msg)
@@ -708,21 +787,54 @@ func (c *Client) writePump(config Config) {
 		c.Conn.Close()
 	}()
 
+	var sec *SecurityConfig
+	if c.Hub != nil {
+		sec = c.Hub.security
+	}
+	// write 送出一則訊息。經過簽名或加密的內容不是合法的 UTF-8，一律用 binary frame：
+	// 先前 JSON codec 仍用 text frame，瀏覽器收到非 UTF-8 的 text frame 會直接關閉連線
+	write := func(message []byte) error {
+		frameType := c.wsFrameType
+		if sec != nil {
+			gcm, hmacKey, _, err := clientKeys(c, sec)
+			if err != nil {
+				return err
+			}
+			if gcm != nil || hmacKey != nil {
+				frameType = websocket.BinaryMessage
+			}
+			if c.replay != nil {
+				message = c.replay.sealOut(message, gcm, hmacKey, sec.SignThenEncrypt)
+			}
+		}
+		c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
+		return c.Conn.WriteMessage(frameType, message)
+	}
+	if c.replay != nil {
+		// hello：把這條連線的 session 告訴客戶端（一律用 Hub 的金鑰）
+		gcm, _ := sec.cipher()
+		var hmacKey []byte
+		if len(sec.HMACKey) > 0 {
+			hmacKey = sec.HMACKey
+		}
+		c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
+		if err := c.Conn.WriteMessage(websocket.BinaryMessage, c.replay.hello(gcm, hmacKey, sec.SignThenEncrypt)); err != nil {
+			return
+		}
+	}
 	for {
 		select {
 		case <-c.done:
 			c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
 			c.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			return
-
 		case message := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(config.WriteTimeout))
-			if err := c.Conn.WriteMessage(c.wsFrameType, message); err != nil {
+			if err := write(message); err != nil {
 				return
 			}
 			// 批量發送佇列中已有的訊息（只有本 goroutine 讀取 Send，長度不會縮減）
 			for n := len(c.Send); n > 0; n-- {
-				if err := c.Conn.WriteMessage(c.wsFrameType, <-c.Send); err != nil {
+				if err := write(<-c.Send); err != nil {
 					return
 				}
 			}
@@ -780,7 +892,7 @@ func (c *Client) resolveTarget(msg *Message) {
 func (c *Client) handleMessage(msg *Message) {
 	switch msg.Type {
 	case "subscribe":
-		if msg.Channel != "" {
+		if msg.Channel != "" && c.allowSubscription(msg, false) {
 			c.Subscribe(msg.Channel)
 		}
 
@@ -796,7 +908,7 @@ func (c *Client) handleMessage(msg *Message) {
 		c.Hub.BroadcastMessage(msg)
 
 	case "join_room":
-		if msg.Channel != "" {
+		if msg.Channel != "" && c.allowSubscription(msg, true) {
 			c.JoinRoom(msg.Channel)
 		}
 
@@ -805,6 +917,33 @@ func (c *Client) handleMessage(msg *Message) {
 			c.LeaveRoom(msg.Channel)
 		}
 	}
+}
+
+// allowSubscription 檢查客戶端要求的訂閱 / 加入房間是否仍在 MaxSubscriptions 內；
+// 超過時回一則 type 為 "error" 的訊息（channel 為被拒絕的目標）並回傳 false
+func (c *Client) allowSubscription(msg *Message, room bool) bool {
+	max := c.Hub.config.MaxSubscriptions
+	if max <= 0 {
+		return true
+	}
+	c.mu.RLock()
+	have := c.Channels[msg.Channel]
+	if room {
+		have = c.rooms[msg.Channel]
+	}
+	n := len(c.Channels) + len(c.rooms)
+	c.mu.RUnlock()
+	if have || n < max {
+		return true
+	}
+	c.Hub.logger.Debugf("Client %s reached MaxSubscriptions (%d)", c.ID, max)
+	c.Hub.SendToClient(c.ID, &Message{
+		Type:      "error",
+		Channel:   msg.Channel,
+		Data:      json.RawMessage(`"subscription limit reached"`),
+		Timestamp: time.Now().UnixNano(),
+	})
+	return false
 }
 
 // ===== 頻道管理 =====
@@ -964,8 +1103,13 @@ func (c *Client) LeaveRoom(roomID string) {
 
 // ===== Hub 便利方法 =====
 
-// enqueueBroadcast 送進廣播佇列；Hub 已關閉時丟棄（先前永久阻塞）
+// enqueueBroadcast 送進廣播佇列；Hub 尚未 Run 或已關閉時丟棄。
+// 先前 Run 之前的廣播在佇列（256）滿了之後永久阻塞，而那時不可能有任何連線
 func (h *Hub) enqueueBroadcast(msg *Message) {
+	if !h.started.Load() {
+		msg.Release()
+		return
+	}
 	select {
 	case h.broadcast <- msg:
 	case <-h.done:
@@ -1055,8 +1199,8 @@ func (h *Hub) SendToClient(clientID string, data interface{}) error {
 		return err
 	}
 
-	// 安全管線：簽名 + 加密
-	if h.security != nil {
+	// 安全管線：簽名 + 加密（重放保護的連線在 writePump 依序號加密）
+	if h.security != nil && client.replay == nil {
 		msgBytes, err = applySecurityOut(msgBytes, client, h.security)
 		if err != nil {
 			return fmt.Errorf("security pipeline failed: %w", err)
@@ -1092,6 +1236,7 @@ func (h *Hub) GetStats() map[string]interface{} {
 		"messages_received":  h.stats.MessagesReceived.Load(),
 		"bytes_sent":         h.stats.BytesSent.Load(),
 		"bytes_received":     h.stats.BytesReceived.Load(),
+		"messages_dropped":   h.stats.MessagesDropped.Load(),
 		"total_clients":      len(h.clients),
 		"total_channels":     len(h.channels),
 		"total_rooms":        len(h.rooms),

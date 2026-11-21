@@ -2,10 +2,37 @@
 package mysql
 
 import (
-	_ "github.com/go-sql-driver/mysql"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	driver "github.com/go-sql-driver/mysql"
+	"github.com/maoxiaoyue/hypgo/pkg/hidb"
 	"github.com/uptrace/bun/dialect/mysqldialect"
 	"github.com/uptrace/bun/schema"
 )
+
+func init() { hidb.RegisterErrorClassifier(classify) }
+
+// classify 把 MySQL 的錯誤碼對應到 hidb 的錯誤分類
+func classify(err error) error {
+	var me *driver.MySQLError
+	if !errors.As(err, &me) {
+		return nil
+	}
+	switch me.Number {
+	case 1062: // ER_DUP_ENTRY
+		return hidb.ErrDuplicate
+	case 1451, 1452: // ER_ROW_IS_REFERENCED_2 / ER_NO_REFERENCED_ROW_2
+		return hidb.ErrForeignKey
+	case 1213: // ER_LOCK_DEADLOCK
+		return hidb.ErrDeadlock
+	}
+	return nil
+}
 
 // Dialect MySQL/TiDB 方言實現
 // TiDB 兼容 MySQL 協議，使用者同樣用 mysql.New()
@@ -24,4 +51,56 @@ func (d *Dialect) DriverName() string {
 // BunDialect 返回 bun ORM 使用的方言實例
 func (d *Dialect) BunDialect() schema.Dialect {
 	return mysqldialect.New()
+}
+
+// CheckDSN 實作 hidb.DSNChecker：沒有 parseTime=true 時 DATETIME / TIMESTAMP 欄位以 []byte 回傳，
+// 掃進 time.Time 會失敗——要到第一個含時間欄位的查詢才發現
+func (d *Dialect) CheckDSN(dsn string) []string {
+	cfg, err := driver.ParseDSN(dsn)
+	if err != nil || cfg.ParseTime {
+		return nil
+	}
+	return []string{"parseTime=true is not set: DATETIME / TIMESTAMP columns cannot be scanned into time.Time (add ?parseTime=true to the DSN)"}
+}
+
+// ReplicaLag 實作 hidb.LagProber：讀 SHOW REPLICA STATUS 的 Seconds_Behind_Source
+// （MySQL 8.0.22 前為 SHOW SLAVE STATUS / Seconds_Behind_Master）。帳號需要 REPLICATION CLIENT 權限。
+// 不是副本（沒有任何列）時為 0；複寫停止（值為 NULL）時回錯
+func (d *Dialect) ReplicaLag(ctx context.Context, db *sql.DB) (time.Duration, error) {
+	rows, err := db.QueryContext(ctx, "SHOW REPLICA STATUS")
+	if err != nil {
+		if rows, err = db.QueryContext(ctx, "SHOW SLAVE STATUS"); err != nil {
+			return 0, err
+		}
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return 0, err
+	}
+	if !rows.Next() {
+		return 0, rows.Err()
+	}
+	values := make([]sql.RawBytes, len(cols))
+	dest := make([]interface{}, len(cols))
+	for i := range values {
+		dest[i] = &values[i]
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return 0, err
+	}
+	for i, col := range cols {
+		if strings.EqualFold(col, "Seconds_Behind_Source") || strings.EqualFold(col, "Seconds_Behind_Master") {
+			if values[i] == nil {
+				return 0, fmt.Errorf("replication is not running (%s is NULL)", col)
+			}
+			var seconds int64
+			if _, err := fmt.Sscan(string(values[i]), &seconds); err != nil {
+				return 0, fmt.Errorf("%s = %q: %w", col, values[i], err)
+			}
+			return time.Duration(seconds) * time.Second, nil
+		}
+	}
+	return 0, fmt.Errorf("SHOW REPLICA STATUS has no Seconds_Behind_Source column")
 }

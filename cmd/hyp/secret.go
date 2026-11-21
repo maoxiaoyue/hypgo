@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
@@ -37,11 +39,25 @@ Examples:
   hyp secret init                  # create crypt.yaml and generate the key
   hyp secret set db_pass           # value is read from the terminal or stdin
   hyp secret list
-  hyp secret rotate --new-key-file new.key`,
-	RunE: requireSubcommand,
+  hyp secret rotate --new-key-file new.key
+  hyp secret --restore             # write the plaintext back into config/*.yaml
+
+The key file (.hyp/secret.key, or .hyp/secret.age) must never be committed:
+hyp secret init adds it to .gitignore, and every hyp secret command refuses to
+run while git tracks it.`,
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if restore, _ := cmd.Flags().GetBool("restore"); restore && len(args) == 0 {
+			return runSecretRestore(cmd)
+		}
+		return requireSubcommand(cmd, args)
+	},
 }
 
 func init() {
+	secretCmd.Flags().Bool("restore", false, "Replace every ${secret:name} in the config files with its decrypted value")
+	secretCmd.Flags().String("file", "", "With --restore: the one file to rewrite (default: every .yaml / .yml under config/)")
+
 	secretInit := &cobra.Command{
 		Use:          "init",
 		Short:        "Create .hyp/crypt.yaml if missing and generate the key for its method",
@@ -110,13 +126,76 @@ wherever it is deployed.`,
 	secretCmd.AddCommand(secretInit, secretSet, secretGet, secretList, secretRm, secretKeygen, secretRotate)
 }
 
-// secretSettings 讀取目前專案的 .hyp/crypt.yaml
-func secretSettings() (*secret.Settings, error) {
-	return secret.LoadSettings(secret.FindRoot("."))
+// secretSettings 讀取目前專案的 .hyp/crypt.yaml，並確認金鑰檔沒有被 git 追蹤
+func secretSettings(cmd *cobra.Command) (*secret.Settings, error) {
+	settings, err := secret.LoadSettings(secret.FindRoot("."))
+	if err != nil {
+		return nil, err
+	}
+	return settings, checkKeyFile(cmd, settings)
+}
+
+// checkKeyFile 金鑰檔在專案內而且被 git 追蹤時回錯：金鑰與密文一起進版控，加密就沒有作用。
+// 仍在使用 v0.9.3 之前的位置（家目錄）時提示搬移
+func checkKeyFile(cmd *cobra.Command, settings *secret.Settings) error {
+	var path, configured, ext, def string
+	var err error
+	switch settings.Method {
+	case secret.MethodPassphrase:
+		return nil
+	case secret.MethodAge:
+		path, err = settings.IdentityFilePath()
+		configured, ext, def = settings.Age.IdentityFile, ".age", secret.DefaultIdentityFile
+	default:
+		path, err = settings.KeyFilePath()
+		configured, ext, def = settings.Key.File, ".key", secret.DefaultKeyFile
+	}
+	if err != nil {
+		return err
+	}
+	rel, rerr := filepath.Rel(settings.Root(), path)
+	if rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		if configured == "" && path == settings.LegacyKeyPath(ext) {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Note: using the key at %s (the location before v0.9.3). Move it to %s to keep it with the project.\n", path, def)
+		}
+		return nil
+	}
+	if gitTracks(settings.Root(), rel) {
+		rel = filepath.ToSlash(rel)
+		return fmt.Errorf("%s is tracked by git: anyone with the repository can decrypt %s.\n"+
+			"Run: git rm --cached %s   (and commit), make sure .gitignore has %s,\n"+
+			"then replace the key: hyp secret keygen -o new.key && hyp secret rotate --new-key-file new.key",
+			rel, settings.SecretFile, rel, secret.KeyIgnorePattern)
+	}
+	return nil
+}
+
+// gitTracks 回報 rel 是否在 git 的索引裡；不是 git repo 或沒有 git 時為 false
+func gitTracks(root, rel string) bool {
+	return exec.Command("git", "-C", root, "ls-files", "--error-unmatch", "--", filepath.ToSlash(rel)).Run() == nil
+}
+
+// ensureKeyIgnored 把金鑰檔的樣式加進 .gitignore（沒有就建立）；
+// 專案有 Dockerfile 或 .dockerignore 時 .dockerignore 也加，金鑰不會被 COPY 進映像
+func ensureKeyIgnored(cmd *cobra.Command, root string) error {
+	files := []string{".gitignore"}
+	if fileExists(filepath.Join(root, ".dockerignore")) || fileExists(filepath.Join(root, "Dockerfile")) {
+		files = append(files, ".dockerignore")
+	}
+	for _, name := range files {
+		added, err := secret.EnsureIgnored(filepath.Join(root, name))
+		if err != nil {
+			return err
+		}
+		if added {
+			fmt.Fprintf(cmd.OutOrStdout(), "Added %s to %s\n", secret.KeyIgnorePattern, name)
+		}
+	}
+	return nil
 }
 
 func openSecretStore(cmd *cobra.Command) (*secret.Store, error) {
-	settings, err := secretSettings()
+	settings, err := secretSettings(cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +274,12 @@ func runSecretInit(cmd *cobra.Command, _ []string) error {
 	root := secret.FindRoot(".")
 	cryptPath := filepath.Join(root, ".hyp", "crypt.yaml")
 	method, _ := cmd.Flags().GetString("method")
+	// 寫檔前先驗證：先前打錯的 --method 會先寫進 crypt.yaml 才回錯，之後 init 一直失敗到手動改檔為止
+	method = strings.ToLower(strings.TrimSpace(method))
+	if method != "" && !secret.ValidMethod(method) {
+		return fmt.Errorf("unknown method %q (use %s, %s, %s or %s)", method,
+			secret.MethodAES, secret.MethodChaCha, secret.MethodPassphrase, secret.MethodAge)
+	}
 
 	content := scaffold.CryptYamlTemplate
 	if _, err := os.Stat(cryptPath); errors.Is(err, os.ErrNotExist) {
@@ -218,6 +303,13 @@ func runSecretInit(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("crypt.yaml already uses %s: change method there, then run hyp secret rotate", settings.Method)
 	}
 
+	// 先確保金鑰檔會被忽略，再產生金鑰
+	if err := ensureKeyIgnored(cmd, root); err != nil {
+		return err
+	}
+	if err := checkKeyFile(cmd, settings); err != nil {
+		return err
+	}
 	switch settings.Method {
 	case secret.MethodPassphrase:
 		fmt.Fprintf(out, "Method passphrase: no key file. Set $%s, or enter it when prompted by hyp secret.\n", settings.Passphrase.Env)
@@ -241,7 +333,6 @@ func runSecretInit(cmd *cobra.Command, _ []string) error {
 		if err := writeNewKey(cmd, path); err != nil {
 			return err
 		}
-		warnKeyInsideProject(cmd, settings, path)
 	}
 	fmt.Fprintf(out, "Next: hyp secret set <name>, then reference it in config.yaml as ${secret:<name>}\n")
 	return nil
@@ -255,7 +346,7 @@ func writeNewKey(cmd *cobra.Command, path string) error {
 	if err := secret.WriteKeyFile(path, key); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Generated key: %s\nBack it up and share it out of band: without it, key.secret cannot be decrypted.\n", path)
+	fmt.Fprintf(cmd.OutOrStdout(), "Generated key: %s\nNever commit it. Back it up and share it out of band: without it, key.secret cannot be decrypted.\n", path)
 	return nil
 }
 
@@ -287,8 +378,7 @@ func initAge(cmd *cobra.Command, settings *secret.Settings, cryptPath string) er
 		if err := secret.WriteKeyFile(path, identity); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "Generated identity: %s\nBack it up: without it, key.secret cannot be decrypted.\n", path)
-		warnKeyInsideProject(cmd, settings, path)
+		fmt.Fprintf(out, "Generated identity: %s\nNever commit it. Back it up: without it, key.secret cannot be decrypted.\n", path)
 	}
 
 	data, err := os.ReadFile(cryptPath)
@@ -305,14 +395,6 @@ func initAge(cmd *cobra.Command, settings *secret.Settings, cryptPath string) er
 	}
 	fmt.Fprintf(out, "Added recipient to crypt.yaml: %s\n", recipient)
 	return nil
-}
-
-// warnKeyInsideProject 金鑰放在專案內容易被 commit，也會被 AI 工具讀到
-func warnKeyInsideProject(cmd *cobra.Command, settings *secret.Settings, path string) {
-	rel, err := filepath.Rel(settings.Root(), path)
-	if err == nil && !strings.HasPrefix(rel, "..") {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s is inside the project: make sure it is git-ignored and out of reach of AI tools.\n", rel)
-	}
 }
 
 func runSecretSet(cmd *cobra.Command, args []string) error {
@@ -371,11 +453,17 @@ func runSecretRm(cmd *cobra.Command, args []string) error {
 }
 
 func runSecretKeygen(cmd *cobra.Command, _ []string) error {
-	settings, err := secretSettings()
+	settings, err := secretSettings(cmd)
 	if err != nil {
 		return err
 	}
 	path, _ := cmd.Flags().GetString("output")
+	if path == "" && settings.Method != secret.MethodPassphrase {
+		// 預設位置在專案的 .hyp/ 下：先確保它被忽略
+		if err := ensureKeyIgnored(cmd, settings.Root()); err != nil {
+			return err
+		}
+	}
 	switch settings.Method {
 	case secret.MethodPassphrase:
 		return errors.New("method passphrase has no key file")
@@ -403,29 +491,62 @@ func runSecretKeygen(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 	}
-	warnKeyInsideProject(cmd, settings, path)
 	return nil
 }
-
 func runSecretRotate(cmd *cobra.Command, _ []string) error {
-	settings, err := secretSettings()
+	settings, err := secretSettings(cmd)
 	if err != nil {
 		return err
 	}
 	var ropts secret.RotateOptions
-	if path, _ := cmd.Flags().GetString("new-key-file"); path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
+	var newKey []byte // 新金鑰檔的內容
+	newKeyFile, _ := cmd.Flags().GetString("new-key-file")
+	if newKeyFile != "" {
+		if newKey, err = os.ReadFile(newKeyFile); err != nil {
 			return err
 		}
-		if ropts.NewKey, err = secret.DecodeKey(string(data)); err != nil {
-			return fmt.Errorf("%s: %w", path, err)
+		if ropts.NewKey, err = secret.DecodeKey(string(newKey)); err != nil {
+			return fmt.Errorf("%s: %w", newKeyFile, err)
+		}
+	}
+	// 舊金鑰來自金鑰檔（不是環境變數）時，rotate 之後要把那個檔案換成新金鑰
+	var keyFile string
+	if ropts.NewKey != nil && os.Getenv(settings.Key.Env) == "" {
+		if p, perr := settings.KeyFilePath(); perr == nil && fileExists(p) {
+			keyFile = p
 		}
 	}
 	n, err := secret.Rotate(settings, secret.Options{Prompt: secretPrompt(cmd)}, ropts)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Re-encrypted %d value(s) with %s. Update the key wherever it is deployed.\n", n, settings.Method)
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "Re-encrypted %d value(s) with %s.\n", n, settings.Method)
+	if keyFile != "" {
+		// 先前金鑰檔仍是舊金鑰：下一個 hyp secret get 回報 key does not match，要自己把新金鑰搬過去
+		old, err := swapKeyFile(keyFile, strings.TrimSpace(string(newKey)))
+		if err != nil {
+			return fmt.Errorf("%s was re-encrypted but the key file was not replaced: copy %s to %s yourself: %w",
+				settings.SecretFile, newKeyFile, keyFile, err)
+		}
+		fmt.Fprintf(out, "Key file now holds the new key: %s\nThe old key was kept at:       %s (delete it once nothing needs it)\n", keyFile, old)
+	}
+	fmt.Fprintln(out, "Update the key wherever it is deployed.")
 	return nil
+}
+
+// swapKeyFile 把目前的金鑰檔改名為 .old（已存在時加上時間，不覆寫任何金鑰），再把新金鑰寫到原位
+func swapKeyFile(path, newKey string) (old string, err error) {
+	old = path + ".old"
+	if _, serr := os.Stat(old); serr == nil {
+		old += "." + time.Now().Format("20060102-150405")
+	}
+	if err := os.Rename(path, old); err != nil {
+		return "", err
+	}
+	if err := secret.WriteKeyFile(path, newKey); err != nil {
+		os.Rename(old, path) // 還原，金鑰檔不能消失
+		return "", err
+	}
+	return old, nil
 }

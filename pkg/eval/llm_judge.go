@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -33,6 +34,11 @@ type LLMJudge struct {
 
 	// Client 可注入自訂 http.Client（測試用）；nil 時依 Config timeout 建立
 	Client *http.Client
+
+	// Temperature 取樣溫度。nil 時送 0：評分要可重現，先前不送這個參數而用供應商的預設值，
+	// 同一份回應每次分數不同，落在門檻附近的測試時過時不過。
+	// 設成負數表示不送（少數模型不接受這個參數）
+	Temperature *float64
 }
 
 // Name 實作 Grader 介面
@@ -40,8 +46,20 @@ func (j LLMJudge) Name() string { return "llm_judge" }
 
 // judgeVerdict LLM 評分回應的預期 JSON 形狀
 type judgeVerdict struct {
-	Score  *float64 `json:"score"` // 指標：沒有 score 不等於 0 分
-	Reason string   `json:"reason"`
+	Score  *judgeScore `json:"score"` // 指標：沒有 score 不等於 0 分
+	Reason string      `json:"reason"`
+}
+
+// judgeScore 接受數字與數字字串：部分模型把分數回成 "0.8"，先前整個回覆被判為無效
+type judgeScore float64
+
+func (s *judgeScore) UnmarshalJSON(data []byte) error {
+	f, err := strconv.ParseFloat(strings.TrimSpace(strings.Trim(strings.TrimSpace(string(data)), `"`)), 64)
+	if err != nil {
+		return fmt.Errorf("score %s is not a number", data)
+	}
+	*s = judgeScore(f)
+	return nil
 }
 
 // Grade 實作 Grader 介面：組 prompt → 呼叫 LLM → 解析 {"score","reason"}
@@ -50,7 +68,13 @@ func (j LLMJudge) Grade(ctx context.Context, s Sample) (GraderResult, error) {
 		return GraderResult{}, fmt.Errorf("eval: LLMJudge.Rubric is empty")
 	}
 
-	raw, err := completeText(ctx, j.Config, j.Client, judgePrompt(j.Rubric, s, rand.Text()))
+	temperature := new(float64) // 預設 0
+	if j.Temperature != nil {
+		if temperature = j.Temperature; *temperature < 0 {
+			temperature = nil
+		}
+	}
+	raw, err := completeText(ctx, j.Config, j.Client, judgePrompt(j.Rubric, s, rand.Text()), temperature)
 	if err != nil {
 		return GraderResult{}, err
 	}
@@ -62,7 +86,7 @@ func (j LLMJudge) Grade(ctx context.Context, s Sample) (GraderResult, error) {
 
 	return GraderResult{
 		Name:   j.Name(),
-		Score:  *verdict.Score,
+		Score:  float64(*verdict.Score),
 		Reason: verdict.Reason,
 	}, nil
 }

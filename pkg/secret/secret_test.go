@@ -445,8 +445,8 @@ func TestKeyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rel, err := filepath.Rel(s.Root(), path); err != nil || !strings.HasPrefix(rel, ".hypgo") {
-		t.Errorf("default key path should be under home: %s", path)
+	if want := filepath.Join(s.Root(), ".hyp", "secret.key"); path != want {
+		t.Errorf("default key path = %s, want %s", path, want)
 	}
 	if err := mustOpen(t, s).Set("a", "x"); err == nil || !strings.Contains(err.Error(), "no key found") {
 		t.Fatalf("missing key: %v", err)

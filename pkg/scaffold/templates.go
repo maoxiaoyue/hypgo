@@ -720,7 +720,8 @@ database:
 
 logger:
   level: info
-  output: stdout
+  output: stdout    # stdout、stderr 或檔案路徑（依 rotation 輪轉）
+  format: text      # text 或 json
   colors: true
 `
 
@@ -752,7 +753,6 @@ import (
 	"fyne.io/fyne/v2/app"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
-	"github.com/maoxiaoyue/hypgo/pkg/logger"
 
 	"{{.ModuleName}}/app/views"
 )
@@ -774,7 +774,7 @@ func main() {
 	}
 
 	// logger 依設定建立；cfg.Database 等區段可在此傳給 services
-	log, err := logger.New(cfg.Logger.Level, cfg.Logger.Output, nil, cfg.Logger.Colors)
+	log, err := cfg.NewLogger() // level / output / format / colors / rotation 都依設定檔
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "init logger:", err)
 		os.Exit(1)
@@ -921,7 +921,8 @@ database:
 
 logger:
   level: info
-  output: stdout
+  output: stdout    # stdout、stderr 或檔案路徑（依 rotation 輪轉）
+  format: text      # text 或 json
   colors: true
 `
 
@@ -956,7 +957,6 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypgrpc "github.com/maoxiaoyue/hypgo/pkg/grpc"
 	"github.com/maoxiaoyue/hypgo/pkg/grpc/interceptor"
-	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 
@@ -974,7 +974,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load %s: %v", configPath, err)
 	}
-	appLog, err := logger.New(cfg.Logger.Level, cfg.Logger.Output, nil, cfg.Logger.Colors)
+	appLog, err := cfg.NewLogger() // level / output / format / colors / rotation 都依設定檔
 	if err != nil {
 		log.Fatalf("Failed to init logger: %v", err)
 	}
@@ -1207,7 +1207,8 @@ database:
 
 logger:
   level: info
-  output: stdout
+  output: stdout    # stdout、stderr 或檔案路徑（依 rotation 輪轉）
+  format: text      # text 或 json
   colors: true
 `
 
@@ -1375,7 +1376,8 @@ method: aes-256-gcm
 secret_file: key.secret
 
 # aes-256-gcm / chacha20-poly1305 的金鑰來源：環境變數優先，其次金鑰檔（內容為 base64）
-# file 留空時為 ~/.hypgo/keys/<專案目錄名>.key。金鑰不要放進專案或 .hyp/：AI 工具會讀取這些目錄
+# file 留空時為 .hyp/secret.key。金鑰檔不可進版控（.gitignore 要有 .hyp/secret.*，hyp secret init 會加）；
+# 部署環境建議用環境變數提供金鑰
 key:
   env: HYPGO_MASTER_KEY
   file: ""
@@ -1385,7 +1387,7 @@ passphrase:
   env: HYPGO_PASSPHRASE
 
 # age：recipients 為公鑰（可列多把，每位持有對應私鑰的人都能解密）
-# 私鑰來源：環境變數優先，其次私鑰檔；identity_file 留空時為 ~/.hypgo/keys/<專案目錄名>.age
+# 私鑰來源：環境變數優先，其次私鑰檔；identity_file 留空時為 .hyp/secret.age（同樣不可進版控）
 age:
   recipients: []
   identity_env: HYPGO_AGE_IDENTITY
@@ -1460,6 +1462,9 @@ go.work
 .hyp/eval_history.jsonl
 .hyp/observe_*.html
 .hyp/lostintent.md
+
+# hyp secret 的金鑰檔：不可進版控
+.hyp/secret.*
 
 # 執行期檔案：server 的 PID 檔、hyp chkcomment 的備份
 hypgo.pid

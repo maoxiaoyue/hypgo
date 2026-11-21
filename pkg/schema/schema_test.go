@@ -25,9 +25,9 @@ func TestTypeName(t *testing.T) {
 		input interface{}
 		want  string
 	}{
-		{testUser{}, "testUser"},
-		{&testUser{}, "testUser"},
-		{(*testUser)(nil), "testUser"},
+		{testUser{}, "schema.testUser"},
+		{&testUser{}, "schema.testUser"},
+		{(*testUser)(nil), "schema.testUser"},
 		{nil, ""},
 		{42, "int"},
 		{"hello", "string"},
@@ -178,11 +178,11 @@ func TestSchemaRouteAutoTypeName(t *testing.T) {
 	// 模擬 NewSchemaRoute 的自動填入
 	sr := NewSchemaRoute(route, nil)
 
-	if sr.route.InputName != "testUser" {
-		t.Errorf("InputName = %q, want %q", sr.route.InputName, "testUser")
+	if sr.route.InputName != "schema.testUser" {
+		t.Errorf("InputName = %q, want %q", sr.route.InputName, "schema.testUser")
 	}
-	if sr.route.OutputName != "testOptionalUser" {
-		t.Errorf("OutputName = %q, want %q", sr.route.OutputName, "testOptionalUser")
+	if sr.route.OutputName != "schema.testOptionalUser" {
+		t.Errorf("OutputName = %q, want %q", sr.route.OutputName, "schema.testOptionalUser")
 	}
 }
 
@@ -200,13 +200,13 @@ func TestGoTypeToSchemaType(t *testing.T) {
 		// 複合型別寫出元素與具名 struct 的名稱（先前一律 array / object）
 		{[]int{}, "[]integer"},
 		{map[string]int{}, "map[string]integer"},
-		{testUser{}, "testUser"},
-		{[]*testUser{}, "[]testUser"},
+		{testUser{}, "schema.testUser"},
+		{[]*testUser{}, "[]schema.testUser"},
 		{struct{ A int }{}, "object"},
 	}
 
 	for _, tt := range tests {
-		got := goTypeToSchemaType(reflect.TypeOf(tt.input))
+		got := goTypeToSchemaType(reflect.TypeOf(tt.input), nil)
 		if got != tt.want {
 			t.Errorf("goTypeToSchemaType(%T) = %q, want %q", tt.input, got, tt.want)
 		}

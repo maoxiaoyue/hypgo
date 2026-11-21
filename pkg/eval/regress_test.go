@@ -21,12 +21,14 @@ func TestParseVerdict(t *testing.T) {
 		`{"score":0,"reason":"bad"}`:                 0,
 		`{"score":1,"reason":"good"}`:                1,
 		`{"score":0.5}`:                              0.5,
+		`{"score":"0.8"}`:                            0.8, // 數字字串也收（先前整個回覆被判為無效）
+		`{"score": " 1 "}`:                           1,
 		"Sure!\n```json\n{\"score\":0.7}\n```\nDone": 0.7,
 	} {
 		v, err := parseVerdict(raw)
 		if err != nil {
 			t.Errorf("%q: %v", raw, err)
-		} else if *v.Score != want {
+		} else if float64(*v.Score) != want {
 			t.Errorf("%q: score = %v", raw, *v.Score)
 		}
 	}
@@ -38,7 +40,8 @@ func TestParseVerdict(t *testing.T) {
 		`{"reason":"I cannot evaluate this"}`,
 		`{"text":"sorry"}`,
 		`{"score":null}`,
-		`{"score":"0.8"}`,
+		`{"score":"high"}`,
+		`{"score":"8"}`,
 		`I refuse`,
 		``,
 	} {

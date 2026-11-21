@@ -13,7 +13,8 @@ import (
 
 // AuthFunc 驗證函式型別
 // 接收 token 字串（已去掉 "Bearer " 前綴），回傳使用者資訊（存入 context）和錯誤。
-// 回傳 status error（如 codes.PermissionDenied）時原樣傳給客戶端，其他錯誤一律為 Unauthenticated
+// 回傳 status error（如 codes.PermissionDenied）時原樣傳給客戶端（訊息由 authFn 決定）；
+// 其他錯誤一律回 Unauthenticated "invalid token"，錯誤內容不送出——需要留紀錄時在 authFn 裡記錄
 type AuthFunc func(ctx context.Context, token string) (interface{}, error)
 
 // contextKey 避免 key 衝突
@@ -90,7 +91,8 @@ func newAuthenticator(authFn AuthFunc, skipMethods []string) func(context.Contex
 			if _, ok := status.FromError(err); ok {
 				return nil, err
 			}
-			return nil, status.Error(codes.Unauthenticated, err.Error())
+			// 先前把 err.Error() 送給客戶端：驗證時查資料庫失敗，連線位址與帳號就出現在回應裡
+			return nil, status.Error(codes.Unauthenticated, "invalid token")
 		}
 		return context.WithValue(ctx, userContextKey, user), nil
 	}

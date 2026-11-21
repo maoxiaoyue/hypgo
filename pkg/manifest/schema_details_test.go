@@ -39,7 +39,7 @@ func TestManifestIncludesSchemaDetails(t *testing.T) {
 	if len(got.Params) != 1 || got.Params[0].Name != "id" || len(got.Headers) != 1 || got.Headers[0].Name != "X-Tenant" {
 		t.Errorf("Params=%+v Headers=%+v", got.Params, got.Headers)
 	}
-	if got.Responses[404] != "not found" || got.ResponseTypes[404] != "notFoundResp" {
+	if got.Responses[404] != "not found" || got.ResponseTypes[404] != "manifest.notFoundResp" {
 		t.Errorf("Responses=%v ResponseTypes=%v", got.Responses, got.ResponseTypes)
 	}
 }

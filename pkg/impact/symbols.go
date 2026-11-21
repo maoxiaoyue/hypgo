@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -30,6 +31,7 @@ type SymbolUsage struct {
 // fileDecls 為目標檔案的宣告
 type fileDecls struct {
 	pkgName     string
+	names       map[string]bool     // 套件層級的所有宣告（含未匯出的），供同套件內的使用比對
 	symbols     map[string]string   // 套件層級的匯出符號 → 種類
 	methods     map[string][]string // 匯出型別 → 匯出方法
 	handlers    []string            // 所有函式與方法在 runtime 的名稱（比對 manifest 的 handler_names）
@@ -43,7 +45,7 @@ func parseFileDecls(file string) (*fileDecls, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &fileDecls{pkgName: f.Name.Name, symbols: map[string]string{}, methods: map[string][]string{}}
+	d := &fileDecls{pkgName: f.Name.Name, names: map[string]bool{}, symbols: map[string]string{}, methods: map[string][]string{}}
 	for _, decl := range f.Decls {
 		switch decl := decl.(type) {
 		case *ast.FuncDecl:
@@ -62,6 +64,9 @@ func parseFileDecls(file string) (*fileDecls, error) {
 func (d *fileDecls) addFunc(fn *ast.FuncDecl) {
 	if fn.Recv == nil || len(fn.Recv.List) == 0 {
 		d.handlers = append(d.handlers, d.pkgName+"."+fn.Name.Name)
+		if name := fn.Name.Name; name != "init" && name != "main" && name != "_" {
+			d.names[name] = true
+		}
 		if fn.Name.IsExported() {
 			d.symbols[fn.Name.Name] = kindFunc
 		}
@@ -82,6 +87,7 @@ func (d *fileDecls) addGen(gen *ast.GenDecl) {
 	for _, spec := range gen.Specs {
 		switch spec := spec.(type) {
 		case *ast.TypeSpec:
+			d.names[spec.Name.Name] = true
 			if spec.Name.IsExported() {
 				d.symbols[spec.Name.Name] = kindType
 			}
@@ -94,6 +100,9 @@ func (d *fileDecls) addGen(gen *ast.GenDecl) {
 				kind = kindConst
 			}
 			for _, name := range spec.Names {
+				if name.Name != "_" {
+					d.names[name.Name] = true
+				}
 				if name.IsExported() {
 					d.symbols[name.Name] = kind
 				}
@@ -199,6 +208,51 @@ func (u *usageIndex) scanFile(file, pkg, target string, decls *fileDecls, report
 		}
 		return true
 	})
+}
+
+// samePackageUses 找出同套件內用到目標檔案宣告的其他檔案（含測試檔與未匯出的符號）。
+// 先前報告只看其他套件：改一個被同套件十個檔案使用的未匯出函式，報告裡什麼都沒有。
+// 以名稱比對（Obj 為 nil 的識別字是對套件層級宣告的引用），struct 欄位與方法名稱同名時可能多報
+func (p *project) samePackageUses(target, targetFile string, decls *fileDecls) []FileUse {
+	info := p.packages[target]
+	if info == nil || len(decls.names) == 0 {
+		return nil
+	}
+	var out []FileUse
+	for _, file := range append(append([]string(nil), info.files...), info.testFiles...) {
+		if strings.EqualFold(filepath.Clean(file), filepath.Clean(targetFile)) {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+		if err != nil || f.Name.Name != decls.pkgName { // 外部測試套件（pkg_test）經由 import 使用，已算在 API
+			continue
+		}
+		used := map[string]bool{}
+		var walk func(n ast.Node) bool
+		walk = func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.SelectorExpr:
+				ast.Inspect(n.X, walk) // 只看 X：Sel 是欄位或方法名
+				return false
+			case *ast.KeyValueExpr:
+				if _, ok := n.Key.(*ast.Ident); ok { // 複合常值的欄位名稱不是引用
+					ast.Inspect(n.Value, walk)
+					return false
+				}
+			case *ast.Ident:
+				if n.Obj == nil && decls.names[n.Name] {
+					used[n.Name] = true
+				}
+			}
+			return true
+		}
+		ast.Inspect(f, walk)
+		if len(used) > 0 {
+			out = append(out, FileUse{File: filepath.Base(file), Uses: sortedKeys(used)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].File < out[j].File })
+	return out
 }
 
 func (u *usageIndex) record(symbol, pkg string) {

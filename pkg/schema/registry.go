@@ -2,6 +2,7 @@
 package schema
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -24,16 +25,33 @@ func Global() *Registry {
 	return globalRegistry
 }
 
-// Register 註冊一個路由 schema（支援所有協議）；同 key 重複註冊時以新宣告取代。
-// 衍生欄位（Method 大寫、InputName / OutputName / Responses TypeName）於此補齊，
-// 直接呼叫 Register 與經 router.Schema / RegisterGRPC 等註冊的結果一致
+// Register 註冊一個路由 schema（支援所有協議）。
+// 衍生欄位（Protocol 小寫、Method 大寫、InputName / OutputName / Responses TypeName）於此補齊，
+// 直接呼叫 Register 與經 router.Schema / RegisterGRPC 等註冊的結果一致。
+//
+// 以下是寫錯的宣告，直接 panic（先前照收，之後查不到也沒有提示）：
+//   - REST 路由沒有 Method，或 Path 不是以 "/" 開頭
+//   - 非 REST 路由沒有 Command 也沒有 Method / Path
+//   - 非 REST 的同一個 key 註冊了內容不同的宣告（多半是複製後忘了改名；先前靜默以後者取代）。
+//     內容相同的重複註冊不受影響；REST 路由重複註冊時以新宣告取代（同一路由是否重複由 router 把關）
 func (r *Registry) Register(route Route) {
 	route = normalize(route)
+	if route.IsREST() {
+		if route.Method == "" || !strings.HasPrefix(route.Path, "/") {
+			panic(fmt.Sprintf("schema: REST route needs a Method and a Path starting with \"/\" (got Method %q, Path %q)", route.Method, route.Path))
+		}
+	} else if route.Command == "" && route.Method == "" && route.Path == "" {
+		panic(fmt.Sprintf("schema: %s route needs a Command", route.Protocol))
+	}
 	key := route.RouteKey()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if i, ok := r.byKey[key]; ok {
+		if old := r.schemas[i]; !route.IsREST() && (old.Summary != route.Summary || old.InputName != route.InputName || old.OutputName != route.OutputName) {
+			panic(fmt.Sprintf("schema: %s %q is already registered with a different declaration (%q, %s → %s)",
+				route.Protocol, strings.TrimPrefix(key, route.Protocol+"|"), old.Summary, old.InputName, old.OutputName))
+		}
 		r.schemas[i] = route
 		return
 	}
@@ -48,7 +66,7 @@ func (r *Registry) Register(route Route) {
 // （Route 內的 slice / map 仍與註冊表共用，勿就地修改）。
 // 其他協議或依協議篩選請走 All()
 func (r *Registry) Get(method, path string) (*Route, bool) {
-	key := Route{Method: strings.ToUpper(method), Path: path}.RouteKey()
+	key := Route{Method: strings.ToUpper(strings.TrimSpace(method)), Path: path}.RouteKey()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 

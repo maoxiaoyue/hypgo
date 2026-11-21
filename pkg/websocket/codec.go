@@ -183,8 +183,8 @@ func marshalForClients(msg *Message, clients []*Client, security *SecurityConfig
 
 		data := cache[idx]
 
-		// 安全管線
-		if security != nil {
+		// 安全管線（重放保護的連線在 writePump 依序號加密）
+		if security != nil && client.replay == nil {
 			gcm, hmacKey, override, err := clientKeys(client, security)
 			if err != nil {
 				continue
@@ -192,11 +192,11 @@ func marshalForClients(msg *Message, clients []*Client, security *SecurityConfig
 			switch {
 			case override:
 				// per-client 金鑰：逐 client 運算
-				data = applySecurityOutKeys(data, gcm, hmacKey, security.SignThenEncrypt)
+				data = protect(data, gcm, hmacKey, security.SignThenEncrypt, nil)
 			case secured[idx] != nil:
 				data = secured[idx]
 			default:
-				data = applySecurityOutKeys(data, gcm, hmacKey, security.SignThenEncrypt)
+				data = protect(data, gcm, hmacKey, security.SignThenEncrypt, nil)
 				secured[idx] = data
 			}
 		}

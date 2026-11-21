@@ -101,9 +101,9 @@ func (r Route) RouteKey() string {
 	return proto + "|" + id
 }
 
-// IsREST 判斷是否為 REST 路由
+// IsREST 判斷是否為 REST 路由（Protocol 留空或 "rest"，不分大小寫）
 func (r Route) IsREST() bool {
-	return r.Protocol == "" || r.Protocol == "rest"
+	return r.Protocol == "" || strings.EqualFold(strings.TrimSpace(r.Protocol), "rest")
 }
 
 // SchemaRegistrar 由 Router 和 Group 實作，用於將 schema 與路由一起註冊
@@ -129,8 +129,16 @@ func NewSchemaRoute(route Route, registrar SchemaRegistrar) *SchemaRoute {
 // normalize 補齊衍生欄位：Method 轉大寫（"get" 原本會建出 "get" 路由樹，真正的 GET 請求 404）、
 // 自動填 InputName / OutputName 與 Responses 的 TypeName。
 // Responses 寫在副本上：先前直接改呼叫端的 map，多條路由共用同一個 map 時互相污染、並行註冊會競爭
+//
+// Protocol / Platform 轉小寫並去空白，REST 一律存成空字串：先前 Protocol: "REST" 被當成另一種協議
+// （IsREST 為 false、key 是 "REST|GET /x"），各套件以 == "" 或 == "rest" 判斷的地方結果不一
 func normalize(route Route) Route {
-	route.Method = strings.ToUpper(route.Method)
+	route.Protocol = strings.ToLower(strings.TrimSpace(route.Protocol))
+	if route.Protocol == "rest" {
+		route.Protocol = ""
+	}
+	route.Platform = strings.ToLower(strings.TrimSpace(route.Platform))
+	route.Method = strings.ToUpper(strings.TrimSpace(route.Method))
 	if route.Input != nil && route.InputName == "" {
 		route.InputName = TypeName(route.Input)
 	}

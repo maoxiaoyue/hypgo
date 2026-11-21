@@ -68,28 +68,17 @@ func (g SchemaGrader) Grade(_ context.Context, s Sample) (GraderResult, error) {
 	return GraderResult{Name: g.Name(), Score: 1.0}, nil
 }
 
-// Aggregate 將多個評分結果加權平均為單一分數（0.0–1.0）。
-// weights 以 GraderResult.Name 為 key；nil 或缺項時該評判器權重為 1（等權）。
-// 無結果時回傳 0
-func Aggregate(results []GraderResult, weights map[string]float64) float64 {
-	var sum, totalWeight float64
-	for _, r := range results {
-		w := 1.0
-		if weights != nil {
-			if custom, ok := weights[r.Name]; ok {
-				w = custom
-			}
-		}
-		if w <= 0 {
-			continue
-		}
-		sum += r.Score * w
-		totalWeight += w
-	}
-	if totalWeight == 0 {
+// Aggregate 將多個評分結果平均為單一分數（0.0–1.0）；無結果時回傳 0。
+// 先前有一個 weights 參數，但沒有任何地方能設定它（TestCase 沒有對應欄位），已移除
+func Aggregate(results []GraderResult) float64 {
+	if len(results) == 0 {
 		return 0
 	}
-	return sum / totalWeight
+	var sum float64
+	for _, r := range results {
+		sum += r.Score
+	}
+	return sum / float64(len(results))
 }
 
 // clampScore 將分數夾到 [0,1]（防 LLM 回傳超界值）

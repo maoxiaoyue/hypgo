@@ -55,7 +55,7 @@ func TestSecretSymmetricWorkflow(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, ".hyp", "crypt.yaml")); err != nil {
 		t.Fatalf("crypt.yaml not created: %v", err)
 	}
-	keyPath := filepath.Join(home, ".hypgo", "keys", "myapp.key")
+	keyPath := filepath.Join(root, ".hyp", "secret.key")
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		t.Fatalf("key file not created at %s: %v", keyPath, err)
@@ -109,14 +109,23 @@ func TestSecretSymmetricWorkflow(t *testing.T) {
 	if _, err := runSecret(t, "", "rotate", "--new-key-file", newKey); err != nil {
 		t.Fatal(err)
 	}
+	// 先前金鑰檔仍是舊金鑰，rotate 之後的第一個 get 就回報 key does not match
+	if got, err := runSecret(t, "", "get", "db_pass"); err != nil || got != "p@ss word\n" {
+		t.Errorf("get after rotate = %q, %v", got, err)
+	}
+	data, _ := os.ReadFile(newKey)
+	if now, _ := os.ReadFile(keyPath); strings.TrimSpace(string(now)) != strings.TrimSpace(string(data)) {
+		t.Error("key file was not replaced with the new key")
+	}
+	if old, _ := os.ReadFile(keyPath + ".old"); string(old) != string(key) {
+		t.Error("old key was not kept as .old")
+	}
+	// 舊金鑰解不開
+	t.Setenv(secret.DefaultKeyEnv, strings.TrimSpace(string(key)))
 	if _, err := runSecret(t, "", "get", "db_pass"); err == nil {
 		t.Error("old key still decrypts after rotate")
 	}
-	data, _ := os.ReadFile(newKey)
-	t.Setenv(secret.DefaultKeyEnv, strings.TrimSpace(string(data)))
-	if got, err := runSecret(t, "", "get", "db_pass"); err != nil || got != "p@ss word\n" {
-		t.Errorf("get with new key = %q, %v", got, err)
-	}
+	t.Setenv(secret.DefaultKeyEnv, "")
 
 	if _, err := runSecret(t, "", "rm", "db_pass"); err != nil {
 		t.Fatal(err)
@@ -165,7 +174,8 @@ func TestSecretAgeWorkflow(t *testing.T) {
 	}
 
 	// 只有公鑰的開發者：能 set、不能 get
-	identity := filepath.Join(home, ".hypgo", "keys", "myapp.age")
+	_ = home
+	identity := filepath.Join(root, ".hyp", "secret.age")
 	if err := os.Rename(identity, identity+".away"); err != nil {
 		t.Fatal(err)
 	}
@@ -263,6 +273,14 @@ func TestProjectsIncludeCryptYAML(t *testing.T) {
 		if settings.Method != secret.MethodAES {
 			t.Errorf("%s: method = %s", name, settings.Method)
 		}
+		// 金鑰檔預設在 .hyp/ 下：新專案的 .gitignore 一開始就要忽略它
+		if data, _ := os.ReadFile(filepath.Join(name, ".gitignore")); !strings.Contains(string(data), "\n"+secret.KeyIgnorePattern+"\n") {
+			t.Errorf("%s: .gitignore does not ignore %s", name, secret.KeyIgnorePattern)
+		}
+	}
+	// Dockerfile 的建置階段是 COPY . .：金鑰檔不能進 build context
+	if data, _ := os.ReadFile(filepath.Join("apiapp", ".dockerignore")); !strings.Contains(string(data), secret.KeyIgnorePattern+"\n") {
+		t.Errorf("apiapp: .dockerignore = %q", data)
 	}
 	dockerfile, _ := os.ReadFile(filepath.Join("apiapp", "Dockerfile"))
 	for _, want := range []string{"key.secre[t]", ".hyp/crypt.yaml"} {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
 	"github.com/maoxiaoyue/hypgo/pkg/eval"
@@ -213,5 +214,38 @@ func TestGraderNamesDoNotCollide(t *testing.T) {
 	}
 	if math.Abs(scores["aggregate"]-0.5) > 1e-9 {
 		t.Errorf("aggregate = %v", scores["aggregate"])
+	}
+}
+
+// slowGrader 模擬要等 LLM 回覆的評判器
+type slowGrader struct{ wait time.Duration }
+
+func (slowGrader) Name() string { return "llm_judge" }
+func (g slowGrader) Grade(context.Context, eval.Sample) (eval.GraderResult, error) {
+	time.Sleep(g.wait)
+	return eval.GraderResult{Score: 0.9}, nil
+}
+
+// 歷史紀錄帶案例名稱，並把 Graders 的時間與 handler 的時間分開。
+// 歷史 bug：沒有名稱可區分同一路由的不同案例；latency_ms 含 LLM 評分的時間
+func TestHistoryRecordsCaseNameAndSeparatesGraderTime(t *testing.T) {
+	root := modulePackageDir(t)
+	r := schemaRouter(t)
+
+	Test(t, r, TestCase{
+		Name: "happy path", Route: "GET /ping", ExpectStatus: 200, RecordHistory: true,
+		Graders: []eval.Grader{slowGrader{wait: 120 * time.Millisecond}},
+	})
+	Test(t, r, TestCase{Route: "GET /ping", ExpectStatus: 200, RecordHistory: true})
+
+	got := historyAt(t, root)
+	if len(got) != 2 {
+		t.Fatalf("records = %+v", got)
+	}
+	if got[0].Case != "happy path" || got[0].GraderMs < 100 || got[0].LatencyMs >= 100 {
+		t.Errorf("graded record: case = %q, latency_ms = %d, grader_ms = %d", got[0].Case, got[0].LatencyMs, got[0].GraderMs)
+	}
+	if got[1].Case != "" || got[1].GraderMs != 0 {
+		t.Errorf("plain record = %+v", got[1])
 	}
 }

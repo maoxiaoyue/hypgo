@@ -179,3 +179,54 @@ func TestEvalReportPaths(t *testing.T) {
 		t.Errorf("reports = %v, err = %v", reports, err)
 	}
 }
+
+func caseLine(route, name, hash string, aggregate float64) string {
+	scores := `"contract":1`
+	if aggregate >= 0 {
+		scores += fmt.Sprintf(`,"aggregate":%g`, aggregate)
+	}
+	return fmt.Sprintf(`{"route":%q,"case":%q,"input_hash":%q,"status":"pass","scores":{%s},"attempts":1}`, route, name, hash, scores)
+}
+
+// 同一條路由的不同案例各自統計；--fail-on-regression 在有退化時 exit 非零。
+// 歷史 bug：只按路由分組——成功案例從 0.95 掉到 0.30、錯誤路徑案例一直通過，交錯平均後顯示「↑ +0.14」；
+// 不論結果一律 exit 0
+func TestEvalReportSeparatesCasesAndCanFail(t *testing.T) {
+	var lines []string
+	for i := 0; i < 10; i++ {
+		q := 0.95
+		if i >= 5 {
+			q = 0.30
+		}
+		lines = append(lines,
+			caseLine("POST /sum", "happy", "sha256:aaaaaaaa", q),
+			caseLine("POST /sum", "", "sha256:bbbbbbbbcccc", -1), // 沒有名稱：以輸入 hash 區分
+			caseLine("GET /one", "", "", 0.9))
+	}
+	out := runReport(t, lines...)
+	if row := reportRow(t, out, "POST /sum [happy]"); !strings.HasPrefix(row, "0.30 0.95 1.00 ↓ -0.65 ⚠") {
+		t.Errorf("happy case row = %q\n%s", row, out)
+	}
+	if row := reportRow(t, out, "POST /sum [bbbbbb]"); !strings.HasPrefix(row, "1.00 1.00 1.00 → stable") {
+		t.Errorf("unnamed case row = %q\n%s", row, out)
+	}
+	// 只有一個案例的路由不加標籤
+	if row := reportRow(t, out, "GET /one"); !strings.HasPrefix(row, "0.90 0.90") || strings.Contains(out, "GET /one [") {
+		t.Errorf("single-case row = %q\n%s", row, out)
+	}
+
+	path := filepath.Join(t.TempDir(), "h.jsonl")
+	os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+	if _, err := runHypOutput(t, "eval-report", "--path", path); err != nil {
+		t.Errorf("without the flag a regression must not change the exit code: %v", err)
+	}
+	_, err := runHypOutput(t, "eval-report", "--path", path, "--fail-on-regression")
+	if err == nil || !strings.Contains(err.Error(), "POST /sum [happy]") {
+		t.Errorf("--fail-on-regression: err = %v", err)
+	}
+	stable := filepath.Join(t.TempDir(), "s.jsonl")
+	os.WriteFile(stable, []byte(strings.Join(statuses("GET /a", "PPPPPPPPPP"), "\n")+"\n"), 0o644)
+	if _, err := runHypOutput(t, "eval-report", "--path", stable, "--fail-on-regression"); err != nil {
+		t.Errorf("--fail-on-regression without a regression: %v", err)
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"golang.org/x/mod/modfile"
 	"gopkg.in/yaml.v3"
 )
@@ -525,6 +526,19 @@ func generateFile(dir, filename, tmplStr string, data interface{}) error {
 					return err
 				}
 				if merged {
+					if OnMerge != nil {
+						OnMerge(path)
+					}
+					return nil
+				}
+			}
+			// 既有的 .gitignore 是使用者自己的：只確認金鑰檔有被忽略
+			if filename == ".gitignore" {
+				added, err := secret.EnsureIgnored(path)
+				if err != nil {
+					return err
+				}
+				if added {
 					if OnMerge != nil {
 						OnMerge(path)
 					}

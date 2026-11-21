@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -48,34 +50,46 @@ type Store struct {
 // Open 讀取 key.secret（不存在時視為空），此時還不需要金鑰：list 與 age 的 set 都用不到私鑰
 func Open(settings *Settings, opts Options) (*Store, error) {
 	st := &Store{settings: settings, opts: opts}
-	data, err := os.ReadFile(settings.Path())
-	if errors.Is(err, os.ErrNotExist) {
+	file, exists, err := loadFile(settings)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
 		st.file = fileFormat{Version: fileVersion, Method: settings.Method, Secrets: map[string]string{}}
 		return st, nil
 	}
+	if settings.explicit && file.Method != settings.Method && !opts.allowMethodMismatch {
+		return nil, fmt.Errorf("secret: %s uses %s but .hyp/crypt.yaml says %s: run hyp secret rotate",
+			settings.SecretFile, file.Method, settings.Method)
+	}
+	st.file, st.exists = file, true
+	return st, nil
+}
+
+// loadFile 讀取並檢查 key.secret；檔案不存在時 exists 為 false
+func loadFile(settings *Settings) (file fileFormat, exists bool, err error) {
+	data, err := os.ReadFile(settings.Path())
+	if errors.Is(err, os.ErrNotExist) {
+		return file, false, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("secret: read %s: %w", settings.SecretFile, err)
+		return file, false, fmt.Errorf("secret: read %s: %w", settings.SecretFile, err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
-	if err := dec.Decode(&st.file); err != nil {
-		return nil, fmt.Errorf("secret: invalid %s: %w", settings.SecretFile, err)
+	if err := dec.Decode(&file); err != nil {
+		return file, false, fmt.Errorf("secret: invalid %s: %w", settings.SecretFile, err)
 	}
-	if st.file.Version != fileVersion {
-		return nil, fmt.Errorf("secret: %s has unsupported version %d", settings.SecretFile, st.file.Version)
+	if file.Version != fileVersion {
+		return file, false, fmt.Errorf("secret: %s has unsupported version %d", settings.SecretFile, file.Version)
 	}
-	if !validMethod(st.file.Method) {
-		return nil, fmt.Errorf("secret: %s has unknown method %q", settings.SecretFile, st.file.Method)
+	if !ValidMethod(file.Method) {
+		return file, false, fmt.Errorf("secret: %s has unknown method %q", settings.SecretFile, file.Method)
 	}
-	if settings.explicit && st.file.Method != settings.Method && !opts.allowMethodMismatch {
-		return nil, fmt.Errorf("secret: %s uses %s but .hyp/crypt.yaml says %s: run hyp secret rotate",
-			settings.SecretFile, st.file.Method, settings.Method)
+	if file.Secrets == nil {
+		file.Secrets = map[string]string{}
 	}
-	if st.file.Secrets == nil {
-		st.file.Secrets = map[string]string{}
-	}
-	st.exists = true
-	return st, nil
+	return file, true, nil
 }
 
 // Method 回傳 key.secret 使用的加密方式
@@ -125,8 +139,7 @@ func (st *Store) Set(name, value string) error {
 	if err != nil {
 		return fmt.Errorf("secret: encrypt %q: %w", name, err)
 	}
-	st.file.Secrets[name] = sealed
-	return st.save()
+	return st.update(func(secrets map[string]string) { secrets[name] = sealed })
 }
 
 // Delete 移除機密值；不需要金鑰
@@ -134,8 +147,67 @@ func (st *Store) Delete(name string) error {
 	if !st.Has(name) {
 		return fmt.Errorf("secret: %q not found in %s", name, st.settings.SecretFile)
 	}
-	delete(st.file.Secrets, name)
+	return st.update(func(secrets map[string]string) { delete(secrets, name) })
+}
+
+// update 在鎖定下重新讀檔、只套用這一筆改動再寫回。
+// 先前直接寫出開啟時讀到的內容：兩個行程各自開啟後寫入，先寫的那筆消失
+func (st *Store) update(apply func(secrets map[string]string)) error {
+	unlock, err := lockFile(st.settings.Path())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	cur, exists, err := loadFile(st.settings)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if cur.Method != st.file.Method || (cur.KeyID != "" && st.file.KeyID != "" && cur.KeyID != st.file.KeyID) {
+			return fmt.Errorf("secret: %s was changed by another process (different key or method), nothing written: run the command again",
+				st.settings.SecretFile)
+		}
+		st.file.Secrets = cur.Secrets
+		if st.file.KeyID == "" {
+			st.file.KeyID = cur.KeyID
+		}
+		if st.file.KDF == nil {
+			st.file.KDF = cur.KDF
+		}
+	}
+	apply(st.file.Secrets)
 	return st.save()
+}
+
+var lockWait = 10 * time.Second // 測試會縮短
+
+// 持有鎖的時間只有一次讀寫；超過這麼久的鎖檔是行程中斷留下的
+const lockStale = 30 * time.Second
+
+// lockFile 以 <path>.lock 互斥（O_EXCL 建立），回傳解鎖函式
+func lockFile(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("secret: create directory: %w", err)
+	}
+	lock := path + ".lock"
+	deadline := time.Now().Add(lockWait)
+	for {
+		f, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(lock) }, nil
+		}
+		if info, serr := os.Stat(lock); serr == nil && time.Since(info.ModTime()) > lockStale {
+			os.Remove(lock)
+			continue
+		}
+		// Windows 上剛被刪除的鎖檔短暫回報拒絕存取，一併重試到期限為止
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("secret: %s is locked by another process (delete %s if none is running): %w",
+				filepath.Base(path), lock, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // prepare 取得金鑰並確認它與 key.secret 相符。金鑰不符時立刻回錯：
@@ -377,6 +449,19 @@ func Rotate(settings *Settings, opts Options, ropts RotateOptions) (int, error) 
 				return 0, fmt.Errorf("secret: verify %q failed, %s not changed", name, settings.SecretFile)
 			}
 		}
+	}
+	// 解密與輸入密碼的期間不持有鎖；寫入前確認檔案沒有被別的行程改過，否則那筆改動會被蓋掉
+	unlock, err := lockFile(settings.Path())
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	cur, exists, err := loadFile(settings)
+	if err != nil {
+		return 0, err
+	}
+	if !exists || cur.KeyID != old.file.KeyID || !reflect.DeepEqual(cur.Secrets, old.file.Secrets) {
+		return 0, fmt.Errorf("secret: %s was changed by another process during rotate, nothing written: run it again", settings.SecretFile)
 	}
 	if err := next.save(); err != nil {
 		return 0, err

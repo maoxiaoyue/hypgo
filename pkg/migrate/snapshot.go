@@ -88,5 +88,15 @@ func SaveSnapshot(path string, tables []TableSchema, dialect string) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	return os.WriteFile(path, append(data, '\n'), 0644)
+	// 先寫暫存檔再換上：寫到一半失敗不會留下壞掉的快照
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0644); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

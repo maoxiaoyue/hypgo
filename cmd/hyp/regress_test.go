@@ -619,3 +619,48 @@ func TestNewHomePageUsesEmbeddedTemplate(t *testing.T) {
 		t.Error("router.go should install the embedded template set")
 	}
 }
+
+// TestMigrateDiffRiskyGate 迴歸測試：會在既有資料上失敗的變更（SET NOT NULL、ADD UNIQUE）未加 --allow-risky 時
+// 失敗且不寫檔、不更新快照；MySQL 另外提醒 DDL 不能回滾。
+// 歷史 bug：這兩種變更不需要任何旗標
+func TestMigrateDiffRiskyGate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a project against the local hypgo module")
+	}
+	migrateProject(t)
+	snapPath := filepath.Join(".hyp", "schema_snapshot.json")
+	ups := func() []string {
+		files, _ := filepath.Glob(filepath.Join("migs", "*.up.sql"))
+		return files
+	}
+
+	writeWidgetModel(t, "Code string `bun:\"code\"`", true)
+	if err := runHyp(t, "migrate", "diff", "-o", "migs", "-d", "mysql"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(snapPath)
+
+	writeWidgetModel(t, "Code string `bun:\"code,notnull,unique\"`", true)
+	err := runHyp(t, "migrate", "diff", "-o", "migs", "-d", "mysql")
+	if err == nil {
+		t.Fatal("SET NOT NULL / ADD UNIQUE went through without --allow-risky")
+	}
+	for _, want := range []string{"sets widgets.code NOT NULL", "UNIQUE constraint on widgets (code)", "--allow-risky", "cannot roll back DDL"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q:\n%v", want, err)
+		}
+	}
+	if after, _ := os.ReadFile(snapPath); len(ups()) != 1 || !bytes.Equal(before, after) {
+		t.Fatal("a refused migration must not write files or update the snapshot")
+	}
+	// --allow-destructive 不放行這一類
+	if err := runHyp(t, "migrate", "diff", "-o", "migs", "-d", "mysql", "--allow-destructive"); err == nil {
+		t.Error("--allow-destructive should not allow risky changes")
+	}
+	if err := runHyp(t, "migrate", "diff", "-o", "migs", "-d", "mysql", "--allow-risky"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ups()) != 2 {
+		t.Errorf("up files = %v, want 2", ups())
+	}
+}

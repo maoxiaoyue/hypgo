@@ -9,8 +9,10 @@
 package errors
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -27,6 +29,30 @@ type AppError struct {
 	cause error // Wrap 附加的底層錯誤：只出現在 Error() 與 Unwrap()，不寫進回應
 }
 
+// MarshalJSON 與 JSON() 輸出相同的形狀（code / message / details）。
+// 先前直接 c.JSON(404, appErr) 會依 struct tag 多送出 http_status 與 category，
+// 同一個專案兩種寫法混用時客戶端看到兩種錯誤格式
+func (e *AppError) MarshalJSON() ([]byte, error) {
+	return json.Marshal(e.JSON())
+}
+
+// detailValue 把細節值整理成一定能寫進 JSON 的形式：error 取它的訊息（先前序列化成 {}），
+// 無法序列化的值（chan、func…）改用 fmt.Sprint——錯誤回應不該因為細節而寫不出來
+// （先前 c.JSON 在這裡 panic，客戶端拿到空的 500）
+func detailValue(v any) any {
+	if err, ok := v.(error); ok {
+		return err.Error()
+	}
+	if _, err := json.Marshal(v); err != nil {
+		switch reflect.ValueOf(v).Kind() {
+		case reflect.Chan, reflect.Func: // 印出來只是位址，改寫型別
+			return fmt.Sprintf("<%T>", v)
+		}
+		return fmt.Sprint(v)
+	}
+	return v
+}
+
 // Error 實作 error 介面（含 Wrap 的底層錯誤，供 log 使用）
 func (e *AppError) Error() string {
 	msg := fmt.Sprintf("[%s] %s", e.Code, e.Message)
@@ -40,7 +66,8 @@ func (e *AppError) Error() string {
 }
 
 // Wrap 產生附帶底層錯誤的副本（原 AppError 不變）。底層錯誤供 errors.Is / errors.As 與 log 使用，
-// 不寫進 JSON 回應，避免內部訊息洩漏給客戶端。
+// 不寫進 JSON 回應，避免內部訊息洩漏給客戶端；AbortWithAppError / RespondError 會把它交給
+// c.Error，由 server 記錄。
 // 先前只能 With("err", err)：error 值序列化成 JSON 是 {}，回應裡只剩 "err":{}
 func (e *AppError) Wrap(cause error) *AppError {
 	cp := e.clone()
@@ -59,7 +86,7 @@ func (e *AppError) With(key string, value any) *AppError {
 	if cp.Details == nil {
 		cp.Details = make(map[string]any)
 	}
-	cp.Details[key] = value
+	cp.Details[key] = detailValue(value)
 	return cp
 }
 
@@ -75,7 +102,7 @@ func (e *AppError) WithDetails(kvs map[string]any) *AppError {
 		cp.Details = make(map[string]any)
 	}
 	for k, v := range kvs {
-		cp.Details[k] = v
+		cp.Details[k] = detailValue(v)
 	}
 	return cp
 }
@@ -90,7 +117,7 @@ func (e *AppError) WithMessage(msg string) *AppError {
 // Is 判斷是否為同一錯誤碼（忽略 Details）
 func (e *AppError) Is(target error) bool {
 	t, ok := target.(*AppError)
-	if !ok {
+	if !ok || t == nil || e == nil { // 先前 target 是 nil 的 *AppError 時 panic
 		return false
 	}
 	return e.Code == t.Code
@@ -136,10 +163,14 @@ var globalCatalog = &Catalog{
 // 通常在 package-level var 區塊中使用。以下屬於程式啟動期的設定錯誤，直接 panic：
 //   - 同一個錯誤碼重複定義：先前靜默覆蓋 catalog，同一個碼在 catalog 與原變數中意義不同
 //     （例如應用程式定義 E1001 = User not found，c.BindInput 驗證失敗回的也是 E1001）
-//   - HTTP 狀態碼不在 100–599：先前狀態碼 0 的錯誤實際以 200 送出
+//   - HTTP 狀態碼不在 400–599：先前狀態碼 0 的錯誤實際以 200 送出；錯誤目錄也不該有成功或重導向的狀態
+//   - 錯誤碼是空字串
 func Define(code string, httpStatus int, message, category string) *AppError {
-	if httpStatus < 100 || httpStatus > 599 {
-		panic(fmt.Sprintf("errors: Define(%q): invalid HTTP status %d", code, httpStatus))
+	if code == "" {
+		panic(fmt.Sprintf("errors: Define: empty error code (message %q)", message))
+	}
+	if httpStatus < 400 || httpStatus > 599 {
+		panic(fmt.Sprintf("errors: Define(%q): invalid HTTP status %d (want 400-599)", code, httpStatus))
 	}
 	e := &AppError{
 		Code:       code,
@@ -167,38 +198,35 @@ func GlobalCatalog() *Catalog {
 	return globalCatalog
 }
 
-// All 返回所有已定義的錯誤，依錯誤碼排序（manifest 據此輸出，順序固定才不會每次啟動都改寫）
+// All 返回所有已定義的錯誤，依錯誤碼排序（manifest 據此輸出，順序固定才不會每次啟動都改寫）。
+// 回傳的是副本：先前是 catalog 內的指標，改它的 Message 會連帶改掉 ErrNotFound 這些全域定義
 func (c *Catalog) All() []*AppError {
+	return c.ByCategory("")
+}
+
+// Get 根據 code 查詢錯誤（回傳副本，以 errors.Is 與原定義比對）
+func (c *Catalog) Get(code string) (*AppError, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.errors[code]
+	if !ok {
+		return nil, false
+	}
+	return e.clone(), true
+}
+
+// ByCategory 根據分類查詢，依錯誤碼排序（先前順序隨 map 走訪每次不同）；回傳副本
+func (c *Catalog) ByCategory(category string) []*AppError {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	result := make([]*AppError, 0, len(c.errors))
 	for _, e := range c.errors {
-		result = append(result, e)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Code < result[j].Code })
-	return result
-}
-
-// Get 根據 code 查詢錯誤
-func (c *Catalog) Get(code string) (*AppError, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	e, ok := c.errors[code]
-	return e, ok
-}
-
-// ByCategory 根據分類查詢
-func (c *Catalog) ByCategory(category string) []*AppError {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	var result []*AppError
-	for _, e := range c.errors {
-		if e.Category == category {
-			result = append(result, e)
+		if category == "" || e.Category == category {
+			result = append(result, e.clone())
 		}
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Code < result[j].Code })
 	return result
 }
 

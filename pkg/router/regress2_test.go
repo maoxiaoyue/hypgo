@@ -174,7 +174,7 @@ func TestRegistrationRejectsBrokenRoutes(t *testing.T) {
 	// 先前註冊成功，請求進來才 nil pointer panic
 	mustPanic(t, "nil handler", func() { New().GET("/nil", nil) })
 	mustPanic(t, "nil 中間件", func() { New().NewGroup("/g", nil).GET("/x", ok) })
-	mustPanic(t, "小寫方法", func() { New().Handle("get", "/x", ok) })
+	mustPanic(t, "含空白的方法", func() { New().Handle("GE T", "/x", ok) })
 	mustPanic(t, "空方法", func() { New().Handle("", "/x", ok) })
 
 	r := New()

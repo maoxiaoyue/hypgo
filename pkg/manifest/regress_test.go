@@ -52,10 +52,10 @@ func TestDefaultManifestIncludesFields(t *testing.T) {
 	r.Schema(schema.Route{Method: "POST", Path: "/f", Input: regressIn{}}).Handle(listOrdersHandler)
 
 	m := NewCollector(r, nil).Collect()
-	if rm := routeByPath(m, "/f"); rm == nil || rm.InputType != "regressIn" {
+	if rm := routeByPath(m, "/f"); rm == nil || rm.InputType != "manifest.regressIn" {
 		t.Fatalf("route = %+v, want input_type regressIn", rm)
 	}
-	if f := m.Types["regressIn"]; len(f) != 1 || f[0].Name != "name" {
+	if f := m.Types["manifest.regressIn"]; len(f) != 1 || f[0].Name != "name" {
 		t.Errorf("types[regressIn] = %+v, want [name]", f)
 	}
 }
@@ -193,12 +193,12 @@ type listItem struct {
 func TestCollectTypesRegistersSliceElements(t *testing.T) {
 	types := map[string]TypeFields{}
 	r := schema.Route{Output: []listItem{}, OutputName: schema.TypeName([]listItem{}),
-		Responses: map[int]schema.ResponseSchema{200: {Type: map[string]*listItem{}, TypeName: "map[string]listItem"}}}
+		Responses: map[int]schema.ResponseSchema{200: {Type: map[string]*listItem{}, TypeName: "map[string]manifest.listItem"}}}
 	collectTypes(types, &r)
-	if r.OutputName != "[]listItem" {
-		t.Errorf("OutputName = %q, want []listItem", r.OutputName)
+	if r.OutputName != "[]manifest.listItem" {
+		t.Errorf("OutputName = %q, want []manifest.listItem", r.OutputName)
 	}
-	if f, ok := types["listItem"]; !ok || len(f) != 1 || f[0].Name != "id" {
+	if f, ok := types["manifest.listItem"]; !ok || len(f) != 1 || f[0].Name != "id" {
 		t.Errorf("types = %v, want listItem with field id", types)
 	}
 }

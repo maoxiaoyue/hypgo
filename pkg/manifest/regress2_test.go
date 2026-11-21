@@ -6,9 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"github.com/uptrace/bun"
 )
 
 type r2Addr struct {
@@ -63,9 +66,9 @@ func TestTypesDescribeNestedShapes(t *testing.T) {
 		r.Schema(schema.Route{Method: "POST", Path: "/orders", Summary: "s", Input: r2Order{}, Output: []r2Order{}}).Handle(func(c *hypcontext.Context) {})
 	})
 	want := map[string]map[string]string{
-		"r2Order": {"addr": "r2Addr", "lines": "[]r2Line", "meta": "map[string]string", "created": "string"},
-		"r2Line":  {"ship": "r2Addr", "next": "r2Line", "alt": "[]r2Addr"},
-		"r2Addr":  {"city": "string"},
+		"manifest.r2Order": {"addr": "manifest.r2Addr", "lines": "[]manifest.r2Line", "meta": "map[string]string", "created": "string"},
+		"manifest.r2Line":  {"ship": "manifest.r2Addr", "next": "manifest.r2Line", "alt": "[]manifest.r2Addr"},
+		"manifest.r2Addr":  {"city": "string"},
 	}
 	for typ, fields := range want {
 		got := map[string]string{}
@@ -169,5 +172,93 @@ func TestRoutesListOnlyAPIsWithSensibleSummaries(t *testing.T) {
 	}
 	if m.Server != nil || strings.Contains(out, "server:") {
 		t.Errorf("server section should be omitted without a config:\n%s", out)
+	}
+}
+
+// FieldInfo 與 schema.FieldInfo 同名、欄位不同
+type FieldInfo struct {
+	Mine int `json:"mine"`
+}
+
+type r2Tree []r2Tree
+
+type r2Paged[T any] struct {
+	Items []T `json:"items"`
+}
+
+// 不同套件的同名型別各自一份；自我參照的容器型別不會卡住；泛型名稱不帶匯入路徑。
+// 歷史 bug：types 以短名稱為鍵，兩條路由都寫 input_type: FieldInfo 而欄位只有其中一份；
+// Output 是 type Tree []Tree 時產生 manifest 的迴圈永遠不結束（server 啟動卡住）
+func TestTypesAreKeyedByQualifiedName(t *testing.T) {
+	done := make(chan struct{})
+	var m *Manifest
+	var out string
+	go func() {
+		defer close(done)
+		m, out = r2Manifest(t, func(r *router.Router) {
+			h := func(c *hypcontext.Context) {}
+			r.Schema(schema.Route{Method: "POST", Path: "/mine", Summary: "s", Input: FieldInfo{}, Output: r2Paged[FieldInfo]{}}).Handle(h)
+			r.Schema(schema.Route{Method: "POST", Path: "/theirs", Summary: "s", Input: schema.FieldInfo{}, Output: r2Tree{}}).Handle(h)
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("collecting a manifest with a self-referential type did not finish")
+	}
+
+	inputs := map[string]string{}
+	for _, rt := range m.Routes {
+		inputs[rt.Path] = rt.InputType + " -> " + rt.OutputType
+	}
+	if inputs["/mine"] != "manifest.FieldInfo -> manifest.r2Paged[manifest.FieldInfo]" || inputs["/theirs"] != "schema.FieldInfo -> manifest.r2Tree" {
+		t.Errorf("route types = %v", inputs)
+	}
+	mine, theirs := m.Types["manifest.FieldInfo"], m.Types["schema.FieldInfo"]
+	if len(mine) != 1 || mine[0].Name != "mine" || len(theirs) != 3 || theirs[0].Name != "name" {
+		t.Errorf("types: mine = %v, theirs = %v\n%s", mine, theirs, out)
+	}
+	if paged := m.Types["manifest.r2Paged[manifest.FieldInfo]"]; len(paged) != 1 || paged[0].Type != "[]manifest.FieldInfo" {
+		t.Errorf("generic type = %v\n%s", paged, out)
+	}
+	if strings.Contains(out, "github.com") {
+		t.Errorf("import path leaked into the manifest:\n%s", out)
+	}
+}
+
+type r2Stamp struct {
+	bun.BaseModel `bun:"table:r2_stamps"`
+	ID            int64     `bun:",pk,autoincrement"`
+	At            time.Time `bun:"at"`
+}
+
+// models 區段的型別依專案的資料庫。
+// 歷史 bug：一律用 PostgreSQL 方言，MySQL 專案的 manifest 寫著 BIGSERIAL、TIMESTAMPTZ
+func TestModelTypesFollowDatabaseDriver(t *testing.T) {
+	reg := migrate.NewRegistry()
+	reg.Register((*r2Stamp)(nil))
+	types := func(driver string) string {
+		var cfg *config.Config
+		if driver != "none" {
+			cfg = &config.Config{}
+			cfg.Database.Driver = driver
+		}
+		m := newCollector(router.New(), cfg, reg, DefaultEnrichConfig()).Collect()
+		if len(m.Models) != 1 {
+			t.Fatalf("%s: models = %+v", driver, m.Models)
+		}
+		var out []string
+		for _, f := range m.Models[0].Fields {
+			out = append(out, f.SQLType)
+		}
+		return strings.Join(out, ",")
+	}
+	for driver, want := range map[string]string{
+		"mysql": "BIGINT,DATETIME", "tidb": "BIGINT,DATETIME",
+		"postgres": "BIGSERIAL,TIMESTAMPTZ", "": "BIGSERIAL,TIMESTAMPTZ", "none": "BIGSERIAL,TIMESTAMPTZ",
+	} {
+		if got := types(driver); got != want {
+			t.Errorf("driver %q: types = %s, want %s", driver, got, want)
+		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/modfile"
 )
@@ -106,6 +107,8 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		{Path: "docker-compose.yml", Content: dockerComposeContent},
 		{Path: "Makefile", Content: makefileContent},
 		{Path: ".gitignore", Content: scaffold.GitignoreTemplate},
+		// 金鑰檔不進 build context：Dockerfile 的建置階段是 COPY . .
+		{Path: ".dockerignore", Content: "# hyp secret 的金鑰檔\n" + secret.KeyIgnorePattern + "\n"},
 		{Path: "README.md", Content: readmeContent},
 		{Path: "go.mod", Content: goModContent},
 	}
@@ -632,7 +635,7 @@ func createAPIMainFile(projectName, module string) error {
 		"\tdefault:\n" +
 		"\t\tdialect = pg.New()\n" +
 		"\t}\n\n" +
-		"\tdb, err := hidb.NewWithInterface(&cfg.Database, hidb.WithDialect(dialect))\n" +
+		"\tdb, err := hidb.NewWithInterface(&cfg.Database, hidb.WithDialect(dialect), hidb.WithLogger(log))\n" +
 		"\tif err != nil {\n" +
 		"\t\tlog.Errorf(\"database init failed: %v\", err)\n" +
 		"\t\tos.Exit(1)\n" +
@@ -744,14 +747,22 @@ database:
   dsn: ""                  # 留空 = 不連資料庫；例：postgres://user:pass@localhost:5432/app?sslmode=disable
   max_idle_conns: 10
   max_open_conns: 100
+  # 以下沒寫時用預設值，明確寫 0 代表關閉：
+  # slow_query: 500          # 毫秒；超過即記一行慢查詢日誌
+  # tx_retries: 1            # 交易遇到死結時重跑交易函式的次數
+  # read_your_writes: 1000   # 毫秒；寫入後同一位使用者的讀取走主庫（有 replicas 並掛上 db.Middleware() 時生效）
+  # max_replica_lag: 0       # 毫秒；副本落後超過即暫不使用（0 = 不檢查）
+  # replicas:                # 讀取副本：db.ReadHypDB() 的查詢會輪詢它們
+  #   - dsn: ""
   redis:                   # 需要時在 main.go 加上 hidb.WithRedis(redis.New())
     addr: "localhost:6379"
     password: ""
     db: 0
 
 logger:
-  level: info              # debug | info | notice | warning | emergency
+  level: info              # debug | info | notice | warning | error | emergency
   output: "logs/api.log"   # stdout 或檔案路徑
+  format: text             # text | json
   colors: true             # 僅輸出到終端機時上色；寫檔、管線、Docker 不含色碼
   rotation:
     max_size: 100MB

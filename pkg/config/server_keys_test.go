@@ -78,3 +78,27 @@ func TestCORSConfigKeys(t *testing.T) {
 		t.Errorf("typo not reported: %q", warn)
 	}
 }
+
+// database 的 hidb 行為設定：沒寫是 0（hidb 用預設值），明確寫 0 存成 -1（關閉）；Redis 的進階設定讀得進來
+func TestDatabaseOptionKeys(t *testing.T) {
+	cfg, warn, err := loadYAML(t, "database:\n  driver: postgres\n  dsn: x\n")
+	if o := cfg.Database.GetDatabaseOptions(); err != nil || warn != "" || o != (DatabaseOptions{}) {
+		t.Errorf("absent: %+v, warn = %q, err = %v", o, warn, err)
+	}
+	cfg, warn, err = loadYAML(t, "database:\n  driver: postgres\n  dsn: x\n  slow_query: 0\n  read_your_writes: 250\n  tx_retries: 0\n"+
+		"  max_replica_lag: 2000\n  conn_max_lifetime: 600\n  conn_max_idle_time: 0\n  strict_columns: true\n"+
+		"  redis:\n    username: app\n    tls: true\n    pool_size: 20\n    dial_timeout: 2\n    read_timeout: 1\n    write_timeout: 1\n")
+	if err != nil || warn != "" {
+		t.Fatalf("warn = %q, err = %v", warn, err)
+	}
+	want := DatabaseOptions{SlowQuery: -1, ReadYourWrites: 250, MaxReplicaLag: 2000, TxRetries: -1, ConnMaxLifetime: 600, ConnMaxIdleTime: -1, StrictColumns: true}
+	if o := cfg.Database.GetDatabaseOptions(); o != want {
+		t.Errorf("options = %+v, want %+v", o, want)
+	}
+	if r := cfg.Database.Redis.GetRedisOptions(); r != (RedisOptions{Username: "app", TLS: true, PoolSize: 20, DialTimeout: 2, ReadTimeout: 1, WriteTimeout: 1}) {
+		t.Errorf("redis options = %+v", r)
+	}
+	if _, warn, _ := loadYAML(t, "database:\n  slow_querys: 5\n"); !strings.Contains(warn, "slow_query") {
+		t.Errorf("typo not reported: %q", warn)
+	}
+}

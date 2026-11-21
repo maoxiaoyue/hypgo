@@ -107,7 +107,7 @@ func generateMinimalJSON(typ interface{}) string {
 		return "{}"
 	}
 
-	fields := structFields(t)
+	fields := structFields(t, map[reflect.Type]bool{t: true})
 
 	data, err := json.Marshal(fields)
 	if err != nil {
@@ -117,10 +117,10 @@ func generateMinimalJSON(typ interface{}) string {
 }
 
 // structFields 將 struct 的每個 JSON 欄位（內嵌 struct 已展開）生成 JSON 名稱 → 測試值的 map
-func structFields(t reflect.Type) map[string]interface{} {
+func structFields(t reflect.Type, onPath map[reflect.Type]bool) map[string]interface{} {
 	fields := make(map[string]interface{})
 	for _, f := range jsonFields(t) {
-		fields[f.Name] = generateFieldValue(f.StructField, f.Name)
+		fields[f.Name] = generateFieldValue(f.StructField, f.Name, onPath)
 	}
 	return fields
 }
@@ -155,7 +155,7 @@ func addQueryFields(q map[string]string, t reflect.Type) {
 		if name == "" {
 			continue
 		}
-		if s, ok := queryString(generateFieldValue(f, name)); ok {
+		if s, ok := queryString(generateFieldValue(f, name, map[reflect.Type]bool{})); ok {
 			q[name] = s
 		}
 	}
@@ -191,7 +191,7 @@ func queryString(v interface{}) (string, bool) {
 
 // generateFieldValue 為單一 struct 欄位生成合理的測試值
 // 優先順序：validate: 的 oneof 約束 → 型別 + 其餘約束 + 欄位名稱語意
-func generateFieldValue(f reflect.StructField, jsonName string) interface{} {
+func generateFieldValue(f reflect.StructField, jsonName string, onPath map[reflect.Type]bool) interface{} {
 	tag := f.Tag.Get("validate")
 
 	rules := parseValidateTag(tag)
@@ -210,7 +210,7 @@ func generateFieldValue(f reflect.StructField, jsonName string) interface{} {
 		return coerceString(rules.oneOf[0], f.Type)
 	}
 
-	v := valueForType(f.Type, rules, strings.ToLower(jsonName))
+	v := valueForType(f.Type, rules, strings.ToLower(jsonName), onPath)
 	// ne：剛好產生出被排除的值時換一個
 	if rules.ne != "" {
 		switch x := v.(type) {
@@ -358,10 +358,22 @@ func parseFloatPtr(s string) *float64 {
 	return nil
 }
 
-// valueForType 依 Go 型別、validate 約束與欄位名稱語意生成測試值
-func valueForType(t reflect.Type, rules validateRules, name string) interface{} {
+// valueForType 依 Go 型別、validate 約束與欄位名稱語意生成測試值。
+// onPath 記錄目前展開路徑上的具名型別：自我參照（type Node struct{ Next *Node }、type Tree []Tree）
+// 再遇到時給 null，不再往下展開。先前無限遞迴，TestAll 產生輸入時 stack overflow
+func valueForType(t reflect.Type, rules validateRules, name string, onPath map[reflect.Type]bool) interface{} {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
+	}
+	if t.Name() != "" {
+		switch t.Kind() {
+		case reflect.Struct, reflect.Slice, reflect.Array, reflect.Map:
+			if onPath[t] {
+				return nil
+			}
+			onPath[t] = true
+			defer delete(onPath, t)
+		}
 	}
 
 	switch t.Kind() {
@@ -397,14 +409,14 @@ func valueForType(t reflect.Type, rules validateRules, name string) interface{} 
 		}
 		arr := make([]interface{}, 0, n)
 		for i := 0; i < n; i++ {
-			arr = append(arr, valueForType(t.Elem(), validateRules{}, name))
+			arr = append(arr, valueForType(t.Elem(), validateRules{}, name, onPath))
 		}
 		return arr
 
 	case reflect.Map:
 		m := map[string]interface{}{}
 		if rules.required {
-			m["key"] = valueForType(t.Elem(), validateRules{}, name)
+			m["key"] = valueForType(t.Elem(), validateRules{}, name, onPath)
 		}
 		return m
 
@@ -413,7 +425,7 @@ func valueForType(t reflect.Type, rules validateRules, name string) interface{} 
 		if t.PkgPath() == "time" && t.Name() == "Time" {
 			return "2026-06-10T00:00:00Z"
 		}
-		return structFields(t)
+		return structFields(t, onPath)
 
 	default:
 		return nil
@@ -604,8 +616,7 @@ func floatValue(rules validateRules, name string) float64 {
 	return v
 }
 
-// floatLowerBound 由 gte / min / gt 推導浮點下界。gt 是開區間：有上界時取兩者中點，否則邊界 +1。
-// 先前一律 +1 再被上界夾回去：gt=0,lt=1 得到 0，本身就不合格
+// floatLowerBound 由 gte / min / gt 推導浮點下界（gt 取邊界 +1；超過上界時由上界夾回）
 func floatLowerBound(rules validateRules) (float64, bool) {
 	switch {
 	case rules.gte != nil:
@@ -613,15 +624,13 @@ func floatLowerBound(rules validateRules) (float64, bool) {
 	case rules.min != nil:
 		return *rules.min, true
 	case rules.gt != nil:
-		if hi, ok := closedOrOpenUpper(rules); ok {
-			return (*rules.gt + hi) / 2, true
-		}
 		return *rules.gt + 1, true
 	}
 	return 0, false
 }
 
-// floatUpperBound 由 lte / max / lt 推導浮點上界。lt 是開區間：有下界時取兩者中點，否則邊界 -1
+// floatUpperBound 由 lte / max / lt 推導浮點上界。lt 是開區間：有下界時取兩者中點，否則邊界 -1。
+// 先前一律 -1：gt=0,lt=1 的下界 1 被夾到上界 0，本身就不合格
 func floatUpperBound(rules validateRules) (float64, bool) {
 	switch {
 	case rules.lte != nil:
@@ -637,16 +646,7 @@ func floatUpperBound(rules validateRules) (float64, bool) {
 	return 0, false
 }
 
-// closedOrOpenUpper / closedOrOpenLower 回傳 tag 寫的上 / 下邊界值本身（不論開閉）
-func closedOrOpenUpper(rules validateRules) (float64, bool) {
-	for _, p := range []*float64{rules.lte, rules.max, rules.lt} {
-		if p != nil {
-			return *p, true
-		}
-	}
-	return 0, false
-}
-
+// closedOrOpenLower 回傳 tag 寫的下邊界值本身（不論開閉）
 func closedOrOpenLower(rules validateRules) (float64, bool) {
 	for _, p := range []*float64{rules.gte, rules.min, rules.gt} {
 		if p != nil {

@@ -83,7 +83,7 @@ func TestRegisterNormalizesDerivedFields(t *testing.T) {
 	if !ok {
 		t.Fatal("lowercase method not normalized: Get(GET) found nothing")
 	}
-	if got.Method != "GET" || got.InputName != "PEmbedBase" || got.Responses[200].TypeName != "PEmbedBase" {
+	if got.Method != "GET" || got.InputName != "schema.PEmbedBase" || got.Responses[200].TypeName != "schema.PEmbedBase" {
 		t.Errorf("normalized route = %+v", got)
 	}
 	if resps[200].TypeName != "" {
@@ -230,11 +230,11 @@ func TestTypeNameComposite(t *testing.T) {
 		v    interface{}
 		want string
 	}{
-		{[]PEmbedBase{}, "[]PEmbedBase"},
-		{[]*PEmbedBase{}, "[]PEmbedBase"},
-		{&[]PEmbedBase{}, "[]PEmbedBase"},
-		{map[string]PEmbedBase{}, "map[string]PEmbedBase"},
-		{[2]PEmbedBase{}, "[2]PEmbedBase"},
+		{[]PEmbedBase{}, "[]schema.PEmbedBase"},
+		{[]*PEmbedBase{}, "[]schema.PEmbedBase"},
+		{&[]PEmbedBase{}, "[]schema.PEmbedBase"},
+		{map[string]PEmbedBase{}, "map[string]schema.PEmbedBase"},
+		{[2]PEmbedBase{}, "[2]schema.PEmbedBase"},
 	}
 	for _, c := range cases {
 		if got := TypeName(c.v); got != c.want {

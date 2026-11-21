@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
@@ -43,8 +44,9 @@ func init() {
 
 // credential 為一個待加密的值
 type credential struct {
-	name string // key.secret 的名稱，例如 database.postgresql.password
-	node *yaml.Node
+	name  string // key.secret 的名稱，例如 database.postgresql.password
+	node  *yaml.Node
+	value string // 要寫進檔案的新值
 }
 
 // isCredentialField 判斷欄位是否為帳號或密碼
@@ -103,7 +105,7 @@ func findCredentials(doc *yaml.Node, key string) (todo []credential, skipped []s
 			// 已是 ${secret:name}，或是其他引用：把引用本身加密就壞了
 			skipped = append(skipped, name+" (already a reference)")
 		default:
-			todo = append(todo, credential{name: name, node: value})
+			todo = append(todo, credential{name: name, node: value, value: "${secret:" + name + "}"})
 		}
 	}
 	if !found {
@@ -166,8 +168,9 @@ func replaceCredentials(data []byte, doc *yaml.Node, creds []credential) ([]byte
 		if !ok {
 			return nil, unsupportedValue(c)
 		}
-		lines[idx] = string(line[:start]) + secretRef(c.name) + string(line[end:])
-		c.node.Value, c.node.Tag, c.node.Style = "${secret:"+c.name+"}", "!!str", yaml.DoubleQuotedStyle
+		// strconv.Quote 的跳脫都是合法的 YAML 雙引號跳脫；下面再以解析結果比對一次
+		lines[idx] = string(line[:start]) + strconv.Quote(c.value) + string(line[end:])
+		c.node.Value, c.node.Tag, c.node.Style = c.value, "!!str", yaml.DoubleQuotedStyle
 	}
 	out := []byte(strings.Join(lines, "\n"))
 
@@ -189,8 +192,109 @@ func unsupportedValue(c credential) error {
 	return fmt.Errorf("line %d: %s is not a plain one-line value, nothing changed: rewrite it on one line, or use hyp secret set", c.node.Line, c.name)
 }
 
-func secretRef(name string) string {
-	return `"${secret:` + name + `}"`
+// findReferences 找出 doc 裡所有含 ${secret:name} 的純量（依文件順序），value 為展開後的明文
+func findReferences(doc *yaml.Node, store *secret.Store) ([]credential, error) {
+	var refs []credential
+	var walk func(n *yaml.Node) error
+	walk = func(n *yaml.Node) error {
+		if n.Kind == yaml.ScalarNode && secret.HasReference(n.Value) {
+			plain, err := store.Expand(n.Value)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", n.Line, err)
+			}
+			refs = append(refs, credential{name: n.Value, node: n, value: plain})
+		}
+		for _, c := range n.Content { // alias 不往下走：值在定義它的地方
+			if err := walk(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return refs, walk(doc)
+}
+
+// restoreTargets 回傳 --restore 要處理的檔案：有 --file 時照給的，否則是專案 config/ 下所有 YAML
+func restoreTargets(root, file string) ([]string, error) {
+	if file != "" {
+		return []string{file}, nil
+	}
+	var out []string
+	err := filepath.WalkDir(filepath.Join(root, "config"), func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if ext := strings.ToLower(filepath.Ext(p)); !d.IsDir() && (ext == ".yaml" || ext == ".yml") {
+			out = append(out, p)
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, errors.New("no config/ directory in this project: name the file with --file")
+	}
+	return out, err
+}
+
+// runSecretRestore 把設定檔裡的 ${secret:name} 換回明文（hyp crypt 的反向）。key.secret 不變。
+// 全部檔案都解密、改寫成功後才開始寫入
+func runSecretRestore(cmd *cobra.Command) error {
+	settings, err := secretSettings(cmd)
+	if err != nil {
+		return err
+	}
+	store, err := secret.Open(settings, secret.Options{Prompt: secretPrompt(cmd)})
+	if err != nil {
+		return err
+	}
+	file, _ := cmd.Flags().GetString("file")
+	targets, err := restoreTargets(settings.Root(), file)
+	if err != nil {
+		return err
+	}
+
+	type change struct {
+		path string
+		data []byte
+		n    int
+	}
+	var changes []change
+	for _, path := range targets {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		var doc yaml.Node
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		refs, err := findReferences(&doc, store)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if len(refs) == 0 {
+			continue
+		}
+		updated, err := replaceCredentials(data, &doc, refs)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		changes = append(changes, change{path, updated, len(refs)})
+	}
+
+	out := cmd.OutOrStdout()
+	if len(changes) == 0 {
+		fmt.Fprintln(out, "No ${secret:name} references found, nothing changed.")
+		return nil
+	}
+	for _, c := range changes {
+		if err := writeFileAtomic(c.path, c.data); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Restored %d value(s) in %s\n", c.n, c.path)
+	}
+	fmt.Fprintf(out, "These files now hold the plaintext: do not commit them. %s is unchanged;\n"+
+		"put the references back by hand, or with hyp crypt --key <section> for user / password fields.\n", settings.SecretFile)
+	return nil
 }
 
 // writeFileAtomic 寫入暫存檔再 rename，中途失敗不會留下寫到一半的設定檔
@@ -249,6 +353,9 @@ func runCryptCmd(cmd *cobra.Command, _ []string) error {
 	// 專案根目錄的找法與載入設定時（secret.ExpandConfig）相同，否則執行期會找不到 key.secret
 	settings, err := secret.LoadSettings(secret.FindRoot(filepath.Dir(file)))
 	if err != nil {
+		return err
+	}
+	if err := checkKeyFile(cmd, settings); err != nil {
 		return err
 	}
 	store, err := secret.Open(settings, secret.Options{Prompt: secretPrompt(cmd)})

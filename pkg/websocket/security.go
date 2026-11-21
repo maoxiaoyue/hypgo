@@ -31,6 +31,13 @@ type SecurityConfig struct {
 	// 只在訊息經過簽名或加密時有意義：否則 Timestamp 可被任意竄改
 	MaxClockSkew time.Duration
 
+	// ReplayProtection 把每則訊息綁定方向、連線與序號（預設關閉；線上格式不同，客戶端必須配合，
+	// 見 replay.go 開頭的格式說明與 ClientSession）。需要 AESKey 或 HMACKey。
+	// 關閉時，取得任何一則加密 / 簽名訊息的人不需要金鑰就能把它原樣送回伺服器（包括伺服器自己
+	// 送出的訊息），MaxClockSkew 只限制能重放多久。
+	// 開啟後廣播改為每條連線各自加密（關閉時所有連線共用一次加密的結果）
+	ReplayProtection bool
+
 	aeadOnce sync.Once
 	aead     cipher.AEAD
 	aeadErr  error
@@ -68,20 +75,20 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 }
 
 // seal 以 aead 加密，輸出格式：[nonce (12 bytes)][ciphertext + GCM tag]
-func seal(gcm cipher.AEAD, plaintext []byte) []byte {
+func seal(gcm cipher.AEAD, plaintext, ad []byte) []byte {
 	nonce := make([]byte, gcm.NonceSize(), gcm.NonceSize()+len(plaintext)+gcm.Overhead())
 	rand.Read(nonce) // Go 1.24 起 crypto/rand.Read 不會回傳錯誤
-	return gcm.Seal(nonce, nonce, plaintext, nil)
+	return gcm.Seal(nonce, nonce, plaintext, ad)
 }
 
 // open 解密 seal 的輸出
-func open(gcm cipher.AEAD, ciphertext []byte) ([]byte, error) {
+func open(gcm cipher.AEAD, ciphertext, ad []byte) ([]byte, error) {
 	nonceSize := gcm.NonceSize()
 	if len(ciphertext) < nonceSize {
 		return nil, fmt.Errorf("ciphertext too short: need at least %d bytes, got %d", nonceSize, len(ciphertext))
 	}
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	return gcm.Open(nil, nonce, ciphertext, ad)
 }
 
 // Encrypt 使用 AES-256-GCM 加密資料（key 須為 32 bytes）
@@ -91,7 +98,7 @@ func Encrypt(plaintext, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return seal(gcm, plaintext), nil
+	return seal(gcm, plaintext, nil), nil
 }
 
 // Decrypt 使用 AES-256-GCM 解密資料（key 須為 32 bytes）
@@ -101,15 +108,19 @@ func Decrypt(ciphertext, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return open(gcm, ciphertext)
+	return open(gcm, ciphertext, nil)
 }
 
 // ===== HMAC-SHA256 簽名 =====
 
 // Sign 使用 HMAC-SHA256 簽名資料
 // 輸出格式：[32-byte HMAC signature][original data]
-func Sign(data, key []byte) []byte {
+func Sign(data, key []byte) []byte { return signAD(data, key, nil) }
+
+// signAD 簽名 ad || data，輸出 [簽名][data]（ad 不輸出）
+func signAD(data, key, ad []byte) []byte {
 	mac := hmac.New(sha256.New, key)
+	mac.Write(ad)
 	mac.Write(data)
 	sig := mac.Sum(nil) // 32 bytes
 
@@ -121,7 +132,9 @@ func Sign(data, key []byte) []byte {
 
 // Verify 驗證 HMAC-SHA256 簽名並返回原始資料
 // 輸入格式：[32-byte HMAC signature][original data]
-func Verify(signed, key []byte) ([]byte, error) {
+func Verify(signed, key []byte) ([]byte, error) { return verifyAD(signed, key, nil) }
+
+func verifyAD(signed, key, ad []byte) ([]byte, error) {
 	if len(signed) < 32 {
 		return nil, fmt.Errorf("signed data too short: need at least 32 bytes, got %d", len(signed))
 	}
@@ -130,6 +143,7 @@ func Verify(signed, key []byte) ([]byte, error) {
 	data := signed[32:]
 
 	mac := hmac.New(sha256.New, key)
+	mac.Write(ad)
 	mac.Write(data)
 	expected := mac.Sum(nil)
 
@@ -168,30 +182,62 @@ func applySecurityOut(data []byte, client *Client, hubSec *SecurityConfig) ([]by
 	if err != nil {
 		return nil, err
 	}
-	return applySecurityOutKeys(data, gcm, hmacKey, hubSec.SignThenEncrypt), nil
+	return protect(data, gcm, hmacKey, hubSec.SignThenEncrypt, nil), nil
 }
 
-// applySecurityOutKeys 以指定金鑰執行出站安全管線（不查 client）。
+// protect 以指定金鑰執行出站安全管線（不查 client）。ad 為不送出、但納入簽名與 GCM 驗證的
+// 附加資料（重放保護的方向 / 連線 / 序號；nil 時與先前的格式相同）。
 // 廣播時所有未覆寫金鑰的 client 共用 hub 金鑰——同一份明文以同一組
 // 金鑰加密一次、發給全部共用者，功能等價（先前 N 個 client 重算
 // N 次相同的 HMAC + AES）
-func applySecurityOutKeys(data []byte, gcm cipher.AEAD, hmacKey []byte, signThenEncrypt bool) []byte {
+func protect(data []byte, gcm cipher.AEAD, hmacKey []byte, signThenEncrypt bool, ad []byte) []byte {
 	if signThenEncrypt {
 		if hmacKey != nil {
-			data = Sign(data, hmacKey)
+			data = signAD(data, hmacKey, ad)
 		}
 		if gcm != nil {
-			data = seal(gcm, data)
+			data = seal(gcm, data, ad)
 		}
 		return data
 	}
 	if gcm != nil {
-		data = seal(gcm, data)
+		data = seal(gcm, data, ad)
 	}
 	if hmacKey != nil {
-		data = Sign(data, hmacKey)
+		data = signAD(data, hmacKey, ad)
 	}
 	return data
+}
+
+// unprotect 為 protect 的反向
+func unprotect(data []byte, gcm cipher.AEAD, hmacKey []byte, signThenEncrypt bool, ad []byte) ([]byte, error) {
+	var err error
+	if signThenEncrypt {
+		// 反向：先解密，再驗證
+		if gcm != nil {
+			if data, err = open(gcm, data, ad); err != nil {
+				return nil, fmt.Errorf("AES decrypt: %w", err)
+			}
+		}
+		if hmacKey != nil {
+			if data, err = verifyAD(data, hmacKey, ad); err != nil {
+				return nil, fmt.Errorf("HMAC verify: %w", err)
+			}
+		}
+		return data, nil
+	}
+	// 反向：先驗證，再解密
+	if hmacKey != nil {
+		if data, err = verifyAD(data, hmacKey, ad); err != nil {
+			return nil, fmt.Errorf("HMAC verify: %w", err)
+		}
+	}
+	if gcm != nil {
+		if data, err = open(gcm, data, ad); err != nil {
+			return nil, fmt.Errorf("AES decrypt: %w", err)
+		}
+	}
+	return data, nil
 }
 
 // applySecurityIn 入站安全管線：從 wire 讀取 → 解密/驗證 → 反序列化
@@ -203,33 +249,10 @@ func applySecurityIn(data []byte, client *Client, hubSec *SecurityConfig) ([]byt
 	if err != nil {
 		return nil, err
 	}
-
-	if hubSec.SignThenEncrypt {
-		// 反向：先解密，再驗證
-		if gcm != nil {
-			if data, err = open(gcm, data); err != nil {
-				return nil, fmt.Errorf("AES decrypt: %w", err)
-			}
-		}
-		if hmacKey != nil {
-			if data, err = Verify(data, hmacKey); err != nil {
-				return nil, fmt.Errorf("HMAC verify: %w", err)
-			}
-		}
-		return data, nil
+	if rs := client.replay; rs != nil {
+		return rs.openIn(data, gcm, hmacKey, hubSec.SignThenEncrypt)
 	}
-	// 反向：先驗證，再解密
-	if hmacKey != nil {
-		if data, err = Verify(data, hmacKey); err != nil {
-			return nil, fmt.Errorf("HMAC verify: %w", err)
-		}
-	}
-	if gcm != nil {
-		if data, err = open(gcm, data); err != nil {
-			return nil, fmt.Errorf("AES decrypt: %w", err)
-		}
-	}
-	return data, nil
+	return unprotect(data, gcm, hmacKey, hubSec.SignThenEncrypt, nil)
 }
 
 // withinSkew 回報入站訊息的 Timestamp 是否在 MaxClockSkew 窗口內（未設定時一律通過）

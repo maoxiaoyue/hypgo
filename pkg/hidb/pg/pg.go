@@ -2,10 +2,35 @@
 package pg
 
 import (
-	_ "github.com/lib/pq"
+	"context"
+	"database/sql"
+	"errors"
+	"time"
+
+	"github.com/lib/pq"
+	"github.com/maoxiaoyue/hypgo/pkg/hidb"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/schema"
 )
+
+func init() { hidb.RegisterErrorClassifier(classify) }
+
+// classify 把 PostgreSQL 的 SQLSTATE 對應到 hidb 的錯誤分類
+func classify(err error) error {
+	var pe *pq.Error
+	if !errors.As(err, &pe) {
+		return nil
+	}
+	switch pe.Code {
+	case "23505": // unique_violation
+		return hidb.ErrDuplicate
+	case "23503": // foreign_key_violation
+		return hidb.ErrForeignKey
+	case "40001", "40P01": // serialization_failure / deadlock_detected
+		return hidb.ErrDeadlock
+	}
+	return nil
+}
 
 // Dialect PostgreSQL 方言實現
 type Dialect struct{}
@@ -23,4 +48,21 @@ func (d *Dialect) DriverName() string {
 // BunDialect 返回 bun ORM 使用的方言實例
 func (d *Dialect) BunDialect() schema.Dialect {
 	return pgdialect.New()
+}
+
+// lagQuery 回傳副本落後的秒數。已重放到收到的最新位置時為 0：主庫沒有寫入時
+// now() - pg_last_xact_replay_timestamp() 會一直變大，不代表落後。主庫上（不在 recovery）也是 0
+const lagQuery = `SELECT CASE
+	WHEN NOT pg_is_in_recovery() THEN 0
+	WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0
+	ELSE COALESCE(EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp()), 0)
+END`
+
+// ReplicaLag 實作 hidb.LagProber
+func (d *Dialect) ReplicaLag(ctx context.Context, db *sql.DB) (time.Duration, error) {
+	var seconds float64
+	if err := db.QueryRowContext(ctx, lagQuery).Scan(&seconds); err != nil {
+		return 0, err
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }

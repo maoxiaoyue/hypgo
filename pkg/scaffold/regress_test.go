@@ -1,7 +1,10 @@
 package scaffold
 
 import (
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -271,13 +274,65 @@ func TestKeepExistingSkipsFiles(t *testing.T) {
 	if err := GenerateCLIProject(dir, "demo", "demo"); err != nil {
 		t.Fatal(err)
 	}
-	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine\n" {
-		t.Error("existing file was overwritten")
+	// 既有的 .gitignore 保留，只補上 hyp secret 金鑰檔的樣式
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine\n\n# hyp secret 的金鑰檔：不可進版控\n.hyp/secret.*\n" {
+		t.Errorf("existing .gitignore = %q", data)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
 		t.Error("project was not completed")
 	}
-	if !strings.Contains(strings.Join(kept, " "), ".gitignore") {
+	if !strings.Contains(strings.Join(kept, " "), "main.go") {
 		t.Errorf("kept = %v", kept)
+	}
+}
+
+// 先前 gRPC / desktop 的 main.go 以 logger.New 建立 logger：設定檔的 logger.rotation 與 format 不生效
+func TestProjectMainUsesConfigLogger(t *testing.T) {
+	for kind, gen := range map[string]func(dir string) error{
+		"grpc":    func(dir string) error { return GenerateGRPCProject(dir, "demo", "demo") },
+		"desktop": func(dir string) error { return GenerateDesktopProject(dir, "demo", "demo") },
+	} {
+		dir := filepath.Join(t.TempDir(), "demo")
+		if err := gen(dir); err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		src, err := os.ReadFile(filepath.Join(dir, "main.go"))
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		if !strings.Contains(string(src), "cfg.NewLogger()") || strings.Contains(string(src), "logger.New(") {
+			t.Errorf("%s: main.go should build the logger with cfg.NewLogger()", kind)
+		}
+		// 每個 import 都要用到：生成的專案在這裡編譯不了（gRPC 要先 make proto、desktop 要 cgo），以語法樹檢查
+		file, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		used := map[string]bool{}
+		ast.Inspect(file, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if id, ok := sel.X.(*ast.Ident); ok {
+					used[id.Name] = true
+				}
+			}
+			return true
+		})
+		for _, imp := range file.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			name := filepath.Base(path)
+			if len(name) > 1 && name[0] == 'v' && strings.Trim(name[1:], "0123456789") == "" {
+				name = filepath.Base(filepath.Dir(path)) // fyne.io/fyne/v2 的套件名是 fyne
+			}
+			if imp.Name != nil {
+				name = imp.Name.Name
+			}
+			if name != "_" && !used[name] {
+				t.Errorf("%s: main.go imports %s but never uses it", kind, imp.Path.Value)
+			}
+		}
+		cfg, _ := os.ReadFile(filepath.Join(dir, "config", "config.yaml"))
+		if !strings.Contains(string(cfg), "\n  format: text") {
+			t.Errorf("%s: config.yaml has no logger.format", kind)
+		}
 	}
 }
