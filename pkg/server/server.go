@@ -29,6 +29,7 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/middleware"
 	"github.com/maoxiaoyue/hypgo/pkg/migrate"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -263,6 +264,12 @@ func (s *Server) Start() error {
 		return manifest.NewAutoSync(manifest.AutoSyncConfig{
 			Enabled: true, Path: out, Format: "json", DisableLLMAutoDiscovery: true,
 		}, s.router, s.config, s.logger).Sync()
+	}
+
+	// HYPGO_SECRET_OPTIONAL 只給上面兩種執行方式用：設了它，設定裡的 ${secret:name} 不會解密。
+	// 先前服務照樣啟動，資料庫密碼是字面的 "${secret:db_pass}"
+	if os.Getenv(secret.OptionalEnv) != "" {
+		return fmt.Errorf("server: $%s is set, so ${secret:name} values in the config were not decrypted: unset it to start the server (it is only for hyp context / hyp migrate)", secret.OptionalEnv)
 	}
 
 	s.restarted = os.Getenv(restartEnv) == "1"

@@ -394,8 +394,9 @@ func TestForceKeepsExistingFilesAndFinishes(t *testing.T) {
 				t.Fatalf("%s run %d: %v", c.name, run, err)
 			}
 		}
-		if data, _ := os.ReadFile(filepath.Join(c.name, ".gitignore")); string(data) != "mine/\n" {
-			t.Errorf("%s: existing .gitignore was overwritten", c.name)
+		// 既有的 .gitignore 保留，只補上金鑰檔的樣式（重跑不重複加）
+		if data, _ := os.ReadFile(filepath.Join(c.name, ".gitignore")); string(data) != "mine/\n\n# hyp secret 的金鑰檔：不可進版控\n.hyp/secret.*\n" {
+			t.Errorf("%s: existing .gitignore = %q", c.name, data)
 		}
 		if data, _ := os.ReadFile(filepath.Join(c.name, "README.md")); string(data) != "# mine\n" {
 			t.Errorf("%s: existing README.md was overwritten", c.name)
@@ -722,8 +723,8 @@ func TestNewInPlaceProtectsExistingProjects(t *testing.T) {
 	if data, _ := os.ReadFile(filepath.Join(dir, "main.go")); string(data) != "package main\n\nfunc main() {}\n" {
 		t.Error("existing main.go was overwritten")
 	}
-	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine/\n" {
-		t.Error("existing .gitignore was overwritten")
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine/\n\n# hyp secret 的金鑰檔：不可進版控\n.hyp/secret.*\n" {
+		t.Errorf("existing .gitignore = %q", data)
 	}
 	if !exists(filepath.Join(dir, "app", "commands", "root.go")) {
 		t.Error("project was not generated")

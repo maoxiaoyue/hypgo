@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/modfile"
 )
@@ -106,6 +107,8 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		{Path: "docker-compose.yml", Content: dockerComposeContent},
 		{Path: "Makefile", Content: makefileContent},
 		{Path: ".gitignore", Content: scaffold.GitignoreTemplate},
+		// 金鑰檔不進 build context：Dockerfile 的建置階段是 COPY . .
+		{Path: ".dockerignore", Content: "# hyp secret 的金鑰檔\n" + secret.KeyIgnorePattern + "\n"},
 		{Path: "README.md", Content: readmeContent},
 		{Path: "go.mod", Content: goModContent},
 	}

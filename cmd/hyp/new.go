@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
+	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -387,9 +388,13 @@ func reportKept(path string) {
 	fmt.Printf("  = kept existing %s\n", filepath.ToSlash(path))
 }
 
-// reportMerged 回報既有 go.mod 補上了骨架需要的 require
+// reportMerged 回報既有檔案補上了骨架需要的內容（go.mod 的 require、.gitignore 的金鑰檔樣式）
 func reportMerged(path string) {
-	fmt.Printf("  ~ added requirements to %s\n", filepath.ToSlash(path))
+	what := "requirements"
+	if filepath.Base(path) != "go.mod" {
+		what = secret.KeyIgnorePattern
+	}
+	fmt.Printf("  ~ added %s to %s\n", what, filepath.ToSlash(path))
 }
 
 // writeNewFile 建立新檔案，絕不截斷既有檔案：已存在時回錯，--force（keepExisting）時保留並略過。
@@ -414,6 +419,17 @@ func writeNewFile(path string, data []byte, perm os.FileMode) error {
 						return merr
 					}
 					if merged {
+						reportMerged(path)
+						return nil
+					}
+				}
+				// 既有的 .gitignore / .dockerignore：確認 hyp secret 的金鑰檔有被忽略
+				if base := filepath.Base(path); base == ".gitignore" || base == ".dockerignore" {
+					added, ierr := secret.EnsureIgnored(path)
+					if ierr != nil {
+						return ierr
+					}
+					if added {
 						reportMerged(path)
 						return nil
 					}

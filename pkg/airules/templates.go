@@ -129,6 +129,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("- `math/rand` for tokens or session ids: use `crypto/rand`\n")
 	sb.WriteString("- `time.Sleep` inside handlers\n")
 	sb.WriteString("- Hardcoded DSN, API key or secret: read from config (pkg/config)\n")
+	sb.WriteString("- Reading, printing or committing `.hyp/secret.key` / `.hyp/secret.age` (the decryption key for `key.secret`)\n")
 
 	sb.WriteString("\n## Build & Test\n\n```bash\n")
 	sb.WriteString("go build ./... && go vet ./... && go test ./...\n")

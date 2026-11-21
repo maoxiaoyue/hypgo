@@ -271,13 +271,14 @@ func TestKeepExistingSkipsFiles(t *testing.T) {
 	if err := GenerateCLIProject(dir, "demo", "demo"); err != nil {
 		t.Fatal(err)
 	}
-	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine\n" {
-		t.Error("existing file was overwritten")
+	// 既有的 .gitignore 保留，只補上 hyp secret 金鑰檔的樣式
+	if data, _ := os.ReadFile(filepath.Join(dir, ".gitignore")); string(data) != "mine\n\n# hyp secret 的金鑰檔：不可進版控\n.hyp/secret.*\n" {
+		t.Errorf("existing .gitignore = %q", data)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
 		t.Error("project was not completed")
 	}
-	if !strings.Contains(strings.Join(kept, " "), ".gitignore") {
+	if !strings.Contains(strings.Join(kept, " "), "main.go") {
 		t.Errorf("kept = %v", kept)
 	}
 }
