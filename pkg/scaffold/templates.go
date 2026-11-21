@@ -720,7 +720,8 @@ database:
 
 logger:
   level: info
-  output: stdout
+  output: stdout    # stdout、stderr 或檔案路徑（依 rotation 輪轉）
+  format: text      # text 或 json
   colors: true
 `
 
@@ -752,7 +753,6 @@ import (
 	"fyne.io/fyne/v2/app"
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
-	"github.com/maoxiaoyue/hypgo/pkg/logger"
 
 	"{{.ModuleName}}/app/views"
 )
@@ -774,7 +774,7 @@ func main() {
 	}
 
 	// logger 依設定建立；cfg.Database 等區段可在此傳給 services
-	log, err := logger.New(cfg.Logger.Level, cfg.Logger.Output, nil, cfg.Logger.Colors)
+	log, err := cfg.NewLogger() // level / output / format / colors / rotation 都依設定檔
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "init logger:", err)
 		os.Exit(1)
@@ -921,7 +921,8 @@ database:
 
 logger:
   level: info
-  output: stdout
+  output: stdout    # stdout、stderr 或檔案路徑（依 rotation 輪轉）
+  format: text      # text 或 json
   colors: true
 `
 
@@ -956,7 +957,6 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypgrpc "github.com/maoxiaoyue/hypgo/pkg/grpc"
 	"github.com/maoxiaoyue/hypgo/pkg/grpc/interceptor"
-	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 
@@ -974,7 +974,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load %s: %v", configPath, err)
 	}
-	appLog, err := logger.New(cfg.Logger.Level, cfg.Logger.Output, nil, cfg.Logger.Colors)
+	appLog, err := cfg.NewLogger() // level / output / format / colors / rotation 都依設定檔
 	if err != nil {
 		log.Fatalf("Failed to init logger: %v", err)
 	}
@@ -1207,7 +1207,8 @@ database:
 
 logger:
   level: info
-  output: stdout
+  output: stdout    # stdout、stderr 或檔案路徑（依 rotation 輪轉）
+  format: text      # text 或 json
   colors: true
 `
 

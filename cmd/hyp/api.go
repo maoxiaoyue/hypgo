@@ -760,8 +760,9 @@ database:
     db: 0
 
 logger:
-  level: info              # debug | info | notice | warning | emergency
+  level: info              # debug | info | notice | warning | error | emergency
   output: "logs/api.log"   # stdout 或檔案路徑
+  format: text             # text | json
   colors: true             # 僅輸出到終端機時上色；寫檔、管線、Docker 不含色碼
   rotation:
     max_size: 100MB

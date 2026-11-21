@@ -728,8 +728,9 @@ database:
     db: 0
 
 logger:
-  level: debug  # debug, info, notice, warning, emergency
+  level: debug  # debug, info, notice, warning, error, emergency
   output: logs/app.log  # stdout or file path
+  format: text  # text or json
   colors: true  # only applied when writing to a terminal
   rotation:
     max_size: 100MB

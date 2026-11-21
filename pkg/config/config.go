@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
 	"gopkg.in/yaml.v3"
 )
@@ -216,8 +217,9 @@ type DatabaseConfigInterface interface {
 }
 
 type LoggerConfig struct {
-	Level    string               `yaml:"level"` // debug, info, notice, warning, emergency
-	Output   string               `yaml:"output"`
+	Level    string               `yaml:"level"`  // debug, info, notice, warning, error, emergency
+	Output   string               `yaml:"output"` // stdout、stderr 或檔案路徑
+	Format   string               `yaml:"format"` // text（預設）或 json
 	Colors   bool                 `yaml:"colors"`
 	Rotation LoggerRotationConfig `yaml:"rotation"`
 }
@@ -415,6 +417,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Logger.Output == "" {
 		c.Logger.Output = "stdout"
 	}
+	if c.Logger.Format == "" {
+		c.Logger.Format = "text"
+	}
 	if c.Logger.Rotation.MaxSize == "" {
 		c.Logger.Rotation.MaxSize = "100MB"
 	}
@@ -433,6 +438,12 @@ func (c *Config) normalize() {
 		c.Server.Protocol = full // pkg/server 一向接受的簡寫；先前在這裡就被驗證擋下
 	}
 	c.Logger.Level = strings.ToLower(strings.TrimSpace(c.Logger.Level))
+	c.Logger.Format = strings.ToLower(strings.TrimSpace(c.Logger.Format))
+	// 先前 output: "STDOUT" 被當成檔名，工作目錄多出一個叫 STDOUT 的日誌檔
+	c.Logger.Output = strings.TrimSpace(c.Logger.Output)
+	if lower := strings.ToLower(c.Logger.Output); lower == "stdout" || lower == "stderr" {
+		c.Logger.Output = lower
+	}
 	c.Database.Driver = canonicalDriver(c.Database.Driver)
 
 	for _, n := range []*int{
@@ -475,6 +486,9 @@ func (c *Config) Validate() error {
 	// 驗證日誌級別
 	if err := ValidateLogLevel(c.Logger.Level); err != nil {
 		return err
+	}
+	if f := c.Logger.Format; f != "" && f != "text" && f != "json" {
+		return fmt.Errorf("logger.format %q: must be text or json", f)
 	}
 
 	// 驗證數據庫驅動
@@ -590,12 +604,34 @@ var rotationSize = regexp.MustCompile(`(?i)^\s*\d+(\.\d+)?\s*(B|K|KB|M|MB|G|GB)?
 
 // validRotationAge 與 pkg/logger 的 parseAge 接受的格式一致：<n>h / <n>d / <n>w，或 time.ParseDuration 的寫法
 func validRotationAge(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "M") { // 月或分鐘無法分辨；pkg/logger 的 parseAge 也拒絕
+		return false
+	}
+	s = strings.ToLower(s)
 	if n := len(s); n > 1 && strings.ContainsRune("hdw", rune(s[n-1])) && strings.Trim(s[:n-1], "0123456789") == "" {
 		return true
 	}
 	d, err := time.ParseDuration(s)
 	return err == nil && d >= 0
+}
+
+// NewLogger 依 logger 區段建立 Logger：level、output、format、colors 與 rotation 都會生效。
+// 先前只有 hypgo.New 套用 rotation；模板以 logger.New 建立的 CLI / gRPC / desktop 專案一律是預設的輪轉設定。
+// 回傳錯誤時 Logger 仍可用（見 logger.NewWithOptions）
+func (c *Config) NewLogger() (*logger.Logger, error) {
+	return logger.NewWithOptions(logger.Options{
+		Level:  c.Logger.Level,
+		Output: c.Logger.Output,
+		Format: c.Logger.Format,
+		Colors: c.Logger.Colors,
+		Rotation: &logger.RotationConfig{
+			MaxSize:    c.Logger.Rotation.MaxSize,
+			MaxAge:     c.Logger.Rotation.MaxAge,
+			MaxBackups: c.Logger.Rotation.MaxBackups,
+			Compress:   c.Logger.Rotation.Compress,
+		},
+	})
 }
 
 // GetServerConfig 實現 ConfigInterface

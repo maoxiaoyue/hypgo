@@ -187,9 +187,12 @@ func TestParseLevel(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := parseLevel(tt.input)
+		got, err := ParseLevel(tt.input)
 		if got != tt.expected {
-			t.Errorf("parseLevel(%q) = %d, want %d", tt.input, got, tt.expected)
+			t.Errorf("ParseLevel(%q) = %d, want %d", tt.input, got, tt.expected)
+		}
+		if (err != nil) != (tt.input == "unknown") {
+			t.Errorf("ParseLevel(%q) err = %v", tt.input, err)
 		}
 	}
 }

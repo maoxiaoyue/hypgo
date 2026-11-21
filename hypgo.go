@@ -222,30 +222,14 @@ func resolveConfig(explicit string) *config.Config {
 // Output 為檔案路徑時接上 Rotation writer（依 config 的 rotation 區段自動輪轉）；
 // 開檔失敗時退回 stdout 並告警，不讓啟動失敗。
 func buildLogger(cfg *config.Config, jsonLogs bool) *logger.Logger {
-	output := cfg.Logger.Output
-	if output == "" {
-		output = "stdout"
+	// 與 CLI / gRPC / desktop 模板共用 cfg.NewLogger：output 不分大小寫、format 來自設定檔
+	log, err := cfg.NewLogger()
+	if err != nil {
+		// 無法使用的部分已退回可用的預設值；檔案開不了時改到 stdout（NewLogger 退回的是 stderr）
+		log.SetOutput(os.Stdout)
+		log.Warningf("logger: %v，改輸出到 stdout", err)
 	}
-
-	var log *logger.Logger
-	if output != "stdout" && output != "stderr" {
-		rc := &logger.RotationConfig{
-			MaxSize:    cfg.Logger.Rotation.MaxSize,
-			MaxAge:     cfg.Logger.Rotation.MaxAge,
-			MaxBackups: cfg.Logger.Rotation.MaxBackups,
-			Compress:   cfg.Logger.Rotation.Compress,
-		}
-		var err error
-		log, err = logger.NewWithRotation(cfg.Logger.Level, output, rc, cfg.Logger.Colors)
-		if err != nil {
-			log, _ = logger.New(cfg.Logger.Level, "stdout", nil, cfg.Logger.Colors)
-			log.Warningf("logger: 無法開啟日誌檔 %s（%v），改輸出到 stdout", output, err)
-		}
-	} else {
-		log, _ = logger.New(cfg.Logger.Level, output, nil, cfg.Logger.Colors)
-	}
-
-	if jsonLogs {
+	if jsonLogs { // WithJSONLogs 優先於設定檔的 logger.format
 		log.SetFormat("json")
 	}
 	return log

@@ -70,8 +70,13 @@ func newLogger(level Level, colorEnabled bool) *Logger {
 // 輸出目的地依序為：writer（非 nil 時）、output 為 "stdout" / "stderr" / ""（stderr），
 // 其餘 output 視為檔案路徑，以預設輪轉設定（100MB、保留 10 份、7 天）寫入。
 // 先前檔案路徑會被靜默改寫到 stderr。開檔失敗時回傳錯誤，但仍回傳寫到 stderr 的可用實例（不會回傳 nil）。
+//
+// level 不分大小寫；認不得的層級以 INFO 建立並回傳錯誤（先前靜默當成 INFO）。
+// 要套用設定檔的 rotation / format，用 NewWithOptions（或 config.Config 的 NewLogger）。
 func New(level string, output string, writer io.Writer, colorEnabled bool) (*Logger, error) {
-	l := newLogger(parseLevel(level), colorEnabled)
+	lv, lvErr := ParseLevel(level)
+	l := newLogger(lv, colorEnabled)
+	output = strings.TrimSpace(output)
 	switch {
 	case writer != nil:
 		l.out.set(writer, nil)
@@ -87,39 +92,89 @@ func New(level string, output string, writer io.Writer, colorEnabled bool) (*Log
 		}
 		l.out.set(rot, rot)
 	}
-	return l, nil
+	return l, lvErr
+}
+
+// Options 為 NewWithOptions 的設定，欄位對應 config.yaml 的 logger 區段
+type Options struct {
+	Level    string          // 不分大小寫；空字串為 info
+	Output   string          // "stdout"（空字串亦同）、"stderr"，其餘為檔案路徑
+	Format   string          // "text"（空字串亦同）或 "json"
+	Colors   bool            // 只在終端機上生效
+	Rotation *RotationConfig // Output 為檔案時的輪轉設定；nil 為預設值（100MB、7 天、10 份）
+}
+
+// NewWithOptions 依 Options 建立 Logger：設定檔的每個欄位（含 rotation 與 format）都會生效。
+// 先前只有 hypgo.New 套用 rotation；用 logger.New 建立的 CLI / gRPC / desktop 專案一律是預設的輪轉設定。
+//
+// 設定值無效（層級、格式、輪轉設定、開檔失敗）時回傳錯誤，同時仍回傳可用的 Logger
+// （無法使用的部分退回 INFO / 文字格式 / stderr），不會回傳 nil。
+func NewWithOptions(o Options) (*Logger, error) {
+	lv, err := ParseLevel(o.Level)
+	l := newLogger(lv, o.Colors)
+
+	switch format := strings.ToLower(strings.TrimSpace(o.Format)); format {
+	case "", "text":
+	case "json":
+		l.json.Store(true)
+	default:
+		err = errors.Join(err, fmt.Errorf("logger: unknown format %q (use text or json)", o.Format))
+	}
+
+	output := strings.TrimSpace(o.Output)
+	switch {
+	case output == "" || strings.EqualFold(output, "stdout"):
+		l.out.set(os.Stdout, nil)
+	case strings.EqualFold(output, "stderr"):
+		l.out.set(os.Stderr, nil)
+	default:
+		rc := o.Rotation
+		if rc == nil {
+			rc = defaultRotationConfig()
+		}
+		rot, rerr := NewRotation(output, rc)
+		if rerr != nil {
+			l.out.set(os.Stderr, nil)
+			return l, errors.Join(err, fmt.Errorf("logger: open %s: %w", output, rerr))
+		}
+		l.out.set(rot, rot)
+	}
+	return l, err
 }
 
 // NewWithRotation 建立寫入 filename 且自動輪轉的 Logger。
 // 輪轉依 config（max_size / max_age / max_backups / compress）在寫入路徑內自動觸發；
 // Logger.Close 會一併關閉輪轉檔案。
+// 輪轉設定無效或開檔失敗時回傳 nil 與錯誤；層級認不得時回傳 INFO 的 Logger 與錯誤。
 func NewWithRotation(level, filename string, rc *RotationConfig, colorEnabled bool) (*Logger, error) {
 	rot, err := NewRotation(filename, rc)
 	if err != nil {
 		return nil, err
 	}
-	l := newLogger(parseLevel(level), colorEnabled)
+	lv, lvErr := ParseLevel(level)
+	l := newLogger(lv, colorEnabled)
 	l.out.set(rot, rot)
-	return l, nil
+	return l, lvErr
 }
 
-// parseLevel 將字串轉換為 Level
-func parseLevel(level string) Level {
-	switch level {
-	case "debug", "DEBUG":
-		return DEBUG
-	case "info", "INFO":
-		return INFO
-	case "notice", "NOTICE":
-		return NOTICE
-	case "warning", "WARNING", "warn", "WARN":
-		return WARNING
-	case "error", "ERROR":
-		return ERROR
-	case "emergency", "EMERGENCY":
-		return EMERGENCY
+// ParseLevel 將字串轉換為 Level：不分大小寫、忽略前後空白，warn 同 warning，空字串為 INFO。
+// 認不得的值回傳 INFO 與錯誤。先前 "Debug"、" debug"、"trace" 都靜默變成 INFO
+func ParseLevel(level string) (Level, error) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return DEBUG, nil
+	case "info", "":
+		return INFO, nil
+	case "notice":
+		return NOTICE, nil
+	case "warning", "warn":
+		return WARNING, nil
+	case "error":
+		return ERROR, nil
+	case "emergency":
+		return EMERGENCY, nil
 	default:
-		return INFO
+		return INFO, fmt.Errorf("logger: unknown level %q (use debug, info, notice, warning, error or emergency)", level)
 	}
 }
 
@@ -155,9 +210,10 @@ func GetLogger() *Logger {
 	return defaultLogger
 }
 
-// InitLogger 初始化Logger
+// InitLogger 把全域 Logger 重設為預設值；參數沒有作用。
+//
+// Deprecated: config 一向被忽略。要依設定建立 Logger 用 NewWithOptions 或 config.Config 的 NewLogger。
 func InitLogger(config interface{}) {
-	// 這裡可以根據config初始化logger
 	defaultLogger = NewLogger()
 }
 
@@ -463,6 +519,9 @@ type sink struct {
 	closed  bool
 	colorOn bool        // 使用者設定（colors: true）
 	color   atomic.Bool // colorOn 且目的地為終端機
+
+	lost       int       // 上次回報之後寫入失敗的筆數
+	lastReport time.Time // 上次把寫入失敗印到 stderr 的時間
 }
 
 func (s *sink) Write(p []byte) (int, error) {
@@ -471,7 +530,28 @@ func (s *sink) Write(p []byte) (int, error) {
 	if s.closed || s.w == nil {
 		return len(p), nil
 	}
-	return s.w.Write(p)
+	n, err := s.w.Write(p)
+	if err != nil {
+		s.reportLocked(err)
+	}
+	return n, err
+}
+
+// errOut 為日誌自身出問題時的回報去處；供測試替換
+var errOut io.Writer = os.Stderr
+
+// writeErrorInterval 寫入失敗最多多久回報一次（磁碟滿時每一筆都失敗，不能洗版）
+const writeErrorInterval = time.Minute
+
+// reportLocked 把寫入失敗印到 stderr。先前完全無聲：Error() 沒有回傳值，磁碟滿或檔案無法寫入時
+// 日誌消失而沒有任何跡象。輸出本身就是 stderr 時不印（印不出來）
+func (s *sink) reportLocked(err error) {
+	s.lost++
+	if s.w == io.Writer(os.Stderr) || time.Since(s.lastReport) < writeErrorInterval {
+		return
+	}
+	fmt.Fprintf(errOut, "logger: write failed, %d log line(s) lost: %v\n", s.lost, err)
+	s.lost, s.lastReport = 0, time.Now()
 }
 
 // set 切換輸出；closer 為 Logger 擁有、需在換掉或 Close 時關閉的資源

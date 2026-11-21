@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -47,7 +48,16 @@ type Rotation struct {
 	maxBytes int64 // 0 = 不依大小輪轉
 	last     time.Time
 	closed   bool
+
+	blocked      bool      // 輪轉失敗中：直接附加到目前的檔案
+	blockedSince time.Time // 開始失敗的時間
 }
+
+// ljRotate 供測試替換（模擬 rename 失敗）
+var ljRotate = (*lumberjack.Logger).Rotate
+
+// rotateRetry 輪轉失敗後多久再試一次（每次嘗試都要關檔、rename）；測試會縮短
+var rotateRetry = time.Second
 
 // noSizeLimitMB 代表「不依大小輪轉」（lumberjack 的 MaxSize 為 0 時會改用 100MB 預設值）
 const noSizeLimitMB = math.MaxInt32
@@ -156,8 +166,13 @@ func parseSize(s string) (int64, error) {
 }
 
 // parseAge 解析時間長度：h / d / w 後綴或 time.ParseDuration 格式，拒絕負數。
+// 大寫 M 回錯：先前轉成小寫後當成分鐘，"1M"（想寫一個月）變成保留 1 天
 func parseAge(s string) (time.Duration, error) {
-	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "M") {
+		return 0, fmt.Errorf("%q: M is ambiguous (month or minute): write days or weeks, e.g. 30d or 4w", s)
+	}
+	s = strings.ToLower(s)
 
 	var d time.Duration
 	var err error
@@ -180,9 +195,12 @@ func parseAge(s string) (time.Duration, error) {
 
 // Write 寫入日誌，寫入前若會超過 max_size 則先輪轉。
 //
-// 單行超過 max_size 時截斷到上限（保留結尾換行），不會為它切出空的備份檔；
-// 先前會先輪轉出一個空備份再寫入。輪轉失敗（例如 Windows 上有其他程式開著檔案導致
-// rename 失敗）只影響這一筆，之後的寫入照常重試；先前檔案被關掉後再也寫不進去。
+// 單行超過 max_size 時截斷到上限（截在完整字元的邊界、保留結尾換行），不會為它切出空的備份檔；
+// 先前會先輪轉出一個空備份再寫入。
+//
+// 輪轉失敗（例如 Windows 上有其他程式開著檔案導致 rename 失敗）時照樣寫進目前的檔案，
+// 檔案暫時超過 max_size，之後每隔 rotateRetry 再試一次，並在 stderr 各印一次失敗與恢復。
+// 先前失敗的那一筆直接丟掉：只要檔案還被別人開著，之後每一筆日誌都消失。
 func (r *Rotation) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -195,24 +213,71 @@ func (r *Rotation) Write(p []byte) (int, error) {
 	// 剛好等於上限的空檔也會被切成空備份
 	n := len(p)
 	if limit := r.maxBytes - 1; r.maxBytes > 0 && int64(len(p)) > limit {
-		trunc := make([]byte, limit)
-		copy(trunc, p[:limit-1])
-		trunc[len(trunc)-1] = '\n'
+		cut := int(limit - 1)
+		for cut > 0 && !utf8.RuneStart(p[cut]) { // 不截在多位元組字元中間
+			cut--
+		}
+		trunc := make([]byte, cut+1)
+		copy(trunc, p[:cut])
+		trunc[cut] = '\n'
 		p = trunc
 	}
 
-	if r.maxBytes > 0 && r.size > 0 && r.size+int64(len(p)) >= r.maxBytes {
-		if err := r.rotateLocked(); err != nil {
-			return 0, err
+	switch {
+	case r.blocked:
+		// 失敗中：不論本層記錄的大小，定期再試（被別的行程寫大的檔案，本層的 size 並不知道）
+		if time.Since(r.last) >= rotateRetry {
+			r.noteRotate(r.rotateLocked())
 		}
+	case r.maxBytes > 0 && r.size > 0 && r.size+int64(len(p)) >= r.maxBytes:
+		r.noteRotate(r.rotateLocked())
 	}
 
-	written, err := r.lj.Write(p)
+	var written int
+	var err error
+	if !r.blocked {
+		written, err = r.lj.Write(p)
+		// 檔案被別的行程寫大時，lumberjack 會在 Write 裡自行輪轉；它失敗時同樣改為直接附加。
+		// 先前這條路徑每一筆都回錯：兩個行程寫同一個檔時，其中一個的日誌全部消失
+		if err != nil && written == 0 && r.maxBytes > 0 {
+			r.last = time.Now()
+			r.noteRotate(err)
+		}
+	}
+	if r.blocked {
+		written, err = r.appendDirect(p)
+	}
 	r.size += int64(written)
 	if err != nil {
 		return written, err
 	}
 	return n, nil
+}
+
+// noteRotate 記錄輪轉的結果，狀態改變時在 stderr 印一行
+func (r *Rotation) noteRotate(err error) {
+	switch {
+	case err != nil && !r.blocked:
+		r.blocked, r.blockedSince = true, time.Now()
+		fmt.Fprintf(errOut, "logger: cannot rotate %s, still writing to it and retrying: %v\n", r.lj.Filename, err)
+	case err == nil && r.blocked:
+		r.blocked = false
+		fmt.Fprintf(errOut, "logger: %s rotated after failing for %s\n", r.lj.Filename, time.Since(r.blockedSince).Round(time.Second))
+	}
+}
+
+// appendDirect 繞過 lumberjack 直接附加：它在檔案超過上限時只會再試輪轉，不肯寫入。
+// 每次都開檔、關檔：Windows 上自己持有的控制代碼也會讓 rename 失敗
+func (r *Rotation) appendDirect(p []byte) (int, error) {
+	f, err := os.OpenFile(r.lj.Filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return 0, err
+	}
+	n, err := f.Write(p)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return n, err
 }
 
 // Rotate 立即強制輪轉（無視門檻），供外部（如訊號 handler）強制切檔。
@@ -222,7 +287,11 @@ func (r *Rotation) Rotate() error {
 	if r.closed {
 		return os.ErrClosed
 	}
-	return r.rotateLocked()
+	err := r.rotateLocked()
+	if err == nil {
+		r.noteRotate(nil)
+	}
+	return err
 }
 
 // rotateLocked 執行輪轉（呼叫方須持有鎖）。
@@ -235,7 +304,7 @@ func (r *Rotation) rotateLocked() error {
 			time.Sleep(next.Sub(now))
 		}
 	}
-	err := r.lj.Rotate()
+	err := ljRotate(r.lj)
 	r.last = time.Now()
 	if err != nil {
 		return err
