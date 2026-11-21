@@ -17,8 +17,11 @@ import (
 	"strings"
 )
 
-// 風險等級
+// 風險等級。NONE 代表「這個檔案以外沒有東西受影響」（沒有其他套件依賴、沒有路由直接宣告在上面），
+// 不代表改動安全：main 套件的檔案沒有人 import，但它就是程式本身。
+// 先前「完全沒有依賴者」與「只有 1 個依賴者」同樣是 LOW
 const (
+	RiskNone   = "NONE"
 	RiskLow    = "LOW"
 	RiskMedium = "MEDIUM"
 	RiskHigh   = "HIGH"
@@ -33,9 +36,10 @@ type ImpactReport struct {
 	RiskReasons []string `json:"risk_reasons"`       // 風險等級的依據
 	Warnings    []string `json:"warnings,omitempty"` // 分析不完整之處
 
-	API        []SymbolUsage   `json:"api,omitempty"`        // 這個檔案的匯出 API 與外部使用情況
-	Dependents []DependentFile `json:"dependents,omitempty"` // 直接依賴此套件的套件
-	Transitive []TransitiveDep `json:"transitive,omitempty"` // 間接依賴此套件的套件
+	API         []SymbolUsage   `json:"api,omitempty"`          // 這個檔案的匯出 API 與外部使用情況
+	SamePackage []FileUse       `json:"same_package,omitempty"` // 同套件內用到這個檔案的其他檔案
+	Dependents  []DependentFile `json:"dependents,omitempty"`   // 直接依賴此套件的套件
+	Transitive  []TransitiveDep `json:"transitive,omitempty"`   // 間接依賴此套件的套件
 
 	RoutesKnown bool          `json:"routes_known"`     // 有 .hyp/context.yaml 可供比對
 	Routes      []RouteImpact `json:"routes,omitempty"` // 受影響的路由（直接者在前）
@@ -44,6 +48,15 @@ type ImpactReport struct {
 	UntestedPackages []string     `json:"untested_packages,omitempty"` // 受影響但沒有測試的套件
 	TestCommand      string       `json:"test_command,omitempty"`      // 跑受影響測試的指令
 	NextSteps        []string     `json:"next_steps,omitempty"`        // 改完後還要做的事
+
+	pkgName string // 目標的 package 名稱
+	ignored string // 目標不參與建置的原因（testdata 等目錄、//go:build ignore）
+}
+
+// FileUse 同套件內用到目標檔案宣告的另一個檔案
+type FileUse struct {
+	File string   `json:"file"`           // 檔名
+	Uses []string `json:"uses,omitempty"` // 用到的符號（含未匯出的）
 }
 
 // DependentFile 直接依賴此套件的套件
@@ -56,8 +69,9 @@ type DependentFile struct {
 
 // TransitiveDep 間接依賴此套件的套件
 type TransitiveDep struct {
-	Path string `json:"path"`
-	Via  string `json:"via"` // 經由哪個套件依賴（離目標較近的一層）
+	Path        string `json:"path"`
+	Via         string `json:"via"`                    // 經由哪個套件依賴（離目標較近的一層）
+	TestsImport bool   `json:"tests_import,omitempty"` // 它的測試直接 import 目標套件
 }
 
 // TestImpact 受影響的測試
@@ -106,8 +120,27 @@ func Analyze(targetFile string, projectRoot string) (*ImpactReport, error) {
 
 	report := &ImpactReport{
 		Target:     filepath.ToSlash(targetFile),
-		Package:    targetPkg,
 		IsTestFile: strings.HasSuffix(absTarget, "_test.go"),
+	}
+	switch {
+	case proj.ignored[absTarget] || proj.ignored[filepath.Join(absRoot, relTarget)]:
+		report.ignored = "it has //go:build ignore"
+	case proj.packages[targetPkg] != nil:
+	default:
+		// 套件以路徑為鍵：大小寫與磁碟上不同時（Windows、macOS 找得到檔案）對不上。
+		// 先前這時回報「沒有任何依賴、LOW」，等於告訴 AI 可以放心改
+		if actual := proj.foldPackage(targetPkg); actual != "" {
+			report.Warnings = append(report.Warnings, fmt.Sprintf("path case differs from disk: analysed as %s", actual))
+			targetPkg = actual
+		} else if dir := ignoredDir(targetPkg); dir != "" {
+			report.ignored = "the Go toolchain ignores directories named " + dir
+		} else {
+			return nil, fmt.Errorf("no Go package found for %s: the file is not part of the scanned module (check the path)", targetFile)
+		}
+	}
+	report.Package = targetPkg
+	if info := proj.packages[targetPkg]; info != nil {
+		report.pkgName = info.name
 	}
 	reach := proj.reach(targetPkg)
 
@@ -118,6 +151,9 @@ func Analyze(targetFile string, projectRoot string) (*ImpactReport, error) {
 		}
 	}
 	usage := proj.scanUsage(targetPkg, decls, report)
+	if decls != nil {
+		report.SamePackage = proj.samePackageUses(targetPkg, absTarget, decls)
+	}
 
 	if !report.IsTestFile {
 		for _, dep := range reach.direct {
@@ -128,7 +164,9 @@ func Analyze(targetFile string, projectRoot string) (*ImpactReport, error) {
 		}
 		sort.Slice(report.Dependents, func(i, j int) bool { return report.Dependents[i].Path < report.Dependents[j].Path })
 		for _, dep := range reach.transitive {
-			report.Transitive = append(report.Transitive, TransitiveDep{Path: dep, Via: reach.via[dep]})
+			report.Transitive = append(report.Transitive, TransitiveDep{
+				Path: dep, Via: reach.via[dep], TestsImport: proj.packages[dep].testImports[targetPkg],
+			})
 		}
 		report.API = usage.symbols(decls)
 		report.applyRoutes(proj, decls, reach)
@@ -284,7 +322,10 @@ func (r *ImpactReport) outsideTests() int {
 // （舊規則「測試 >= 50 即 HIGH」套用後，只有 1 個依賴者的 pkg/websocket/proto 也是 HIGH）
 func assessRisk(r *ImpactReport) (string, []string) {
 	if r.IsTestFile {
-		return RiskLow, []string{"test file: only affects its own package's tests"}
+		return RiskNone, []string{"test file: only its own package's tests are affected"}
+	}
+	if r.ignored != "" {
+		return RiskNone, []string{"this file is not part of the build: " + r.ignored}
 	}
 	direct := 0
 	for _, dep := range r.Dependents {
@@ -296,7 +337,18 @@ func assessRisk(r *ImpactReport) (string, []string) {
 	outside := r.outsideTests()
 	directRoutes := r.directRouteCount()
 
-	level := 0
+	// 沒有其他套件依賴、也沒有路由直接宣告在上面：這個檔案以外沒有東西受影響。
+	// 只被別人的測試 import 也算在這裡（要跑的測試照樣列出）
+	if total == 0 && directRoutes == 0 {
+		reasons := []string{"no other package depends on this one"}
+		if r.pkgName == "main" {
+			reasons = append(reasons, "package main: nothing imports it, but it is the program itself")
+		}
+		return RiskNone, append(reasons, "NONE means nothing outside this file's package is affected, not that the change is safe")
+	}
+
+	const low, medium, high = 1, 2, 3
+	level := low
 	var reasons []string
 	raise := func(to int, reason string) {
 		if to > level {
@@ -309,29 +361,43 @@ func assessRisk(r *ImpactReport) (string, []string) {
 	case total == 0:
 		reasons = append(reasons, "no other package depends on this one")
 	case direct >= 5:
-		raise(2, fmt.Sprintf("%d packages import it directly, %d depend on it in total", direct, total))
+		raise(high, fmt.Sprintf("%d packages import it directly, %d depend on it in total", direct, total))
 	case total >= 6:
-		raise(2, fmt.Sprintf("%d packages depend on it (%d directly)", total, direct))
+		raise(high, fmt.Sprintf("%d packages depend on it (%d directly)", total, direct))
 	case direct >= 2 || total >= 3:
-		raise(1, fmt.Sprintf("%d packages depend on it (%d directly)", total, direct))
+		raise(medium, fmt.Sprintf("%d packages depend on it (%d directly)", total, direct))
 	default:
 		reasons = append(reasons, fmt.Sprintf("%d package(s) depend on it", total))
 	}
 	if outside >= 20 {
-		raise(1, fmt.Sprintf("%d tests in other packages are affected", outside))
+		raise(medium, fmt.Sprintf("%d tests in other packages are affected", outside))
 	}
 	if directRoutes > 0 {
-		raise(1, fmt.Sprintf("%d route(s) declared directly against this file", directRoutes))
+		raise(medium, fmt.Sprintf("%d route(s) declared directly against this file", directRoutes))
 	}
 	// 有人依賴卻沒有測試保護時，錯誤最容易直接進到正式環境。最多拉到 MEDIUM：
 	// 否則只有 1 個依賴者的 pkg/websocket/proto（protoc 產物）也會變成 HIGH
 	if total > 0 && !r.hasOwnTests() {
-		if level == 0 {
-			level = 1
+		if level == low {
+			level = medium
 		}
 		reasons = append(reasons, "this package has no tests of its own")
 	}
-	return []string{RiskLow, RiskMedium, RiskHigh}[level], reasons
+	return []string{RiskNone, RiskLow, RiskMedium, RiskHigh}[level], reasons
+}
+
+// foldPackage 回傳與 pkg 只差大小寫的套件路徑；沒有或不只一個時回傳 ""
+func (p *project) foldPackage(pkg string) string {
+	found := ""
+	for key := range p.packages {
+		if strings.EqualFold(key, pkg) {
+			if found != "" {
+				return ""
+			}
+			found = key
+		}
+	}
+	return found
 }
 
 func (r *ImpactReport) hasOwnTests() bool {

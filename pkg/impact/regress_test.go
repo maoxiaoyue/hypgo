@@ -490,7 +490,7 @@ func TestRootPackageTestCommand(t *testing.T) {
 
 func TestTestFileTarget(t *testing.T) {
 	r := mustAnalyze(t, moduleProject(t), "pkg/core/core_test.go")
-	if !r.IsTestFile || r.Risk != RiskLow || r.TestCommand != "go test ./pkg/core/" {
+	if !r.IsTestFile || r.Risk != RiskNone || r.TestCommand != "go test ./pkg/core/" {
 		t.Errorf("report = %+v", r)
 	}
 	if len(r.Dependents) != 0 || len(r.API) != 0 {
@@ -555,19 +555,23 @@ func TestAssessRisk(t *testing.T) {
 		r    ImpactReport
 		want string
 	}{
-		"no dependents":                  {ImpactReport{Tests: own}, RiskLow},
-		"no dependents no tests":         {ImpactReport{}, RiskLow},
+		"no dependents":                  {ImpactReport{Tests: own}, RiskNone},
+		"no dependents no tests":         {ImpactReport{}, RiskNone},
 		"one dependent":                  {ImpactReport{Dependents: deps(1, false), Tests: own}, RiskLow},
-		"tests only importers":           {ImpactReport{Dependents: deps(9, true), Tests: own}, RiskLow},
+		"tests only importers":           {ImpactReport{Dependents: deps(9, true), Tests: own}, RiskNone},
+		"tests only, many outside tests": {ImpactReport{Dependents: deps(2, true), Tests: withOutside(500)}, RiskNone},
+		"direct route, no dependents":    {ImpactReport{Tests: own, Routes: []RouteImpact{{Direct: true}}}, RiskMedium},
+		"test file":                      {ImpactReport{IsTestFile: true, Dependents: deps(9, false)}, RiskNone},
+		"not built":                      {ImpactReport{ignored: "x", Dependents: deps(9, false)}, RiskNone},
 		"two direct":                     {ImpactReport{Dependents: deps(2, false), Tests: own}, RiskMedium},
 		"three total":                    {ImpactReport{Dependents: deps(1, false), Transitive: make([]TransitiveDep, 2), Tests: own}, RiskMedium},
 		"five direct":                    {ImpactReport{Dependents: deps(5, false), Tests: own}, RiskHigh},
 		"six total":                      {ImpactReport{Dependents: deps(1, false), Transitive: make([]TransitiveDep, 5), Tests: own}, RiskHigh},
 		"20 outside tests":               {ImpactReport{Dependents: deps(1, false), Tests: withOutside(20)}, RiskMedium},
 		"many outside tests stay medium": {ImpactReport{Dependents: deps(1, false), Tests: withOutside(500)}, RiskMedium},
-		"own tests don't count":          {ImpactReport{Tests: []TestImpact{{File: "p/*_test.go", TestCount: 500}}}, RiskLow},
+		"own tests don't count":          {ImpactReport{Tests: []TestImpact{{File: "p/*_test.go", TestCount: 500}}}, RiskNone},
 		"direct route":                   {ImpactReport{Tests: own, Routes: []RouteImpact{{Direct: true}}}, RiskMedium},
-		"indirect route":                 {ImpactReport{Tests: own, Routes: []RouteImpact{{}}}, RiskLow},
+		"indirect route":                 {ImpactReport{Tests: own, Routes: []RouteImpact{{}}}, RiskNone},
 		"no own tests raises":            {ImpactReport{Dependents: deps(1, false)}, RiskMedium},
 		"no own tests stops at medium":   {ImpactReport{Dependents: deps(1, false), Tests: []TestImpact{{File: "q/*_test.go", TestCount: 60}}}, RiskMedium},
 		"no own tests caps":              {ImpactReport{Dependents: deps(5, false)}, RiskHigh},

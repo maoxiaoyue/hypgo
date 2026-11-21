@@ -3,6 +3,7 @@ package impact
 
 import (
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/mod/modfile"
 )
@@ -30,6 +32,10 @@ type project struct {
 	root     string
 	module   string // go.mod 的 module 路徑；沒有 go.mod 時為空
 	packages map[string]*pkgInfo
+
+	newest     time.Time       // 最新的 .go 檔修改時間（比對 manifest 是否過期）
+	newestFile string          // 該檔案（相對於專案根目錄）
+	ignored    map[string]bool // 帶 //go:build ignore、不參與建置的檔案（絕對路徑）
 }
 
 // scanProject 掃描專案，建立套件依賴圖。只保留專案內的依賴：
@@ -39,7 +45,7 @@ func scanProject(root string) (*project, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &project{root: absRoot, module: readModulePath(absRoot), packages: map[string]*pkgInfo{}}
+	p := &project{root: absRoot, module: readModulePath(absRoot), packages: map[string]*pkgInfo{}, ignored: map[string]bool{}}
 	raw := map[*pkgInfo]map[string]bool{}
 	rawTest := map[*pkgInfo]map[string]bool{}
 
@@ -64,15 +70,23 @@ func scanProject(root string) (*project, error) {
 		if !strings.HasSuffix(name, ".go") {
 			return nil
 		}
-		f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
+		f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly|parser.ParseComments)
 		if err != nil {
 			return nil // 跳過無法解析的檔案
+		}
+		// //go:build ignore 的檔案（產生器、範例）不參與建置：先前 tools/gen.go 讓它 import 的套件多一個依賴者
+		if buildIgnored(f) {
+			p.ignored[file] = true
+			return nil
 		}
 		rel, err := filepath.Rel(absRoot, filepath.Dir(file))
 		if err != nil {
 			return nil
 		}
 		key := filepath.ToSlash(rel)
+		if fi, err := d.Info(); err == nil && fi.ModTime().After(p.newest) {
+			p.newest, p.newestFile = fi.ModTime(), path.Join(key, name)
+		}
 		info := p.packages[key]
 		if info == nil {
 			info = &pkgInfo{path: key, imports: map[string]bool{}, testImports: map[string]bool{}}
@@ -113,6 +127,47 @@ func scanProject(root string) (*project, error) {
 		info.tests = countTestFuncs(info.testFiles)
 	}
 	return p, nil
+}
+
+// buildIgnored 回報檔案是否以 //go:build ignore 排除在建置之外。
+// 其他 build tag（平台、自訂 tag）不判斷：那些檔案在某些環境會被編譯，寧可多報
+func buildIgnored(f *ast.File) bool {
+	for _, group := range f.Comments {
+		if group.Pos() >= f.Package {
+			break
+		}
+		for _, c := range group.List {
+			if !constraint.IsGoBuild(c.Text) {
+				continue
+			}
+			if expr, err := constraint.Parse(c.Text); err == nil && requiresIgnore(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// requiresIgnore 回報條件是否一定需要 ignore tag（ignore、ignore && x）
+func requiresIgnore(expr constraint.Expr) bool {
+	switch e := expr.(type) {
+	case *constraint.TagExpr:
+		return e.Tag == "ignore"
+	case *constraint.AndExpr:
+		return requiresIgnore(e.X) || requiresIgnore(e.Y)
+	}
+	return false
+}
+
+// ignoredDir 回報套件路徑是否在 Go 工具鏈會略過的目錄下（testdata、vendor、_ 或 . 開頭）
+func ignoredDir(pkg string) string {
+	for _, part := range strings.Split(pkg, "/") {
+		if part == "testdata" || part == "vendor" || part == "node_modules" ||
+			(len(part) > 1 && (part[0] == '.' || part[0] == '_')) {
+			return part
+		}
+	}
+	return ""
 }
 
 // readModulePath 讀取 go.mod 的 module 路徑

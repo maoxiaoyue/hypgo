@@ -27,14 +27,20 @@ Risk levels ("depend" counts production code only):
   HIGH     >= 5 direct dependents, or >= 6 in total
   MEDIUM   >= 2 direct, >= 3 total, >= 20 tests in other packages,
            or a route declared directly against this file
-  LOW      everything else
+  LOW      some package depends on it, below the thresholds above
+  NONE     no other package depends on it and no route is declared against it
+           (also test files, and files the Go toolchain does not build)
   At least MEDIUM if other packages depend on it and it has no tests of its own.
+  NONE means nothing outside the file's package is affected, not that the change
+  is safe: a file in package main is NONE, and it is the program itself.
 
 Limits:
   - Static analysis of source files; the project does not need to compile
   - Method calls are not tracked (x.With() needs type information), so a package
     that imports this one may use the file even when no symbol is listed for it
-  - Routes through affected packages are matched by package name
+  - Routes come from .hyp/context.yaml: a warning is printed when a source file
+    is newer than it. Handlers are matched by package name and function
+  - Only //go:build ignore is honoured; files behind other build tags all count
 
 Examples:
   hyp impact pkg/errors/catalog.go
