@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/resource"
@@ -23,15 +24,32 @@ type queryHook struct{ d *Database }
 func (queryHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context { return ctx }
 
 func (h queryHook) AfterQuery(ctx context.Context, e *bun.QueryEvent) {
-	resource.MarkDB()
+	// BEGIN / COMMIT / ROLLBACK / SAVEPOINT 不是應用程式寫的查詢：不計數，也不算寫入。
+	// 先前交易裡 2 個 SELECT 計成 4 次，唯讀交易結束後還讓該使用者的讀取改走主庫
+	control := isTxControl(e)
+	if !control {
+		resource.MarkDB()
+	}
 	d := h.d
 	if took := time.Since(e.StartTime); d.set.slowQuery > 0 && took >= d.set.slowQuery {
 		d.log.Warning("slow query",
 			"ms", took.Milliseconds(), "operation", e.Operation(), "query", truncateSQL(e.Query), "err", errText(e.Err))
 	}
-	if e.Err == nil && !bun.IsReadOnlyQuery(e.IQuery) {
+	if e.Err == nil && !control && !bun.IsReadOnlyQuery(e.IQuery) {
 		d.markWrite(ctx)
 	}
+}
+
+// isTxControl 回報事件是否為 bun 自己送出的交易控制語句（沒有對應的 query 物件）
+func isTxControl(e *bun.QueryEvent) bool {
+	if e.IQuery != nil {
+		return false
+	}
+	switch strings.ToUpper(e.Operation()) {
+	case "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE":
+		return true
+	}
+	return false
 }
 
 // maxLoggedSQL 慢查詢日誌裡 SQL 的長度上限（批次 INSERT 可能有數 MB）

@@ -591,7 +591,7 @@ func renderRouteCard(idx int, r ObserveResult) string {
       <div class="meta-item">
         <span class="meta-key">使用資料儲存</span>
         <span class="meta-val">%s</span>
-      </div>`, boolText(r.Resources.UsesStorage()))
+      </div>`, boolText(r.Resources.Any()))
 	}
 
 	fmt.Fprintf(&sb, `
