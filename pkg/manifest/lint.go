@@ -13,6 +13,7 @@ import (
 
 	"github.com/maoxiaoyue/hypgo/pkg/router"
 	"github.com/maoxiaoyue/hypgo/pkg/schema"
+	"github.com/maoxiaoyue/hypgo/pkg/validate"
 )
 
 // defaultLintIgnore 預設忽略的路由前綴（本來就不需要 Schema，避免警告疲勞）
@@ -115,6 +116,7 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 				Message: "未填 Summary，manifest 中此路由沒有描述",
 			})
 		}
+		rep.Warnings = append(rep.Warnings, lintValidateTags(key, s)...)
 	}
 
 	// 只在 registry、router 上沒有的 REST Schema：多半是路徑或方法寫錯，或路由被移除而宣告留著。
@@ -138,6 +140,35 @@ func lintRoutes(r *router.Router, reg *schema.Registry) *LintReport {
 
 	rep.Coverage = fmt.Sprintf("%d/%d", rep.WithSchema, rep.Total)
 	return rep
+}
+
+// lintValidateTags 檢查 Input / Output 的 validate 標籤。
+// 先前標籤打錯（validate:"requried"）在註冊時沒有任何提示，第一個請求進來才 panic；
+// struct 的 slice / map 沒寫 dive 時元素不被驗證，不合格的請求照樣回 200
+func lintValidateTags(key string, s *schema.Route) []LintWarning {
+	var out []LintWarning
+	for _, side := range []struct {
+		name  string
+		value interface{}
+		dive  bool
+	}{{"Input", s.Input, true}, {"Output", s.Output, false}} { // Output 由 contract 逐層驗證，不需要 dive
+		if side.value == nil {
+			continue
+		}
+		for _, issue := range validate.CheckType(side.value) {
+			switch issue.Kind {
+			case validate.IssueInvalidTag:
+				out = append(out, LintWarning{Route: key, Kind: "invalid_validate_tag",
+					Message: fmt.Sprintf("%s %s 的 validate 標籤無法使用：%s", side.name, issue.Field, issue.Message)})
+			case validate.IssueMissingDive:
+				if side.dive {
+					out = append(out, LintWarning{Route: key, Kind: "missing_dive",
+						Message: fmt.Sprintf("%s 欄位 %s 的元素不會被驗證：%s", side.name, issue.Field, issue.Message)})
+				}
+			}
+		}
+	}
+	return out
 }
 
 // declaresResponse 回報 Schema 是否已用 Responses 說明成功回應：宣告了 204（不回 body），

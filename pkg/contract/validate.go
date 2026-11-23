@@ -233,7 +233,7 @@ func walkConstraints(rv reflect.Value, path string, validateHere bool, add func(
 		}
 		if validateHere {
 			// 使用 pkg/validate 的共用 registry，讓 app 註冊的自訂規則同樣生效
-			err := hypvalidate.Default().Struct(rv.Interface())
+			err := hypvalidate.Struct(rv.Interface()) // 標籤打錯時回錯而不是 panic
 			var verrs validator.ValidationErrors
 			switch {
 			case errors.As(err, &verrs):

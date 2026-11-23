@@ -120,6 +120,13 @@ func (c *Context) BindInput(obj interface{}) bool {
 
 	// 3. 執行 validate tag 驗證（共用 registry，與 pkg/json 同步生效）
 	if err := validateBound(obj); err != nil {
+		// validate 標籤本身有問題（規則名稱打錯）是伺服器端的錯，不是請求的錯：回 500 並交給 server 記錄。
+		// 先前 validator 直接 panic，這條路由的每個請求都靠 Recovery 接住
+		if stderrors.Is(err, hypvalidate.ErrInvalidTag) {
+			_ = c.Error(err)
+			c.abortBindError(http.StatusInternalServerError, "E0003", "Internal server error", nil)
+			return false
+		}
 		c.abortBindError(http.StatusUnprocessableEntity, "E1001", "Validation failed",
 			validationDetails(err))
 		return false

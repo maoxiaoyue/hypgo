@@ -42,7 +42,7 @@ type LintReport struct {
 // LintWarning 單一缺漏項目
 type LintWarning struct {
 	Route   string `json:"route" yaml:"route"` // "POST /api/orders"
-	Kind    string `json:"kind" yaml:"kind"`   // no_schema | missing_input | missing_output | missing_summary | unregistered_schema | config_warning
+	Kind    string `json:"kind" yaml:"kind"`   // no_schema | missing_input | missing_output | missing_summary | unregistered_schema | config_warning | invalid_validate_tag | missing_dive
 	Message string `json:"message" yaml:"message"`
 }
 
