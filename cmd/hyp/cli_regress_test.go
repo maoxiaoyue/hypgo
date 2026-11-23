@@ -326,6 +326,12 @@ func TestAPIProjectTemplate(t *testing.T) {
 		return string(data)
 	}
 
+	// AI 規則要求 contract 測試：先前生成的專案一個測試檔都沒有
+	if got := read("routers/router_contract_test.go"); !strings.Contains(got, "func TestSetup_Contracts(t *testing.T)") ||
+		!strings.Contains(got, "contract.TestAll(t, r)") || !strings.Contains(got, "t.Skip(") {
+		t.Errorf("contract test skeleton:\n%s", got)
+	}
+
 	// 先前內附的 001_create_users 與生成的 User model 欄位不同，hyp migrate diff 又產生一份 CREATE TABLE users
 	entries, _ := os.ReadDir(filepath.Join("shop", "migrations"))
 	for _, e := range entries {

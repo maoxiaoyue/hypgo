@@ -12,6 +12,7 @@ import (
 
 	"github.com/maoxiaoyue/hypgo/pkg/scaffold"
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
+	"github.com/maoxiaoyue/hypgo/pkg/testgen"
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/modfile"
 )
@@ -155,6 +156,12 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		}},
 		{"routers/router.go", func() error { return createAPIRouterSetup(projectName, t.module, today) }},
 		{"main.go", func() error { return createAPIMainFile(projectName, t.module) }},
+		// AI 規則要求每條路由都有 contract 測試：先前生成的專案一個測試檔都沒有。
+		// 骨架預設 t.Skip（多數路由需要 DB 或授權），與 hyp testgen 產生的相同
+		{"routers/router_contract_test.go", func() error {
+			_, err := testgen.GenerateForFile(filepath.Join(projectName, "routers", "router.go"), testgen.DefaultOptions())
+			return err
+		}},
 	}
 	for _, g := range gen {
 		if err := g.fn(); err != nil {

@@ -12,8 +12,13 @@ import (
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 )
 
-// windsurfCharLimit Windsurf 規則檔的字數上限（各來源不一致，取較保守的值）
-const windsurfCharLimit = 6000
+// windsurfCharLimit Windsurf 工作區規則檔（.windsurf/rules/*.md）每個檔案的字數上限。
+// 先前寫 6000，那是全域規則的上限：約 35 條路由就把路由表拿掉
+const windsurfCharLimit = 12000
+
+// maxRouteRows 路由表最多列幾條。規則檔每次對話都會載入，而同樣的資訊已在 .hyp/context.yaml；
+// 先前沒有上限，300 條路由讓每個檔案長到 20,000 字元
+const maxRouteRows = 50
 
 // effectiveComment 回傳 opts.Comment；未設定（nil）時用預設值。
 // 全部為 false 是使用者的明確選擇：先前當成「未設定」，comment.yaml 全關仍生成 REQUIRED 的註釋規範
@@ -66,25 +71,34 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("   }).Handle(handler)\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("2. **BindInput** (MANDATORY, pkg/context): bind input with `c.BindInput`, which parses, validates and answers 400/422 on failure. Never hand-roll JSON decoding.\n")
+	sb.WriteString("2. **BindInput** (MANDATORY, pkg/context): bind input with `c.BindInput`, which parses, validates and answers 400 / 413 / 415 / 422 on failure. Never hand-roll JSON decoding. A slice or map of structs needs `validate:\"dive\"`, or its elements are not validated.\n")
 	sb.WriteString("   ```go\n")
 	sb.WriteString("   var req CreateUserReq\n")
 	sb.WriteString("   if !c.BindInput(&req) { return }\n")
 	sb.WriteString("   ```\n\n")
 
-	// 範例的錯誤碼不能落在保留區：AI 照抄 E1001 會與 BindInput 的驗證錯誤撞號，啟動就 panic
-	sb.WriteString("3. **Typed errors + always log** (MANDATORY, pkg/errors, pkg/logger): use the Error Catalog, never `c.JSON(500, ...)`. Log every error with `log.Error` before aborting. Logger settings live under `logger:` in `config/config.yaml`; never hardcode them.\n")
+	// 範例的錯誤碼不能落在保留區（E0xxx-E2xxx），也不能是 scaffold 會生成的資源（user、auth）：
+	// AI 照抄就與既有的碼撞號，啟動即 panic。
+	// 先前要求「每個錯誤先 log.Error 再中止」：生成的 controller 沒有 logger，
+	// 而 Wrap 的底層錯誤已由 server 記錄，照做會記兩次
+	sb.WriteString("3. **Typed errors** (MANDATORY, pkg/errors): use the Error Catalog, never `c.JSON(500, ...)`. Pass the underlying error with `.Wrap(err)`: the server logs it and it never reaches the response, so do not log it again in the handler. Elsewhere log with `pkg/logger`; its settings live under `logger:` in `config/config.yaml`, never hardcode them.\n")
 	sb.WriteString("   ```go\n")
-	sb.WriteString("   // E0xxx-E2xxx are reserved for the framework; a duplicate code panics at startup\n")
-	sb.WriteString("   var ErrNotFound = errors.Define(\"E4001\", 404, \"Not found\", \"users\")\n")
-	sb.WriteString("   log.Error(\"load user failed\", \"id\", id, \"err\", err)\n")
-	sb.WriteString("   errors.AbortWithAppError(c, ErrNotFound.With(\"id\", id))\n")
+	sb.WriteString("   // Codes are unique per project (a duplicate panics at startup); E0xxx-E2xxx are reserved for the framework\n")
+	sb.WriteString("   var (\n")
+	sb.WriteString("       ErrOrderNotFound = errors.Define(\"E_order_001\", 404, \"Order not found\", \"orders\")\n")
+	sb.WriteString("       ErrOrderInternal = errors.Define(\"E_order_002\", 500, \"Internal error\", \"orders\")\n")
+	sb.WriteString("   )\n")
+	sb.WriteString("   errors.AbortWithAppError(c, ErrOrderNotFound.With(\"id\", id))\n")
+	sb.WriteString("   errors.AbortWithAppError(c, ErrOrderInternal.Wrap(err))\n")
 	sb.WriteString("   ```\n\n")
 
-	sb.WriteString("4. **Contract tests** (MANDATORY, pkg/contract): every schema route needs tests for the happy path, a boundary and at least one error case. Use `contract.Request` for explicit cases.\n")
+	// 範例與 hyp testgen 生成的骨架一致。先前寫 contract.TestAll(t, setupRouter())，專案裡沒有這個函式
+	sb.WriteString("4. **Contract tests** (MANDATORY, pkg/contract): every schema route needs tests for the happy path, a boundary and at least one error case. `hyp testgen` creates the `contract.TestAll` skeleton next to the root registration function; use `contract.Test` for explicit cases.\n")
 	sb.WriteString("   ```go\n")
-	sb.WriteString("   func TestContracts(t *testing.T) {\n")
-	sb.WriteString("       contract.TestAll(t, setupRouter())\n")
+	sb.WriteString("   func TestSetup_Contracts(t *testing.T) { // package routers\n")
+	sb.WriteString("       r := router.New()\n")
+	sb.WriteString("       Setup(r)\n")
+	sb.WriteString("       contract.TestAll(t, r)\n")
 	sb.WriteString("   }\n")
 	sb.WriteString("   ```\n\n")
 
@@ -134,6 +148,7 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 	sb.WriteString("\n## Build & Test\n\n```bash\n")
 	sb.WriteString("go build ./... && go vet ./... && go test ./...\n")
 	sb.WriteString("hyp lint              # Schema completeness CI gate (non-zero exit on gaps)\n")
+	sb.WriteString("hyp lint --deep       # also checks that handlers bind the declared Input type\n")
 	sb.WriteString("hyp chkcomment ./...  # Comment completeness\n")
 	sb.WriteString("```\n")
 
@@ -149,7 +164,9 @@ func coreContent(m *manifest.Manifest, opts Options) string {
 		sb.WriteString("- **After making changes**: `hyp diff-log` logs them to logs/ai.diff_YYYYMMDD.log\n")
 	}
 
-	if m != nil && len(m.Routes) > 0 {
+	if m != nil && len(m.Routes) > maxRouteRows {
+		fmt.Fprintf(&sb, "\n## Current Routes\n\n%d routes: see `routes` in `.hyp/context.yaml` (the table is left out above %d).\n", len(m.Routes), maxRouteRows)
+	} else if m != nil && len(m.Routes) > 0 {
 		sb.WriteString("\n## Current Routes\n\n")
 		sb.WriteString("| Method | Path | Summary |\n")
 		sb.WriteString("|--------|------|--------|\n")

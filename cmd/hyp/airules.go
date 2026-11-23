@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/maoxiaoyue/hypgo/pkg/airules"
 	"github.com/maoxiaoyue/hypgo/pkg/config"
@@ -43,8 +44,13 @@ Extended set (generated only when explicitly named, or with --only every):
 Files are written to the module root (the nearest go.mod going up) unless --dir is set.
 
 Generated files carry a marker with a content hash and are updated on re-run.
-Files edited since they were generated are kept unless you pass --force.
+Files edited since they were generated, and files that have the marker but no
+content hash (older versions, files you adopted by adding the marker), are kept
+unless you pass --force.
 Manually created files (no marker at the top) are never overwritten.
+
+The route table comes from .hyp/context.yaml (hyp context -o .hyp/context.yaml);
+above 50 routes the files point at it instead of listing them.
 
 Examples:
   hyp ai-rules                              # 6 default targets
@@ -114,6 +120,7 @@ func aiRulesDir(cmd *cobra.Command) (string, error) {
 }
 
 func runAIRules(cmd *cobra.Command, args []string) error {
+	out := cmd.OutOrStdout()
 	only, _ := cmd.Flags().GetString("only")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	force, _ := cmd.Flags().GetBool("force")
@@ -142,7 +149,7 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	errored := 0
+	errored, created, unchanged, needForce := 0, 0, 0, 0
 	for _, r := range results {
 		rel, _ := filepath.Rel(dir, r.Path)
 		if rel == "" {
@@ -150,13 +157,20 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 		}
 		switch r.Status {
 		case airules.StatusCreated:
-			fmt.Printf("  + %s\n", rel)
+			fmt.Fprintf(out, "  + %s\n", rel)
+			created++
+		case airules.StatusUnchanged:
+			fmt.Fprintf(out, "  = %s (unchanged)\n", rel)
+			unchanged++
 		case airules.StatusSkipped:
-			fmt.Printf("  ~ %s (skipped: %s)\n", rel, r.Message)
+			fmt.Fprintf(out, "  ~ %s (skipped: %s)\n", rel, r.Message)
+			if r.NeedsForce {
+				needForce++
+			}
 		case airules.StatusDryRun:
-			fmt.Printf("  [dry-run] %s\n", rel)
-			fmt.Println(r.Content)
-			fmt.Println("---")
+			fmt.Fprintf(out, "  [dry-run] %s\n", rel)
+			fmt.Fprintln(out, r.Content)
+			fmt.Fprintln(out, "---")
 		case airules.StatusError:
 			fmt.Fprintf(os.Stderr, "  ! %s: %s\n", rel, r.Message)
 			errored++
@@ -164,13 +178,18 @@ func runAIRules(cmd *cobra.Command, args []string) error {
 	}
 
 	if !dryRun {
-		created := 0
-		for _, r := range results {
-			if r.Status == airules.StatusCreated {
-				created++
-			}
+		fmt.Fprintf(out, "\n%d file(s) generated", created)
+		if unchanged > 0 {
+			fmt.Fprintf(out, ", %d unchanged", unchanged)
 		}
-		fmt.Printf("\n%d file(s) generated.\n", created)
+		fmt.Fprintln(out, ".")
+	}
+	// 先前被略過的檔案只有中間一行 ~，結尾仍是「N file(s) generated.」，看不出規則檔沒更新
+	if needForce > 0 {
+		fmt.Fprintf(out, "⚠️  %d file(s) were not updated because they may hold your own edits; re-run with --force to overwrite them.\n", needForce)
+	}
+	if note := manifestNote(dir, m); note != "" {
+		fmt.Fprintln(out, "⚠️  "+note)
 	}
 
 	// 先前寫檔失敗只印到 stderr，仍 exit 0
@@ -238,6 +257,47 @@ func runAIRulesClean(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("%d file(s) could not be removed", errored)
 	}
 	return nil
+}
+
+// manifestNote 回報路由表的來源有沒有問題：規則檔的路由表讀自磁碟上的 .hyp/context.yaml，不執行專案。
+// 先前沒有 manifest 時路由表整段不見且沒有提示，manifest 過期時寫進去的是舊的路由
+func manifestNote(dir string, m *manifest.Manifest) string {
+	path := filepath.Join(dir, ".hyp", "context.yaml")
+	if m == nil {
+		return ".hyp/context.yaml not found: the rule files have no route table. Run `hyp context -o .hyp/context.yaml`, then `hyp ai-rules` again."
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	newest, newestFile := info.ModTime(), ""
+	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if p != dir && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "vendor" || name == "node_modules" || name == "testdata") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		if fi, err := d.Info(); err == nil && fi.ModTime().After(newest) {
+			newest, newestFile = fi.ModTime(), p
+		}
+		return nil
+	})
+	if newestFile == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(dir, newestFile)
+	if err != nil {
+		rel = newestFile
+	}
+	return fmt.Sprintf(".hyp/context.yaml is older than %s: the route table may be out of date. Run `hyp context -o .hyp/context.yaml`, then `hyp ai-rules` again.", filepath.ToSlash(rel))
 }
 
 // loadCommentToggles 讀取 .hyp/comment.yaml，回傳註釋開關設定。
