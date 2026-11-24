@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -165,6 +166,18 @@ func CORS(config CORSConfig) hypcontext.HandlerFunc {
 		panic("middleware: " + err.Error())
 	}
 	return h
+}
+
+// corsPC 是 NewCORS 回傳的 handler 的程式位址：同一個函式字面值建立的閉包位址相同
+var corsPC = func() uintptr {
+	h, _ := NewCORS(CORSConfig{AllowOrigins: []string{"*"}})
+	return reflect.ValueOf(h).Pointer()
+}()
+
+// IsCORS 回報 h 是不是 CORS / NewCORS 建立的中間件。server 用它判斷使用者有沒有自己掛 CORS：
+// 有的話不再掛預設的那一份
+func IsCORS(h hypcontext.HandlerFunc) bool {
+	return h != nil && reflect.ValueOf(h).Pointer() == corsPC
 }
 
 // normalizeOrigin 把設定裡的來源整理成瀏覽器 Origin 標頭的寫法（scheme://host[:port]，小寫、無結尾斜線）

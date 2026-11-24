@@ -3,6 +3,7 @@ package interceptor
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -88,8 +89,11 @@ func newAuthenticator(authFn AuthFunc, skipMethods []string) func(context.Contex
 		if err != nil {
 			// status error 原樣傳出。先前一律包成 Unauthenticated：PermissionDenied 等代碼遺失，
 			// 訊息還帶著 "rpc error: code = ... desc = ..." 前綴
-			if _, ok := status.FromError(err); ok {
-				return nil, err
+			// 只取出 status 本身：fmt.Errorf("lookup %s: %w", dsn, statusErr) 這樣包過的錯誤，
+			// grpc-go 會把整串文字當成訊息送給客戶端（先前原樣回傳 err，包裝的內容因此外洩）
+			var se interface{ GRPCStatus() *status.Status }
+			if errors.As(err, &se) {
+				return nil, se.GRPCStatus().Err()
 			}
 			// 先前把 err.Error() 送給客戶端：驗證時查資料庫失敗，連線位址與帳號就出現在回應裡
 			return nil, status.Error(codes.Unauthenticated, "invalid token")

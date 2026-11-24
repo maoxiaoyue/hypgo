@@ -624,8 +624,8 @@ import "github.com/maoxiaoyue/hypgo/pkg/schema"
 // @ai:sideeffect 寫入全域 schema.Registry
 func RegisterSchemas() {
 	schema.RegisterCLI("{{.ProjectName}}", "{{.Name}} root command", nil, nil)
-	// 由 hyp generate command <name> 新增子命令後，請在此補登：
-	// schema.RegisterCLI("process", "Process data", nil, nil)
+	// 子命令（hyp generate command <name>）在自己的 init() 登錄，這裡不必再寫一次：
+	// 同一個命令以不同的內容登錄兩次，啟動時會 panic
 }
 `
 
@@ -662,12 +662,19 @@ func main() {
 	log, _ := logger.New("info", "stderr", os.Stderr, false)
 
 	// AutoSync 會自動探測同目錄的 .hyp/llm.yaml；無檔或 mode=none 時退回純 Go 推斷
-	as := manifest.NewAutoSync(manifest.AutoSyncConfig{Enabled: true}, router.New(), nil, log)
+	cfg := manifest.AutoSyncConfig{Enabled: true}
+	// hyp lint / hyp context 只要目前的內容：寫到它指定的暫存檔，不動 .hyp/context.yaml、不呼叫 LLM
+	if out := os.Getenv(manifest.ManifestOutEnv); out != "" {
+		cfg.Path, cfg.Format, cfg.DisableLLMAutoDiscovery = out, "json", true
+	}
+	as := manifest.NewAutoSync(cfg, router.New(), nil, log)
 	if err := as.Sync(); err != nil {
 		fmt.Fprintln(os.Stderr, "genctx:", err)
 		os.Exit(1)
 	}
-	fmt.Println("manifest written to .hyp/context.yaml")
+	if cfg.Path == "" {
+		fmt.Println("manifest written to .hyp/context.yaml")
+	}
 }
 `
 
@@ -878,12 +885,19 @@ func main() {
 	log, _ := logger.New("info", "stderr", os.Stderr, false)
 
 	// AutoSync 會自動探測同目錄的 .hyp/llm.yaml；無檔或 mode=none 時退回純 Go 推斷
-	as := manifest.NewAutoSync(manifest.AutoSyncConfig{Enabled: true}, router.New(), nil, log)
+	cfg := manifest.AutoSyncConfig{Enabled: true}
+	// hyp lint / hyp context 只要目前的內容：寫到它指定的暫存檔，不動 .hyp/context.yaml、不呼叫 LLM
+	if out := os.Getenv(manifest.ManifestOutEnv); out != "" {
+		cfg.Path, cfg.Format, cfg.DisableLLMAutoDiscovery = out, "json", true
+	}
+	as := manifest.NewAutoSync(cfg, router.New(), nil, log)
 	if err := as.Sync(); err != nil {
 		fmt.Fprintln(os.Stderr, "genctx:", err)
 		os.Exit(1)
 	}
-	fmt.Println("manifest written to .hyp/context.yaml")
+	if cfg.Path == "" {
+		fmt.Println("manifest written to .hyp/context.yaml")
+	}
 }
 `
 

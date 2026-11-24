@@ -99,9 +99,24 @@ func walkYAML(file string, node *yaml.Node, t reflect.Type, path string, allowEx
 	fields := yamlFields(t)
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		k, v := node.Content[i], node.Content[i+1]
+		// alias（server: *base）指向的內容照常檢查。先前 alias 節點既不是 mapping 也不是 sequence，整段略過
+		if v.Kind == yaml.AliasNode && v.Alias != nil {
+			v = v.Alias
+		}
+		// 合併鍵（<<: *defaults）：帶進來的鍵與直接寫的一樣檢查、一樣算「有寫」。
+		// 先前被報成未知的鍵 "<<"，而帶進來的 read_timeout: 0 不算明確設定、退回預設值
+		if k.ShortTag() == "!!merge" {
+			for _, m := range mergeSources(v) {
+				walkYAML(file, m, t, path, allowExtra, nested, warnings, explicit)
+			}
+			continue
+		}
 		key := path + k.Value
 		ft, ok := fields[k.Value]
 		if !ok {
+			// 頂層的 mapping 是使用者自己的區段（redis:、db:、tls:），只有像錯字時才提示。
+			// 先前只要與任何巢狀鍵同名就報「少了縮排」，連帶擋下 hyp lint
+			ownSection := allowExtra && v.Kind == yaml.MappingNode
 			// 頂層只在很像打錯時才提示（差一個字），避免把使用者自己的區段（service、payment…）當成錯字
 			maxDist := min(3, len(k.Value)/3+1)
 			if allowExtra {
@@ -112,6 +127,8 @@ func walkYAML(file string, node *yaml.Node, t reflect.Type, path string, allowEx
 			switch full, isNested := nested[k.Value]; {
 			case suggestion != "":
 				msg += fmt.Sprintf(" (did you mean %q?)", suggestion)
+			case ownSection:
+				continue
 			case allowExtra && isNested && full != "":
 				// 少了縮排：server 底下的 addr 寫到了最外層
 				msg += fmt.Sprintf(" at the top level (did you mean %s? check the indentation)", full)
@@ -121,6 +138,11 @@ func walkYAML(file string, node *yaml.Node, t reflect.Type, path string, allowEx
 				continue // 使用者自己的區段
 			}
 			*warnings = append(*warnings, Warning{File: file, Key: key, Line: k.Line, Message: msg})
+			continue
+		}
+		// 空值（read_timeout: 或 read_timeout: ~）等於沒寫。先前鍵存在就算明確設定，
+		// 值是 0，於是逾時與 max_handlers 被關掉
+		if v.Kind == yaml.ScalarNode && v.ShortTag() == "!!null" {
 			continue
 		}
 		explicit[key] = true
@@ -147,7 +169,26 @@ func walkYAML(file string, node *yaml.Node, t reflect.Type, path string, allowEx
 	}
 }
 
-// yamlFields 回傳 struct 的「yaml 鍵名 → 欄位型別」
+// mergeSources 回傳合併鍵的來源 mapping：<<: *a 或 <<: [*a, *b]
+func mergeSources(v *yaml.Node) []*yaml.Node {
+	if v.Kind == yaml.AliasNode && v.Alias != nil {
+		v = v.Alias
+	}
+	switch v.Kind {
+	case yaml.MappingNode:
+		return []*yaml.Node{v}
+	case yaml.SequenceNode:
+		var out []*yaml.Node
+		for _, item := range v.Content {
+			out = append(out, mergeSources(item)...)
+		}
+		return out
+	}
+	return nil
+}
+
+// yamlFields 回傳 struct 的「yaml 鍵名 → 欄位型別」。`yaml:",inline"` 的 struct 欄位攤平到同一層：
+// 先前把 config.Config 以 inline 嵌進自己的 struct 時，server / logger 全被報成未知的鍵
 func yamlFields(t reflect.Type) map[string]reflect.Type {
 	out := map[string]reflect.Type{}
 	for i := 0; i < t.NumField(); i++ {
@@ -155,7 +196,21 @@ func yamlFields(t reflect.Type) map[string]reflect.Type {
 		if !f.IsExported() {
 			continue
 		}
-		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		name, opts, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if strings.Contains(","+opts+",", ",inline,") {
+			ft := f.Type
+			for ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				for n, nt := range yamlFields(ft) {
+					if _, dup := out[n]; !dup {
+						out[n] = nt
+					}
+				}
+			}
+			continue
+		}
 		if name == "-" {
 			continue
 		}
@@ -262,8 +317,10 @@ func applyEnv(v reflect.Value, path string, c *Config) error {
 			continue
 		}
 		env := EnvPrefix + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
-		raw, ok := os.LookupEnv(env)
-		if !ok {
+		// 空字串視同沒設定：docker-compose 的 `VAR: ${X}` 在 X 沒設定時正好產生空值。
+		// 先前它把 allow_origins: [] 換成 nil（掛回預設的 *）、清掉設定檔的 DSN、讓整數欄位載入失敗
+		raw := os.Getenv(env)
+		if raw == "" {
 			continue
 		}
 		switch fv.Kind() {

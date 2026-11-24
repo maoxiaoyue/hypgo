@@ -182,11 +182,17 @@ func JWT(config JWTConfig) hypcontext.HandlerFunc {
 		config.TokenHeadName = "Bearer"
 	}
 	src := parseValueSource(config.TokenLookup, "header", "query", "cookie")
+	authHeader := strings.EqualFold(src.name, "Authorization")
 
 	return func(c *hypcontext.Context) {
 		token := src.get(c)
 		if src.kind == "header" {
-			token = stripAuthScheme(token, config.TokenHeadName)
+			// 方案名稱（Bearer）是 Authorization 標頭的規範，只有它必須帶。自訂標頭
+			// （X-Auth-Token、閘道轉發的 X-Forwarded-Access-Token）放的是原始 token：有前綴就去掉，
+			// 沒有就原樣使用。先前所有標頭都要求前綴，自訂標頭的請求一律 401 且無法關閉
+			if stripped := stripAuthScheme(token, config.TokenHeadName); stripped != "" || authHeader {
+				token = stripped
+			}
 		}
 		if token == "" {
 			jwtError(c, config, src, fmt.Errorf("token not found"))

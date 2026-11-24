@@ -3,6 +3,7 @@ package interceptor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -168,5 +169,18 @@ func TestAuthDoesNotLeakErrorText(t *testing.T) {
 	}
 	if st.Message() != "invalid token" {
 		t.Errorf("message = %q, want a fixed message without the underlying error", st.Message())
+	}
+}
+
+// authFn 把 status error 包了一層時，只送出 status 本身。
+// 歷史 bug：原樣回傳，grpc-go 把整串包裝後的文字當成訊息送給客戶端
+func TestAuthDoesNotLeakWrappedStatusText(t *testing.T) {
+	authFn := func(ctx context.Context, token string) (interface{}, error) {
+		return nil, fmt.Errorf("lookup at 10.0.3.7:5432 as app: %w", status.Error(codes.PermissionDenied, "admins only"))
+	}
+	_, err := Auth(authFn)(withToken("x"), nil, testInfo, mockHandler)
+	st, _ := status.FromError(err)
+	if st.Code() != codes.PermissionDenied || st.Message() != "admins only" {
+		t.Errorf("code = %v, message = %q; want PermissionDenied \"admins only\"", st.Code(), st.Message())
 	}
 }

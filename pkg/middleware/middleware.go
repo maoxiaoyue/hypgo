@@ -446,6 +446,9 @@ type timeoutWriter struct {
 
 func (w *timeoutWriter) Header() http.Header { return w.h }
 
+// Unwrap 讓 http.ResponseController 找得到底層的 writer（c.DisableWriteTimeout 需要）
+func (w *timeoutWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *timeoutWriter) WriteHeader(code int) {
 	w.mu.Lock()
 	if code > 0 && !w.wrote {

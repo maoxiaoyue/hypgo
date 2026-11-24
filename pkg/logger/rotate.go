@@ -56,6 +56,9 @@ type Rotation struct {
 // ljRotate 供測試替換（模擬 rename 失敗）
 var ljRotate = (*lumberjack.Logger).Rotate
 
+// ljWrite 供測試替換（模擬磁碟滿等寫入錯誤）
+var ljWrite = (*lumberjack.Logger).Write
+
 // rotateRetry 輪轉失敗後多久再試一次（每次嘗試都要關檔、rename）；測試會縮短
 var rotateRetry = time.Second
 
@@ -225,9 +228,19 @@ func (r *Rotation) Write(p []byte) (int, error) {
 
 	switch {
 	case r.blocked:
-		// 失敗中：不論本層記錄的大小，定期再試（被別的行程寫大的檔案，本層的 size 並不知道）
+		// 失敗中：定期再試，以磁碟上實際的大小判斷（被別的行程寫大的檔案，本層的 size 並不知道）。
+		// 先前不看大小就輪轉：檔案其實沒超過上限時，每次重試都切出一個新備份，把真正的歷史備份擠掉
 		if time.Since(r.last) >= rotateRetry {
-			r.noteRotate(r.rotateLocked())
+			if r.overLimit(len(p)) {
+				r.noteRotate(r.rotateLocked())
+			} else {
+				r.last, r.blocked, r.size = time.Now(), false, 0
+				if info, err := os.Stat(r.lj.Filename); err == nil {
+					r.size = info.Size()
+				}
+				r.lj.Close() // 讓 lumberjack 重新開檔、依實際大小計算
+				fmt.Fprintf(errOut, "logger: %s is below max_size again, writing normally\n", r.lj.Filename)
+			}
 		}
 	case r.maxBytes > 0 && r.size > 0 && r.size+int64(len(p)) >= r.maxBytes:
 		r.noteRotate(r.rotateLocked())
@@ -236,10 +249,12 @@ func (r *Rotation) Write(p []byte) (int, error) {
 	var written int
 	var err error
 	if !r.blocked {
-		written, err = r.lj.Write(p)
+		written, err = ljWrite(r.lj, p)
 		// 檔案被別的行程寫大時，lumberjack 會在 Write 裡自行輪轉；它失敗時同樣改為直接附加。
-		// 先前這條路徑每一筆都回錯：兩個行程寫同一個檔時，其中一個的日誌全部消失
-		if err != nil && written == 0 && r.maxBytes > 0 {
+		// 先前這條路徑每一筆都回錯：兩個行程寫同一個檔時，其中一個的日誌全部消失。
+		// 只有檔案真的到了上限才算輪轉失敗：磁碟滿、EIO、配額這些寫入錯誤與輪轉無關，
+		// 先前一律進入「輪轉失敗」模式，每秒強制輪轉一次並交替印出失敗與恢復
+		if err != nil && written == 0 && r.maxBytes > 0 && r.overLimit(len(p)) {
 			r.last = time.Now()
 			r.noteRotate(err)
 		}
@@ -252,6 +267,12 @@ func (r *Rotation) Write(p []byte) (int, error) {
 		return written, err
 	}
 	return n, nil
+}
+
+// overLimit 回報磁碟上的日誌檔加上這一筆是否到了 max_size
+func (r *Rotation) overLimit(extra int) bool {
+	info, err := os.Stat(r.lj.Filename)
+	return err == nil && r.maxBytes > 0 && info.Size()+int64(extra) >= r.maxBytes
 }
 
 // noteRotate 記錄輪轉的結果，狀態改變時在 stderr 印一行

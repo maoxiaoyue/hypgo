@@ -34,17 +34,20 @@ func UseMaster(ctx context.Context) context.Context {
 	return context.WithValue(ctx, masterKey{}, true)
 }
 
-// defaultSessionKey 以已驗證的使用者（JWT 的 sub）辨識；沒有登入時用客戶端 IP
+// defaultSessionKey 以已驗證的使用者（JWT 的 sub）辨識。沒有登入時回空字串：只做同一個請求內的寫後讀。
+// 先前改用客戶端 IP，而 trusted_proxies 沒設時那是負載平衡器的位址——所有匿名訪客共用一個鍵，
+// 一位訪客寫入後其他人的讀取全走主庫
 func defaultSessionKey(c *hypcontext.Context) string {
 	if claims, ok := middleware.JWTClaimsFrom(c, ""); ok && claims.Subject != "" {
 		return "u:" + claims.Subject
 	}
-	return "ip:" + c.ClientIP()
+	return ""
 }
 
 // Middleware 啟用寫後讀：把請求的狀態放進 c.Request 的 context，
 // 以 c 或 c.Request.Context() 執行的查詢都看得到。
-// keyFn 自訂「同一個使用者」的辨識方式（跨請求用）；省略時為 JWT 的 sub，沒有登入時為客戶端 IP
+// keyFn 自訂「同一個使用者」的辨識方式（跨請求用）；省略時為 JWT 的 sub。回空字串表示這個請求
+// 不做跨請求的寫後讀（未登入的請求預設如此；要以 session cookie 或 IP 辨識時自己提供 keyFn）
 func (d *Database) Middleware(keyFn ...func(*hypcontext.Context) string) hypcontext.HandlerFunc {
 	key := defaultSessionKey
 	if len(keyFn) > 0 && keyFn[0] != nil {
@@ -60,6 +63,9 @@ func (d *Database) Middleware(keyFn ...func(*hypcontext.Context) string) hypcont
 		}
 		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), sessionKey{}, s))
 		c.Next()
+		// handler 返回後 c 會被放回池子重複使用：在這裡定下鍵，之後才執行的查詢
+		// （handler 啟動的 goroutine）拿到的是這個值，不再碰 c
+		s.key()
 	}
 }
 
@@ -79,8 +85,12 @@ func (d *Database) markWrite(ctx context.Context) {
 	if d.set.readYourWrites <= 0 {
 		return
 	}
+	key := s.key()
+	if key == "" {
+		return
+	}
 	now := time.Now().UnixNano()
-	d.recent.m.Store(s.key(), now)
+	d.recent.m.Store(key, now)
 	// 每 1024 次寫入清一次過期的紀錄，表不會無限成長
 	if d.recent.writes.Add(1)%1024 == 0 {
 		d.recent.m.Range(func(k, v interface{}) bool {
@@ -107,7 +117,11 @@ func (d *Database) needsMaster(ctx context.Context) bool {
 	if d.set.readYourWrites <= 0 {
 		return false
 	}
-	if v, ok := d.recent.m.Load(s.key()); ok {
+	key := s.key()
+	if key == "" {
+		return false
+	}
+	if v, ok := d.recent.m.Load(key); ok {
 		return time.Now().UnixNano()-v.(int64) < int64(d.set.readYourWrites)
 	}
 	return false

@@ -220,9 +220,11 @@ func TestMatchRefs(t *testing.T) {
 		ref  routeRef
 		want int
 	}{
-		"exact":                          {routeRef{method: "GET", path: "/api/users/:id"}, matchSure},
-		"suffix with group prefix":       {routeRef{method: "GET", path: "/users/:id", grouped: true}, matchSure},
-		"suffix confirmed by handler":    {routeRef{method: "GET", path: "/:id", handler: "Get"}, matchSure},
+		"exact":                    {routeRef{method: "GET", path: "/api/users/:id"}, matchSure},
+		"suffix with group prefix": {routeRef{method: "GET", path: "/users/:id", grouped: true}, matchSure},
+		// 只有方法名稱相同不算確認：每個 controller 都有 Get。
+		// 歷史 bug：routers/order.go 的 g.GET("/:id", c.Get) 認領了 GET /api/users/:id
+		"suffix, same method name only":  {routeRef{method: "GET", path: "/:id", handler: "Get", qual: "c"}, matchMaybe},
 		"suffix only":                    {routeRef{method: "GET", path: "/:id"}, matchMaybe},
 		"another handler":                {routeRef{method: "GET", path: "/:id", handler: "Show"}, matchNone},
 		"exact path but another handler": {routeRef{method: "GET", path: "/api/users/:id", handler: "Show"}, matchNone},
@@ -231,6 +233,19 @@ func TestMatchRefs(t *testing.T) {
 		"group prefix of another route":  {routeRef{method: "GET", path: "/api/orders/:id", grouped: true}, matchNone},
 	} {
 		if got := matchRefs([]routeRef{tt.ref}, "GET", "/api/users/:id", "", handlers); got != tt.want {
+			t.Errorf("%s: matchRefs = %d, want %d", name, got, tt.want)
+		}
+	}
+	// 套件層級的函式連套件名稱都相同才算確認
+	pkgFunc := []string{"controllers.GetUser"}
+	for name, tt := range map[string]struct {
+		ref  routeRef
+		want int
+	}{
+		"same package and name":      {routeRef{method: "GET", path: "/:id", handler: "GetUser", qual: "controllers"}, matchSure},
+		"same name, another package": {routeRef{method: "GET", path: "/:id", handler: "GetUser", qual: "admin"}, matchMaybe},
+	} {
+		if got := matchRefs([]routeRef{tt.ref}, "GET", "/api/users/:id", "", pkgFunc); got != tt.want {
 			t.Errorf("%s: matchRefs = %d, want %d", name, got, tt.want)
 		}
 	}

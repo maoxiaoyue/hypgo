@@ -60,6 +60,10 @@ type Config struct {
 	// grpc-go 預設 5 分鐘：客戶端設得比它頻繁（例如常見的每 10 秒）時，伺服器在幾次之後回
 	// GOAWAY too_many_pings 並關閉連線，進行中的 stream 一起中斷。應設成不大於客戶端的間隔
 	KeepaliveMinTime time.Duration
+	// DisableDefaultRecovery 不掛預設的 Recovery 攔截器。自己的 panic 處理器（回報 Sentry、記指標）
+	// 以 grpc.UnaryInterceptor 掛在最外層時，預設的 Recovery 會先把 panic 轉成 Internal，它就收不到了。
+	// 關掉之後務必自己 recover：grpc-go 不會，handler panic 即行程結束
+	DisableDefaultRecovery bool
 	// KeepalivePermitWithoutStream 允許客戶端在沒有進行中的 RPC 時也送 ping
 	// （客戶端開了 PermitWithoutStream 時需要，否則同樣被當成過於頻繁）
 	KeepalivePermitWithoutStream bool
@@ -180,11 +184,15 @@ func New(cfg Config, log *logger.Logger, opts ...grpc.ServerOption) *Server {
 
 	// Recovery 預設掛在最外層（與 HTTP 的預設中間件一致）。grpc-go 不會 recover handler 的 panic：
 	// 先前沒有自己掛 interceptor.Recovery 的服務，任何一個 handler panic 整個行程就結束。
-	// 使用者再掛一次也無妨（panic 由較內層的那個處理）
-	serverOpts = append(serverOpts,
-		grpc.ChainUnaryInterceptor(interceptor.Recovery(log)),
-		grpc.ChainStreamInterceptor(interceptor.StreamRecovery(log)),
-	)
+	// 使用者再掛一次也無妨（panic 由較內層的那個處理）。
+	// 它排在 grpc.UnaryInterceptor(x) 的 x 之後（grpc-go 把 x 放在所有 Chain 攔截器之前）、
+	// 其餘 Chain 攔截器之前：要自己接 panic 的（Sentry、指標）以 DisableDefaultRecovery 關掉它
+	if !cfg.DisableDefaultRecovery {
+		serverOpts = append(serverOpts,
+			grpc.ChainUnaryInterceptor(interceptor.Recovery(log)),
+			grpc.ChainStreamInterceptor(interceptor.StreamRecovery(log)),
+		)
+	}
 
 	// 使用者自訂 options（interceptor 等）
 	serverOpts = append(serverOpts, opts...)

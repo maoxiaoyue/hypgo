@@ -555,11 +555,13 @@ func TestAssessRisk(t *testing.T) {
 		r    ImpactReport
 		want string
 	}{
-		"no dependents":                  {ImpactReport{Tests: own}, RiskNone},
-		"no dependents no tests":         {ImpactReport{}, RiskNone},
-		"one dependent":                  {ImpactReport{Dependents: deps(1, false), Tests: own}, RiskLow},
-		"tests only importers":           {ImpactReport{Dependents: deps(9, true), Tests: own}, RiskNone},
-		"tests only, many outside tests": {ImpactReport{Dependents: deps(2, true), Tests: withOutside(500)}, RiskNone},
+		"no dependents":          {ImpactReport{Tests: own}, RiskNone},
+		"no dependents no tests": {ImpactReport{}, RiskNone},
+		"one dependent":          {ImpactReport{Dependents: deps(1, false), Tests: own}, RiskLow},
+		"tests only importers":   {ImpactReport{Dependents: deps(9, true), Tests: own}, RiskNone},
+		// 別的套件的測試用到它就不是 NONE。歷史 bug：被 25 個測試引用的 testutil 判成 NONE
+		"tests only, many outside tests": {ImpactReport{Dependents: deps(2, true), Tests: withOutside(500)}, RiskMedium},
+		"tests only, few outside tests":  {ImpactReport{Dependents: deps(2, true), Tests: withOutside(5)}, RiskLow},
 		"direct route, no dependents":    {ImpactReport{Tests: own, Routes: []RouteImpact{{Direct: true}}}, RiskMedium},
 		"test file":                      {ImpactReport{IsTestFile: true, Dependents: deps(9, false)}, RiskNone},
 		"not built":                      {ImpactReport{ignored: "x", Dependents: deps(9, false)}, RiskNone},

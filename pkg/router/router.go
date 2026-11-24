@@ -326,6 +326,11 @@ func (r *Router) Use(middleware ...hypcontext.HandlerFunc) {
 	r.globalMW = append(r.globalMW, middleware...)
 }
 
+// Middlewares 回傳目前的全域中間件（副本）
+func (r *Router) Middlewares() []hypcontext.HandlerFunc {
+	return append([]hypcontext.HandlerFunc(nil), r.globalMW...)
+}
+
 // UseFirst 把中間件放在已註冊的全域中間件之前（最外層）。server.Start 以此安置預設的
 // Recovery / Logger，使它們包住使用者的中間件
 func (r *Router) UseFirst(middleware ...hypcontext.HandlerFunc) {
@@ -415,6 +420,11 @@ func collectRoutes(prefix, method string, routes []RouteInfo, n *radixNode) []Ro
 //	    Output:  UserResponse{},
 //	}).Handle(createUserHandler)
 func (r *Router) Schema(route schema.Route) *schema.SchemaRoute {
+	// 與 Group.Schema、r.GET("users") 一致：沒有前導斜線的路徑補上。先前路由以 /users 註冊後
+	// schema 登錄 panic，留下半註冊的路由
+	if route.Path != "" {
+		route.Path = joinPaths("/", route.Path)
+	}
 	return schema.NewSchemaRoute(route, r)
 }
 

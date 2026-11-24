@@ -39,7 +39,7 @@ Examples:
   hyp secret init                  # create crypt.yaml and generate the key
   hyp secret set db_pass           # value is read from the terminal or stdin
   hyp secret list
-  hyp secret rotate --new-key-file new.key
+  hyp secret rotate --new-key-file .hyp/secret.new
   hyp secret --restore             # write the plaintext back into config/*.yaml
 
 The key file (.hyp/secret.key, or .hyp/secret.age) must never be committed:
@@ -111,8 +111,12 @@ func init() {
 		Long: `Decrypt every value with the current key and re-encrypt it using .hyp/crypt.yaml.
 Use it after changing method or age.recipients, or to replace the key:
 
-  hyp secret keygen -o new.key
-  hyp secret rotate --new-key-file new.key
+  hyp secret keygen -o .hyp/secret.new
+  hyp secret rotate --new-key-file .hyp/secret.new
+
+The new key replaces the key file and the --new-key-file copy is removed. A key
+at the pre-v0.9.3 location (~/.hypgo/keys/) is left alone, since another project
+with the same directory name may use it: the new key goes to .hyp/secret.key.
 
 With passphrase, the new passphrase comes from $HYPGO_NEW_PASSPHRASE or a prompt.
 key.secret is left untouched if any step fails. After rotating, update the key
@@ -164,7 +168,7 @@ func checkKeyFile(cmd *cobra.Command, settings *secret.Settings) error {
 		rel = filepath.ToSlash(rel)
 		return fmt.Errorf("%s is tracked by git: anyone with the repository can decrypt %s.\n"+
 			"Run: git rm --cached %s   (and commit), make sure .gitignore has %s,\n"+
-			"then replace the key: hyp secret keygen -o new.key && hyp secret rotate --new-key-file new.key",
+			"then replace the key: hyp secret keygen -o .hyp/secret.new && hyp secret rotate --new-key-file .hyp/secret.new",
 			rel, settings.SecretFile, rel, secret.KeyIgnorePattern)
 	}
 	return nil
@@ -523,13 +527,34 @@ func runSecretRotate(cmd *cobra.Command, _ []string) error {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "Re-encrypted %d value(s) with %s.\n", n, settings.Method)
 	if keyFile != "" {
-		// 先前金鑰檔仍是舊金鑰：下一個 hyp secret get 回報 key does not match，要自己把新金鑰搬過去
-		old, err := swapKeyFile(keyFile, strings.TrimSpace(string(newKey)))
-		if err != nil {
-			return fmt.Errorf("%s was re-encrypted but the key file was not replaced: copy %s to %s yourself: %w",
-				settings.SecretFile, newKeyFile, keyFile, err)
+		if settings.Key.File == "" && keyFile == settings.LegacyKeyPath(".key") {
+			// 舊位置的金鑰檔以專案目錄名命名，同名的其他專案共用它：不能動。新金鑰放進專案自己的 .hyp/。
+			// 先前把它改名為 .old 並寫入新金鑰，另一個專案從此解不開自己的 key.secret
+			own := filepath.Join(settings.Root(), filepath.FromSlash(secret.DefaultKeyFile))
+			if err := ensureKeyIgnored(cmd, settings.Root()); err != nil {
+				return err
+			}
+			if err := secret.WriteKeyFile(own, strings.TrimSpace(string(newKey))); err != nil {
+				return fmt.Errorf("%s was re-encrypted but the new key was not saved: copy %s to %s yourself: %w",
+					settings.SecretFile, newKeyFile, own, err)
+			}
+			fmt.Fprintf(out, "The new key is at: %s\nThe old key at %s was left untouched: another project with the same directory name may still use it.\n", own, keyFile)
+		} else {
+			// 先前金鑰檔仍是舊金鑰：下一個 hyp secret get 回報 key does not match，要自己把新金鑰搬過去
+			old, err := swapKeyFile(keyFile, strings.TrimSpace(string(newKey)))
+			if err != nil {
+				return fmt.Errorf("%s was re-encrypted but the key file was not replaced: copy %s to %s yourself: %w",
+					settings.SecretFile, newKeyFile, keyFile, err)
+			}
+			fmt.Fprintf(out, "Key file now holds the new key: %s\nThe old key was kept at:       %s (delete it once nothing needs it)\n", keyFile, old)
 		}
-		fmt.Fprintf(out, "Key file now holds the new key: %s\nThe old key was kept at:       %s (delete it once nothing needs it)\n", keyFile, old)
+		// 新金鑰已經在金鑰檔裡：--new-key-file 那一份不留。先前它留在原地（建議的寫法是專案根目錄的
+		// new.key，沒有被 .gitignore 涵蓋），一次 git add . 就把現役金鑰提交
+		if err := os.Remove(newKeyFile); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not remove %s (%v); delete it yourself, it is a copy of the key.\n", newKeyFile, err)
+		} else {
+			fmt.Fprintf(out, "Removed %s (the key file has its content).\n", newKeyFile)
+		}
 	}
 	fmt.Fprintln(out, "Update the key wherever it is deployed.")
 	return nil

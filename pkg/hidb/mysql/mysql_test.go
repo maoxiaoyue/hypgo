@@ -73,3 +73,26 @@ func TestReplicaLagAgainstRealMySQL(t *testing.T) {
 	}
 	t.Logf("lag = %s (0 on a server that is not a replica)", lag)
 }
+
+// 舊版的外鍵碼與另外兩個重複鍵碼。歷史 bug：1216 / 1217 / 1022 / 1586 不被分類
+func TestClassifyLegacyMySQLCodes(t *testing.T) {
+	for number, want := range map[uint16]error{
+		1022: hidb.ErrDuplicate, 1586: hidb.ErrDuplicate, 1216: hidb.ErrForeignKey, 1217: hidb.ErrForeignKey,
+	} {
+		if err := hidb.Classify(&driver.MySQLError{Number: number, Message: "boom"}); !errors.Is(err, want) {
+			t.Errorf("error %d: %v, want %v", number, err, want)
+		}
+	}
+}
+
+// 查詢途中連線中斷（mysql.ErrInvalidConn）算連線層錯誤，副本可以即時摘除
+func TestInvalidConnIsAConnError(t *testing.T) {
+	d := &Dialect{}
+	if !d.IsConnError(fmt.Errorf("query: %w", driver.ErrInvalidConn)) {
+		t.Error("ErrInvalidConn is not recognised")
+	}
+	if d.IsConnError(&driver.MySQLError{Number: 1064}) || d.IsConnError(nil) {
+		t.Error("a query error was taken for a connection error")
+	}
+	var _ hidb.ConnErrorChecker = d
+}

@@ -254,13 +254,36 @@ func (defaultBinding) For(req *http.Request) (Binding, error) {
 	if b := bindingForMedia(contentType); b != nil {
 		return b, nil
 	}
-	if req.ContentLength == 0 || req.Body == nil || req.Body == http.NoBody {
+	if !hasBody(req) {
 		if req.Method == http.MethodDelete {
 			return Query, nil
 		}
 		return Form, nil
 	}
 	return nil, fmt.Errorf("%w %q", ErrUnsupportedMediaType, contentType)
+}
+
+// hasBody 回報請求有沒有 body。長度未知（ContentLength -1）時讀一個位元組確認：
+// HTTP/3 沒帶 Content-Length 的請求（quic-go 一律掛 stream body）與 HTTP/1.1 的 chunked 空 body
+// 都是 -1。先前只看 ContentLength == 0，這兩種沒有 body 的 POST / PUT / DELETE 被回 415
+func hasBody(req *http.Request) bool {
+	if req.ContentLength == 0 || req.Body == nil || req.Body == http.NoBody {
+		return false
+	}
+	if req.ContentLength > 0 {
+		return true
+	}
+	var first [1]byte
+	n, _ := io.ReadFull(req.Body, first[:])
+	if n == 0 {
+		return false
+	}
+	// 把讀掉的位元組接回去，之後讀 body 的人看到的內容不變
+	req.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(first[:]), req.Body), req.Body}
+	return true
 }
 
 // bindingForMedia 回傳 Content-Type 對應的綁定器；認不得時回 nil

@@ -391,10 +391,18 @@ func (c *Context) ClientIP() string {
 		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
 			s := strings.TrimSpace(parts[i])
-			if s == "" || !isValidIP(s) {
+			if s == "" {
 				continue
 			}
-			if ip := net.ParseIP(s); ip != nil && !isTrustedProxy(ip) {
+			// 有些代理附加 ip:port 或 [v6]:port（Azure Application Gateway）
+			s = stripPort(s)
+			ip := net.ParseIP(s)
+			if ip == nil {
+				// 看不懂的項目是代理寫的，它左邊的都是客戶端自己填的：到此為止。
+				// 先前略過它繼續往左找，XFF: 6.6.6.6 + 203.0.113.7:51234 回傳偽造的 6.6.6.6
+				return remote
+			}
+			if !isTrustedProxy(ip) {
 				return s
 			}
 		}
@@ -407,6 +415,14 @@ func (c *Context) ClientIP() string {
 	}
 
 	return remote
+}
+
+// stripPort 去掉位址的埠號與中括號："1.2.3.4:80" → "1.2.3.4"、"[::1]:80" 與 "[::1]" → "::1"
+func stripPort(s string) string {
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return host
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
 }
 
 // forwardedFor 回傳全部 X-Forwarded-For 標頭行依序以逗號接起來的值。

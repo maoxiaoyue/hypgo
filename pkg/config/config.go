@@ -189,6 +189,7 @@ type DatabaseConfig struct {
 	// 以下為 pkg/hidb 的行為設定。沒寫時用預設值；明確寫 0 代表關閉
 	// （載入後以負數表示「關閉」、0 表示「沒設定」，見 ApplyDefaults）
 	SlowQuery       int  `yaml:"slow_query"`         // 毫秒，超過即記一行慢查詢日誌；預設 500
+	SlowQuerySQL    bool `yaml:"slow_query_sql"`     // true 時慢查詢日誌帶 SQL（內嵌參數值）；預設 false，只記操作與表名
 	ReadYourWrites  int  `yaml:"read_your_writes"`   // 毫秒，寫入後同一使用者的讀取走主庫的時間；預設 1000
 	MaxReplicaLag   int  `yaml:"max_replica_lag"`    // 毫秒，副本複寫延遲超過即暫不使用；預設 0（不檢查）
 	TxRetries       int  `yaml:"tx_retries"`         // 交易遇到死結 / 序列化失敗時的重試次數；預設 1
@@ -767,7 +768,7 @@ type DatabaseOptions struct {
 	SlowQuery, ReadYourWrites, MaxReplicaLag int // 毫秒
 	TxRetries                                int
 	ConnMaxLifetime, ConnMaxIdleTime         int // 秒
-	StrictColumns                            bool
+	StrictColumns, SlowQuerySQL              bool
 }
 
 // DatabaseOptionsProvider 為 DatabaseConfigInterface 的可選擴充；未實作時 hidb 全部用預設值
@@ -780,7 +781,7 @@ func (d *DatabaseConfig) GetDatabaseOptions() DatabaseOptions {
 	return DatabaseOptions{
 		SlowQuery: d.SlowQuery, ReadYourWrites: d.ReadYourWrites, MaxReplicaLag: d.MaxReplicaLag,
 		TxRetries: d.TxRetries, ConnMaxLifetime: d.ConnMaxLifetime, ConnMaxIdleTime: d.ConnMaxIdleTime,
-		StrictColumns: d.StrictColumns,
+		StrictColumns: d.StrictColumns, SlowQuerySQL: d.SlowQuerySQL,
 	}
 }
 

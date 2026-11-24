@@ -198,7 +198,7 @@ func lockFile(path string) (func(), error) {
 			return func() { os.Remove(lock) }, nil
 		}
 		if info, serr := os.Stat(lock); serr == nil && time.Since(info.ModTime()) > lockStale {
-			os.Remove(lock)
+			clearStaleLock(lock)
 			continue
 		}
 		// Windows 上剛被刪除的鎖檔短暫回報拒絕存取，一併重試到期限為止
@@ -208,6 +208,21 @@ func lockFile(path string) (func(), error) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// clearStaleLock 移除過期的鎖檔：先改名，再確認拿到的真的是過期的那一個。
+// 先前直接 Remove：兩個等待者同時判定過期時，後到的那個刪掉的是對方剛建立的新鎖，
+// 兩邊都進入、一筆更新遺失
+func clearStaleLock(lock string) {
+	stale := fmt.Sprintf("%s.stale.%d", lock, os.Getpid())
+	if os.Rename(lock, stale) != nil {
+		return
+	}
+	if info, err := os.Stat(stale); err == nil && time.Since(info.ModTime()) <= lockStale {
+		os.Rename(stale, lock) // 拿到的是別人的新鎖：還回去
+		return
+	}
+	os.Remove(stale)
 }
 
 // prepare 取得金鑰並確認它與 key.secret 相符。金鑰不符時立刻回錯：

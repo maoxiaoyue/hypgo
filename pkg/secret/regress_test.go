@@ -231,3 +231,27 @@ func TestRotateRefusesFileChangedMeanwhile(t *testing.T) {
 		t.Errorf("the concurrent write was lost or re-encrypted: %q, %v", v, err)
 	}
 }
+
+// 接手過期的鎖檔時，別人剛建立的新鎖不能被移除。
+// 歷史 bug：兩個等待者都判定過期後各自 Remove，後到的刪掉對方剛建立的新鎖，兩者同時持有
+func TestClearStaleLockKeepsAFreshLock(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), "key.secret.lock")
+
+	// 判定過期之後、動手之前，另一個行程已經接手並建立了新鎖
+	os.WriteFile(lock, nil, 0o600)
+	clearStaleLock(lock)
+	if _, err := os.Stat(lock); err != nil {
+		t.Error("a lock another process had just created was removed")
+	}
+
+	// 真的過期的那一個會被移除
+	old := time.Now().Add(-2 * lockStale)
+	os.Chtimes(lock, old, old)
+	clearStaleLock(lock)
+	if _, err := os.Stat(lock); err == nil {
+		t.Error("the stale lock is still there")
+	}
+	if left, _ := filepath.Glob(lock + ".stale.*"); len(left) != 0 {
+		t.Errorf("leftover files: %v", left)
+	}
+}

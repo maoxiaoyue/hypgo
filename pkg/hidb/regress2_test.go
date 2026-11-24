@@ -360,7 +360,7 @@ func TestOnlyConnectionErrorsEjectReplicas(t *testing.T) {
 		io.ErrUnexpectedEOF:             true,
 		errors.New("syntax error"):      false,
 		context.Canceled:                false,
-		context.DeadlineExceeded:        false,
+		context.DeadlineExceeded:        true, // 驅動自己的撥號逾時；呼叫端的逾時由 failed 以 ctx 判斷
 		fmt.Errorf("x: %w", io.EOF):     true,
 		sql.ErrNoRows:                   false,
 		fmt.Errorf("pq: duplicate key"): false,

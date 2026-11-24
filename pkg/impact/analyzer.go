@@ -337,9 +337,10 @@ func assessRisk(r *ImpactReport) (string, []string) {
 	outside := r.outsideTests()
 	directRoutes := r.directRouteCount()
 
-	// 沒有其他套件依賴、也沒有路由直接宣告在上面：這個檔案以外沒有東西受影響。
-	// 只被別人的測試 import 也算在這裡（要跑的測試照樣列出）
-	if total == 0 && directRoutes == 0 {
+	// 沒有其他套件依賴、沒有路由直接宣告在上面、也沒有別的套件的測試用到它：這個檔案的套件以外
+	// 沒有東西受影響。先前只被別人的測試 import 也算在這裡：被 25 個測試引用的 testutil 是 NONE，
+	// 理由還寫著「套件以外沒有東西受影響」
+	if total == 0 && directRoutes == 0 && outside == 0 {
 		reasons := []string{"no other package depends on this one"}
 		if r.pkgName == "main" {
 			reasons = append(reasons, "package main: nothing imports it, but it is the program itself")

@@ -258,6 +258,8 @@ var (
 	// middleware.RateLimiter／middleware.Timeout 的預設回應
 	ErrTooManyRequests = Define("E0007", http.StatusTooManyRequests, "Too many requests", "general")
 	ErrTimeout         = Define("E0008", http.StatusServiceUnavailable, "Request timed out", "general")
+	// server.max_handlers 用完且等待逾時
+	ErrServerBusy = Define("E0009", http.StatusServiceUnavailable, "Server busy", "general")
 
 	// 驗證
 	ErrValidationFailed = Define("E1001", http.StatusUnprocessableEntity, "Validation failed", "validation")

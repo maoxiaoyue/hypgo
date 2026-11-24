@@ -317,3 +317,77 @@ func TestAPIKeepsExistingDockerignore(t *testing.T) {
 		t.Errorf(".dockerignore = %q", data)
 	}
 }
+
+// 舊位置（~/.hypgo/keys/<目錄名>.key）的金鑰由同名專案共用：rotate 不能動它，新金鑰放進專案的 .hyp/。
+// 歷史 bug：rotate 把它改名為 .old 並寫入新金鑰，另一個同名專案從此回報 key does not match
+func TestSecretRotateLeavesSharedLegacyKeyAlone(t *testing.T) {
+	root, home := secretWorkdir(t)
+	key, _ := secret.GenerateKey()
+	legacy := filepath.Join(home, ".hypgo", "keys", "myapp.key")
+	if err := secret.WriteKeyFile(legacy, key); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(secret.DefaultKeyEnv, key)
+	if _, err := runSecret(t, "v\n", "set", "a"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(secret.DefaultKeyEnv, "")
+	before, _ := os.ReadFile(legacy)
+
+	next := filepath.Join(root, ".hyp", "secret.new")
+	if _, err := runSecret(t, "", "keygen", "-o", next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runSecret(t, "", "rotate", "--new-key-file", next); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.ReadFile(legacy); err != nil || string(after) != string(before) {
+		t.Errorf("the shared legacy key was changed (err %v)", err)
+	}
+	if _, err := os.Stat(legacy + ".old"); err == nil {
+		t.Error("the shared legacy key was renamed to .old")
+	}
+	if _, err := os.Stat(filepath.Join(root, ".hyp", "secret.key")); err != nil {
+		t.Errorf("the new key is not in the project: %v", err)
+	}
+	if got, err := runSecret(t, "", "get", "a"); err != nil || got != "v\n" {
+		t.Errorf("get after rotate = %q, %v", got, err)
+	}
+	if ignore, _ := os.ReadFile(filepath.Join(root, ".gitignore")); !strings.Contains(string(ignore), secret.KeyIgnorePattern) {
+		t.Errorf(".gitignore does not cover the new key: %q", ignore)
+	}
+}
+
+// --restore 把明文寫回被 git 追蹤的設定檔時指名警告。歷史 bug：只有一句籠統的「不要提交」
+func TestSecretRestoreWarnsAboutTrackedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root, _ := secretWorkdir(t)
+	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	if _, err := runSecret(t, "", "init"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runSecret(t, "p@ss\n", "set", "db_pass"); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(root, "config"), 0o755)
+	for _, name := range []string{"config.yaml", "local.yaml"} {
+		os.WriteFile(filepath.Join(root, "config", name), []byte("database:\n  password: ${secret:db_pass}\n"), 0o644)
+	}
+	if out, err := exec.Command("git", "-C", root, "add", "config/config.yaml").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	out, err := runHypOutput(t, "secret", "--restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "config/config.yaml is tracked by git") {
+		t.Errorf("no warning for the tracked file: %q", out)
+	}
+	if strings.Contains(out, "local.yaml is tracked") {
+		t.Errorf("warned about an untracked file: %q", out)
+	}
+}

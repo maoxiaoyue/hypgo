@@ -207,6 +207,10 @@ func (g generator) service() error {
 
 // command 生成 CLI 子命令（CLI 專案用）
 func (g generator) command() error {
+	// 與專案同名的子命令和根命令在 Schema registry 用同一個名稱：兩者內容不同，啟動時 panic
+	if root := filepath.Base(g.module); strings.EqualFold(g.name, root) {
+		return fmt.Errorf("%q is the name of the root command; choose another name for the subcommand", root)
+	}
 	if err := scaffold.GenerateCommand(g.dir("app", "commands"), g.name); err != nil {
 		return err
 	}
