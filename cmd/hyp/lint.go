@@ -47,6 +47,10 @@ RegisterSchema it checks the handler (and helpers it passes c to) binds the
 declared Input via c.BindInput:
   deep:input_mismatch  handler binds a type different from the declared Input
   deep:no_bindinput    writable handler never calls c.BindInput at all
+  deep:input_unbound   GET / DELETE handler with a declared Input never calls
+                       c.BindInput (info level: only fails with --strict)
+Every handler passed to Handle(...) is scanned, so the binding may live in an
+earlier one. Positions are relative to the module root.
 This promotes the "bound wrong struct" silent failure — previously only the
 runtime BindInput reporter could catch it (and only when a request fired) — into
 a build-time CI gate. Routes that cannot be resolved statically are listed as
@@ -158,7 +162,7 @@ func runLint(cmd *cobra.Command, args []string) error {
 		// 載入錯誤代表分析不完整：先前只有 --strict 才算失敗，打錯樣式或編譯不過都會通過
 		hardFailures += len(rep.Findings) + len(rep.LoadErrors)
 		if strict {
-			hardFailures += len(rep.Skipped)
+			hardFailures += len(rep.Skipped) + len(rep.Info)
 		}
 	}
 
