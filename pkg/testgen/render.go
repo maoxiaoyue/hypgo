@@ -47,7 +47,9 @@ func fileImports(f *ast.File) map[string]importInfo {
 			continue
 		}
 		if imp.Name != nil {
-			if imp.Name.Name != "_" && imp.Name.Name != "." {
+			if imp.Name.Name == "." {
+				out["."] = importInfo{} // dot import：簽名裡未限定的名稱可能來自它，見 newTableSpec
+			} else if imp.Name.Name != "_" {
 				out[imp.Name.Name] = importInfo{path: path, spec: imp.Name.Name + " " + imp.Path.Value}
 			}
 			continue
@@ -114,7 +116,8 @@ func classify(fd *ast.FuncDecl, imps map[string]importInfo) candKind {
 
 type tableField struct {
 	name, typ string
-	cmp       bool // 以 reflect.DeepEqual 比對；func 值無法比對（只有都為 nil 才相等），不產生 want 欄位
+	imports   []string // 這個型別用到的 import spec
+	cmp       bool     // 以 reflect.DeepEqual 比對；func 值無法比對（只有都為 nil 才相等），不產生 want 欄位
 }
 
 // tableSpec 依簽名組出的 table-driven 測試內容
@@ -124,7 +127,8 @@ type tableSpec struct {
 	variadic bool
 	results  []tableField // 非 error 的回傳值：want、want1…
 	hasErr   bool         // 最後一個回傳值為 error
-	imports  []string     // 簽名用到的 import spec
+	imports  []string     // 骨架實際寫出的型別用到的 import spec（見 setImports）
+	base     map[string]bool
 }
 
 // reservedNames 測試本身使用的識別字，參數同名時加上 Arg 後綴
@@ -133,15 +137,59 @@ var reservedNames = map[string]bool{
 	"err": true, "wantErr": true, "reflect": true, "testing": true,
 }
 
+// shadowed 骨架裡會遮住同名函式的識別字
+var shadowed = map[string]bool{"t": true, "tt": true, "tests": true, "reflect": true, "testing": true}
+
+// markFuncResults 把回傳型別是函式型別的結果標成不比對：套件內宣告的（type Handler func(...)），
+// 以及名稱以 Func 結尾的（http.HandlerFunc、context.CancelFunc）。
+// 先前只認字面的 func(...)：具名的函式型別以 reflect.DeepEqual 比對，除非都是 nil 否則永遠不相等
+func (s *tableSpec) markFuncResults(fd *ast.FuncDecl, local map[string]bool) {
+	if s == nil || fd.Type.Results == nil {
+		return
+	}
+	defer s.setImports()
+	i := 0
+	for _, r := range fd.Type.Results.List {
+		for range max(1, len(r.Names)) {
+			if i >= len(s.results) {
+				return
+			}
+			name := ""
+			switch t := r.Type.(type) {
+			case *ast.Ident:
+				name = t.Name
+				if local[name] {
+					s.results[i].cmp = false
+				}
+			case *ast.SelectorExpr:
+				name = t.Sel.Name
+			}
+			if strings.HasSuffix(name, "Func") {
+				s.results[i].cmp = false
+			}
+			i++
+		}
+	}
+}
+
 // newTableSpec 依函式簽名建立骨架內容；泛型函式、泛型 receiver 或簽名引用了解析不到的套件時回傳 nil
 func newTableSpec(fd *ast.FuncDecl, imps map[string]importInfo) *tableSpec {
 	if fd.Type.TypeParams != nil {
 		return nil
 	}
+	// 有 dot import 時分不出簽名裡的 Duration 是本套件的型別還是 time.Duration：退回空殼。
+	// 先前照樣產生骨架，測試檔沒有那個 import 而 undefined
+	if _, dot := imps["."]; dot {
+		return nil
+	}
+	// 函式與骨架自己的區域變數同名時（未匯出的 tests、t…）呼叫不到它
+	if fd.Recv == nil && shadowed[fd.Name.Name] {
+		return nil
+	}
 	spec := &tableSpec{}
 	needed := map[string]bool{}
 	ok := true
-	collect := func(e ast.Expr) {
+	collect := func(e ast.Expr, needed map[string]bool) {
 		ast.Inspect(e, func(n ast.Node) bool {
 			switch v := n.(type) {
 			case *ast.IndexExpr, *ast.IndexListExpr:
@@ -175,7 +223,7 @@ func newTableSpec(fd *ast.FuncDecl, imps map[string]importInfo) *tableSpec {
 
 	if fd.Recv != nil && len(fd.Recv.List) > 0 {
 		r := fd.Recv.List[0].Type
-		collect(r)
+		collect(r, needed)
 		spec.recv = &tableField{name: "recv", typ: types.ExprString(r)}
 		used["recv"] = true
 	}
@@ -186,7 +234,7 @@ func newTableSpec(fd *ast.FuncDecl, imps map[string]importInfo) *tableSpec {
 			spec.variadic = true
 			typ = &ast.ArrayType{Elt: ell.Elt}
 		}
-		collect(typ)
+		collect(typ, needed)
 		names := p.Names
 		if len(names) == 0 {
 			names = []*ast.Ident{nil}
@@ -214,23 +262,47 @@ func newTableSpec(fd *ast.FuncDecl, imps map[string]importInfo) *tableSpec {
 			}
 		}
 		for i, r := range results {
-			collect(r)
+			own := map[string]bool{}
+			collect(r, own)
 			name := "want"
 			if i > 0 {
 				name = fmt.Sprintf("want%d", i)
 			}
 			_, isFunc := r.(*ast.FuncType)
-			spec.results = append(spec.results, tableField{name: name, typ: types.ExprString(r), cmp: !isFunc})
+			f := tableField{name: name, typ: types.ExprString(r), cmp: !isFunc}
+			for s := range own {
+				f.imports = append(f.imports, s)
+			}
+			spec.results = append(spec.results, f)
 		}
 	}
 	if !ok {
 		return nil
 	}
-	for s := range needed {
-		spec.imports = append(spec.imports, s)
-	}
-	sort.Strings(spec.imports)
+	spec.base = needed
+	spec.setImports()
 	return spec
+}
+
+// setImports 算出骨架需要的 import：receiver、參數，以及要比對的回傳值。不比對的回傳值（函式型別）
+// 沒有 want 欄位，型別不會出現在測試檔裡——把它的 import 也加進去就成了 imported and not used
+func (s *tableSpec) setImports() {
+	set := map[string]bool{}
+	for imp := range s.base {
+		set[imp] = true
+	}
+	for _, r := range s.results {
+		if r.cmp {
+			for _, imp := range r.imports {
+				set[imp] = true
+			}
+		}
+	}
+	s.imports = s.imports[:0]
+	for imp := range set {
+		s.imports = append(s.imports, imp)
+	}
+	sort.Strings(s.imports)
 }
 
 // needsReflect 回報骨架是否以 reflect.DeepEqual 比對回傳值

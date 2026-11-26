@@ -158,3 +158,30 @@ func TestCLIProjectLintAndRootCommandName(t *testing.T) {
 		t.Error("hyp lint rewrote .hyp/context.yaml in a CLI project")
 	}
 }
+
+// hyp testgen ./... 等同於目前目錄；有目錄無法處理時其餘照常完成，但命令回錯。
+// 歷史 bug：./... 被當成路徑（open ...\dot）；測試檔語法錯誤時 exit 0 並印 No missing tests found.
+func TestTestgenDotsAndProblemExitCode(t *testing.T) {
+	t.Chdir(t.TempDir())
+	os.MkdirAll("ok", 0o755)
+	os.WriteFile(filepath.Join("ok", "a.go"), []byte("package ok\n\nfunc A() {}\n"), 0o644)
+	if err := runHyp(t, "testgen", "./..."); err != nil {
+		t.Fatalf("testgen ./...: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("ok", "a_test.go")); err != nil {
+		t.Error("testgen ./... did not scan the current directory")
+	}
+
+	os.MkdirAll("broken", 0o755)
+	os.WriteFile(filepath.Join("broken", "b.go"), []byte("package broken\n\nfunc B() {}\n"), 0o644)
+	os.WriteFile(filepath.Join("broken", "b_test.go"), []byte("package broken\n\nfunc TestX(t *testing.T) {\n"), 0o644)
+	os.MkdirAll("more", 0o755)
+	os.WriteFile(filepath.Join("more", "m.go"), []byte("package more\n\nfunc M() {}\n"), 0o644)
+	err := runHyp(t, "testgen", "./...")
+	if err == nil || !strings.Contains(err.Error(), "broken") {
+		t.Errorf("a directory that could not be processed: err = %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join("more", "m_test.go")); serr != nil {
+		t.Error("the other directories were not processed")
+	}
+}

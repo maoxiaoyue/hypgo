@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,7 +69,11 @@ func runTest(cmd *cobra.Command, args []string) error {
 		var reports []testgen.Report
 		for _, target := range targets {
 			r, err := testgen.GenerateForDir(target, opts)
-			if err != nil {
+			// 無法處理的目錄（測試檔語法錯誤…）不擋下後面的 go test：它會指出同一個問題
+			var skipped *testgen.SkippedError
+			if errors.As(err, &skipped) {
+				fmt.Fprintf(os.Stderr, "testgen: %v\n", skipped)
+			} else if err != nil {
 				return fmt.Errorf("testgen: %w", err)
 			}
 			reports = append(reports, r...)
