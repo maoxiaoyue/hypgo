@@ -356,6 +356,12 @@ func GenerateProto(baseDir, name, moduleName string) error {
 	protoDir := filepath.Join(baseDir, "app", "proto", lowerName+"pb")
 	rpcDir := filepath.Join(baseDir, "app", "rpc")
 
+	// 兩個檔案都確認不存在才動手：先前 .proto 寫完才發現 server 檔已存在，留下半套
+	for _, path := range []string{filepath.Join(protoDir, lowerName+".proto"), filepath.Join(rpcDir, lowerName+"_server.go")} {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("scaffold: file already exists: %s", path)
+		}
+	}
 	if err := generateFile(protoDir, lowerName+".proto", grpcProtoTemplate, data); err != nil {
 		return err
 	}
@@ -473,6 +479,7 @@ func templateData(name string) map[string]string {
 		"VarName":      strings.ToLower(camel[:1]) + camel[1:], // Go 變數名（exportData）
 		"ServiceName":  service,                                // gRPC 服務名
 		"Plural":       plural,                                 // 路由路徑（/api/order_items）
+		"PluralName":   camelName(plural),                      // gRPC 的 ListOrderItems（先前直接加 s：ListCategorys）
 		"TableName":    plural,                                 // 資料表名
 		"LowerName":    strings.ToLower(name),
 		"Date":         time.Now().Format("2006-01-02"),
@@ -584,6 +591,10 @@ func aiCommentEnabled(dir string) bool {
 				AIComment bool `yaml:"ai_comment"`
 			}
 			return yaml.Unmarshal(data, &cfg) == nil && cfg.AIComment
+		}
+		// 只找到 module 根目錄為止：先前繼續往上，外層目錄的 .hyp/comment.yaml 決定了這個專案的註解
+		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
+			return false
 		}
 		parent := filepath.Dir(d)
 		if parent == d {
@@ -722,6 +733,34 @@ func checkCollisions(dir, filename string, content []byte) error {
 		}
 	}
 	return nil
+}
+
+// MissingDecls 回傳 names 之中、dir 這個套件（不含測試檔）沒有宣告的套件層級識別字。
+// 供 hyp generate 在沿用既有檔案前確認它有生成的程式碼要用的名稱
+func MissingDecls(dir string, names ...string) []string {
+	have := map[string]bool{}
+	fset := token.NewFileSet()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			continue
+		}
+		for id := range topLevelNames(f) {
+			have[id] = true
+		}
+	}
+	var missing []string
+	for _, n := range names {
+		if !have[n] {
+			missing = append(missing, n)
+		}
+	}
+	return missing
 }
 
 // topLevelNames 回傳檔案宣告的套件層級識別字（init、_ 與方法不算）

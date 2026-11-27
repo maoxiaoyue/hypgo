@@ -844,7 +844,7 @@ func TestGenerateControllerIsComplete(t *testing.T) {
 	}
 
 	// 既有的 model 保留、不算錯誤
-	os.WriteFile(filepath.Join(root, "app", "models", "invoice.go"), []byte("package models\n\n// mine\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "app", "models", "invoice.go"), []byte("package models\n\n// mine\ntype (\n\tInvoice struct{}\n\tCreateInvoiceReq struct{}\n\tUpdateInvoiceReq struct{}\n\tInvoiceResp struct{}\n\tInvoiceListResp struct{}\n)\n"), 0o644)
 	if err := runHyp(t, "generate", "controller", "invoice"); err != nil {
 		t.Fatal(err)
 	}
