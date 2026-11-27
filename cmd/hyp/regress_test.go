@@ -116,7 +116,7 @@ func TestRunDevRestartsOnChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runDev(ctx, ".", true) }()
+	go func() { done <- runDev(ctx, ".", true, nil) }()
 
 	waitFor := func(want string) {
 		t.Helper()

@@ -142,7 +142,8 @@ func TestCommandsRejectStrayArguments(t *testing.T) {
 	} {
 		// 要是參數檢查擋下的：health、context 在空目錄本來就會失敗
 		err := runHyp(t, args...)
-		if err == nil || !(strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "accepts")) {
+		if err == nil || !(strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "accepts") ||
+			strings.Contains(err.Error(), "unexpected argument")) { // hyp run：參數要放在 -- 之後
 			t.Errorf("%v: err = %v", args, err)
 		}
 	}

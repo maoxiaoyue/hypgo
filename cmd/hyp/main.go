@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -53,6 +54,11 @@ Use "hyp [command] --help" for detailed information about each command.`,
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
+		// hyp run --watch=false：以應用程式自己的結束碼結束
+		var code exitCodeError
+		if errors.As(err, &code) {
+			os.Exit(int(code))
+		}
 		os.Exit(1)
 	}
 }
