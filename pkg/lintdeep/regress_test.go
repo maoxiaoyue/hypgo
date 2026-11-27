@@ -113,9 +113,9 @@ func TestEdgeCorrectRoutesPass(t *testing.T) {
 			t.Errorf("%s skipped: %s", route, r)
 		}
 	}
-	// 15 條 finding + 9 條通過（/nil-input 沒有 Input，不計入）
-	if rep.Analyzed != 15+9 {
-		t.Errorf("Analyzed = %d, want 24", rep.Analyzed)
+	// 15 條 finding + 8 條通過（/nil-input 沒有 Input；GET /get-unknown 沒有東西可驗證，都不計入）
+	if rep.Analyzed != 15+8 {
+		t.Errorf("Analyzed = %d, want 23", rep.Analyzed)
 	}
 }
 

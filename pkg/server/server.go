@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/maoxiaoyue/hypgo/pkg/config"
 	hypcontext "github.com/maoxiaoyue/hypgo/pkg/context"
+	hyperrors "github.com/maoxiaoyue/hypgo/pkg/errors"
 	"github.com/maoxiaoyue/hypgo/pkg/logger"
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/middleware"
@@ -745,13 +747,19 @@ func (s *Server) wrapHandler(h http.Handler, tcp bool) http.Handler {
 	})
 }
 
+// busyBody 是 rejectBusy 的回應內容
+var busyBody, _ = json.Marshal(hyperrors.ErrServerBusy)
+
 // handlerQueueTimeout 名額用完時請求等待空位的上限（變數：測試會縮短）
 var handlerQueueTimeout = 7 * time.Second
 
 // rejectBusy 名額用完且等待逾時：回 503 + Retry-After，並記一筆警告（每秒至多一筆，避免洗版）
 func (s *Server) rejectBusy(w http.ResponseWriter, r *http.Request) {
+	// 與 router 的 404 / 405、中間件的錯誤同一個形狀（先前是純文字 "server busy"）
 	w.Header().Set("Retry-After", "1")
-	http.Error(w, "server busy", http.StatusServiceUnavailable)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	w.Write(busyBody)
 	now := time.Now().UnixNano()
 	if last := s.lastBusyLog.Load(); now-last >= int64(time.Second) && s.lastBusyLog.CompareAndSwap(last, now) {
 		s.logger.Warning("max_handlers reached; request rejected with 503",
@@ -1047,8 +1055,22 @@ func (s *Server) waitForChildAlive(child *os.Process, window time.Duration) bool
 //
 // CORS 依 server.cors：沒設定時為任何來源；allow_origins 是空清單時不掛（見 config.CORSConfig）
 func (s *Server) applyDefaultMiddlewares() error {
+	// 使用者自己以 Use() 掛了 CORS 時，預設的那一份不掛。預設中間件排在使用者的之前，
+	// 先前預設的 "*" 因此先回應 preflight（帶憑證的請求在瀏覽器失敗），一般請求也帶著
+	// Access-Control-Allow-Origin: *，使用者設定的來源限制形同沒有
+	userCORS := false
+	for _, h := range s.router.Middlewares() {
+		if middleware.IsCORS(h) {
+			userCORS = true
+			break
+		}
+	}
 	var cors hypcontext.HandlerFunc
-	if c := s.config.Server.CORS; c.AllowOrigins == nil || len(c.AllowOrigins) > 0 {
+	if c := s.config.Server.CORS; userCORS {
+		if len(c.AllowOrigins) > 0 {
+			s.logger.Warning("server.cors is ignored: a CORS middleware is registered with Use()")
+		}
+	} else if c.AllowOrigins == nil || len(c.AllowOrigins) > 0 {
 		mc := middleware.DefaultCORSConfig()
 		if c.AllowOrigins != nil {
 			mc.AllowOrigins = c.AllowOrigins

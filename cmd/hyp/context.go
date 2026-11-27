@@ -2,12 +2,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"time"
 
 	"github.com/maoxiaoyue/hypgo/pkg/manifest"
 	"github.com/maoxiaoyue/hypgo/pkg/secret"
@@ -47,6 +51,7 @@ Flags:
   -o, --output   Output file path (default: stdout)
   -f, --format   Output format: yaml or json (default: yaml)
   -p, --pkg      Main package to run (default: .)
+  --timeout      How long the project may run before it is stopped (default: 1m)
 
 Examples:
   hyp context                              Print YAML to stdout
@@ -61,6 +66,7 @@ func init() {
 	contextCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	contextCmd.Flags().StringP("format", "f", "yaml", "Output format: yaml or json")
 	contextCmd.Flags().StringP("pkg", "p", ".", "Main package to run")
+	contextCmd.Flags().Duration("timeout", defaultCollectTimeout, "How long the project may run before it is stopped (compilation not included)")
 }
 
 func runContext(cmd *cobra.Command, args []string) error {
@@ -103,31 +109,85 @@ func collectManifest(cmd *cobra.Command, dir, pkg string) (*manifest.Manifest, e
 	return collectProjectManifest(cmd, dir, pkg)
 }
 
-// collectProjectManifest 以 HYPGO_MANIFEST_OUT 執行 go run <pkg>，讀回 server.Start() 寫出的 manifest。
-// 專案輸出一律導到 stderr，讓 stdout 只有 manifest
-func collectProjectManifest(cmd *cobra.Command, dir, pkg string) (*manifest.Manifest, error) {
-	tmp, err := os.CreateTemp("", "hypgo-manifest-*.json")
-	if err != nil {
-		return nil, err
-	}
-	out := tmp.Name()
-	tmp.Close()
-	os.Remove(out) // 由專案建立；存在與否用來判斷 server.Start() 是否被呼叫
-	defer os.Remove(out)
+// defaultCollectTimeout 是專案編譯完成後、等它寫出 manifest 並結束的時間上限
+const defaultCollectTimeout = time.Minute
 
-	run := exec.CommandContext(cmd.Context(), "go", "run", pkg)
+// collectTimeout 讀 --timeout（hyp lint / hyp context），沒有或無效時用預設值
+func collectTimeout(cmd *cobra.Command) time.Duration {
+	if cmd.Flags().Lookup("timeout") != nil {
+		if d, err := cmd.Flags().GetDuration("timeout"); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultCollectTimeout
+}
+
+// runForManifest 編譯 pkg 並執行它，manifest 由程式寫到 out（HYPGO_MANIFEST_OUT）。
+//
+//   - 執行有時間上限。先前是沒有逾時的 go run：不經 server.Start() 的程式（gRPC 專案，
+//     或 main() 在那之前就阻塞）不理 HYPGO_MANIFEST_OUT、照常監聽，hyp lint 永遠不結束，CI 卡死
+//   - 先編譯再執行編譯出來的檔案：逾時只算執行的時間，而且砍得掉（砍 go run 只結束 go 指令，
+//     它啟動的程式留在背景）
+//   - 專案的輸出只在失敗時印出。先前每次都印出 "starting on :8080 ..."
+func runForManifest(cmd *cobra.Command, dir, pkg, out string) error {
+	tmp, err := os.MkdirTemp("", "hypgo-collect-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	bin := filepath.Join(tmp, "app")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+
+	var output bytes.Buffer
+	build := exec.CommandContext(cmd.Context(), "go", "build", "-o", bin, pkg)
+	build.Dir = dir
+	build.Stdout, build.Stderr = &output, &output
+	if err := build.Run(); err != nil {
+		os.Stderr.Write(output.Bytes())
+		return fmt.Errorf("go build %s: %w", pkg, err)
+	}
+
+	timeout := collectTimeout(cmd)
+	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+	defer cancel()
+	run := exec.CommandContext(ctx, bin)
 	run.Dir = dir
 	// 只為取得路由，不解密 ${secret:name}：CI 不需要持有解密金鑰
 	run.Env = append(os.Environ(), manifest.ManifestOutEnv+"="+out, secret.OptionalEnv+"=1")
-	run.Stdout, run.Stderr = os.Stderr, os.Stderr
-	if err := run.Run(); err != nil {
-		return nil, fmt.Errorf("go run %s: %w", pkg, err)
+	run.Stdout, run.Stderr = &output, &output
+	run.WaitDelay = 5 * time.Second
+	err = run.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		os.Stderr.Write(output.Bytes())
+		return fmt.Errorf("%s was still running after %s and was stopped. With %s set, server.Start() writes the manifest and returns; "+
+			"a program that never reaches it keeps running (a gRPC project, or a main() that blocks first). "+
+			"Use --no-refresh to check the existing manifest, or --timeout if the program needs longer", pkg, timeout, manifest.ManifestOutEnv)
+	}
+	if err != nil {
+		os.Stderr.Write(output.Bytes())
+		return fmt.Errorf("%s exited with an error (%w); its output is above and its own log file may have the reason. "+
+			"main() is run to collect the routes, so it has to get to server.Start() without a database or other services being reachable", pkg, err)
+	}
+	return nil
+}
+
+// collectProjectManifest 以 HYPGO_MANIFEST_OUT 執行專案，讀回 server.Start() 寫出的 manifest
+func collectProjectManifest(cmd *cobra.Command, dir, pkg string) (*manifest.Manifest, error) {
+	out, cleanup, err := manifestTempFile()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	if err := runForManifest(cmd, dir, pkg, out); err != nil {
+		return nil, err
 	}
 
 	data, err := os.ReadFile(out)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("go run %s finished without calling server.Start(), so no routes were collected; "+
-			"gRPC projects write .hyp/context.yaml when they start", pkg)
+		return nil, fmt.Errorf("%s finished without calling server.Start(), so no routes were collected; "+
+			"gRPC projects write .hyp/context.yaml when they start (check it with --no-refresh)", pkg)
 	}
 	if err != nil {
 		return nil, err
@@ -139,20 +199,43 @@ func collectProjectManifest(cmd *cobra.Command, dir, pkg string) (*manifest.Mani
 	return &m, nil
 }
 
-// runGenctx 執行 CLI / Desktop 模板自帶的 tools/genctx（它把 manifest 寫到 .hyp/context.yaml）後讀回
+// manifestTempFile 回傳一個還不存在的暫存檔路徑（由專案建立；存在與否用來判斷它有沒有寫 manifest）
+func manifestTempFile() (path string, cleanup func(), err error) {
+	tmp, err := os.CreateTemp("", "hypgo-manifest-*.json")
+	if err != nil {
+		return "", nil, err
+	}
+	path = tmp.Name()
+	tmp.Close()
+	os.Remove(path)
+	return path, func() { os.Remove(path) }, nil
+}
+
+// runGenctx 執行 CLI / Desktop 模板自帶的 tools/genctx 取得 manifest。
+// genctx 看到 HYPGO_MANIFEST_OUT 時把 manifest 寫到那裡（不動 .hyp/context.yaml、不呼叫 LLM）；
+// v0.9.3 之前生成的 genctx 不認這個變數，照舊寫到 .hyp/context.yaml，這裡改讀它。
+// 先前一律寫 .hyp/context.yaml 並自動探測 .hyp/llm.yaml：hyp lint 說「不寫檔」卻改了工作目錄
 func runGenctx(cmd *cobra.Command, dir string) (*manifest.Manifest, error) {
-	run := exec.CommandContext(cmd.Context(), "go", "run", "./tools/genctx")
-	run.Dir = dir
-	run.Stdout, run.Stderr = os.Stderr, os.Stderr
-	if err := run.Run(); err != nil {
-		return nil, fmt.Errorf("go run ./tools/genctx: %w", err)
+	out, cleanup, err := manifestTempFile()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	if err := runForManifest(cmd, dir, "./tools/genctx", out); err != nil {
+		return nil, err
+	}
+	var m manifest.Manifest
+	if data, err := os.ReadFile(out); err == nil {
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("parse manifest from %s: %w", out, err)
+		}
+		return &m, nil
 	}
 	path := filepath.Join(dir, manifest.DefaultContextPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var m manifest.Manifest
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}

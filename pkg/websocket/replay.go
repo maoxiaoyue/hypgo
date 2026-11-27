@@ -19,7 +19,8 @@ package websocket
 // 效果：別的方向（把伺服器送出的訊息送回）、別條連線、或已收過的訊息，驗證都不會通過。
 // 仍然擋不住的：能改動連線內容的中間人把某個客戶端的訊息改由自己的連線依序轉送
 // （它得先讓該客戶端採用自己連線的 session）。這需要傳輸層保護（wss），或每個客戶端各自的金鑰
-// （Client.SetEncryptionKey / SetHMACKey）。
+// （Client.SetEncryptionKey / SetHMACKey）。hello 一律用 Hub 的金鑰（送出時這條連線的金鑰可能還沒設定），
+// 之後的訊息用這條連線的金鑰：Go 客戶端以 Hub 的金鑰建立 ClientSession，再呼叫 SetDataKeys。
 
 import (
 	"crypto/cipher"
@@ -112,8 +113,10 @@ func (rs *replayState) openIn(frame []byte, gcm cipher.AEAD, hmacKey []byte, ste
 // 收到的每個 frame 交給 Open（第一個是 hello），要送出的內容經 Seal。
 // 不可並行使用（讀與寫各自呼叫時需自行加鎖）
 type ClientSession struct {
-	gcm     cipher.AEAD
+	gcm     cipher.AEAD // hello 用（Hub 的金鑰）
 	hmacKey []byte
+	dataGCM cipher.AEAD // hello 之後的訊息用；沒有呼叫 SetDataKeys 時與上面相同
+	dataMAC []byte
 	ste     bool
 	session [replaySessionSize]byte
 	ready   bool
@@ -137,7 +140,26 @@ func NewClientSession(aesKey, hmacKey []byte, signThenEncrypt bool) (*ClientSess
 	if s.gcm == nil && s.hmacKey == nil {
 		return nil, errors.New("websocket: ClientSession needs an AES key or an HMAC key")
 	}
+	s.dataGCM, s.dataMAC = s.gcm, s.hmacKey
 	return s, nil
+}
+
+// SetDataKeys 設定 hello 之後的訊息使用的金鑰，對應伺服器端的 Client.SetEncryptionKey / SetHMACKey；
+// 空的那一個沿用建立時的金鑰（與伺服器端「沒設定的沿用 Hub 的」相同）。
+// 先前 ClientSession 只有一組金鑰：用 Hub 的金鑰建立，之後每則訊息驗證失敗；
+// 用這條連線的金鑰建立，hello 就失敗——重放保護與每個客戶端各自的金鑰無法並用
+func (s *ClientSession) SetDataKeys(aesKey, hmacKey []byte) error {
+	if len(aesKey) > 0 {
+		gcm, err := newAEAD(aesKey)
+		if err != nil {
+			return err
+		}
+		s.dataGCM = gcm
+	}
+	if len(hmacKey) > 0 {
+		s.dataMAC = append([]byte(nil), hmacKey...)
+	}
+	return nil
 }
 
 // Open 驗證伺服器送來的 frame 並回傳內容。第一個 frame 是 hello：hello 為 true、沒有內容
@@ -158,7 +180,7 @@ func (s *ClientSession) Open(frame []byte) (payload []byte, hello bool, err erro
 		s.ready = true
 		return nil, true, nil
 	}
-	data, seq, err := replayOpen(frame, s.gcm, s.hmacKey, s.ste, dirServerToClient, &s.session, s.in)
+	data, seq, err := replayOpen(frame, s.dataGCM, s.dataMAC, s.ste, dirServerToClient, &s.session, s.in)
 	if err != nil {
 		return nil, false, err
 	}
@@ -172,5 +194,5 @@ func (s *ClientSession) Seal(payload []byte) ([]byte, error) {
 		return nil, errors.New("websocket: Seal before hello frame")
 	}
 	s.out++
-	return replayFrame(payload, s.gcm, s.hmacKey, s.ste, dirClientToServer, &s.session, s.out), nil
+	return replayFrame(payload, s.dataGCM, s.dataMAC, s.ste, dirClientToServer, &s.session, s.out), nil
 }

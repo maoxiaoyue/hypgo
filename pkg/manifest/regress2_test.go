@@ -262,3 +262,55 @@ func TestModelTypesFollowDatabaseDriver(t *testing.T) {
 		}
 	}
 }
+
+type lintTypoIn struct {
+	Name string `json:"name" validate:"requried"`
+}
+
+type lintItem struct {
+	SKU string `json:"sku" validate:"required"`
+}
+
+type lintOrderIn struct {
+	Items []lintItem `json:"items"`
+	Dived []lintItem `json:"dived" validate:"dive"`
+}
+
+type lintOrderOut struct {
+	Items []lintItem `json:"items"` // Output 由 contract 逐層驗證，不需要 dive
+	Bad   string     `json:"bad" validate:"nosuchrule"`
+}
+
+// 先前 validate 標籤打錯在註冊與 lint 時都沒有提示，第一個請求才 panic；
+// struct 的 slice 沒寫 dive 時元素不被驗證，不合格的請求照樣回 200
+func TestLintChecksValidateTags(t *testing.T) {
+	schema.Global().Reset()
+	r := router.New()
+	h := func(c *hypcontext.Context) {}
+	r.Schema(schema.Route{Method: "POST", Path: "/typo", Summary: "s", Input: lintTypoIn{}, Output: lintItem{}}).Handle(h)
+	r.Schema(schema.Route{Method: "POST", Path: "/orders", Summary: "s", Input: lintOrderIn{}, Output: lintOrderOut{}}).Handle(h)
+	r.Schema(schema.Route{Method: "POST", Path: "/fine", Summary: "s", Input: lintItem{}, Output: lintItem{}}).Handle(h)
+
+	rep := lintRoutes(r, schema.Global())
+	var got []string
+	for _, w := range rep.Warnings {
+		got = append(got, w.Route+" "+w.Kind)
+		if InfoKind(w.Kind) {
+			t.Errorf("%s must fail hyp lint, not be informational", w.Kind)
+		}
+	}
+	want := "POST /orders invalid_validate_tag|POST /orders missing_dive|POST /typo invalid_validate_tag"
+	if strings.Join(got, "|") != want {
+		t.Fatalf("warnings = %v\nwant %s", got, want)
+	}
+	for _, w := range rep.Warnings {
+		switch {
+		case w.Route == "POST /typo" && !(strings.Contains(w.Message, "Input") && strings.Contains(w.Message, "requried")):
+			t.Errorf("typo message: %s", w.Message)
+		case w.Kind == "missing_dive" && !(strings.Contains(w.Message, "lintOrderIn.items") && strings.Contains(w.Message, "dive")):
+			t.Errorf("dive message: %s", w.Message)
+		case w.Route == "POST /orders" && w.Kind == "invalid_validate_tag" && !strings.Contains(w.Message, "Output"):
+			t.Errorf("output message: %s", w.Message)
+		}
+	}
+}

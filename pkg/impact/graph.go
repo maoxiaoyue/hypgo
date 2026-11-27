@@ -129,7 +129,7 @@ func scanProject(root string) (*project, error) {
 	return p, nil
 }
 
-// buildIgnored 回報檔案是否以 //go:build ignore 排除在建置之外。
+// buildIgnored 回報檔案是否以 //go:build ignore（或舊式的 // +build ignore）排除在建置之外。
 // 其他 build tag（平台、自訂 tag）不判斷：那些檔案在某些環境會被編譯，寧可多報
 func buildIgnored(f *ast.File) bool {
 	for _, group := range f.Comments {
@@ -137,7 +137,7 @@ func buildIgnored(f *ast.File) bool {
 			break
 		}
 		for _, c := range group.List {
-			if !constraint.IsGoBuild(c.Text) {
+			if !constraint.IsGoBuild(c.Text) && !constraint.IsPlusBuild(c.Text) {
 				continue
 			}
 			if expr, err := constraint.Parse(c.Text); err == nil && requiresIgnore(expr) {

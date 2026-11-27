@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 // restartPIDFile server.Start() 寫入 CWD 的 PID 檔（pkg/server pidFilePath）
@@ -28,11 +27,23 @@ directory, so run this command from that directory) and sends SIGUSR2 to that
 process only. The server forks a new process that inherits the listener, then
 the old process shuts down gracefully.
 
-Requires server.enable_graceful_restart: true in config/config.yaml.
+Requires server.enable_graceful_restart: true (config file or
+HYPGO_SERVER_ENABLE_GRACEFUL_RESTART). When it is not set the server does not
+handle SIGUSR2 and the signal would terminate it, so the command refuses;
+--force sends the signal anyway (for apps that enable it in code).
+
+This is for a compiled binary. Do not use it on an app started by hyp run or
+go run: the new process leaves their control, and their temporary binary is
+deleted when they exit.
+
 Not supported on Windows.`,
 	Args:         cobra.NoArgs,
 	RunE:         runRestart,
 	SilenceUsage: true,
+}
+
+func init() {
+	restartCmd.Flags().Bool("force", false, "Send SIGUSR2 even when the config does not show graceful restart as enabled")
 }
 
 func runRestart(cmd *cobra.Command, args []string) error {
@@ -45,10 +56,14 @@ func runRestart(cmd *cobra.Command, args []string) error {
 	if !isProcessRunning(pid) {
 		return fmt.Errorf("process %d from %s is not running (stale PID file); start the app first", pid, restartPIDFile)
 	}
+	if err := checkPIDWorksHere(pid); err != nil {
+		return err
+	}
 
 	// 未啟用 graceful restart 時 server 不處理 SIGUSR2，訊號的預設動作會直接結束行程
-	if enabled, ok := gracefulRestartConfigured("config/config.yaml"); ok && !enabled {
-		return fmt.Errorf("server.enable_graceful_restart is false in config/config.yaml; SIGUSR2 would terminate PID %d instead of restarting it", pid)
+	force, _ := cmd.Flags().GetBool("force")
+	if err := checkGracefulRestart(pid, force); err != nil {
+		return err
 	}
 
 	fmt.Printf("🔄 Sending graceful restart signal (SIGUSR2) to PID %d...\n", pid)
@@ -73,7 +88,7 @@ func readPIDFile(path string) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, fmt.Errorf("%s not found in the current directory: start the app (hyp run / go run .) from here first", path)
+			return 0, fmt.Errorf("%s not found in the current directory: run this from the working directory of the running app (a compiled binary, not hyp run / go run)", path)
 		}
 		return 0, err
 	}
@@ -84,21 +99,20 @@ func readPIDFile(path string) (int, error) {
 	return pid, nil
 }
 
-// gracefulRestartConfigured 讀取設定檔的 server.enable_graceful_restart；ok 為 false 表示無法判斷
-func gracefulRestartConfigured(path string) (enabled, ok bool) {
-	data, err := os.ReadFile(path)
+// checkPIDWorksHere 確認 PID 檔記的行程是在這個目錄執行的（Linux，讀 /proc/<pid>/cwd）。
+// 應用程式被 kill -9 或機器重開後 PID 檔會留下，該 PID 之後可能屬於別的行程；
+// 先前只確認「有這個行程」就送 SIGUSR2，把無關的行程結束掉。
+// 沒有 /proc 的系統（macOS、BSD）或讀不到時無從判斷，照舊放行
+func checkPIDWorksHere(pid int) error {
+	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
 	if err != nil {
-		return false, false
+		return nil
 	}
-	var cfg struct {
-		Server struct {
-			EnableGracefulRestart *bool `yaml:"enable_graceful_restart"`
-		} `yaml:"server"`
+	here, err := os.Getwd()
+	if err != nil || sameDir(cwd, here) {
+		return nil
 	}
-	if yaml.Unmarshal(data, &cfg) != nil || cfg.Server.EnableGracefulRestart == nil {
-		return false, false
-	}
-	return *cfg.Server.EnableGracefulRestart, true
+	return fmt.Errorf("PID %d from %s is not this app: its working directory is %s (stale PID file reused by another process); remove %s and start the app", pid, restartPIDFile, cwd, restartPIDFile)
 }
 
 func isProcessRunning(pid int) bool {

@@ -32,12 +32,56 @@ func (h queryHook) AfterQuery(ctx context.Context, e *bun.QueryEvent) {
 	}
 	d := h.d
 	if took := time.Since(e.StartTime); d.set.slowQuery > 0 && took >= d.set.slowQuery {
-		d.log.Warning("slow query",
-			"ms", took.Milliseconds(), "operation", e.Operation(), "query", truncateSQL(e.Query), "err", errText(e.Err))
+		// SQL 內嵌著參數值（bun 送出前已把值填進去）：預設只記操作與表名，
+		// 先前整句寫進日誌，密碼、token、個資都在裡面。slow_query_sql: true 才記 SQL
+		fields := []interface{}{"ms", took.Milliseconds(), "operation", e.Operation()}
+		if e.IQuery != nil {
+			if table := e.IQuery.GetTableName(); table != "" {
+				fields = append(fields, "table", table)
+			}
+		}
+		if d.set.slowQuerySQL {
+			fields = append(fields, "query", truncateSQL(e.Query))
+		}
+		d.log.Warning("slow query", append(fields, "err", errText(e.Err))...)
 	}
-	if e.Err == nil && !control && !bun.IsReadOnlyQuery(e.IQuery) {
+	if e.Err == nil && !control && !readOnly(e.IQuery, e.Query) {
 		d.markWrite(ctx)
 	}
+}
+
+// readOnly 回報查詢是否唯讀。bun.IsReadOnlyQuery 只認 NewSelect：NewRaw("SELECT ...") 與
+// db.QueryContext("SELECT ...") 都不算，先前因此不走副本，還被當成寫入（觸發寫後讀）
+func readOnly(q bun.Query, sql string) bool {
+	switch q := q.(type) {
+	case nil:
+		return readOnlySQL(sql)
+	case *bun.RawQuery:
+		if sql == "" {
+			sql = q.String()
+		}
+		return readOnlySQL(sql)
+	}
+	return bun.IsReadOnlyQuery(q)
+}
+
+// readOnlySQL 以開頭的關鍵字判斷原始 SQL 是否唯讀。看不出來的一律當成寫入（走主庫）：
+// WITH 可以帶 INSERT / UPDATE，SELECT ... FOR UPDATE / FOR SHARE 要在主庫上鎖
+func readOnlySQL(sql string) bool {
+	sql = strings.TrimLeft(sql, " \t\r\n(")
+	end := strings.IndexAny(sql, " \t\r\n(")
+	if end < 0 {
+		end = len(sql)
+	}
+	switch strings.ToUpper(sql[:end]) {
+	case "SHOW", "EXPLAIN", "DESCRIBE", "DESC":
+		return true
+	case "SELECT":
+		upper := strings.ToUpper(sql)
+		return !strings.Contains(upper, "FOR UPDATE") && !strings.Contains(upper, "FOR SHARE") &&
+			!strings.Contains(upper, "FOR NO KEY UPDATE") && !strings.Contains(upper, "FOR KEY SHARE")
+	}
+	return false
 }
 
 // isTxControl 回報事件是否為 bun 自己送出的交易控制語句（沒有對應的 query 物件）
@@ -95,7 +139,7 @@ type readResolver struct{ d *Database }
 
 func (r readResolver) ResolveConn(ctx context.Context, query bun.Query) bun.IConn {
 	d := r.d
-	if d.replicaPool == nil || !bun.IsReadOnlyQuery(query) || d.needsMaster(ctx) {
+	if d.replicaPool == nil || !readOnly(query, "") || d.needsMaster(ctx) {
 		return nil
 	}
 	replica := d.replicaPool.next()
@@ -124,8 +168,11 @@ func (c *failoverConn) fallback() *sql.DB {
 	return c.d.sqlDB
 }
 
-func (c *failoverConn) failed(err error) bool {
-	if !isConnError(err) {
+func (c *failoverConn) failed(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false // 呼叫端取消或逾時：不是副本的問題
+	}
+	if ce, ok := c.d.dialect.(ConnErrorChecker); !isConnError(err) && !(ok && ce.IsConnError(err)) {
 		return false
 	}
 	if c.replica.health.markDown(err) {
@@ -136,7 +183,7 @@ func (c *failoverConn) failed(err error) bool {
 
 func (c *failoverConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	rows, err := c.replica.sqlDB.QueryContext(ctx, query, args...)
-	if err != nil && c.failed(err) {
+	if err != nil && c.failed(ctx, err) {
 		return c.fallback().QueryContext(ctx, query, args...)
 	}
 	return rows, err
@@ -144,7 +191,7 @@ func (c *failoverConn) QueryContext(ctx context.Context, query string, args ...a
 
 func (c *failoverConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	res, err := c.replica.sqlDB.ExecContext(ctx, query, args...)
-	if err != nil && c.failed(err) {
+	if err != nil && c.failed(ctx, err) {
 		return c.fallback().ExecContext(ctx, query, args...)
 	}
 	return res, err
@@ -154,10 +201,18 @@ func (c *failoverConn) QueryRowContext(ctx context.Context, query string, args .
 	return c.replica.sqlDB.QueryRowContext(ctx, query, args...) // *sql.Row 的錯誤要到 Scan 才知道，無法重試
 }
 
+// ConnErrorChecker 由方言選擇性實作：辨認驅動自己的連線層錯誤
+// （go-sql-driver 查詢中斷時回 mysql.ErrInvalidConn，既不是 driver.ErrBadConn 也不是 net.Error）
+type ConnErrorChecker interface {
+	IsConnError(err error) bool
+}
+
 // isConnError 回報 err 是否為連線層的錯誤（連不上、連線中斷），而不是查詢本身的錯誤。
-// 呼叫端取消或逾時不算：那不是副本的問題
+// 呼叫端取消或逾時由 failed 以查詢的 ctx 判斷，不看 err：驅動以自己的逾時撥號
+// （go-sql-driver 的 timeout=、lib/pq 的 connect_timeout），連不上主機時的 "dial tcp: i/o timeout"
+// 也符合 context.DeadlineExceeded。先前只要符合就不算連線錯誤，最常見的故障反而要等背景探測（約 15 秒）
 func isConnError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
 	var netErr net.Error

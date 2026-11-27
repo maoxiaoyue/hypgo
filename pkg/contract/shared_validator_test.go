@@ -67,3 +67,15 @@ func TestSharedValidatorE164(t *testing.T) {
 		t.Error("invalid e164 should be rejected")
 	}
 }
+
+type typoOut struct {
+	Name string `json:"name" validate:"requried"`
+}
+
+// Output 的 validate 標籤打錯時，合約驗證回報錯誤而不是讓測試行程 panic
+func TestInvalidValidateTagIsReportedNotPanic(t *testing.T) {
+	err := validateResponse([]byte(`{"name":"a"}`), typoOut{}, false)
+	if err == nil || !strings.Contains(err.Error(), "requried") {
+		t.Errorf("err = %v", err)
+	}
+}

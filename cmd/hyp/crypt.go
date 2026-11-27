@@ -291,6 +291,10 @@ func runSecretRestore(cmd *cobra.Command) error {
 			return err
 		}
 		fmt.Fprintf(out, "Restored %d value(s) in %s\n", c.n, c.path)
+		// 設定檔通常在版控裡：指名哪些檔案現在帶著明文。先前只有一句籠統的「不要提交」
+		if rel, err := filepath.Rel(settings.Root(), c.path); err == nil && gitTracks(settings.Root(), rel) {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s is tracked by git and now holds plaintext secrets; `git diff` shows them and a commit publishes them.\n", filepath.ToSlash(rel))
+		}
 	}
 	fmt.Fprintf(out, "These files now hold the plaintext: do not commit them. %s is unchanged;\n"+
 		"put the references back by hand, or with hyp crypt --key <section> for user / password fields.\n", settings.SecretFile)

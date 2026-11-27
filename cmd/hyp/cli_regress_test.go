@@ -142,7 +142,8 @@ func TestCommandsRejectStrayArguments(t *testing.T) {
 	} {
 		// 要是參數檢查擋下的：health、context 在空目錄本來就會失敗
 		err := runHyp(t, args...)
-		if err == nil || !(strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "accepts")) {
+		if err == nil || !(strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "accepts") ||
+			strings.Contains(err.Error(), "unexpected argument")) { // hyp run：參數要放在 -- 之後
 			t.Errorf("%v: err = %v", args, err)
 		}
 	}
@@ -324,6 +325,12 @@ func TestAPIProjectTemplate(t *testing.T) {
 			t.Fatal(err)
 		}
 		return string(data)
+	}
+
+	// AI 規則要求 contract 測試：先前生成的專案一個測試檔都沒有
+	if got := read("routers/router_contract_test.go"); !strings.Contains(got, "func TestSetup_Contracts(t *testing.T)") ||
+		!strings.Contains(got, "contract.TestAll(t, r)") || !strings.Contains(got, "t.Skip(") {
+		t.Errorf("contract test skeleton:\n%s", got)
 	}
 
 	// 先前內附的 001_create_users 與生成的 User model 欄位不同，hyp migrate diff 又產生一份 CREATE TABLE users
@@ -837,7 +844,7 @@ func TestGenerateControllerIsComplete(t *testing.T) {
 	}
 
 	// 既有的 model 保留、不算錯誤
-	os.WriteFile(filepath.Join(root, "app", "models", "invoice.go"), []byte("package models\n\n// mine\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "app", "models", "invoice.go"), []byte("package models\n\n// mine\ntype (\n\tInvoice struct{}\n\tCreateInvoiceReq struct{}\n\tUpdateInvoiceReq struct{}\n\tInvoiceResp struct{}\n\tInvoiceListResp struct{}\n)\n"), 0o644)
 	if err := runHyp(t, "generate", "controller", "invoice"); err != nil {
 		t.Fatal(err)
 	}

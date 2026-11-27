@@ -9,13 +9,16 @@ import (
 // 與 http.MaxBytesReader 的差別是上限可以事後調整（SetBodyLimit），
 // 讓 server 套用的全域上限能被個別路由放寬或收緊
 type limitedBody struct {
-	rc    io.ReadCloser
-	limit int64
-	n     int64 // 已讀位元組
+	rc       io.ReadCloser
+	limit    int64
+	n        int64 // 已讀位元組
+	declared int64 // 請求的 Content-Length；未知為 -1
 }
 
 func (b *limitedBody) Read(p []byte) (int, error) {
-	if b.n > b.limit {
+	// Content-Length 已經超過上限時不讀：先前仍先讀 limit+1 位元組才拒絕，
+	// 帶 Expect: 100-continue 的客戶端也因此被要求上傳（net/http 在第一次讀 body 時送 100）
+	if b.n > b.limit || b.declared > b.limit {
 		return 0, &http.MaxBytesError{Limit: b.limit}
 	}
 	// 至多讀到 limit+1：多出的那一個位元組用來分辨「剛好等於上限」與「超過」
@@ -44,7 +47,7 @@ func LimitRequestBody(r *http.Request, limit int64) {
 		b.limit = limit
 		return
 	}
-	r.Body = &limitedBody{rc: r.Body, limit: limit}
+	r.Body = &limitedBody{rc: r.Body, limit: limit, declared: r.ContentLength}
 }
 
 // SetBodyLimit 調整這個請求的 body 上限（位元組），要在讀取 body 之前呼叫。

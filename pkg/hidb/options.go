@@ -19,6 +19,7 @@ const (
 // settings 為解析後的行為設定：Option 優先，其次設定檔，最後預設值
 type settings struct {
 	slowQuery       time.Duration // 0 = 不記慢查詢
+	slowQuerySQL    bool          // 慢查詢日誌是否帶 SQL（內嵌參數值）
 	readYourWrites  time.Duration // 0 = 不做跨請求的寫後讀
 	maxReplicaLag   time.Duration // 0 = 不檢查複寫延遲
 	txRetries       int
@@ -31,6 +32,7 @@ type settings struct {
 type overrides struct {
 	slowQuery, readYourWrites, maxReplicaLag *time.Duration
 	txRetries                                *int
+	slowQuerySQL                             *bool
 	bunOpts                                  []bun.DBOption
 	logger                                   *logger.Logger
 }
@@ -49,6 +51,12 @@ func WithBunOptions(opts ...bun.DBOption) Option {
 // WithSlowQuery 設定慢查詢門檻（預設 500ms）；0 或負數關閉
 func WithSlowQuery(threshold time.Duration) Option {
 	return func(db *Database) { db.over.slowQuery = &threshold }
+}
+
+// WithSlowQuerySQL 讓慢查詢日誌帶上 SQL（預設不帶，只記操作、表名與耗時）。
+// SQL 內嵌著參數值：開啟前確認日誌的存放位置可以放密碼、token 與個資
+func WithSlowQuerySQL(on bool) Option {
+	return func(db *Database) { db.over.slowQuerySQL = &on }
 }
 
 // WithReadYourWrites 設定寫入後同一使用者的讀取走主庫的時間（預設 1 秒）；0 或負數關閉跨請求的部分。
@@ -91,6 +99,7 @@ func (d *Database) resolveSettings() {
 		connMaxLifetime: pick(o.ConnMaxLifetime, time.Second, DefaultConnMaxLifetime),
 		connMaxIdleTime: pick(o.ConnMaxIdleTime, time.Second, 0),
 		strictColumns:   o.StrictColumns,
+		slowQuerySQL:    o.SlowQuerySQL,
 		txRetries:       DefaultTxRetries,
 	}
 	switch {
@@ -102,6 +111,9 @@ func (d *Database) resolveSettings() {
 
 	if v := d.over.slowQuery; v != nil {
 		s.slowQuery = max(*v, 0)
+	}
+	if v := d.over.slowQuerySQL; v != nil {
+		s.slowQuerySQL = *v
 	}
 	if v := d.over.readYourWrites; v != nil {
 		s.readYourWrites = max(*v, 0)

@@ -106,14 +106,18 @@ func TestSecretSymmetricWorkflow(t *testing.T) {
 	if _, err := runSecret(t, "", "keygen", "-o", newKey); err == nil {
 		t.Error("keygen overwrote an existing key file")
 	}
+	data, _ := os.ReadFile(newKey)
 	if _, err := runSecret(t, "", "rotate", "--new-key-file", newKey); err != nil {
 		t.Fatal(err)
+	}
+	// 新金鑰已經在金鑰檔裡，--new-key-file 那一份不留（歷史 bug：留在原地，git add . 就提交了現役金鑰）
+	if _, err := os.Stat(newKey); err == nil {
+		t.Error("the --new-key-file copy of the key was left behind")
 	}
 	// 先前金鑰檔仍是舊金鑰，rotate 之後的第一個 get 就回報 key does not match
 	if got, err := runSecret(t, "", "get", "db_pass"); err != nil || got != "p@ss word\n" {
 		t.Errorf("get after rotate = %q, %v", got, err)
 	}
-	data, _ := os.ReadFile(newKey)
 	if now, _ := os.ReadFile(keyPath); strings.TrimSpace(string(now)) != strings.TrimSpace(string(data)) {
 		t.Error("key file was not replaced with the new key")
 	}

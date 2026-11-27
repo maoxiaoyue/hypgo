@@ -126,6 +126,10 @@ type compressWriter struct {
 	decided bool
 }
 
+// Unwrap 讓 http.ResponseController 找得到底層的 writer。先前沒有它，掛了 Compression 之後
+// c.DisableWriteTimeout() 回 ErrNotSupported，SSE 與串流照樣被 write_timeout 切斷
+func (w *compressWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // compressible 依狀態碼與已設定的標頭判斷這個回應能否壓縮
 func (w *compressWriter) compressible() bool {
 	switch status := w.Status(); {

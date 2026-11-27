@@ -169,3 +169,15 @@ func main() {
 		t.Error("a project whose routes cannot be collected should fail")
 	}
 }
+
+// 資訊級的 deep:input_unbound（GET 宣告了 Input 而沒有綁定）只有 --strict 才失敗
+func TestLintDeepInfoFailsOnlyWithStrict(t *testing.T) {
+	migrateProject(t)
+	writeLintProject(t, `r.Schema(schema.Route{Method: "GET", Path: "/g", Input: Req{}}).Handle(func(c *hypcontext.Context) {})`)
+	if err := runHyp(t, "lint", "--no-refresh", "--deep"); err != nil {
+		t.Errorf("info-level finding without --strict: %v", err)
+	}
+	if err := runHyp(t, "lint", "--no-refresh", "--deep", "--strict"); err == nil {
+		t.Error("info-level findings should fail with --strict")
+	}
+}

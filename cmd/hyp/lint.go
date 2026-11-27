@@ -18,8 +18,9 @@ var lintCmd = &cobra.Command{
 and optionally run a static (compile-time) Schema↔handler alignment check.
 
 SHALLOW (default) — runs the project to collect its current routes (the same
-way as hyp context: go run with HYPGO_MANIFEST_OUT, nothing is listened on and
-no file is written) and reports declaration-level gaps:
+way as hyp context: the main package is built and run with HYPGO_MANIFEST_OUT;
+server.Start() writes the manifest to a temporary file and returns without
+listening) and reports declaration-level gaps:
   no_schema            Route registered without r.Schema(...)
   missing_input        POST/PUT/PATCH with a Schema but no Input declared
                        (set NoInput: true when there is no request body)
@@ -27,6 +28,14 @@ no file is written) and reports declaration-level gaps:
                        (declare a 204 in Responses when nothing is returned)
   missing_summary      Schema present but Summary empty (info level)
   unregistered_schema  Schema registered but the router has no such route (info level)
+
+Running the project means main() runs up to server.Start(): it has to get there
+without a database or other services, and whatever it does on the way (opening
+its log file, for instance) happens. A program that is still running after
+--timeout (default 1m) is stopped and the check fails; that is what a gRPC
+project does, since it never calls server.Start(). Use --no-refresh for those.
+CLI / Desktop projects run ./tools/genctx instead; a genctx generated before
+v0.9.3 rewrites .hyp/context.yaml.
 
 With --no-refresh (or -f) the check reads an existing manifest file instead of
 running the project. That file is only as fresh as the last server start or
@@ -38,6 +47,10 @@ RegisterSchema it checks the handler (and helpers it passes c to) binds the
 declared Input via c.BindInput:
   deep:input_mismatch  handler binds a type different from the declared Input
   deep:no_bindinput    writable handler never calls c.BindInput at all
+  deep:input_unbound   GET / DELETE handler with a declared Input never calls
+                       c.BindInput (info level: only fails with --strict)
+Every handler passed to Handle(...) is scanned, so the binding may live in an
+earlier one. Positions are relative to the module root.
 This promotes the "bound wrong struct" silent failure — previously only the
 runtime BindInput reporter could catch it (and only when a request fired) — into
 a build-time CI gate. Routes that cannot be resolved statically are listed as
@@ -59,6 +72,7 @@ Flags:
   -f, --file     Read this manifest file instead of running the project
   --no-refresh   Read .hyp/context.yaml instead of running the project
   -p, --pkg      Main package to run (default: .)
+  --timeout      How long the project may run before it is stopped (default: 1m)
   --deep         Also run the static source-level Schema↔handler check
   --strict       Also fail on info-level findings and skipped routes
   --quiet        Print only the shallow coverage summary line
@@ -78,6 +92,7 @@ func init() {
 	lintCmd.Flags().StringP("file", "f", ".hyp/context.yaml", "Read this manifest file instead of running the project")
 	lintCmd.Flags().Bool("no-refresh", false, "Read .hyp/context.yaml instead of running the project")
 	lintCmd.Flags().StringP("pkg", "p", ".", "Main package to run")
+	lintCmd.Flags().Duration("timeout", defaultCollectTimeout, "How long the project may run before it is stopped (compilation not included)")
 	lintCmd.Flags().Bool("deep", false, "Run static (compile-time) Schema↔handler alignment check")
 	lintCmd.Flags().Bool("strict", false, "Also fail on info-level findings and routes --deep could not verify")
 	lintCmd.Flags().Bool("quiet", false, "Print only the coverage summary line")
@@ -147,7 +162,7 @@ func runLint(cmd *cobra.Command, args []string) error {
 		// 載入錯誤代表分析不完整：先前只有 --strict 才算失敗，打錯樣式或編譯不過都會通過
 		hardFailures += len(rep.Findings) + len(rep.LoadErrors)
 		if strict {
-			hardFailures += len(rep.Skipped)
+			hardFailures += len(rep.Skipped) + len(rep.Info)
 		}
 	}
 

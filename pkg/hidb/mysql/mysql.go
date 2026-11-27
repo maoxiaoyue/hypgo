@@ -24,9 +24,9 @@ func classify(err error) error {
 		return nil
 	}
 	switch me.Number {
-	case 1062: // ER_DUP_ENTRY
+	case 1062, 1022, 1586: // ER_DUP_ENTRY / ER_DUP_KEY / ER_DUP_ENTRY_WITH_KEY_NAME
 		return hidb.ErrDuplicate
-	case 1451, 1452: // ER_ROW_IS_REFERENCED_2 / ER_NO_REFERENCED_ROW_2
+	case 1451, 1452, 1216, 1217: // ER_ROW_IS_REFERENCED_2 / ER_NO_REFERENCED_ROW_2 與舊版的 ER_NO_REFERENCED_ROW / ER_ROW_IS_REFERENCED
 		return hidb.ErrForeignKey
 	case 1213: // ER_LOCK_DEADLOCK
 		return hidb.ErrDeadlock
@@ -63,6 +63,11 @@ func (d *Dialect) CheckDSN(dsn string) []string {
 	return []string{"parseTime=true is not set: DATETIME / TIMESTAMP columns cannot be scanned into time.Time (add ?parseTime=true to the DSN)"}
 }
 
+// IsConnError 實作 hidb.ConnErrorChecker：查詢途中連線中斷時驅動回 ErrInvalidConn
+func (d *Dialect) IsConnError(err error) bool {
+	return errors.Is(err, driver.ErrInvalidConn)
+}
+
 // ReplicaLag 實作 hidb.LagProber：讀 SHOW REPLICA STATUS 的 Seconds_Behind_Source
 // （MySQL 8.0.22 前為 SHOW SLAVE STATUS / Seconds_Behind_Master）。帳號需要 REPLICATION CLIENT 權限。
 // 不是副本（沒有任何列）時為 0；複寫停止（值為 NULL）時回錯
@@ -93,7 +98,7 @@ func (d *Dialect) ReplicaLag(ctx context.Context, db *sql.DB) (time.Duration, er
 	for i, col := range cols {
 		if strings.EqualFold(col, "Seconds_Behind_Source") || strings.EqualFold(col, "Seconds_Behind_Master") {
 			if values[i] == nil {
-				return 0, fmt.Errorf("replication is not running (%s is NULL)", col)
+				return 0, fmt.Errorf("%w (%s is NULL)", hidb.ErrReplicationStopped, col)
 			}
 			var seconds int64
 			if _, err := fmt.Sscan(string(values[i]), &seconds); err != nil {

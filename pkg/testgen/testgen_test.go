@@ -53,7 +53,7 @@ func helper() {}
 	if !strings.Contains(out, "func TestSvc_Process(t *testing.T)") {
 		t.Errorf("TestSvc_Process missing in:\n%s", out)
 	}
-	if strings.Contains(out, "TestHelper") || strings.Contains(out, "Testhelper") {
+	if strings.Contains(out, "TestHelper") || strings.Contains(out, "Test_helper") {
 		t.Errorf("should not generate test for unexported helper:\n%s", out)
 	}
 	if !strings.Contains(out, "t.Skip") {
@@ -71,8 +71,8 @@ func helper() {}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Added) != 1 || rep.Added[0] != "Testhelper" {
-		t.Errorf("Added = %v, want [Testhelper]", rep.Added)
+	if len(rep.Added) != 1 || rep.Added[0] != "Test_helper" {
+		t.Errorf("Added = %v, want [Test_helper]", rep.Added)
 	}
 }
 

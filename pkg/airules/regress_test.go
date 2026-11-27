@@ -1,10 +1,12 @@
 package airules
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/maoxiaoyue/hypgo/pkg/contract"
@@ -41,13 +43,26 @@ func TestCoreContentHasNoHarmfulInstructions(t *testing.T) {
 		"`.hyp/config.yaml`", // logger 不在那裡
 		"Rules above marked MANDATORY",
 		"Verify with `go vet", // go vet 不查註解
+		"setupRouter",         // 生成的專案沒有這個函式
+		"Log every error",     // Wrap 的底層錯誤已由 server 記錄
+		"log.Error(",
+		`"E_user_`, // scaffold 生成的資源：照抄會撞號
+		`"E_auth_`,
+		"400/422",
 	} {
 		if strings.Contains(out, bad) {
 			t.Errorf("rules still contain %q", bad)
 		}
 	}
 	for _, want := range []string{
-		`errors.Define("E4001"`,
+		`errors.Define("E_order_001"`,
+		"ErrOrderInternal.Wrap(err)",
+		"do not log it again in the handler",
+		"400 / 413 / 415 / 422",
+		"`validate:\"dive\"`",
+		"`hyp testgen`",
+		"func TestSetup_Contracts(t *testing.T)",
+		"hyp lint --deep",
 		"E0xxx-E2xxx are reserved",
 		"`db.ReadHypDB()`",
 		"`logger:` in `config/config.yaml`",
@@ -122,8 +137,8 @@ func TestWindsurfStaysWithinLimit(t *testing.T) {
 
 	// 路由表放不下時整段拿掉，檔案仍是有效的生成檔
 	big := &manifest.Manifest{}
-	for i := 0; i < 400; i++ {
-		big.Routes = append(big.Routes, manifest.RouteManifest{Method: "GET", Path: "/some/long/path", Summary: "很長的路由說明"})
+	for i := 0; i < maxRouteRows; i++ {
+		big.Routes = append(big.Routes, manifest.RouteManifest{Method: "GET", Path: "/some/long/path", Summary: strings.Repeat("很長的路由說明", 30)})
 	}
 	out := generateOne(t, "windsurf", big, Options{})
 	if n := utf8.RuneCountInString(out); n > windsurfCharLimit {
@@ -284,7 +299,8 @@ func TestEditedFileNeedsForce(t *testing.T) {
 	}
 }
 
-// 舊格式：照舊可以覆寫（才能升級），但 clean 無法確認沒被改過，要 force
+// 有標記、沒有 hash：無法確認內容沒被改過，生成與 clean 都要 force。
+// 先前生成時一律覆寫
 func TestLegacyMarker(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "AGENTS.md")
@@ -296,8 +312,16 @@ func TestLegacyMarker(t *testing.T) {
 	}
 
 	results, _ = GenerateAll(dir, agentsTarget(t), testManifest(), Options{}, false)
+	if results[0].Status != StatusSkipped || !results[0].NeedsForce || !strings.Contains(results[0].Message, "--force") {
+		t.Errorf("generate without force: %+v", results[0])
+	}
+	if data, _ := os.ReadFile(path); string(data) != legacyMarker+"\n# old\n" {
+		t.Errorf("file changed without force:\n%.80s", data)
+	}
+
+	results, _ = GenerateAll(dir, agentsTarget(t), testManifest(), Options{Force: true}, false)
 	if results[0].Status != StatusCreated {
-		t.Errorf("generate: %s", results[0].Status)
+		t.Errorf("generate with force: %s", results[0].Status)
 	}
 	data, _ := os.ReadFile(path)
 	if classify(data) != fileGenerated {
@@ -317,5 +341,96 @@ func TestUnreadablePathIsAnError(t *testing.T) {
 	results, _ := GenerateAll(dir, agentsTarget(t), nil, Options{}, false)
 	if results[0].Status != StatusError {
 		t.Errorf("status = %s", results[0].Status)
+	}
+}
+
+// 先前把最後一行（hash）換成自己的筆記，下次生成筆記就被覆寫且沒有提示
+func TestRemovedHashLineKeepsUserEdits(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	if _, err := GenerateAll(dir, agentsTarget(t), testManifest(), Options{}, false); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	edited := strings.Join(lines[:len(lines)-1], "\n") + "\nMY NOTES\n"
+	os.WriteFile(path, []byte(edited), 0o644)
+
+	results, _ := GenerateAll(dir, agentsTarget(t), testManifest(), Options{}, false)
+	if results[0].Status != StatusSkipped || !results[0].NeedsForce {
+		t.Errorf("result = %+v", results[0])
+	}
+	if data, _ := os.ReadFile(path); string(data) != edited {
+		t.Error("notes were overwritten")
+	}
+	// 手寫檔案的略過不需要 --force 的提示
+	os.WriteFile(path, []byte("# mine\n"), 0o644)
+	if results, _ := GenerateAll(dir, agentsTarget(t), testManifest(), Options{Force: true}, false); results[0].Status != StatusSkipped || results[0].NeedsForce {
+		t.Errorf("manual file: %+v", results[0])
+	}
+}
+
+// 先前內容沒變也重寫檔案並回報 created
+func TestUnchangedFileIsNotRewritten(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	results, _ := GenerateAll(dir, agentsTarget(t), testManifest(), Options{}, false)
+	if results[0].Status != StatusCreated {
+		t.Fatalf("first run: %s", results[0].Status)
+	}
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(path, old, old)
+
+	results, _ = GenerateAll(dir, agentsTarget(t), testManifest(), Options{}, false)
+	if results[0].Status != StatusUnchanged || results[0].Status.String() != "unchanged" {
+		t.Errorf("second run: %s", results[0].Status)
+	}
+	if info, _ := os.Stat(path); info.ModTime().After(old.Add(time.Minute)) {
+		t.Error("file was rewritten")
+	}
+	// 內容變了才寫
+	results, _ = GenerateAll(dir, agentsTarget(t), nil, Options{}, false)
+	if results[0].Status != StatusCreated {
+		t.Errorf("after a change: %s", results[0].Status)
+	}
+}
+
+// 先前路由表沒有上限：300 條路由讓每個每次都載入的檔案長到 20,000 字元
+func TestRouteTableIsCapped(t *testing.T) {
+	routes := func(n int) *manifest.Manifest {
+		m := &manifest.Manifest{}
+		for i := 0; i < n; i++ {
+			m.Routes = append(m.Routes, manifest.RouteManifest{Method: "GET", Path: fmt.Sprintf("/r%d", i), Summary: "s"})
+		}
+		return m
+	}
+	at := coreContent(routes(maxRouteRows), Options{})
+	if !strings.Contains(at, "| GET | /r0 | s |") || !strings.Contains(at, fmt.Sprintf("| GET | /r%d | s |", maxRouteRows-1)) {
+		t.Error("the table should be kept at the limit")
+	}
+	over := coreContent(routes(maxRouteRows+1), Options{})
+	if strings.Contains(over, "| GET |") {
+		t.Error("the table should be left out above the limit")
+	}
+	if !strings.Contains(over, fmt.Sprintf("%d routes: see `routes` in `.hyp/context.yaml`", maxRouteRows+1)) {
+		t.Errorf("no pointer to the manifest:\n%s", over[len(over)-200:])
+	}
+	if len(over) >= len(at) {
+		t.Error("the capped output should be shorter")
+	}
+}
+
+// 先前上限寫成 6000（全域規則的上限）：約 35 條路由就把路由表拿掉
+func TestWindsurfKeepsRouteTableUnderLimit(t *testing.T) {
+	m := &manifest.Manifest{}
+	for i := 0; i < maxRouteRows; i++ {
+		m.Routes = append(m.Routes, manifest.RouteManifest{Method: "GET", Path: fmt.Sprintf("/api/resources%d/:id", i), Summary: "Get resource by ID"})
+	}
+	out := generateOne(t, "windsurf", m, Options{})
+	if n := utf8.RuneCountInString(out); n <= 6000 || n > windsurfCharLimit {
+		t.Fatalf("test needs an output between 6000 and %d chars, got %d", windsurfCharLimit, n)
+	}
+	if !strings.Contains(out, "| GET | /api/resources0/:id |") {
+		t.Error("route table dropped although it fits")
 	}
 }

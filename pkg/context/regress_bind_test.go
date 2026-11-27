@@ -292,11 +292,27 @@ func TestBodyLimit(t *testing.T) {
 	if b, err := io.ReadAll(req.Body); err != nil || string(b) != "12345" {
 		t.Errorf("exactly at the limit: %q, %v", b, err)
 	}
+	// 長度未知（chunked）：讀到上限才知道超過
 	req = httptest.NewRequest("POST", "/", strings.NewReader("123456"))
+	req.ContentLength = -1
 	hypcontext.LimitRequestBody(req, 5)
 	var tooBig *http.MaxBytesError
 	if b, err := io.ReadAll(req.Body); !errors.As(err, &tooBig) || len(b) != 5 {
 		t.Errorf("one byte over: %q, %v", b, err)
+	}
+	// Content-Length 已經超過上限：一個位元組都不讀。歷史 bug：仍先讀 limit+1 位元組，
+	// 帶 Expect: 100-continue 的客戶端也被要求上傳
+	src := &countingReader{r: strings.NewReader("123456")}
+	req = httptest.NewRequest("POST", "/", src)
+	req.ContentLength = 6
+	hypcontext.LimitRequestBody(req, 5)
+	if b, err := io.ReadAll(req.Body); !errors.As(err, &tooBig) || len(b) != 0 || src.n != 0 {
+		t.Errorf("declared length over the limit: read %q (%d from the source), %v", b, src.n, err)
+	}
+	// 放寬上限後照常讀
+	hypcontext.LimitRequestBody(req, 10)
+	if b, err := io.ReadAll(req.Body); err != nil || string(b) != "123456" {
+		t.Errorf("after raising the limit: %q, %v", b, err)
 	}
 }
 
@@ -465,4 +481,15 @@ func TestMiscContextFixes(t *testing.T) {
 	if w := serve(r, req); w.Code != 200 {
 		t.Errorf("metrics: %d %s", w.Code, w.Body.String())
 	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }

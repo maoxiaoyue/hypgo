@@ -101,8 +101,9 @@ type Config struct {
 	// 先前沒有上限：一條連線 2 秒內訂閱 20 萬個頻道，佔掉約 90MB
 	MaxSubscriptions int
 
-	// MaxInvalidMessages 連續這麼多則無法解密、驗證或解析的訊息後，以 1008 關閉連線
-	// （預設 10，負數不限）。先前照單全收，每則記一行警告
+	// MaxInvalidMessages 連續這麼多則無法解密、驗證簽名、重放或時間戳超出範圍的訊息後，以 1008 關閉連線
+	// （預設 10，負數不限）。格式解析失敗的訊息只有接連送來（彼此相隔不到 1 秒）才算：
+	// 以文字 "ping" 當心跳的客戶端不送別的訊息，先前每 10 次心跳就被斷線一次
 	MaxInvalidMessages int
 }
 
@@ -256,6 +257,7 @@ type Client struct {
 	lastActivity atomic.Int64
 	metadata     map[string]interface{} // 客戶端元數據（mu 保護）
 	rooms        map[string]bool        // 已加入的房間 ID（mu 保護；斷線時只走訪所屬房間）
+	requested    map[string]struct{}    // 客戶端自己要求的訂閱 / 房間（"c:" / "r:" 加名稱；mu 保護），MaxSubscriptions 只算這些
 
 	// per-client 安全金鑰（mu 保護；覆寫 hub 層預設）
 	aead    cipher.AEAD
@@ -695,6 +697,7 @@ func (c *Client) readPump() {
 	}
 	limit := hub.config.MaxMessageSize
 	invalid := 0
+	var lastUnparsed time.Time
 	// rejected 記一則無效訊息；連續太多則時關閉連線並回傳 true
 	rejected := func() bool {
 		invalid++
@@ -746,6 +749,12 @@ func (c *Client) readPump() {
 		if err := c.codec.Unmarshal(data, msg); err != nil {
 			hub.logger.Warningf("Invalid message format from client %s: %v", c.ID, err)
 			msg.Release()
+			// 解析不了的訊息不是攻擊的跡象（自訂的文字心跳就是）：只有接連送來才計入
+			now := time.Now()
+			if now.Sub(lastUnparsed) > invalidBurstWindow {
+				invalid = 0
+			}
+			lastUnparsed = now
 			if rejected() {
 				return
 			}
@@ -898,6 +907,7 @@ func (c *Client) handleMessage(msg *Message) {
 
 	case "unsubscribe":
 		if msg.Channel != "" {
+			c.release("c:" + msg.Channel)
 			c.Unsubscribe(msg.Channel)
 		}
 
@@ -914,10 +924,21 @@ func (c *Client) handleMessage(msg *Message) {
 
 	case "leave_room":
 		if msg.Channel != "" {
+			c.release("r:" + msg.Channel)
 			c.LeaveRoom(msg.Channel)
 		}
 	}
 }
+
+// release 歸還一個客戶端要求的訂閱名額
+func (c *Client) release(key string) {
+	c.mu.Lock()
+	delete(c.requested, key)
+	c.mu.Unlock()
+}
+
+// invalidBurstWindow 內接連送來的無法解析的訊息才計入 MaxInvalidMessages（變數：測試會縮短）
+var invalidBurstWindow = time.Second
 
 // allowSubscription 檢查客戶端要求的訂閱 / 加入房間是否仍在 MaxSubscriptions 內；
 // 超過時回一則 type 為 "error" 的訊息（channel 為被拒絕的目標）並回傳 false
@@ -926,14 +947,23 @@ func (c *Client) allowSubscription(msg *Message, room bool) bool {
 	if max <= 0 {
 		return true
 	}
-	c.mu.RLock()
-	have := c.Channels[msg.Channel]
+	key := "c:" + msg.Channel
 	if room {
-		have = c.rooms[msg.Channel]
+		key = "r:" + msg.Channel
 	}
-	n := len(c.Channels) + len(c.rooms)
-	c.mu.RUnlock()
-	if have || n < max {
+	// 只算客戶端自己要求的。先前算的是連線持有的全部頻道與房間：伺服器端以 Subscribe / JoinRoom
+	// 加進去的也佔名額，與上面「伺服器呼叫不受限」的說明相反
+	c.mu.Lock()
+	_, have := c.requested[key]
+	if !have && len(c.requested) < max {
+		if c.requested == nil {
+			c.requested = make(map[string]struct{})
+		}
+		c.requested[key] = struct{}{}
+		have = true
+	}
+	c.mu.Unlock()
+	if have {
 		return true
 	}
 	c.Hub.logger.Debugf("Client %s reached MaxSubscriptions (%d)", c.ID, max)

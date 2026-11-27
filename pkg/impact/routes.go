@@ -136,6 +136,7 @@ type routeRef struct {
 	path    string // 已接上同一個函式內追得到的 Group 前綴
 	grouped bool   // path 含 Group 前綴
 	handler string // handler 的函式名（c.Get → "Get"）；閉包或看不出來時為空
+	qual    string // handler 前面的識別字（controllers.List → "controllers"、c.Get → "c"）
 	command string // 非 REST（schema.RegisterGRPC 等）
 }
 
@@ -288,7 +289,7 @@ func scanFuncRoutes(body ast.Node) []routeRef {
 				return true
 			}
 			if ref, ok := routeFromLiteral(lit); ok {
-				ref.handler = handlerName(call.Args[0])
+				ref.qual, ref.handler = handlerName(call.Args[0])
 				if prefix, grouped := prefixOf(innerSel.X, 0); grouped && ref.command == "" {
 					ref.path, ref.grouped = joinRoute(prefix, ref.path), true
 				}
@@ -298,7 +299,8 @@ func scanFuncRoutes(body ast.Node) []routeRef {
 		case httpVerbs[sel.Sel.Name] && len(call.Args) >= 2:
 			// 至少要有路徑與 handler：先前 HTTP 客戶端的 client.GET("/x") 也被當成路由註冊
 			if arg, ok := stringLiteral(call.Args[0]); ok {
-				ref := routeRef{method: sel.Sel.Name, path: arg, handler: handlerName(call.Args[len(call.Args)-1])}
+				ref := routeRef{method: sel.Sel.Name, path: arg}
+				ref.qual, ref.handler = handlerName(call.Args[len(call.Args)-1])
 				if prefix, grouped := prefixOf(sel.X, 0); grouped {
 					ref.path, ref.grouped = joinRoute(prefix, arg), true
 				}
@@ -334,13 +336,17 @@ func groupCall(expr ast.Expr) (base, prefix string, ok bool) {
 	return base, prefix, true
 }
 
-// handlerName 取出 handler 的函式名：controllers.List → List、c.Get → Get；閉包、呼叫、區域變數回傳 ""
-func handlerName(expr ast.Expr) string {
+// handlerName 取出 handler 的函式名與它前面的識別字：controllers.List → ("controllers", "List")、
+// c.Get → ("c", "Get")；閉包、呼叫、區域變數回傳空字串
+func handlerName(expr ast.Expr) (qual, name string) {
 	// 只認 pkg.Func / recv.Method：單獨的識別字可能是區域變數（h := wrap(...)），名稱不代表 handler
 	if sel, ok := expr.(*ast.SelectorExpr); ok {
-		return sel.Sel.Name
+		if x, ok := sel.X.(*ast.Ident); ok {
+			qual = x.Name
+		}
+		return qual, sel.Sel.Name
 	}
-	return ""
+	return "", ""
 }
 
 // joinRoute 接上 group 前綴與路徑，中間只留一個斜線
@@ -422,15 +428,21 @@ func matchRefs(refs []routeRef, method, routePath, command string, handlers []st
 		if ref.method != method {
 			continue
 		}
-		confirmed := false
+		// named：handler 名稱的最後一段相同；confirmed：連套件也相同（套件層級的函式 controllers.List）。
+		// 只有名稱相同不足以確認：scaffold 的每個 controller 都有 List / Get / Create / Update / Delete，
+		// 先前 routers/order.go 的 g.GET("/:id", c.Get) 因此認領了 GET /api/users/:id
+		named, confirmed := false, false
 		if ref.handler != "" && len(handlers) > 0 {
 			for _, h := range handlers {
 				fn := handlerFunc(h)
 				if fn[strings.LastIndex(fn, ".")+1:] == ref.handler {
-					confirmed = true
+					named = true
+					if ref.qual != "" && fn == ref.qual+"."+ref.handler {
+						confirmed = true
+					}
 				}
 			}
-			if !confirmed {
+			if !named {
 				continue // 同一個路徑結尾，但 handler 是別人的
 			}
 		}

@@ -19,6 +19,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +34,9 @@ import (
 // TestCase 定義單一 contract 測試案例
 type TestCase struct {
 	// Name 案例名稱（選填），RecordHistory 時寫進歷史。同一條路由有多個案例（成功、錯誤路徑…）時，
-	// hyp eval-report 以它分開統計；沒有名稱時以輸入的 hash 區分
+	// hyp eval-report 以它分開統計；沒有名稱時以輸入（body 與 query）的 hash 區分。
+	// 輸入每次都不同（隨機資料）或案例只差在標頭時一定要給名稱，否則每次執行都是一個新案例，
+	// 趨勢與 --fail-on-regression 都無從比較
 	Name string
 
 	// Route 格式為 "METHOD /path"，例如 "POST /api/users"
@@ -349,12 +352,32 @@ func recordHistory(t *testing.T, tc TestCase, route string, pass bool, reason st
 		Attempts:   attempts,
 		LatencyMs:  latency.Milliseconds(),
 		GraderMs:   graderTime.Milliseconds(),
-		InputHash:  eval.HashInput(tc.Input),
+		InputHash:  caseHash(tc),
 		FailReason: reason,
 	})
 	if err != nil {
 		t.Errorf("contract: record history: %v", err)
 	}
+}
+
+// caseHash 辨識沒有名稱的案例：請求 body 加上 query。先前只算 body，同一條路由上
+// ?status=active 與 ?status=banned 兩個案例被當成同一個，分數交錯平均。
+// 標頭不算：測試常在裡面放每次都不同的 token。沒有 query 時與先前的值相同（歷史紀錄接得上）
+func caseHash(tc TestCase) string {
+	if len(tc.Query) == 0 {
+		return eval.HashInput(tc.Input)
+	}
+	keys := make([]string, 0, len(tc.Query))
+	for k := range tc.Query {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString(tc.Input)
+	for _, k := range keys {
+		sb.WriteString("\x00" + k + "=" + tc.Query[k])
+	}
+	return eval.HashInput(sb.String())
 }
 
 // TestAll 自動測試所有 schema-registered 路由

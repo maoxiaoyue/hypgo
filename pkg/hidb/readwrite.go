@@ -4,6 +4,7 @@ package hidb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,10 @@ type LagProber interface {
 	ReplicaLag(ctx context.Context, db *sql.DB) (time.Duration, error)
 }
 
+// ErrReplicationStopped 由 LagProber 回傳：副本的複寫已經停止（不是量不到）。
+// 健康檢查據此把副本移出輪詢，恢復複寫後自動回來
+var ErrReplicationStopped = errors.New("hidb: replication is not running")
+
 // replicaHealth 單一副本的健康狀態
 // 以指標共享：ReadReplica 以值複製進 copy-on-write slice，狀態必須跨副本存活。
 // 全部欄位皆為 atomic：健康檢查 goroutine 與查詢路徑（連線失敗時即時摘除）都會寫
@@ -34,6 +39,7 @@ type replicaHealth struct {
 	fails   atomic.Int32
 	lagNs   atomic.Int64 // 最近一次量到的複寫延遲；-1 = 沒量過
 	lastErr atomic.Value // string：最近一次失敗或被摘除的原因
+	lagWarn atomic.Bool  // 已經記過「量不到延遲」（量到之後重設）
 }
 
 // markDown 把副本標成不健康並記下原因；回報這次是否由健康變成不健康
@@ -84,7 +90,6 @@ type ReplicaPool struct {
 	prober LagProber                               // nil = 不量延遲
 	maxLag time.Duration                           // 0 = 不檢查延遲
 	notify func(index int, up bool, reason string) // 副本被摘除 / 恢復時呼叫（寫日誌）
-	lagErr sync.Once                               // 量不到延遲的原因只記一次
 }
 
 // NewReplicaPool 創建讀取副本池
@@ -207,13 +212,18 @@ func (rp *ReplicaPool) checkAll() {
 			if r.health.markDown(reason) {
 				rp.report(r.index, false, reason.Error())
 			}
+		case errors.Is(lagErr, ErrReplicationStopped):
+			// 複寫停止的副本資料只會越來越舊。先前被當成「量不到」而留在輪詢裡
+			if r.health.markDown(lagErr) {
+				rp.report(r.index, false, lagErr.Error())
+			}
 		default:
 			if measured {
 				r.health.lagNs.Store(int64(lag))
-			} else if lagErr != nil {
-				rp.lagErr.Do(func() {
-					rp.report(r.index, true, "cannot measure replication lag (max_replica_lag is not enforced): "+lagErr.Error())
-				})
+				r.health.lagWarn.Store(false)
+			} else if lagErr != nil && !r.health.lagWarn.Swap(true) {
+				// 每個副本各記一次。先前整個 pool 只記一次，第二個副本量不到時沒有任何紀錄
+				rp.report(r.index, true, "cannot measure replication lag (max_replica_lag is not enforced): "+lagErr.Error())
 			}
 			if r.health.markUp() {
 				rp.report(r.index, true, "")

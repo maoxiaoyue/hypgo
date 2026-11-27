@@ -56,6 +56,11 @@ func validateBody(body []byte, typ interface{}, kind, schemaName string, strict 
 		return nil // 上面已成功解碼，不會到這裡
 	}
 	if decoded == nil {
+		// nil slice / map 序列化成 null，是「沒有資料」的正常結果（var items []Item; c.JSON(200, items)）。
+		// 先前一律判為失敗，回傳空清單的端點全部過不了 TestAll
+		if nullable(t) || customDecoded(t) {
+			return nil
+		}
 		return fmt.Errorf("%s body is null, want %s", kind, name)
 	}
 	var problems []string
@@ -139,7 +144,8 @@ func checkShape(v interface{}, t reflect.Type, path string, strict bool, out *[]
 			}
 			declared[key] = true
 			if obj[key] == nil {
-				if f.Required && !nullable(f.Type) {
+				// 自訂序列化的型別（uuid.NullUUID、null.String、decimal.NullDecimal）以 null 表示沒有值
+				if f.Required && !nullable(f.Type) && !customDecoded(f.Type) {
 					*out = append(*out, at(f.Name)+" is null")
 				}
 				continue
@@ -233,7 +239,7 @@ func walkConstraints(rv reflect.Value, path string, validateHere bool, add func(
 		}
 		if validateHere {
 			// 使用 pkg/validate 的共用 registry，讓 app 註冊的自訂規則同樣生效
-			err := hypvalidate.Default().Struct(rv.Interface())
+			err := hypvalidate.Struct(rv.Interface()) // 標籤打錯時回錯而不是 panic
 			var verrs validator.ValidationErrors
 			switch {
 			case errors.As(err, &verrs):

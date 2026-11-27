@@ -15,8 +15,10 @@
 package testgen
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -42,6 +44,17 @@ type Report struct {
 	Contract []string
 	// ContractFile 本次寫入 contract 測試的檔案（<src>_contract_test.go）；未寫入時為空
 	ContractFile string
+	// BuildMismatch 沒有產生的測試：既有測試檔的 build 條件與原始檔不同，追加進去在某些平台會編不過
+	BuildMismatch []string
+}
+
+// SkippedError 由 GenerateForDir 回傳：有目錄或檔案無法處理（其餘的照常完成，reports 仍然有效）
+type SkippedError struct {
+	Problems []string // "<路徑>: <原因>"
+}
+
+func (e *SkippedError) Error() string {
+	return fmt.Sprintf("%d location(s) could not be processed:\n  %s", len(e.Problems), strings.Join(e.Problems, "\n  "))
 }
 
 // Options 控制產生行為
@@ -105,8 +118,15 @@ func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, erro
 		return report, nil
 	}
 
+	// //go:build ignore 的檔案不參與建置（多半是另一個 package main 的產生器）：不補測試。
+	// 先前照樣產生 gen_test.go，套件變成「found packages x and main」，連 setup 都失敗
+	buildLine, ignored := buildConstraint(srcAST)
+	if ignored {
+		return report, nil
+	}
+
 	// 收集本檔案中需要被測試的函式
-	candidates := collectCandidates(srcAST, opts)
+	candidates := collectCandidates(srcAST, opts, pkg.funcTypes)
 
 	// 把標記 notest 的函式也記錄
 	for _, c := range candidates {
@@ -123,6 +143,9 @@ func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, erro
 	unitFile := readTestFile(testPath)
 	contractPath := strings.TrimSuffix(filename, ".go") + "_contract_test.go"
 	contractFile := readTestFile(contractPath)
+	// 既有測試檔的 build 條件要與原始檔相同才追加。先前不看條件：//go:build linux 的原始檔
+	// 對應沒有條件的測試檔，在其他平台 undefined
+	fits := func(tf testFile) bool { return !tf.exists || tf.build == buildLine }
 
 	var units, contracts []candidate
 	for _, c := range candidates {
@@ -140,8 +163,34 @@ func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, erro
 		case c.kind == kindTable && !unitFile.accepts(pkgName, c.spec.imports):
 			c.kind = kindStub // 既有測試檔是 package x_test 或 import 名稱衝突：骨架無法直接呼叫
 		}
-		if pkg.covered(c.testName) {
-			report.Skipped = append(report.Skipped, c.testName)
+		by := pkg.covered(c.testName)
+		// 未匯出的名稱：手寫的測試多半叫 TestAdd 而不是 Test_add，兩種都算
+		if by == "" && c.altName != "" && !pkg.isCandidate(c.altName) {
+			by = pkg.covered(c.altName)
+		}
+		if by != "" && pkg.generated[by] != "" && pkg.generated[by] != c.funcName && by == c.testName {
+			// 這次執行才為另一個函式產生的同名測試（方法 Foo.Bar 與函式 Foo_Bar 都對應 TestFoo_Bar）：
+			// 先前把後者列為 kept，其實沒有任何測試在測它
+			by = ""
+			for pkg.tests[c.testName] {
+				c.testName += "_2"
+			}
+		}
+		if by != "" {
+			// 不是同名的測試時寫出是哪一個，名稱相近而誤認時看得出來
+			if by != c.testName {
+				report.Skipped = append(report.Skipped, fmt.Sprintf("%s (by %s)", c.testName, by))
+			} else {
+				report.Skipped = append(report.Skipped, c.testName)
+			}
+			continue
+		}
+		target := unitFile
+		if c.kind == kindRegistrar {
+			target = contractFile
+		}
+		if !fits(target) {
+			report.BuildMismatch = append(report.BuildMismatch, c.testName)
 			continue
 		}
 		if c.kind == kindRegistrar {
@@ -152,6 +201,7 @@ func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, erro
 		}
 		report.Added = append(report.Added, c.testName)
 		pkg.tests[c.testName] = true
+		pkg.generated[c.testName] = c.funcName
 	}
 
 	if len(units) == 0 && !unitFile.exists {
@@ -169,21 +219,24 @@ func generateFile(filename string, pkg *pkgContext, opts Options) (*Report, erro
 	}
 
 	if len(units) > 0 {
-		if err := writeTests(testPath, pkgName, unitFile, units, opts); err != nil {
+		if err := writeTests(testPath, pkgName, buildLine, unitFile, units, opts); err != nil {
 			return nil, fmt.Errorf("write %s: %w", testPath, err)
 		}
 	}
 	if len(contracts) > 0 {
-		if err := writeTests(contractPath, pkgName, contractFile, contracts, opts); err != nil {
+		if err := writeTests(contractPath, pkgName, buildLine, contractFile, contracts, opts); err != nil {
 			return nil, fmt.Errorf("write %s: %w", contractPath, err)
 		}
 	}
 	return report, nil
 }
 
-// GenerateForDir 遞迴處理 rootDir 下的所有 .go 檔（跳過 vendor / .git / node_modules / .hyp / testdata）
+// GenerateForDir 遞迴處理 rootDir 下的所有 .go 檔。跳過 vendor / node_modules / testdata 與
+// `.`、`_` 開頭的目錄（Go 不建置它們；先前 .cache、_examples、.claude/worktrees 裡也會被寫入測試檔）。
+// 有目錄或檔案無法處理時其餘的照常完成，回傳 reports 與 *SkippedError
 func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 	var reports []Report
+	var problems []string
 	pkgs := map[string]*pkgContext{} // 每個目錄的套件現況只讀一次
 	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -191,8 +244,8 @@ func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 		}
 		if d.IsDir() {
 			name := d.Name()
-			if name == "vendor" || name == ".git" || name == "node_modules" ||
-				name == ".hyp" || name == "testdata" {
+			if path != rootDir && (name == "vendor" || name == "node_modules" || name == "testdata" ||
+				strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -205,7 +258,7 @@ func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 		if !ok {
 			var loadErr error
 			if pkg, loadErr = loadPkgContext(dir, opts); loadErr != nil {
-				fmt.Fprintf(os.Stderr, "  ! %s: %v\n", dir, loadErr)
+				problems = append(problems, fmt.Sprintf("%s: %v", dir, loadErr))
 				pkg = nil
 			}
 			pkgs[dir] = pkg
@@ -215,15 +268,69 @@ func GenerateForDir(rootDir string, opts Options) ([]Report, error) {
 		}
 		rep, genErr := generateFile(path, pkg, opts)
 		if genErr != nil {
-			fmt.Fprintf(os.Stderr, "  ! %s: %v\n", path, genErr)
+			problems = append(problems, fmt.Sprintf("%s: %v", path, genErr))
 			return nil
 		}
-		if rep != nil && (len(rep.Added) > 0 || len(rep.Skipped) > 0 || len(rep.NoTestNeed) > 0 || len(rep.Contract) > 0) {
+		if rep != nil && !rep.empty() {
 			reports = append(reports, *rep)
 		}
 		return nil
 	})
+	// 先前只在 stderr 印一行就繼續，結尾照樣是「No missing tests found.」、exit 0
+	if err == nil && len(problems) > 0 {
+		err = &SkippedError{Problems: problems}
+	}
 	return reports, err
+}
+
+// empty 回報這個檔案是否沒有任何值得列出的結果
+func (r *Report) empty() bool {
+	return len(r.Added) == 0 && len(r.Skipped) == 0 && len(r.NoTestNeed) == 0 && len(r.Contract) == 0 && len(r.BuildMismatch) == 0
+}
+
+// IsEmpty 回報這個檔案是否沒有任何值得列出的結果
+func (r *Report) IsEmpty() bool { return r == nil || r.empty() }
+
+// buildConstraint 回傳原始檔的 build 條件（正規化成 //go:build 的寫法；沒有時為空字串），
+// 以及它是否一定需要 ignore tag
+func buildConstraint(f *ast.File) (line string, ignored bool) {
+	for _, group := range f.Comments {
+		if group.Pos() >= f.Package {
+			break
+		}
+		for _, c := range group.List {
+			if !constraint.IsGoBuild(c.Text) && !constraint.IsPlusBuild(c.Text) {
+				continue
+			}
+			expr, err := constraint.Parse(c.Text)
+			if err != nil {
+				continue
+			}
+			if requiresIgnore(expr) {
+				return "", true
+			}
+			if line == "" {
+				line = "//go:build " + expr.String()
+			} else { // 多行 // +build 之間是 AND
+				line = "//go:build (" + strings.TrimPrefix(line, "//go:build ") + ") && (" + expr.String() + ")"
+			}
+			if constraint.IsGoBuild(c.Text) {
+				return "//go:build " + expr.String(), false // 有 //go:build 時以它為準
+			}
+		}
+	}
+	return line, false
+}
+
+// requiresIgnore 回報條件是否一定需要 ignore tag（ignore、ignore && x）
+func requiresIgnore(expr constraint.Expr) bool {
+	switch e := expr.(type) {
+	case *constraint.TagExpr:
+		return e.Tag == "ignore"
+	case *constraint.AndExpr:
+		return requiresIgnore(e.X) || requiresIgnore(e.Y)
+	}
+	return false
 }
 
 // pkgContext 一個目錄（Go 套件）的測試現況。先前只看成對的 foo_test.go 裡有沒有
@@ -235,6 +342,8 @@ type pkgContext struct {
 	// calledRegistrars 被同套件其他路由註冊函式呼叫的註冊函式（如 Setup 內的 RegisterUserRoutes）：
 	// 它們的路由已由根註冊函式的 contract 測試涵蓋
 	calledRegistrars map[string]bool
+	funcTypes        map[string]bool   // 套件內宣告的函式型別（type Handler func(...)）
+	generated        map[string]string // 這次執行產生的測試 → 它測的函式
 }
 
 // loadPkgContext 讀取目錄下所有 .go 檔：測試檔收集 Test*，原始檔收集候選名稱。
@@ -244,7 +353,8 @@ func loadPkgContext(dir string, opts Options) (*pkgContext, error) {
 	if err != nil {
 		return nil, err
 	}
-	pkg := &pkgContext{tests: map[string]bool{}, calledRegistrars: map[string]bool{}}
+	pkg := &pkgContext{tests: map[string]bool{}, calledRegistrars: map[string]bool{},
+		funcTypes: map[string]bool{}, generated: map[string]string{}}
 	registrars := map[string]*ast.FuncDecl{}
 	fset := token.NewFileSet()
 	for _, e := range entries {
@@ -269,7 +379,21 @@ func loadPkgContext(dir string, opts Options) (*pkgContext, error) {
 		if err != nil || ast.IsGenerated(f) {
 			continue // 原始檔錯誤由 generateFile 回報
 		}
-		for _, c := range collectCandidates(f, opts) {
+		if _, ignored := buildConstraint(f); ignored {
+			continue
+		}
+		for _, decl := range f.Decls {
+			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
+				for _, s := range gd.Specs {
+					if ts, ok := s.(*ast.TypeSpec); ok {
+						if _, isFunc := ts.Type.(*ast.FuncType); isFunc {
+							pkg.funcTypes[ts.Name.Name] = true
+						}
+					}
+				}
+			}
+		}
+		for _, c := range collectCandidates(f, opts, nil) {
 			pkg.candidates = append(pkg.candidates, c.testName)
 			if c.kind == kindRegistrar && !c.isMethod {
 				registrars[c.funcName] = c.fd
@@ -302,10 +426,28 @@ func covers(test, target string) bool {
 	return !unicode.IsLower(r)
 }
 
-// covered 回報套件內是否已有測試在測 target。一個測試同時符合多個候選時歸給名稱最長者：
-// 有 AddUser 時 TestAddUserWorks 算 AddUser 的測試，不算 Add 的
-func (p *pkgContext) covered(target string) bool {
+// isCandidate 回報 name 是否為套件內某個函式的測試名稱
+func (p *pkgContext) isCandidate(name string) bool {
+	for _, c := range p.candidates {
+		if c == name {
+			return true
+		}
+	}
+	return false
+}
+
+// covered 回傳套件內在測 target 的測試名稱（沒有時為空字串；同名的優先）。一個測試同時符合多個候選時
+// 歸給名稱最長者：有 AddUser 時 TestAddUserWorks 算 AddUser 的測試，不算 Add 的
+func (p *pkgContext) covered(target string) string {
+	if p.tests[target] {
+		return target
+	}
+	names := make([]string, 0, len(p.tests))
 	for test := range p.tests {
+		names = append(names, test)
+	}
+	sort.Strings(names)
+	for _, test := range names {
 		if !covers(test, target) {
 			continue
 		}
@@ -316,10 +458,10 @@ func (p *pkgContext) covered(target string) bool {
 			}
 		}
 		if owner == target {
-			return true
+			return test
 		}
 	}
-	return false
+	return ""
 }
 
 // --- internal ---
@@ -327,6 +469,7 @@ func (p *pkgContext) covered(target string) bool {
 type candidate struct {
 	funcName    string // 原始函式名（含 receiver 樣式：Svc_DoThing）
 	testName    string // 對應的 Test 名稱
+	altName     string // 未匯出的名稱另一種常見的測試寫法（add → TestAdd）；沒有時為空
 	isMethod    bool
 	receiverStr string // 用於 method（例：*Svc）
 	skipNoTest  bool   // 是否標記 //hyp:notest
@@ -336,7 +479,7 @@ type candidate struct {
 }
 
 // collectCandidates 從 AST 抽出所有要產測試的 func / method
-func collectCandidates(f *ast.File, opts Options) []candidate {
+func collectCandidates(f *ast.File, opts Options, funcTypes map[string]bool) []candidate {
 	var out []candidate
 	imps := fileImports(f)
 
@@ -357,14 +500,15 @@ func collectCandidates(f *ast.File, opts Options) []candidate {
 		c := candidate{funcName: name, fd: fd, kind: classify(fd, imps)}
 		if c.kind == kindTable {
 			c.spec = newTableSpec(fd, imps)
+			c.spec.markFuncResults(fd, funcTypes)
 		}
 		if fd.Recv != nil && len(fd.Recv.List) > 0 {
 			c.isMethod = true
 			recv := fd.Recv.List[0].Type
 			c.receiverStr = exprString(recv)
-			c.testName = "Test" + recvBaseName(recv) + "_" + name
+			c.testName, c.altName = testNames(recvBaseName(recv), "_"+name)
 		} else {
-			c.testName = "Test" + name
+			c.testName, c.altName = testNames(name, "")
 		}
 
 		// 檢查 doc comment 是否含 //hyp:notest
@@ -380,6 +524,18 @@ func collectCandidates(f *ast.File, opts Options) []candidate {
 		out = append(out, c)
 	}
 	return out
+}
+
+// testNames 組出測試名稱。Test 之後的第一個字母不能是小寫（go vet 會擋下，go test 也不會執行）：
+// 未匯出的名稱前面加底線，與 gotests 的慣例相同（add → Test_add、server.ServeHTTP → Test_server_ServeHTTP）。
+// 先前直接接上，未匯出型別上的匯出方法產生 Testserver_ServeHTTP，整個套件的測試編不過。
+// alt 是首字母改大寫的寫法，手寫的測試多半用它
+func testNames(first, rest string) (name, alt string) {
+	if ast.IsExported(first) {
+		return "Test" + first + rest, ""
+	}
+	r, size := utf8.DecodeRuneInString(first)
+	return "Test_" + first + rest, "Test" + string(unicode.ToUpper(r)) + first[size:] + rest
 }
 
 func filterNoTest(in []candidate) []candidate {
@@ -454,15 +610,17 @@ type testFile struct {
 	exists  bool
 	pkgName string
 	imports map[string]string // import path → 引用名稱
+	build   string            // build 條件（見 buildConstraint）
 }
 
 func readTestFile(path string) testFile {
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly|parser.ParseComments)
 	if err != nil {
 		_, statErr := os.Stat(path)
 		return testFile{exists: statErr == nil}
 	}
 	tf := testFile{exists: true, pkgName: f.Name.Name, imports: map[string]string{}}
+	tf.build, _ = buildConstraint(f)
 	for _, imp := range f.Imports {
 		path, _ := strconv.Unquote(imp.Path.Value)
 		name := guessPkgName(path)
@@ -491,6 +649,13 @@ func (tf testFile) accepts(pkgName string, specs []string) bool {
 		}
 		if have, ok := tf.imports[path]; ok && have != name {
 			return false
+		}
+		// 同一個名稱已經給了別的套件（原始檔的 errors 是 x/errors，測試檔引入的是標準庫 errors）：
+		// 先前照樣補上，結果 errors redeclared
+		for p, have := range tf.imports {
+			if have == name && p != path {
+				return false
+			}
 		}
 	}
 	return true
@@ -522,7 +687,7 @@ func requiredImports(items []candidate) []string {
 }
 
 // writeTests 把骨架寫進 path：既有檔案補上缺少的 import 後追加（不重排使用者的檔案），否則建立新檔
-func writeTests(path, pkgName string, tf testFile, items []candidate, opts Options) error {
+func writeTests(path, pkgName, buildLine string, tf testFile, items []candidate, opts Options) error {
 	var body strings.Builder
 	for _, c := range items {
 		body.WriteString("\n" + renderTestStub(c, opts))
@@ -534,15 +699,33 @@ func writeTests(path, pkgName string, tf testFile, items []candidate, opts Optio
 		if err != nil {
 			return err
 		}
+		// 原本就是 gofmt 排好的檔案，補完之後再排一次（補進去的 import 才會在排序後的位置）；
+		// 不是的話只做文字插入，不動使用者的排版
+		formatted, ferr := format.Source(src)
+		clean := ferr == nil && bytes.Equal(formatted, src)
+		crlf := bytes.Contains(src, []byte("\r\n"))
 		src, err = addImports(src, imports)
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(path, append(src, body.String()...), 0644)
+		out := append(src, body.String()...)
+		if clean {
+			if formatted, ferr := format.Source(out); ferr == nil {
+				out = formatted
+			}
+		} else if crlf {
+			// 檔案是 CRLF：補進去的內容也用 CRLF，不留下混合的行尾
+			out = bytes.ReplaceAll(bytes.ReplaceAll(out, []byte("\r\n"), []byte("\n")), []byte("\n"), []byte("\r\n"))
+		}
+		return os.WriteFile(path, out, 0644)
 	}
 
 	var sb strings.Builder
-	sb.WriteString("// Code generated by hyp testgen. Replace stubs with real assertions.\n")
+	if buildLine != "" {
+		sb.WriteString(buildLine + "\n\n")
+	}
+	// 不寫 "Code generated"：這個檔案是要讓人改的，有些工具看到那幾個字就把整個檔案當成生成檔略過
+	sb.WriteString("// Test stubs created by hyp testgen: replace each t.Skip with real assertions.\n\n")
 	fmt.Fprintf(&sb, "package %s\n\nimport (\n", pkgName)
 	// 標準庫一組、其餘一組（gofmt 只排序不分組）
 	for _, std := range []bool{true, false} {
@@ -604,7 +787,7 @@ func FormatReports(reports []Report) string {
 	var sb strings.Builder
 	created, added, skipped, notest, contract := 0, 0, 0, 0, 0
 	for _, r := range reports {
-		if len(r.Added) == 0 && len(r.Skipped) == 0 && len(r.NoTestNeed) == 0 && len(r.Contract) == 0 {
+		if r.empty() {
 			continue
 		}
 		mark := "~"
@@ -635,6 +818,9 @@ func FormatReports(reports []Report) string {
 		}
 		if r.ContractFile != "" {
 			sb.WriteString(fmt.Sprintf("      contract test → %s\n", r.ContractFile))
+		}
+		if len(r.BuildMismatch) > 0 {
+			sb.WriteString(fmt.Sprintf("      not added (the existing test file has a different build constraint): %s\n", strings.Join(r.BuildMismatch, ", ")))
 		}
 	}
 	sb.WriteString(fmt.Sprintf("\nSummary: %d files (created=%d), %d Test stubs added, %d kept, %d marked //hyp:notest, %d covered by contract tests\n",

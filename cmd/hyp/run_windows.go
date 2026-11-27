@@ -5,6 +5,7 @@ package main
 import (
 	"os/exec"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -46,4 +47,16 @@ func bindChildLifetime(cmd *exec.Cmd) {
 	}
 	defer windows.CloseHandle(h)
 	windows.AssignProcessToJobObject(devJob, h)
+}
+
+// prepareChild 讓應用程式自成一個行程群組：Ctrl+Break 只能送給群組，而且這樣主控台的 Ctrl+C
+// 不會同時送到應用程式（由 hyp run 收到後轉送一次）
+func prepareChild(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+}
+
+// interruptChild 送 Ctrl+Break：Go 把它當成 os.Interrupt，server 因此優雅關閉。
+// 沒有主控台時（服務、部分 CI）送不出去而回錯，由呼叫端改用 Kill
+func interruptChild(cmd *exec.Cmd) error {
+	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(cmd.Process.Pid))
 }

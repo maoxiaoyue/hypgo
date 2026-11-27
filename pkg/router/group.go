@@ -230,7 +230,16 @@ func (g *Group) StaticWith(relativePath string, fs http.FileSystem, opts StaticO
 	absolutePath := joinPaths(g.basePath, relativePath)
 	fileServer := http.StripPrefix(absolutePath, http.FileServer(staticFS{fs, opts}))
 	handler := func(c *hypcontext.Context) {
-		fileServer.ServeHTTP(c.Writer, c.Request)
+		// 找不到檔案時改由 router 的 404 回應（自訂的 NoRoute 或 Error Catalog JSON）。
+		// 先前是 http.FileServer 的純文字 "404 page not found"，與其他路徑的 404 格式不同
+		w := &static404Writer{ResponseWriter: c.Writer}
+		fileServer.ServeHTTP(w, c.Request)
+		if w.notFound {
+			h := c.Writer.Header()
+			h.Del("Content-Type")
+			h.Del("X-Content-Type-Options")
+			g.router.notFoundHandler()(c)
+		}
 	}
 	urlPattern := relativePath
 	if !strings.HasSuffix(urlPattern, "/") { // 空字串時先前 urlPattern[len-1] 會 panic
@@ -242,6 +251,37 @@ func (g *Group) StaticWith(relativePath string, fs http.FileSystem, opts StaticO
 	return g.returnObj()
 }
 
+// static404Writer 攔下 http.FileServer 的 404：不寫出去，交給呼叫端改寫回應
+type static404Writer struct {
+	hypcontext.ResponseWriter
+	notFound bool
+}
+
+func (w *static404Writer) WriteHeader(code int) {
+	if code == http.StatusNotFound {
+		w.notFound = true
+		return
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *static404Writer) Write(p []byte) (int, error) {
+	if w.notFound {
+		return len(p), nil
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *static404Writer) WriteString(s string) (int, error) {
+	if w.notFound {
+		return len(s), nil
+	}
+	return w.ResponseWriter.WriteString(s)
+}
+
+// Unwrap 讓 http.ResponseController 找得到底層的 writer
+func (w *static404Writer) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // staticFS 依 StaticOptions 把不該提供的路徑變成「不存在」，其餘交給底層檔案系統
 type staticFS struct {
 	fs   http.FileSystem
@@ -250,7 +290,14 @@ type staticFS struct {
 
 func (s staticFS) Open(name string) (http.File, error) {
 	if !s.opts.AllowDotFiles {
-		for _, seg := range strings.Split(name, "/") {
+		// 根目錄的 .well-known 例外（RFC 8615：ACME HTTP-01、security.txt、
+		// apple-app-site-association、assetlinks.json）。先前它與 .env 一起被擋，
+		// 而唯一的開關 AllowDotFiles 會把所有點開頭的檔案一起開放
+		segs := strings.Split(strings.TrimPrefix(name, "/"), "/")
+		if segs[0] == ".well-known" {
+			segs = segs[1:]
+		}
+		for _, seg := range segs {
 			if strings.HasPrefix(seg, ".") {
 				return nil, os.ErrNotExist
 			}

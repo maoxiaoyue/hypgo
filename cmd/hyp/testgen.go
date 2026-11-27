@@ -3,8 +3,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/maoxiaoyue/hypgo/pkg/testgen"
 	"github.com/spf13/cobra"
@@ -23,14 +25,18 @@ and replace them with real tests.
 Behavior:
   - Default scope is the current working directory (recursive)
   - Provide a path argument to scope to a single file or subdirectory
-  - vendor/, .git/, node_modules/, .hyp/, testdata/ are skipped
+  - vendor/, node_modules/, testdata/ and directories starting with "." or "_"
+    are skipped (Go does not build them)
+  - Files with //go:build ignore are skipped; another build constraint is
+    copied into the new test file
+  - Unexported names get an underscore: Test_add, Test_server_ServeHTTP
   - Existing Test* names are preserved (never overwritten)
   - Funcs marked //hyp:notest are skipped entirely
 
 Examples:
   hyp testgen                                 # whole project
   hyp testgen --file app/services/user.go     # one file
-  hyp testgen ./app/services                  # one directory
+  hyp testgen ./app/services                  # one directory (./app/services/... is the same)
   hyp testgen --include-unexported            # also stub for lower-case funcs
   hyp testgen --dry-run                       # preview without writing
 
@@ -80,7 +86,11 @@ func runTestgen(cmd *cobra.Command, args []string) error {
 	// 目錄遞迴
 	target := "."
 	if len(args) > 0 {
-		target = args[0]
+		// testgen 本來就遞迴：./... 與 ./app/... 等同於那個目錄。先前把 "./..." 當成路徑，
+		// 回一個看不懂的 open ...\dot 錯誤
+		if target = strings.TrimRight(strings.TrimSuffix(args[0], "..."), `/\`); target == "" {
+			target = "."
+		}
 	}
 	if dryRun {
 		fmt.Printf("[dry-run] Scanning %s for missing test stubs...\n\n", target)
@@ -88,14 +98,20 @@ func runTestgen(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Scanning %s for missing test stubs...\n\n", target)
 	}
 	reports, err := testgen.GenerateForDir(target, opts)
-	if err != nil {
+	// 有地方無法處理（測試檔語法錯誤…）時其餘的照常完成：先印出做了什麼，再回錯。
+	// 先前只在 stderr 印一行，結尾是「No missing tests found.」、exit 0
+	var skipped *testgen.SkippedError
+	if err != nil && !errors.As(err, &skipped) {
 		return fmt.Errorf("scan failed: %w", err)
 	}
-	if len(reports) == 0 {
+	if len(reports) > 0 {
+		fmt.Print(testgen.FormatReports(reports))
+	} else if skipped == nil {
 		fmt.Println("No missing tests found.")
-		return nil
 	}
-	fmt.Print(testgen.FormatReports(reports))
+	if skipped != nil {
+		return skipped
+	}
 	return nil
 }
 
@@ -107,7 +123,7 @@ func printSingleReport(rep *testgen.Report, dryRun bool) {
 	if dryRun {
 		prefix = "[dry-run] "
 	}
-	if len(rep.Added) == 0 && len(rep.Skipped) == 0 && len(rep.NoTestNeed) == 0 && len(rep.Contract) == 0 {
+	if rep.IsEmpty() {
 		fmt.Fprintf(os.Stdout, "%sNo eligible funcs in %s\n", prefix, rep.SourceFile)
 		return
 	}
@@ -134,5 +150,8 @@ func printSingleReport(rep *testgen.Report, dryRun bool) {
 	}
 	if rep.ContractFile != "" {
 		fmt.Fprintf(os.Stdout, "    contract test → %s\n", rep.ContractFile)
+	}
+	if len(rep.BuildMismatch) > 0 {
+		fmt.Fprintf(os.Stdout, "    not added (the existing test file has a different build constraint): %v\n", rep.BuildMismatch)
 	}
 }
